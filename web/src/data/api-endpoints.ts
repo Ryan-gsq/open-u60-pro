@@ -218,7 +218,11 @@ export const apiCategories: APICategory[] = [
       { method: "POST", path: "/api/ussd/respond", description: "Respond to USSD prompt" },
       { method: "POST", path: "/api/ussd/cancel", description: "Cancel USSD session" },
       { method: "GET", path: "/api/stk/menu", description: "SIM Toolkit menu" },
-      { method: "POST", path: "/api/stk/select", description: "Select STK menu item" },
+      { method: "POST", path: "/api/stk/select", description: "Select STK item (item_id, command_id)" },
+      { method: "GET", path: "/api/stk/session", description: "Current SIM Toolkit session" },
+      { method: "POST", path: "/api/stk/respond", description: "Respond to SIM prompt (command_id, text or yes)" },
+      { method: "POST", path: "/api/stk/back", description: "Return from a SIM command (command_id)" },
+      { method: "POST", path: "/api/stk/cancel", description: "End pending SIM command (command_id)" },
     ],
   },
   {

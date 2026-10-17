@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -269,9 +269,48 @@ pub fn read_network_traffic() -> Vec<NetInterface> {
     ifaces
 }
 
-// -- Speed tracker (ring buffer + background sampler for IPA batch smoothing) --
+// -- Named threads ---------------------------------------------------------
+
+/// `std::thread::spawn` with a name, so per-thread CPU/wakeup measurements on
+/// the router (`/proc/<pid>/task/*/comm`) are attributable. Returns the OS
+/// error (EAGAIN under memory pressure) instead of panicking, for callers that
+/// must keep serving without the thread (request handlers, watchdogs).
+pub fn try_spawn_named<F>(name: &str, f: F) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new().name(name.to_string()).spawn(f)
+}
+
+/// `try_spawn_named` for threads the agent cannot run without. Panics like
+/// `std::thread::spawn` if the OS refuses to create the thread.
+pub fn spawn_named<F>(name: &str, f: F) -> std::thread::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    try_spawn_named(name, f).unwrap_or_else(|e| panic!("spawn thread {name}: {e}"))
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    #[test]
+    fn try_spawn_named_names_the_thread_and_returns_a_handle() {
+        let handle = try_spawn_named("zte-spawn-test", || {
+            assert_eq!(std::thread::current().name(), Some("zte-spawn-test"));
+        })
+        .expect("thread spawn");
+        handle.join().expect("thread body panicked");
+    }
+}
+
+// -- Speed tracker (ring buffer + demand-driven sampler for IPA batch smoothing) --
 
 const SPEED_RING_SIZE: usize = 16; // 16 samples × 1s = 16s window
+/// The sampler keeps ticking this long after the last `/api/network/speed`
+/// request, then parks until the next one (no timer at idle).
+const SPEED_LINGER: Duration = Duration::from_secs(20);
 
 struct NetSample {
     rx_bytes: u64,
@@ -288,68 +327,247 @@ pub struct SpeedSnapshot {
     pub elapsed_ms: u64,
 }
 
+impl SpeedSnapshot {
+    fn at(rx_bytes: u64, tx_bytes: u64) -> Self {
+        SpeedSnapshot {
+            rx_bytes,
+            tx_bytes,
+            rx_speed: 0.0,
+            tx_speed: 0.0,
+            elapsed_ms: 0,
+        }
+    }
+}
+
+struct SpeedInner {
+    ring: Mutex<VecDeque<NetSample>>,
+    latest: Mutex<SpeedSnapshot>,
+    /// When `/api/network/speed` was last requested; `None` until the first request.
+    last_request: Mutex<Option<Instant>>,
+    wake: Condvar,
+}
+
+impl SpeedInner {
+    fn is_idle(last_request: &Option<Instant>) -> bool {
+        last_request.is_none_or(|t| t.elapsed() > SPEED_LINGER)
+    }
+
+    fn run(&self) {
+        loop {
+            // Park until someone asks for speed. No wakeups while idle: the
+            // condvar is only notified by `sample()` on the idle -> active edge.
+            {
+                let guard = self.last_request.lock().unwrap();
+                let _active = self
+                    .wake
+                    .wait_while(guard, |t| Self::is_idle(t))
+                    .unwrap_or_else(|p| p.into_inner());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            let (rx, tx) = read_rmnet_bytes();
+            self.push(rx, tx, Instant::now());
+        }
+    }
+
+    fn push(&self, rx: u64, tx: u64, now: Instant) {
+        let mut buf = self.ring.lock().unwrap();
+        if buf.len() >= SPEED_RING_SIZE {
+            buf.pop_front();
+        }
+        buf.push_back(NetSample {
+            rx_bytes: rx,
+            tx_bytes: tx,
+            time: now,
+        });
+
+        // Compute rolling speed from oldest to newest
+        if buf.len() >= 2 {
+            let oldest = &buf[0];
+            let newest = buf.back().unwrap();
+            let secs = newest.time.duration_since(oldest.time).as_secs_f64();
+            if secs > 0.1 {
+                *self.latest.lock().unwrap() = SpeedSnapshot {
+                    rx_bytes: newest.rx_bytes,
+                    tx_bytes: newest.tx_bytes,
+                    rx_speed: newest.rx_bytes.saturating_sub(oldest.rx_bytes) as f64 / secs,
+                    tx_speed: newest.tx_bytes.saturating_sub(oldest.tx_bytes) as f64 / secs,
+                    elapsed_ms: (secs * 1000.0) as u64,
+                };
+            }
+        }
+    }
+}
+
 pub struct SpeedTracker {
-    latest: Arc<Mutex<SpeedSnapshot>>,
+    inner: Arc<SpeedInner>,
 }
 
 impl SpeedTracker {
     pub fn new() -> Self {
-        let ring = Arc::new(Mutex::new(VecDeque::with_capacity(SPEED_RING_SIZE)));
-        let latest = Arc::new(Mutex::new(SpeedSnapshot {
-            rx_bytes: 0,
-            tx_bytes: 0,
-            rx_speed: 0.0,
-            tx_speed: 0.0,
-            elapsed_ms: 0,
-        }));
-
-        // Seed with initial sample
-        let (rx, tx) = read_rmnet_bytes();
-        ring.lock().unwrap().push_back(NetSample {
-            rx_bytes: rx,
-            tx_bytes: tx,
-            time: Instant::now(),
+        let inner = Arc::new(SpeedInner {
+            ring: Mutex::new(VecDeque::with_capacity(SPEED_RING_SIZE)),
+            latest: Mutex::new(SpeedSnapshot::at(0, 0)),
+            last_request: Mutex::new(None),
+            wake: Condvar::new(),
         });
-
-        // Background sampler thread
-        let ring_c = Arc::clone(&ring);
-        let latest_c = Arc::clone(&latest);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let (rx, tx) = read_rmnet_bytes();
-            let now = Instant::now();
-            let mut buf = ring_c.lock().unwrap();
-            if buf.len() >= SPEED_RING_SIZE {
-                buf.pop_front();
-            }
-            buf.push_back(NetSample {
-                rx_bytes: rx,
-                tx_bytes: tx,
-                time: now,
-            });
-
-            // Compute rolling speed from oldest to newest
-            if buf.len() >= 2 {
-                let oldest = &buf[0];
-                let newest = buf.back().unwrap();
-                let secs = newest.time.duration_since(oldest.time).as_secs_f64();
-                if secs > 0.1 {
-                    *latest_c.lock().unwrap() = SpeedSnapshot {
-                        rx_bytes: newest.rx_bytes,
-                        tx_bytes: newest.tx_bytes,
-                        rx_speed: newest.rx_bytes.saturating_sub(oldest.rx_bytes) as f64 / secs,
-                        tx_speed: newest.tx_bytes.saturating_sub(oldest.tx_bytes) as f64 / secs,
-                        elapsed_ms: (secs * 1000.0) as u64,
-                    };
-                }
-            }
-        });
-
-        Self { latest }
+        let sampler = Arc::clone(&inner);
+        spawn_named("speed-sampler", move || sampler.run());
+        Self { inner }
     }
 
+    /// Current rolling speed. Marks the tracker active; on the idle -> active
+    /// edge the stale ring is replaced by one fresh baseline sample, so the
+    /// first reading after an idle period reports 0 B/s for one tick (the same
+    /// as the first second after boot used to).
     pub fn sample(&self) -> SpeedSnapshot {
-        self.latest.lock().unwrap().clone()
+        let was_idle = {
+            let mut last = self.inner.last_request.lock().unwrap();
+            let idle = SpeedInner::is_idle(&last);
+            *last = Some(Instant::now());
+            idle
+        };
+        if was_idle {
+            let (rx, tx) = read_rmnet_bytes();
+            {
+                let mut buf = self.inner.ring.lock().unwrap();
+                buf.clear();
+                buf.push_back(NetSample {
+                    rx_bytes: rx,
+                    tx_bytes: tx,
+                    time: Instant::now(),
+                });
+            }
+            *self.inner.latest.lock().unwrap() = SpeedSnapshot::at(rx, tx);
+            self.inner.wake.notify_one();
+        }
+        self.inner.latest.lock().unwrap().clone()
+    }
+}
+
+// -- Firmware watchdog: stuck /sbin/zte_post_wifi.sh ------------------------
+
+/// Firmware bug: `zte_post_wifi.sh` (run on every Wi-Fi reconfiguration) loops
+/// without sleeping until it sees one `hostapd_cli` per enabled SSID. With a
+/// radio disabled but its SSID still enabled that never happens, and each stuck
+/// copy forks ~130 processes per second forever. Killing it is safe: the steps
+/// after the loop (MAC filter, tx power) are re-run by the next reload anyway.
+const POST_WIFI_SCRIPT: &str = "/sbin/zte_post_wifi.sh";
+
+/// Kills copies of `zte_post_wifi.sh` older than `max_age_secs`. Returns how many.
+pub fn kill_stuck_post_wifi(max_age_secs: u64) -> usize {
+    let uptime = fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
+    let Some(uptime) = uptime else { return 0 };
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = if hz > 0 { hz as f64 } else { 100.0 };
+    let mut killed = 0;
+    let Ok(entries) = fs::read_dir("/proc") else { return 0 };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { continue };
+        if !is_post_wifi_cmdline(&cmdline) {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+        let Some(age) = process_age_secs(&stat, uptime, hz) else { continue };
+        if age < max_age_secs as f64 {
+            continue;
+        }
+        if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+            eprintln!("[wifi] killed stuck zte_post_wifi.sh pid {pid} (running {age:.0} s)");
+            killed += 1;
+        }
+    }
+    killed
+}
+
+/// `sh /sbin/zte_post_wifi.sh` exactly: never a shell that merely mentions the script.
+fn is_post_wifi_cmdline(cmdline: &[u8]) -> bool {
+    let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
+    matches!(args.as_slice(), [shell, script]
+        if matches!(*shell, b"sh" | b"/bin/sh" | b"ash" | b"/bin/ash") && *script == POST_WIFI_SCRIPT.as_bytes())
+}
+
+/// Age of a process from its `/proc/<pid>/stat` line (field 22, start time in clock ticks).
+fn process_age_secs(stat: &str, uptime_secs: f64, hz: f64) -> Option<f64> {
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let starttime: f64 = rest.split_whitespace().nth(19)?.parse().ok()?;
+    Some(uptime_secs - starttime / hz)
+}
+
+#[cfg(test)]
+mod post_wifi_tests {
+    use super::*;
+
+    #[test]
+    fn matches_only_the_firmware_script_invocation() {
+        assert!(is_post_wifi_cmdline(b"sh\0/sbin/zte_post_wifi.sh\0"));
+        assert!(is_post_wifi_cmdline(b"/bin/sh\0/sbin/zte_post_wifi.sh\0"));
+        // a shell that merely mentions the script (ssh session, grep) must not match
+        assert!(!is_post_wifi_cmdline(b"ash\0-c\0ps | grep zte_post_wifi.sh\0"));
+        assert!(!is_post_wifi_cmdline(b"sh\0/sbin/zte_post_wifi.sh\0extra\0"));
+        assert!(!is_post_wifi_cmdline(b"sh\0/sbin/zte_wlan_func.sh\0"));
+        assert!(!is_post_wifi_cmdline(b""));
+    }
+
+    #[test]
+    fn process_age_uses_field_22_after_the_comm() {
+        // comm with spaces and parentheses, as /proc renders it
+        let stat = "123 (sh (x) y) S 1 123 123 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 4500 1500000 100 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 1 0 0 0 0 0";
+        let age = process_age_secs(stat, 1000.0, 100.0).unwrap();
+        assert!((age - 955.0).abs() < 1e-9);
+        assert!(process_age_secs("garbage", 1000.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn speed_tracker_parks_until_requested() {
+        // Pure check of the idle predicate; the sampler thread itself needs sysfs.
+        assert!(SpeedInner::is_idle(&None));
+        assert!(!SpeedInner::is_idle(&Some(Instant::now())));
+        assert!(SpeedInner::is_idle(&Some(Instant::now() - SPEED_LINGER - Duration::from_secs(1))));
+    }
+}
+
+/// Runs `kill_stuck_post_wifi(120)` once, `delay` from now, on its own thread.
+/// Armed 150 s after every Wi-Fi reload the agent triggers, so an app toggle
+/// is cleaned up quickly; the periodic sweep below covers everything else.
+pub fn arm_post_wifi_watchdog(delay: Duration) {
+    // Called from request handlers: a refused thread must not unwind the
+    // HTTP worker. The periodic sweep below still covers a missed one-shot.
+    let spawned = try_spawn_named("wifi-watchdog", move || {
+        std::thread::sleep(delay);
+        let n = kill_stuck_post_wifi(120);
+        if n > 0 {
+            eprintln!("[wifi] watchdog killed {n} stuck zte_post_wifi.sh process(es)");
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("[wifi] cannot spawn wifi-watchdog: {e}");
+    }
+}
+
+/// How often the periodic sweep looks for a stuck `zte_post_wifi.sh`.
+/// The firmware re-runs the script on its own triggers too (WAN reconnects,
+/// sleep/wake, the stock UI), so a sweep is needed; one wakeup per 5 min is
+/// nothing next to the ~265 forks/s a stuck copy costs. First pass at 150 s
+/// covers the boot-time invocation.
+const POST_WIFI_SWEEP: Duration = Duration::from_secs(300);
+
+pub fn start_post_wifi_watchdog() {
+    let spawned = try_spawn_named("wifi-sweep", move || {
+        std::thread::sleep(Duration::from_secs(150));
+        loop {
+            let n = kill_stuck_post_wifi(120);
+            if n > 0 {
+                eprintln!("[wifi] sweep killed {n} stuck zte_post_wifi.sh process(es)");
+            }
+            std::thread::sleep(POST_WIFI_SWEEP);
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("[wifi] cannot spawn wifi-sweep: {e}");
     }
 }
 

@@ -42,6 +42,19 @@ pub fn uci_get(key: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Run `uci -q show <target>`: one fork for a whole section, as
+/// `config.section.option='value'` lines.
+pub fn uci_show(target: &str) -> Result<String, String> {
+    let output = Command::new("uci")
+        .args(["-q", "show", target])
+        .output()
+        .map_err(|e| format!("uci exec: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("uci show {target}: {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Run `uci set <key>=<value>` followed by `uci commit <config>`.
 #[allow(dead_code)]
 pub fn uci_set(key: &str, value: &str) -> Result<(), String> {
@@ -51,6 +64,65 @@ pub fn uci_set(key: &str, value: &str) -> Result<(), String> {
 }
 
 /// Run `uci set <key>=<value>` without committing.
+/// Parse `uci show <config>` output into `key -> value`, undoing uci's quoting
+/// (`'...'` with embedded quotes written as `'\''`). Section headers
+/// (`wireless.wifi0=wifi-device`) are included unquoted; lists keep their raw
+/// `'a' 'b'` form.
+pub fn uci_show_map(show: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in show.lines() {
+        let Some((key, raw)) = line.split_once('=') else {
+            continue;
+        };
+        map.insert(key.to_string(), uci_unquote(raw));
+    }
+    map
+}
+
+fn uci_unquote(raw: &str) -> String {
+    let raw = raw.trim_end();
+    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
+        // `uci show` prints a list option as `'a' 'b'`. Neutralise escaped
+        // quotes first so a scalar like `'x'\'' '\''y'` (value `x' 'y`) is not
+        // mistaken for a list; if a `' '` separator survives, keep the raw
+        // form rather than mangling it into `a' 'b`.
+        if raw.replace("'\\''", "\u{0}").contains("' '") {
+            return raw.to_string();
+        }
+        raw[1..raw.len() - 1].replace("'\\''", "'")
+    } else {
+        raw.to_string()
+    }
+}
+
+#[cfg(test)]
+mod uci_show_tests {
+    use super::uci_show_map;
+
+    #[test]
+    fn parses_values_sections_and_escaped_quotes() {
+        let show = "wireless.wifi0=wifi-device\nwireless.wifi0.disabled='1'\nwireless.main_5g.ssid='Bob'\\''s Wi-Fi'\nwireless.main_5g.key=''\nwireless.zte_mbb.wifi_onoff='1'\n";
+        let m = uci_show_map(show);
+        assert_eq!(m["wireless.wifi0"], "wifi-device");
+        assert_eq!(m["wireless.wifi0.disabled"], "1");
+        assert_eq!(m["wireless.main_5g.ssid"], "Bob's Wi-Fi");
+        assert_eq!(m["wireless.main_5g.key"], "");
+        assert_eq!(m["wireless.zte_mbb.wifi_onoff"], "1");
+        assert!(!m.contains_key("wireless.missing"));
+    }
+
+    #[test]
+    fn lists_keep_raw_form_and_scalars_still_unescape() {
+        let show = "wireless.x.list='a' 'b'\nwireless.x.list2='a'\\''b' 'c'\nwireless.x.ssid='Bob'\\''s Wi-Fi'\nwireless.x.tricky=''\\'' '\\'''\nwireless.x.spaced='a b'\n";
+        let m = uci_show_map(show);
+        assert_eq!(m["wireless.x.list"], "'a' 'b'");
+        assert_eq!(m["wireless.x.list2"], "'a'\\''b' 'c'");
+        assert_eq!(m["wireless.x.ssid"], "Bob's Wi-Fi");
+        assert_eq!(m["wireless.x.tricky"], "' '");
+        assert_eq!(m["wireless.x.spaced"], "a b");
+    }
+}
+
 pub fn uci_set_no_commit(key: &str, value: &str) -> Result<(), String> {
     let set_out = Command::new("uci")
         .args(["set", &format!("{key}={value}")])
@@ -79,4 +151,3 @@ pub fn uci_commit(config: &str) -> Result<(), String> {
     }
     Ok(())
 }
-

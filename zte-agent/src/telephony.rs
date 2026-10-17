@@ -1,5 +1,7 @@
 use serde_json::{json, Value};
 
+use std::sync::atomic::Ordering;
+
 use crate::at_cmd;
 use crate::handlers::AppState;
 
@@ -112,7 +114,7 @@ fn decode_ussd_response(hex_str: &str, dcs: u32) -> String {
 // Parsers
 // ---------------------------------------------------------------------------
 
-fn parse_clcc(raw: &str) -> Vec<Value> {
+pub(crate) fn parse_clcc(raw: &str) -> Vec<Value> {
     let dir_names = ["mo", "mt"];
     let stat_names = ["active", "held", "dialing", "alerting", "incoming", "waiting", "releasing"];
 
@@ -184,99 +186,6 @@ fn parse_cusd(raw: &str) -> Option<(i64, String, u32)> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// STK TLV parser
-// ---------------------------------------------------------------------------
-
-struct StkMenu {
-    title: String,
-    items: Vec<Value>,
-}
-
-fn parse_stk_menu_tlv(hex: &str) -> Option<StkMenu> {
-    if hex.is_empty() {
-        return None;
-    }
-    let mut title = String::new();
-    let mut items = Vec::new();
-    let mut i = 0;
-    while i + 4 <= hex.len() {
-        let tag = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
-        let len = usize::from_str_radix(&hex[i + 2..i + 4], 16).ok()?;
-        let val_start = i + 4;
-        let val_end = val_start + len * 2;
-        if val_end > hex.len() {
-            break;
-        }
-        let val_hex = &hex[val_start..val_end];
-        match tag {
-            0x85 => {
-                // Alpha identifier (title)
-                title = decode_ucs2(val_hex);
-                if title.is_empty() {
-                    title = decode_hex_ascii(val_hex);
-                }
-            }
-            0x8F => {
-                // Item: first byte = item ID, rest = text
-                if val_hex.len() >= 4 {
-                    let item_id = u8::from_str_radix(&val_hex[..2], 16).unwrap_or(0);
-                    let text_hex = &val_hex[2..];
-                    let mut label = decode_ucs2(text_hex);
-                    if label.is_empty() {
-                        label = decode_hex_ascii(text_hex);
-                    }
-                    items.push(json!({"id": item_id, "label": label}));
-                }
-            }
-            _ => {}
-        }
-        i = val_end;
-    }
-    if !items.is_empty() || !title.is_empty() {
-        Some(StkMenu { title, items })
-    } else {
-        None
-    }
-}
-
-fn decode_hex_ascii(hex: &str) -> String {
-    let bytes = hex_to_bytes(hex);
-    let mut out = String::new();
-    for b in bytes {
-        if b >= 32 {
-            out.push(b as char);
-        }
-    }
-    out
-}
-
-/// Check if the SIM supports STK by reading EF_DIR (AT+CUAD) for STK/USAT AIDs,
-/// and falling back to AT+STIN? as a secondary indicator.
-fn detect_stk_support(at_port: &crate::at_cmd::AtPort) -> (bool, String) {
-    // Check AT+CUAD for SIM application directory
-    if let Ok(resp) = at_cmd::send(at_port, "AT+CUAD", 3) {
-        if !resp.contains("ERROR") {
-            // Look for STK/USAT AID prefix: A000000009
-            let upper = resp.to_uppercase();
-            if upper.contains("A000000009") {
-                return (true, "STK AID found in EF_DIR (AT+CUAD)".into());
-            }
-            // CUAD responded but no STK AID
-            // Fall through to STIN check
-        }
-    }
-
-    // Secondary: check AT+STIN? — if the modem returns any STIN value, STK is active
-    if let Ok(resp) = at_cmd::send(at_port, "AT+STIN?", 2) {
-        if resp.contains("STIN") && !resp.contains("ERROR") {
-            return (true, "STK indicated by AT+STIN? response".into());
-        }
-    }
-
-    (false, "No STK AID in EF_DIR and no STIN response — SIM does not support STK".into())
-}
-
 fn format_ussd_response(parsed: (i64, String, u32)) -> Value {
     let (status, body, dcs) = parsed;
     let decoded = decode_ussd_response(&body, dcs);
@@ -289,6 +198,18 @@ fn format_ussd_response(parsed: (i64, String, u32)) -> Value {
         "dcs": dcs,
         "session_active": session_active,
     })
+}
+
+/// Record whether the network left a USSD prompt open (`+CUSD: 1`): the
+/// modem policies hold off while one is pending.
+fn note_ussd_prompt(state: &AppState, parsed: Option<&(i64, String, u32)>) {
+    let pending = parsed.is_some_and(|(status, _, _)| *status == 1);
+    let at = if pending {
+        crate::conn_watchdog::unix_now()
+    } else {
+        0
+    };
+    state.ussd_prompt_at.store(at, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +230,10 @@ pub fn call_dial(state: &AppState, body: &[u8]) -> (u16, Value) {
     let clean: String = number.chars().filter(|c| c.is_ascii_digit() || "+*#".contains(*c)).collect();
     match at_cmd::send(&state.at_port, &format!("ATD{clean};"), 5) {
         Ok(resp) if resp.contains("ERROR") => (500, json!({"ok": false, "error": "dial failed"})),
-        Ok(_) => (200, json!({"ok": true, "data": {"status": "ok"}})),
+        Ok(_) => {
+            state.call_active.store(true, Ordering::Relaxed);
+            (200, json!({"ok": true, "data": {"status": "ok"}}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
@@ -317,7 +241,10 @@ pub fn call_dial(state: &AppState, body: &[u8]) -> (u16, Value) {
 /// POST /api/call/hangup
 pub fn call_hangup(state: &AppState) -> (u16, Value) {
     match at_cmd::send(&state.at_port, "AT+CHUP", 3) {
-        Ok(_) => (200, json!({"ok": true, "data": {"status": "ok"}})),
+        Ok(_) => {
+            state.call_active.store(false, Ordering::Relaxed);
+            (200, json!({"ok": true, "data": {"status": "ok"}}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
@@ -325,7 +252,12 @@ pub fn call_hangup(state: &AppState) -> (u16, Value) {
 /// POST /api/call/answer
 pub fn call_answer(state: &AppState) -> (u16, Value) {
     match at_cmd::send(&state.at_port, "ATA", 3) {
-        Ok(_) => (200, json!({"ok": true, "data": {"status": "ok"}})),
+        Ok(_) => {
+            // An answered call is active even if the app never polls call_status;
+            // the modem policies must not touch the radio while it lasts.
+            state.call_active.store(true, Ordering::Relaxed);
+            (200, json!({"ok": true, "data": {"status": "ok"}}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
@@ -335,6 +267,13 @@ pub fn call_status(state: &AppState) -> (u16, Value) {
     match at_cmd::send(&state.at_port, "AT+CLCC", 2) {
         Ok(resp) => {
             let calls = parse_clcc(&resp);
+            // Fail closed: the AT node can hand a reply to another reader, so
+            // only a terminal OK with no +CLCC line proves there is no call.
+            if !calls.is_empty() {
+                state.call_active.store(true, Ordering::Relaxed);
+            } else if resp.contains("OK") {
+                state.call_active.store(false, Ordering::Relaxed);
+            }
             (200, json!({"ok": true, "data": {"calls": calls}}))
         }
         Err(e) => (503, json!({"ok": false, "error": e})),
@@ -397,7 +336,9 @@ pub fn ussd_send(state: &AppState, body: &[u8]) -> (u16, Value) {
             if resp.contains("ERROR") {
                 return (500, json!({"ok": false, "error": "USSD failed"}));
             }
-            match parse_cusd(&resp) {
+            let parsed = parse_cusd(&resp);
+            note_ussd_prompt(state, parsed.as_ref());
+            match parsed {
                 Some(parsed) => (200, json!({"ok": true, "data": format_ussd_response(parsed)})),
                 None => {
                     let clean_resp: String = resp.chars().filter(|c| !c.is_control()).collect();
@@ -428,19 +369,29 @@ pub fn ussd_respond(state: &AppState, body: &[u8]) -> (u16, Value) {
     let clean: String = reply.chars().filter(|c| c.is_ascii_digit() || "*#+".contains(*c)).collect();
     let at = format!("AT+CUSD=1,\"{clean}\",15");
     match at_cmd::send(&state.at_port, &at, 8) {
-        Ok(resp) => match parse_cusd(&resp) {
-            Some(parsed) => (200, json!({"ok": true, "data": format_ussd_response(parsed)})),
-            None => {
-                let clean_resp: String = resp.chars().filter(|c| !c.is_control()).collect();
-                (200, json!({"ok": true, "data": {
-                    "response": clean_resp,
-                    "raw_response": clean_resp,
-                    "status": -1,
-                    "dcs": 15,
-                    "session_active": false,
-                }}))
+        Ok(resp) => {
+            let parsed = parse_cusd(&resp);
+            note_ussd_prompt(state, parsed.as_ref());
+            match parsed {
+                Some(parsed) => (
+                    200,
+                    json!({"ok": true, "data": format_ussd_response(parsed)}),
+                ),
+                None => {
+                    let clean_resp: String = resp.chars().filter(|c| !c.is_control()).collect();
+                    (
+                        200,
+                        json!({"ok": true, "data": {
+                            "response": clean_resp,
+                            "raw_response": clean_resp,
+                            "status": -1,
+                            "dcs": 15,
+                            "session_active": false,
+                        }}),
+                    )
+                }
             }
-        },
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
@@ -448,180 +399,20 @@ pub fn ussd_respond(state: &AppState, body: &[u8]) -> (u16, Value) {
 /// POST /api/ussd/cancel
 pub fn ussd_cancel(state: &AppState) -> (u16, Value) {
     match at_cmd::send(&state.at_port, "AT+CUSD=2", 3) {
-        Ok(_) => (200, json!({"ok": true, "data": {"status": "ok"}})),
+        Ok(_) => {
+            state.ussd_prompt_at.store(0, Ordering::Relaxed);
+            (200, json!({"ok": true, "data": {"status": "ok"}}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
 
-/// GET /api/stk/menu
+/// GET /api/stk/menu — Qualcomm RIL session snapshot.
 pub fn stk_menu(state: &AppState) -> (u16, Value) {
-    let (supported, diag) = detect_stk_support(&state.at_port);
-
-    if !supported {
-        return (200, json!({"ok": true, "data": {
-            "supported": false,
-            "items": [],
-            "reason": diag,
-        }}));
-    }
-
-    let mut diagnostics = vec![diag];
-
-    // Try AT+CUSATD first
-    if let Ok(resp) = at_cmd::send(&state.at_port, "AT+CUSATD=1", 5) {
-        if !resp.contains("ERROR") {
-            let hex = extract_hex(&resp, "CUSATD:");
-            if let Some(hex) = hex {
-                if let Some(menu) = parse_stk_menu_tlv(&hex) {
-                    return (200, json!({"ok": true, "data": {
-                        "supported": true,
-                        "title": menu.title,
-                        "items": menu.items,
-                        "source": "at_cusatd",
-                    }}));
-                }
-            }
-            diagnostics.push("AT+CUSATD=1 responded but no parseable menu".into());
-        } else {
-            diagnostics.push("AT+CUSATD=1 returned ERROR".into());
-        }
-    }
-
-    // Try AT+STIN? / AT+STGI fallback
-    if let Ok(resp) = at_cmd::send(&state.at_port, "AT+STIN?", 3) {
-        if resp.contains("STIN") {
-            let stin_type = extract_number_after(&resp, "STIN:");
-            if stin_type == Some(37) || stin_type == Some(25) {
-                let stin_val = stin_type.unwrap();
-                if let Ok(stgi) = at_cmd::send(&state.at_port, &format!("AT+STGI={stin_val}"), 5) {
-                    if !stgi.contains("ERROR") {
-                        let (title, items) = parse_stgi_response(&stgi);
-                        if !items.is_empty() {
-                            return (200, json!({"ok": true, "data": {
-                                "supported": true,
-                                "title": title,
-                                "items": items,
-                                "source": "at_stgi",
-                            }}));
-                        }
-                    }
-                }
-            }
-            diagnostics.push(format!("AT+STIN? returned type {:?}, no menu from STGI", stin_type));
-        }
-    }
-
-    // STK supported but no menu currently available
-    (200, json!({"ok": true, "data": {
-        "supported": true,
-        "items": [],
-        "reason": "no proactive command pending",
-        "diagnostics": diagnostics,
-    }}))
+    state.stk.request("menu", &[])
 }
 
-/// POST /api/stk/select — body: {"item_id": 1}
+/// POST /api/stk/select — requires item_id and command_id from the current snapshot.
 pub fn stk_select(state: &AppState, body: &[u8]) -> (u16, Value) {
-    let (supported, diag) = detect_stk_support(&state.at_port);
-    if !supported {
-        return (200, json!({"ok": true, "data": {
-            "supported": false,
-            "reason": diag,
-        }}));
-    }
-
-    let parsed: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
-    };
-    let item_id = match parsed["item_id"].as_u64() {
-        Some(id) => id as u8,
-        None => return (400, json!({"ok": false, "error": "missing item_id"})),
-    };
-    let envelope = format!("D30782020181900101{item_id:02X}");
-
-    if let Ok(resp) = at_cmd::send(&state.at_port, &format!("AT+CUSATE=\"{envelope}\""), 8) {
-        if !resp.contains("ERROR") {
-            let hex = extract_hex(&resp, "CUSATE:");
-            if let Some(hex) = hex {
-                if let Some(menu) = parse_stk_menu_tlv(&hex) {
-                    if !menu.items.is_empty() {
-                        return (200, json!({"ok": true, "data": {
-                            "type": "menu",
-                            "title": menu.title,
-                            "items": menu.items,
-                            "source": "at_cusate",
-                        }}));
-                    }
-                }
-            }
-            let text: String = resp.chars().filter(|c| !c.is_control()).collect();
-            return (200, json!({"ok": true, "data": {
-                "type": "display",
-                "data": text,
-            }}));
-        }
-    }
-    (500, json!({"ok": false, "error": "item selection failed"}))
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn extract_hex(resp: &str, prefix: &str) -> Option<String> {
-    for line in resp.lines() {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            let hex: String = rest.trim().chars().filter(|c| c.is_ascii_hexdigit()).collect();
-            if hex.len() >= 4 {
-                return Some(hex);
-            }
-        }
-    }
-    // Fallback: find any long hex string in response
-    for line in resp.lines() {
-        let trimmed = line.trim();
-        if trimmed.len() >= 8 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(trimmed.to_string());
-        }
-    }
-    None
-}
-
-fn extract_number_after(resp: &str, prefix: &str) -> Option<i64> {
-    for line in resp.lines() {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            let num_str: String = rest.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
-            return num_str.parse().ok();
-        }
-    }
-    None
-}
-
-fn parse_stgi_response(stgi: &str) -> (String, Vec<Value>) {
-    let mut title = "SIM Menu".to_string();
-    let mut items = Vec::new();
-    let mut first = true;
-    for line in stgi.lines() {
-        let Some(rest) = line.strip_prefix("STGI:") else {
-            continue;
-        };
-        let rest = rest.trim();
-        if first {
-            // First STGI line is the title
-            if let Some(t) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                title = t.to_string();
-            }
-            first = false;
-            continue;
-        }
-        // Item lines: id,type,"label"
-        let parts: Vec<&str> = rest.splitn(3, ',').collect();
-        if parts.len() >= 3 {
-            let id: u64 = parts[0].trim().parse().unwrap_or(0);
-            let label = parts[2].trim().trim_matches('"').to_string();
-            items.push(json!({"id": id, "label": label}));
-        }
-    }
-    (title, items)
+    state.stk.request("select", body)
 }

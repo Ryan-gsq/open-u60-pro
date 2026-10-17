@@ -1,16 +1,19 @@
 use std::sync::Arc;
+use std::io::Read;
 
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::at_terminal;
 use crate::cell;
+use crate::conn_watchdog;
 use crate::device_ext;
 use crate::lan_test;
 use crate::scheduler;
 use crate::handlers::{self, AppState};
 use crate::modem_ext;
 use crate::network_ext;
+use crate::oos_policy;
 use crate::router;
 use crate::sim;
 use crate::sms;
@@ -22,22 +25,33 @@ use crate::usb;
 use crate::wifi;
 
 pub fn start(bind: &str, threads: usize, state: Arc<AppState>) {
-    let server = match Server::http(bind) {
+    // Bind ourselves so TCP keepalive can be set on the listener; accepted
+    // sockets inherit it. tiny_http parks one thread per client connection
+    // with no timeout, so a phone that vanishes without closing (Wi-Fi roam,
+    // sleep) would otherwise pin a thread and two fds forever.
+    let listener = match std::net::TcpListener::bind(bind) {
+        Ok(l) => l,
+        Err(_) => {
+            std::process::exit(1);
+        }
+    };
+    set_tcp_keepalive(&listener);
+    let server = match Server::from_listener(listener, None) {
         Ok(s) => s,
         Err(_) => {
             std::process::exit(1);
         }
     };
-    // Seed the CPU tracker with initial sample (speed tracker self-seeds)
+    // Seed the CPU tracker with initial sample (speed tracker is demand-driven)
     state.cpu.sample();
 
     let server = Arc::new(server);
     let mut handles = Vec::new();
 
-    for _ in 0..threads {
+    for i in 0..threads {
         let server = Arc::clone(&server);
         let state = Arc::clone(&state);
-        let handle = std::thread::spawn(move || {
+        let handle = crate::system::spawn_named(&format!("http-{i}"), move || {
             loop {
                 let request = match server.recv() {
                     Ok(r) => r,
@@ -55,6 +69,39 @@ pub fn start(bind: &str, threads: usize, state: Arc<AppState>) {
         let _ = h.join();
     }
 }
+
+/// SO_KEEPALIVE with a 5 min idle / 60 s interval / 3 probes: a dead peer is
+/// detected within ~8 min and its tiny_http thread exits. Linux only; the
+/// values are inherited by accepted sockets.
+#[cfg(target_os = "linux")]
+fn set_tcp_keepalive(listener: &std::net::TcpListener) {
+    use std::os::unix::io::AsRawFd;
+    let fd = listener.as_raw_fd();
+    let opts: [(libc::c_int, libc::c_int, libc::c_int); 4] = [
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 300),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 60),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3),
+    ];
+    for (level, name, value) in opts {
+        // SAFETY: fd is a valid open socket owned by `listener`; `value` outlives the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                &value as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            eprintln!("[server] setsockopt({level},{name}) failed: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_tcp_keepalive(_listener: &std::net::TcpListener) {}
 
 fn handle_request(mut request: Request, state: &AppState) {
     let method = request.method().clone();
@@ -98,9 +145,22 @@ fn handle_request(mut request: Request, state: &AppState) {
         _ => {}
     }
 
+    if path.starts_with("/api/live-activity") && !state.auth.has_password() {
+        respond(request, 403, json!({"ok": false, "error": "agent password required"}));
+        return;
+    }
+
     // Read body
     let mut body = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
+    if path.starts_with("/api/live-activity") {
+        let _ = std::io::Read::read_to_end(&mut request.as_reader().take(4097), &mut body);
+        if body.len() > 4096 {
+            respond(request, 413, json!({"ok": false, "error": "body too large"}));
+            return;
+        }
+    } else {
+        let _ = std::io::Read::read_to_end(&mut request.as_reader(), &mut body);
+    }
 
     let (status, body_json) = route(&method, path, state, &body);
     respond(request, status, body_json);
@@ -119,6 +179,9 @@ fn parse_query_usize(url: &str, key: &str) -> Option<usize> {
 
 pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16, Value) {
     match (method, path) {
+        (&Method::Get, "/api/live-activity") => state.live_activity.status(),
+        (&Method::Put, "/api/live-activity") => state.live_activity.register(body),
+        (&Method::Delete, "/api/live-activity") => state.live_activity.unregister(),
         // Auth
         (&Method::Post, "/api/auth/login") => handlers::login(state, body),
         // Device info (sysfs)
@@ -162,7 +225,7 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         // Modem
         (&Method::Get, "/api/data-usage") => handlers::data_usage(state),
         (&Method::Get, "/api/modem/status") => handlers::modem_status(state),
-        (&Method::Post, "/api/modem/online") => handlers::modem_online(state),
+        (&Method::Post, "/api/modem/online") => modem_ext::modem_online_user(state),
         (&Method::Get, "/api/modem/data") => modem_ext::modem_data_get(state),
         (&Method::Put, "/api/modem/data") => modem_ext::modem_data_set(state, body),
         (&Method::Post, "/api/modem/airplane") => modem_ext::modem_airplane(state, body),
@@ -172,6 +235,14 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Get, "/api/modem/scan/results") => modem_ext::modem_scan_results(state),
         (&Method::Post, "/api/modem/register") => modem_ext::modem_register(state, body),
         (&Method::Get, "/api/modem/register/result") => modem_ext::modem_register_result(state),
+        (&Method::Get, "/api/modem/oos-policy") => oos_policy::config_get(&state.oos_policy),
+        (&Method::Put, "/api/modem/oos-policy") => oos_policy::config_set(&state.oos_policy, body),
+        (&Method::Get, "/api/modem/conn-watchdog") => {
+            conn_watchdog::config_get(&state.conn_watchdog)
+        }
+        (&Method::Put, "/api/modem/conn-watchdog") => {
+            conn_watchdog::config_set(&state.conn_watchdog, body)
+        }
         // SMS
         (&Method::Post, "/api/sms/list") => sms::sms_list(state, body),
         (&Method::Get, "/api/sms/capacity") => sms::sms_capacity(state),
@@ -265,6 +336,10 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         // Telephony — STK
         (&Method::Get, "/api/stk/menu") => telephony::stk_menu(state),
         (&Method::Post, "/api/stk/select") => telephony::stk_select(state, body),
+        (&Method::Get, "/api/stk/session") => state.stk.request("status", &[]),
+        (&Method::Post, "/api/stk/respond") => state.stk.request("respond", body),
+        (&Method::Post, "/api/stk/cancel") => state.stk.request("cancel", body),
+        (&Method::Post, "/api/stk/back") => state.stk.request("back", body),
         // DoH
         (&Method::Get, "/api/doh/status") => doh_status(state),
         (&Method::Put, "/api/doh/config") => doh_config_set(state, body),

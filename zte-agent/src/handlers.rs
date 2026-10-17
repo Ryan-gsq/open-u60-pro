@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 use crate::at_cmd::AtPort;
 use crate::auth::AuthState;
+use crate::cache::{self, UbusCache};
 use crate::charge_policy::ChargeLimitEnforcer;
 use crate::scheduler::Scheduler;
 use crate::sms_forward::SmsForwarder;
@@ -11,33 +12,51 @@ use crate::system::{self, CpuTracker, ProcessTracker, SpeedTracker};
 use crate::ubus;
 
 pub struct AppState {
+    pub live_activity: Arc<crate::live_activity::LiveActivity>,
     pub auth: AuthState,
     pub cpu: CpuTracker,
     pub speed: SpeedTracker,
     pub proc_tracker: ProcessTracker,
     pub at_port: AtPort,
+    pub stk: crate::stk::StkService,
     pub doh: std::sync::Arc<crate::doh::DohProxy>,
     pub scheduler: Arc<Scheduler>,
     pub speedtest: crate::speedtest::SpeedTest,
     pub charge_limit: Arc<ChargeLimitEnforcer>,
     pub sms_forward: Arc<SmsForwarder>,
     pub tailscale: Arc<crate::tailscale::TailscaleManager>,
+    /// Single-flight TTL cache in front of the `ubus` CLI (see cache.rs).
+    pub cache: Arc<UbusCache>,
+    pub oos_policy: Arc<crate::oos_policy::OosPolicy>,
+    pub conn_watchdog: Arc<crate::conn_watchdog::ConnWatchdog>,
+    /// A voice call is (believed to be) in progress; set by the telephony
+    /// handlers, re-checked with `AT+CLCC` by the policies' busy guard.
+    pub call_active: std::sync::atomic::AtomicBool,
+    /// Unix seconds of the last USSD prompt that still needs a reply (0 = none).
+    pub ussd_prompt_at: std::sync::atomic::AtomicU64,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
+            live_activity: Arc::new(crate::live_activity::LiveActivity::new()),
             auth: AuthState::new(),
             cpu: CpuTracker::new(),
             speed: SpeedTracker::new(),
             proc_tracker: ProcessTracker::new(),
             at_port: AtPort::new(),
+            stk: crate::stk::StkService::new(),
             doh: std::sync::Arc::new(crate::doh::DohProxy::new()),
             scheduler: Arc::new(Scheduler::new()),
             speedtest: crate::speedtest::SpeedTest::new(),
             charge_limit: Arc::new(ChargeLimitEnforcer::new()),
             sms_forward: Arc::new(SmsForwarder::new()),
             tailscale: Arc::new(crate::tailscale::TailscaleManager::new()),
+            cache: Arc::new(UbusCache::new()),
+            oos_policy: Arc::new(crate::oos_policy::OosPolicy::new()),
+            conn_watchdog: Arc::new(crate::conn_watchdog::ConnWatchdog::new()),
+            call_active: std::sync::atomic::AtomicBool::new(false),
+            ussd_prompt_at: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -100,10 +119,17 @@ pub fn memory(_state: &AppState) -> (u16, Value) {
     }
 }
 
-/// GET /api/network/signal
-pub fn network_signal(_state: &AppState) -> (u16, Value) {
-    match ubus::call("zte_nwinfo_api", "nwinfo_get_netinfo", Some("{}")) {
-        Ok(data) => (200, json!({"ok": true, "data": data})),
+/// GET /api/network/signal — `nwinfo_get_netinfo` plus `bearer`, the QoS the
+/// network granted on the data session (see bearer.rs). Overlapping pollers
+/// share one read for `NETINFO_TTL`.
+pub fn network_signal(state: &AppState) -> (u16, Value) {
+    match state.cache.netinfo(cache::NETINFO_TTL) {
+        Ok(mut data) => {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("bearer".into(), crate::bearer::read());
+            }
+            (200, json!({"ok": true, "data": data}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
@@ -120,11 +146,105 @@ pub fn network_speed(state: &AppState) -> (u16, Value) {
     (200, json!({"ok": true, "data": snap}))
 }
 
-/// GET /api/modem/status
+/// GET /api/modem/status — `zte_nwinfo.sys_info.operate_mode` read the way
+/// `uci get` reads it (committed file plus the uncommitted delta), without
+/// the fork. No TTL: the daemon rewrites this key asynchronously after mode
+/// toggles, so any cache would pin stale state. Falls back to `uci get` on
+/// any miss so the result is always what the CLI would have printed.
 pub fn modem_status(_state: &AppState) -> (u16, Value) {
-    match ubus::uci_get("zte_nwinfo.sys_info.operate_mode") {
+    let read = |path: &str| std::fs::read_to_string(path).ok();
+    let from_files = read(UCI_NWINFO_CONFIG).and_then(|config| {
+        uci_operate_mode(&config, read(UCI_NWINFO_DELTA).as_deref().unwrap_or(""))
+    });
+    let mode = match from_files {
+        Some(mode) => Ok(mode),
+        None => ubus::uci_get(UCI_OPERATE_MODE_KEY),
+    };
+    match mode {
         Ok(mode) => (200, json!({"ok": true, "data": {"operate_mode": mode}})),
         Err(e) => (503, json!({"ok": false, "error": e})),
+    }
+}
+
+const UCI_NWINFO_CONFIG: &str = "/etc/config/zte_nwinfo";
+const UCI_NWINFO_DELTA: &str = "/tmp/.uci/zte_nwinfo";
+const UCI_OPERATE_MODE_KEY: &str = "zte_nwinfo.sys_info.operate_mode";
+
+/// Resolve `zte_nwinfo.sys_info.operate_mode` from the committed config text
+/// and the delta (`uci set` without `commit`) text. `None` means "not sure":
+/// the option is absent, deleted, or the delta does something this reader
+/// does not model (section add/rename), and the caller must ask `uci get`.
+fn uci_operate_mode(config: &str, delta: &str) -> Option<String> {
+    let mut value = uci_config_option(config, "sys_info", "operate_mode");
+    for line in delta.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let (lhs, rhs) = match line.split_once('=') {
+            Some((lhs, rhs)) => (lhs, Some(rhs)),
+            None => (line, None),
+        };
+        match lhs {
+            // `uci set` of the key: last write wins.
+            "zte_nwinfo.sys_info.operate_mode" => {
+                let raw = rhs?.trim();
+                if uci_value_torn(raw) {
+                    return None;
+                }
+                value = Some(uci_unquote(raw));
+            }
+            // Deleting the option or the whole section removes it.
+            "-zte_nwinfo.sys_info.operate_mode" | "-zte_nwinfo.sys_info" => value = None,
+            // Section creation/rename or list ops touching sys_info: bail.
+            _ if lhs.starts_with(['+', '@', '|', '~']) && line.contains("sys_info") => return None,
+            _ => {}
+        }
+    }
+    value
+}
+
+/// Value of `option <name>` inside the named section of a UCI config file.
+fn uci_config_option(config: &str, section: &str, option: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in config.lines() {
+        let (keyword, rest) = split_first_word(line);
+        let (second, rest) = split_first_word(rest);
+        match keyword {
+            // `config <type> '<name>'`; an anonymous section has no name.
+            "config" => in_section = !rest.is_empty() && uci_unquote(rest) == section,
+            "option" if in_section && second == option => return Some(uci_unquote(rest)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `(first word, trimmed remainder)` of a line; both empty for a blank line.
+fn split_first_word(line: &str) -> (&str, &str) {
+    let line = line.trim();
+    match line.find(char::is_whitespace) {
+        Some(i) => (&line[..i], line[i..].trim()),
+        None => (line, ""),
+    }
+}
+
+/// `true` for an empty value or one whose opening quote never closes. `uci`
+/// appends the delta under flock and this reader does not take it, so a torn
+/// last line must fall back to the CLI instead of yielding `'LP`.
+fn uci_value_torn(raw: &str) -> bool {
+    match raw.chars().next() {
+        None => true,
+        Some(quote @ ('\'' | '"')) => raw.len() < 2 || !raw.ends_with(quote),
+        Some(_) => false,
+    }
+}
+
+/// Strip the quotes `uci` writes around a value and undo its `'\''` escape.
+fn uci_unquote(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
+        raw[1..raw.len() - 1].replace("'\\''", "'")
+    } else if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.to_string()
     }
 }
 
@@ -165,7 +285,13 @@ pub fn data_usage(_state: &AppState) -> (u16, Value) {
 /// POST /api/modem/online
 pub fn modem_online(state: &AppState) -> (u16, Value) {
     use crate::at_cmd;
-    match at_cmd::send(&state.at_port, "AT+CFUN=1", 8) {
+    let result = at_cmd::send(&state.at_port, "AT+CFUN=1", 8);
+    // The data session comes back asynchronously; keep the apps' post-write
+    // confirmation polls fresh while it does.
+    state
+        .cache
+        .invalidate_with_settle(cache::MODEM_DATA, cache::SETTLE_WINDOW);
+    match result {
         Ok(resp) if resp.contains("OK") => (200, json!({"ok": true, "data": {"status": "ok"}})),
         Ok(resp) => (500, json!({"ok": false, "error": "AT+CFUN=1 failed", "raw": resp})),
         Err(e) => (503, json!({"ok": false, "error": e})),
@@ -199,4 +325,107 @@ pub fn system_kill_bloat(_state: &AppState, body: &[u8]) -> (u16, Value) {
 
     let result = system::kill_bloat(pids.as_deref());
     (200, json!({"ok": true, "data": result}))
+}
+
+#[cfg(test)]
+mod uci_tests {
+    use super::*;
+
+    const CONFIG: &str = "
+config sys_info 'sys_info'
+	option net_select 'LTE_AND_5G'
+	option operate_mode 'ONLINE'
+	option ps_no_srv_check_timer_cfg '5'
+
+config other 'other'
+	option operate_mode 'DECOY'
+";
+
+    #[test]
+    fn reads_committed_value_when_no_delta() {
+        assert_eq!(uci_operate_mode(CONFIG, "").as_deref(), Some("ONLINE"));
+    }
+
+    #[test]
+    fn delta_overrides_committed_value_last_write_wins() {
+        let delta = "zte_nwinfo.sys_info.net_select='Only_5G'\n\
+                     zte_nwinfo.sys_info.operate_mode='LPM'\n\
+                     zte_nwinfo.sys_info.operate_mode='ONLINE'\n\
+                     zte_nwinfo.sys_info.operate_mode='LPM'\n";
+        assert_eq!(uci_operate_mode(CONFIG, delta).as_deref(), Some("LPM"));
+        // Older uci wrote the delta unquoted.
+        assert_eq!(
+            uci_operate_mode(CONFIG, "zte_nwinfo.sys_info.operate_mode=LPM").as_deref(),
+            Some("LPM")
+        );
+    }
+
+    #[test]
+    fn delta_removal_and_unmodelled_ops_force_the_cli_fallback() {
+        assert_eq!(
+            uci_operate_mode(CONFIG, "-zte_nwinfo.sys_info.operate_mode"),
+            None
+        );
+        assert_eq!(uci_operate_mode(CONFIG, "-zte_nwinfo.sys_info"), None);
+        assert_eq!(
+            uci_operate_mode(CONFIG, "@zte_nwinfo.cfg0123=sys_info"),
+            None
+        );
+        // Deltas for other sections are ignored.
+        assert_eq!(
+            uci_operate_mode(CONFIG, "-zte_nwinfo.other\n+zte_nwinfo.cfg9=foo").as_deref(),
+            Some("ONLINE")
+        );
+    }
+
+    #[test]
+    fn torn_delta_value_forces_the_cli_fallback() {
+        for delta in [
+            "zte_nwinfo.sys_info.operate_mode='LP",
+            "zte_nwinfo.sys_info.operate_mode='",
+            "zte_nwinfo.sys_info.operate_mode=\"LP",
+            "zte_nwinfo.sys_info.operate_mode=",
+            "zte_nwinfo.sys_info.operate_mode",
+            "zte_nwinfo.sys_info.operate_mode='LPM'\nzte_nwinfo.sys_info.operate_mode='ON",
+        ] {
+            assert_eq!(uci_operate_mode(CONFIG, delta), None, "{delta:?}");
+        }
+        // An empty but properly quoted value is complete, not torn.
+        assert_eq!(
+            uci_operate_mode(CONFIG, "zte_nwinfo.sys_info.operate_mode=''").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn missing_option_or_section_is_a_miss() {
+        assert_eq!(
+            uci_operate_mode("config sys_info 'sys_info'\n\toption x 'y'\n", ""),
+            None
+        );
+        assert_eq!(
+            uci_operate_mode("config sys_info\n\toption operate_mode 'ONLINE'\n", ""),
+            None
+        );
+        assert_eq!(
+            uci_operate_mode("", "zte_nwinfo.sys_info.operate_mode='LPM'").as_deref(),
+            Some("LPM")
+        );
+    }
+
+    #[test]
+    fn unquotes_single_double_and_escaped_values() {
+        assert_eq!(uci_unquote("'ONLINE'"), "ONLINE");
+        assert_eq!(uci_unquote("\"ONLINE\""), "ONLINE");
+        assert_eq!(uci_unquote("ONLINE"), "ONLINE");
+        assert_eq!(uci_unquote("'it'\\''s'"), "it's");
+        assert_eq!(
+            uci_config_option("config s 's'\n  option  o   \"v w\"  \n", "s", "o").as_deref(),
+            Some("v w")
+        );
+        assert_eq!(
+            uci_config_option("config s s\n\toption o v\n", "s", "o").as_deref(),
+            Some("v")
+        );
+    }
 }
