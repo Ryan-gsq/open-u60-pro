@@ -1,6 +1,6 @@
 # Tailscale as Remote Management in zte-agent — Feasibility & Design Investigation
 
-**Device:** ZTE U60 Pro (Qualcomm SDX75 "sdxpinn", 4× Cortex-A55 @ 2.2 GHz, 1.6 GB RAM, 8 GB eMMC, OpenWrt 23.05.4 userland on vendor kernel `5.15.170-perf`, CGNAT cellular WAN `100.119.13.253/30`, live global IPv6)
+**Device:** ZTE U60 Pro (Qualcomm SDX75 "sdxpinn", 4× Cortex-A55 @ 2.2 GHz, 1.6 GB RAM, 8 GB eMMC, OpenWrt 23.05.4 userland on vendor kernel `5.15.170-perf`, CGNAT cellular WAN `100.119.x.x/30`, live global IPv6)
 **Tailscale version referenced throughout:** stable **1.98.9** (published 2026-07-14). **Report date:** 2026-07-17.
 
 ---
@@ -93,7 +93,7 @@ tailscale --socket=... set --accept-dns=false --accept-routes=false --hostname=u
 ```
 `--accept-dns=false` is mandatory hygiene: MagicDNS otherwise clobbers `/etc/resolv.conf` on OpenWrt-style systems (#15174, openwrt/packages#26761) — doubly important since the agent runs its own DoH proxy. In userspace mode no DNS configurator runs anyway, but set it so a future kernel-mode switch can't regress.
 
-**Kernel-TUN upgrade path (v2, gated on checklist):** Qualcomm's CLO reference build for this exact SoC+userspace combo (`build.config.msm.sdxpinn`: `MSM_ARCH=sdxpinn`, `PREFERRED_USERSPACE=owrt`, perf_defconfig = `generic_csm_defconfig` + `vendor/sdxpinn.config`) ships **`CONFIG_TUN=y` and `CONFIG_WIREGUARD=y`**, and the sdxpinn fragment does not unset them — so TUN is very likely built-in on the U60 Pro; only ZTE-specific stripping remains possible. If the probe confirms TUN and you want real peer IPs + kernel-speed subnet routing, switch to kernel mode **only with**: the `disable-linux-cgnat-drop-rule` nodeAttr in the tailnet policy (capver 136, first stable v1.98.2 — converts the `! -i tailscale0 -s 100.64.0.0/10 -j DROP` that tailscaled inserts at **position 1 of filter/INPUT** into RETURN), because the carrier WAN 100.119.13.253 is inside that range; note `--netfilter-mode=off` is **not** zero-state (it still installs ip rules at pref 5210/5230/5250/5270 and table-52 per-peer /32 routes — a /32 collision with a carrier endpoint is a small but real risk), and iptables backend choice must follow what `iptables -V` reveals (legacy vs nf_tables) — QCMAP is legacy-iptables on this firmware.
+**Kernel-TUN upgrade path (v2, gated on checklist):** Qualcomm's CLO reference build for this exact SoC+userspace combo (`build.config.msm.sdxpinn`: `MSM_ARCH=sdxpinn`, `PREFERRED_USERSPACE=owrt`, perf_defconfig = `generic_csm_defconfig` + `vendor/sdxpinn.config`) ships **`CONFIG_TUN=y` and `CONFIG_WIREGUARD=y`**, and the sdxpinn fragment does not unset them — so TUN is very likely built-in on the U60 Pro; only ZTE-specific stripping remains possible. If the probe confirms TUN and you want real peer IPs + kernel-speed subnet routing, switch to kernel mode **only with**: the `disable-linux-cgnat-drop-rule` nodeAttr in the tailnet policy (capver 136, first stable v1.98.2 — converts the `! -i tailscale0 -s 100.64.0.0/10 -j DROP` that tailscaled inserts at **position 1 of filter/INPUT** into RETURN), because the carrier WAN 100.119.x.x is inside that range; note `--netfilter-mode=off` is **not** zero-state (it still installs ip rules at pref 5210/5230/5250/5270 and table-52 per-peer /32 routes — a /32 collision with a carrier endpoint is a small but real risk), and iptables backend choice must follow what `iptables -V` reveals (legacy vs nf_tables) — QCMAP is legacy-iptables on this firmware.
 
 ### 4.3 Enroll
 
@@ -167,7 +167,7 @@ tailscale --socket=... set --accept-dns=false --accept-routes=false --hostname=u
   "tagOwners": { "tag:router": ["autogroup:admin"] },
   "acls": [
     { "action": "accept",
-      "src":    ["jesther@tradestockapps.com"],
+      "src":    ["user@example.com"],
       "dst":    ["tag:router:9090,2222,22,80"] }
   ],
   "autoApprovers": { "routes": { "192.168.0.0/24": ["tag:router"] } },
@@ -176,11 +176,11 @@ tailscale --socket=... set --accept-dns=false --accept-routes=false --hostname=u
     { "target": ["tag:router"], "attr": ["disable-linux-cgnat-drop-rule"] }
   ],
   "ssh": [
-    { "action": "accept", "src": ["jesther@tradestockapps.com"],
+    { "action": "accept", "src": ["user@example.com"],
       "dst": ["tag:router"], "users": ["root"] }
   ],
   "tests": [
-    { "src": "jesther@tradestockapps.com", "accept": ["tag:router:9090"] }
+    { "src": "user@example.com", "accept": ["tag:router:9090"] }
   ]
 }
 ```
@@ -368,7 +368,7 @@ Status parsing: define a `#[derive(Deserialize)] #[serde(default)]` struct with 
 | **Clock skew at boot (no RTC)** | Control TLS fails "certificate not yet valid"; #11518 documents the Tailscale-DNS + broken-clock deadlock. | Gate spawn on sane year/NTP; `--accept-dns=false` always; carrier NITZ time as sanity source. |
 | **tailscaled OOM** | 60–75 MB RSS idle; >85 MB under bulk (128 MB devices die: #7272; even a 512 MB router died at 32 MB/s sustained: GuNanOvO#17). GOMEMLIMIT is soft (NanoKVM#660: killed despite it). | 1.6 GB RAM makes this a non-issue for management traffic; `GOGC=25 GOMEMLIMIT=192MiB` as hygiene; sidecar isolation means an OOM kills tailscaled, not the agent; supervisor respawns. |
 | **CLI JSON / interface drift** | `--json` officially "subject to change" but frozen-in-practice (#17619); top-level `ipnstate.Status` fields identical v1.90.0→v1.98.8; LocalAPI "v0 … not necessarily stable". `tailscale debug` namespace explicitly unstable. | Pin the binary version; parse only established top-level fields, serde ignore-unknown; upgrades are deliberate (test rebind/restun still exist post-upgrade before relying on them). |
-| **CGNAT 100.64/10 conflict** (kernel mode only) | tailscaled inserts `! -i tailscale0 -s 100.64.0.0/10 -j DROP` at **position 1 of filter/INPUT** (both backends) — ahead of ESTABLISHED accepts; WAN 100.119.13.253 is in-range (#12829 "can brick it", #18762). `--netfilter-mode=off` is NOT zero-state: still installs pref-5210/5230/5250/5270 ip rules + table-52 /32 routes. | Ship userspace mode (immune by construction). Kernel mode later only with nodeAttr `disable-linux-cgnat-drop-rule` (≥v1.98.2) or `disable-ipv4` (IPv6-only tailnet addressing), tested with console access. |
+| **CGNAT 100.64/10 conflict** (kernel mode only) | tailscaled inserts `! -i tailscale0 -s 100.64.0.0/10 -j DROP` at **position 1 of filter/INPUT** (both backends) — ahead of ESTABLISHED accepts; WAN 100.119.x.x is in-range (#12829 "can brick it", #18762). `--netfilter-mode=off` is NOT zero-state: still installs pref-5210/5230/5250/5270 ip rules + table-52 /32 routes. | Ship userspace mode (immune by construction). Kernel mode later only with nodeAttr `disable-linux-cgnat-drop-rule` (≥v1.98.2) or `disable-ipv4` (IPv6-only tailnet addressing), tested with console access. |
 | **Enrollment footgun** | Re-passing an expired `--auth-key` at boot blocks an authenticated node (#16987 open; #19501 dup). | `--auth-key` only in `POST /setup` when no valid state; boot = spawn only, no `up`. |
 | **Dropbear unreachable via loopback redial** | Netstack redials 127.0.0.1; a `192.168.0.1:2222`-only bind refuses ("could not connect to local backend server", #13931's error path). | Checklist verifies bind; fallbacks: loopback bind, subnet route, or Tailscale SSH. |
 | **UPX-packed binaries** | Open segfault when packed daemon+CLI run concurrently (#8613); decompresses into non-evictable anon RAM. | Use official/stripped binaries; store xz on /data if flash-tight. |
@@ -414,7 +414,7 @@ Every remaining unknown, with the exact command (SSH `root@192.168.0.1 -p 2222`)
 
 **Prior art:** docs.gl-inet.com Tailscale guide · github.com/Admonstrator/glinet-tailscale-updater · github.com/RemoteToHome-io/gl-tailscale-fix · github.com/hassio-addons/app-tailscale · github.com/GuNanOvO/openwrt-tailscale (+issue #17) · github.com/iamromulan/quectel-rgmii-toolkit (Tailscale on SDXPINN/SDX75) · QCMAP source via github.com/randcd-APY/QuectelShare (`QCMAP_NATALG.cpp`, `QCMAP_Backhaul_WWAN.cpp`) · openwrt/packages#19774/#23480/#26761 · sipeed/NanoKVM#660.
 
-**In-repo:** `CLAUDE.md`, `README.md` (1.6 GB RAM, 8 GB eMMC, ~225 MB ZTE stack), `probe_results_2026-04-11.md` (sleep subsystem), `device_report.json`, `zte-agent/src/{main,server,handlers,ubus,event_bus,device_ext}.rs`, `zte-agent/src/doh/{mod,config}.rs`, `setup.sh`, `deploy.sh`, `scripts/check-reboot.sh`.
+**In-repo:** `CLAUDE.md`, `README.md` (1.6 GB RAM, 8 GB eMMC, ~225 MB ZTE stack), `docs/research/probe_results_2026-04-11.md` (sleep subsystem), `zte-agent/src/{main,server,handlers,ubus,event_bus,device_ext}.rs`, `zte-agent/src/doh/{mod,config}.rs`, `setup.sh`, `deploy.sh`, `scripts/check-reboot.sh`.
 ---
 
 ## Appendix A — On-Device Probe Commands (copy-paste)

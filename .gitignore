@@ -30,3 +30,30 @@ DerivedData/
 mobile/ios/**/build/
 mobile/ios/**/DerivedData/
 mobile/ios/**/*.xcuserstate
+
+# Apple push credentials and private device configuration
+*.p8
+**/live-activity.private.json
+
+# Private research material: firmware images and device backups (vendor
+# binaries, device-specific data), raw probe captures (serial numbers, MACs,
+# IPs, screenshots) and personal deployment logs never go into the repository.
+/firmware/
+/probe_evidence/
+zte-agent/docs/apns-deployment-*.md
+*.dtb
+__pycache__/
+
+# lpac build workspace: only the recipe (README, scripts, patches, tests, pin
+# manifests) is tracked.
+lpac-qrtr-build/downloads/
+lpac-qrtr-build/sources/
+lpac-qrtr-build/work/
+lpac-qrtr-build/sysroot/
+lpac-qrtr-build/host-tools/
+lpac-qrtr-build/host-qemu/
+lpac-qrtr-build/vm/
+lpac-qrtr-build/out/
+lpac-qrtr-build/toolchain.cmake
+lpac-qrtr-build/evidence/*.log
+lpac-qrtr-build/evidence/*.txt
