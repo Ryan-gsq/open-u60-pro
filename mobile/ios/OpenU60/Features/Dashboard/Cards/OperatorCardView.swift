@@ -4,6 +4,7 @@ struct OperatorCardView: View, Equatable {
     let operatorInfo: OperatorInfo
     let nrSignal: NRSignal
     let lteSignal: LTESignal
+    var padding: CGFloat = 16
 
     private var displayType: String {
         operatorInfo.networkType.isEmpty
@@ -12,7 +13,7 @@ struct OperatorCardView: View, Equatable {
     }
 
     var body: some View {
-        CardView {
+        CardView(padding: padding) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(operatorInfo.provider.isEmpty ? "No Operator" : operatorInfo.provider)

@@ -148,6 +148,33 @@ struct SignalSnapshot: Identifiable, Equatable {
     }
 }
 
+/// QoS the network granted on the data session: the QCI/5QI of the default bearer and the
+/// AMBR, the operator's rate cap, both as negotiated at session setup. The agent sends it as
+/// `bearer` on /api/network/signal: null while the data session is down, absent on agents
+/// that predate it.
+struct BearerInfo: Equatable {
+    var qci: Int?
+    var ambrDownlinkMbps: Double?
+    var ambrUplinkMbps: Double?
+
+    /// "2000 / 200 Mbps" (down / up), or nil when the agent reported no AMBR.
+    var ambrText: String? {
+        guard ambrDownlinkMbps != nil || ambrUplinkMbps != nil else { return nil }
+        let down = ambrDownlinkMbps.map(Self.formatMbps) ?? "--"
+        let up = ambrUplinkMbps.map(Self.formatMbps) ?? "--"
+        return "\(down) / \(up) Mbps"
+    }
+
+    /// Whole numbers without a decimal point, otherwise to the kbps: "2000", "8.64", "0.5".
+    static func formatMbps(_ value: Double) -> String {
+        let rounded = (value * 1000).rounded() / 1000
+        if rounded == rounded.rounded(), rounded.magnitude < 1e15 { return String(Int(rounded)) }
+        var text = String(format: "%.3f", rounded)
+        while text.hasSuffix("0") { text.removeLast() }
+        return text
+    }
+}
+
 /// Parser that extracts signal data from the agent nwinfo_get_netinfo response.
 enum SignalParser {
 
@@ -217,6 +244,18 @@ enum SignalParser {
         op.roaming = stringVal(data["simcard_roam"]) == "1"
 
         return (nr, lte, wcdma, op)
+    }
+
+    /// The agent's `bearer` object. Nil while the data session is down, on agents that predate
+    /// it, and when it holds no usable value.
+    static func parseBearer(_ data: [String: Any]) -> BearerInfo? {
+        guard let raw = data["bearer"] as? [String: Any] else { return nil }
+        let bearer = BearerInfo(
+            qci: positiveNumber(raw["qci"]).map { Int($0) },
+            ambrDownlinkMbps: positiveNumber(raw["ambr_dl_mbps"]),
+            ambrUplinkMbps: positiveNumber(raw["ambr_ul_mbps"])
+        )
+        return bearer == BearerInfo() ? nil : bearer
     }
 
     // MARK: - Carrier lists
@@ -311,6 +350,19 @@ enum SignalParser {
         }
         if let r = result, r > 9000 || r < -9000 { return nil }
         return result
+    }
+
+    /// Unlike `parseDouble`, no ±9000 sentinel cut-off: a 10 Gbps AMBR is 10000 Mbps.
+    private static func positiveNumber(_ value: Any?) -> Double? {
+        let number: Double?
+        switch value {
+        case let d as Double: number = d
+        case let i as Int: number = Double(i)
+        case let s as String: number = Double(s.trimmingCharacters(in: .whitespaces))
+        default: number = nil
+        }
+        guard let number, number.isFinite, number > 0 else { return nil }
+        return number
     }
 
     private static func stringVal(_ value: Any?) -> String {

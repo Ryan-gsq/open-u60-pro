@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "deviceModel": "9eSIM B1",
+  "baseline": "User-tested B1 inserted in ZTE U60 Pro",
+  "protocolStatus": "unverified",
+  "evidenceSource": null,
+  "b1Protocol": {
+    "discovery": null,
+    "serviceUuid": null,
+    "outgoingCharacteristic": null,
+    "incomingCharacteristic": null,
+    "authorization": null,
+    "initialization": null,
+    "messageFormat": null,
+    "fragmentation": null,
+    "responses": null,
+    "sessionBehavior": null
+  },
+  "interpretation": "Null means not established. GATT observations are not verified B1 protocol constants."
+}

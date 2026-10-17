@@ -89,5 +89,5 @@ ubus call zwrt_data get_wwaniface '{"source_module":"zte_topsw_data","cid":1}'
 - **Charge policy bug**: Wall mode `enable` STOPS charging, `disable` STARTS charging (inverted).
 - **procd respawn**: `kill -9` may trigger procd respawn. Use `/etc/init.d/<name> stop` instead.
 - **Touchscreen**: Sitronix at I2C `1-0055`, kernel module `sitronix-ts.ko` loaded by `/usr/bin/mtdev2tuio.sh`.
-- **eSIM**: NOT feasible — no eUICC chip on hardware.
+- **eSIM**: No built-in eUICC. The user-tested 9eSIM B1 in the SIM slot is the baseline. Native phone BLE and application-level profile actions/download/export controllers and UI are implemented with unit tests. Production uses an explicit unavailable adapter until B1 authorization, framing and LPA integration are verified. See `mobile/docs/b1-bluetooth.md`. Current testing is coding/unit tests only; no Simulator or hardware checks were requested for the management work.
 - **IMEI**: Hardware-locked (QFPROM fused), not modifiable.

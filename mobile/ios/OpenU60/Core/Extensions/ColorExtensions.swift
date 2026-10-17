@@ -2,46 +2,47 @@ import SwiftUI
 
 extension Color {
     /// Color based on RSRP signal strength thresholds.
-    /// >= -80: green (excellent), >= -100: yellow (good), >= -110: orange (fair), < -110: red (poor)
+    /// >= -80: green (excellent), >= -100: green (good), >= -110: orange (fair), < -110: red (poor)
     static func rsrpColor(_ rsrp: Double?) -> Color {
-        guard let rsrp = rsrp else { return .gray }
+        guard let rsrp = rsrp else { return .secondary }
         if rsrp >= -80 { return .green }
-        if rsrp >= -100 { return .yellow }
+        if rsrp >= -100 { return .green }
         if rsrp >= -110 { return .orange }
         return .red
     }
 
     /// Color based on SINR/SNR thresholds.
-    /// >= 20: green, >= 10: yellow, >= 0: orange, < 0: red
+    /// >= 20: green, >= 10: green, >= 0: orange, < 0: red
     static func sinrColor(_ sinr: Double?) -> Color {
-        guard let sinr = sinr else { return .gray }
+        guard let sinr = sinr else { return .secondary }
         if sinr >= 20 { return .green }
-        if sinr >= 10 { return .yellow }
+        if sinr >= 10 { return .green }
         if sinr >= 0 { return .orange }
         return .red
     }
 
     /// Color based on RSRQ thresholds.
-    /// >= -10: green, >= -15: yellow, >= -20: orange, < -20: red
+    /// >= -10: green, >= -15: green, >= -20: orange, < -20: red
     static func rsrqColor(_ rsrq: Double?) -> Color {
-        guard let rsrq = rsrq else { return .gray }
+        guard let rsrq = rsrq else { return .secondary }
         if rsrq >= -10 { return .green }
-        if rsrq >= -15 { return .yellow }
+        if rsrq >= -15 { return .green }
         if rsrq >= -20 { return .orange }
         return .red
     }
 
     /// Color for battery percentage.
     static func batteryColor(_ percent: Int) -> Color {
+        guard (0...100).contains(percent) else { return .secondary }
         if percent >= 50 { return .green }
-        if percent >= 20 { return .yellow }
+        if percent >= 20 { return .orange }
         return .red
     }
 
     /// Color for CPU usage percentage (0-100%).
     static func cpuUsageColor(_ percent: Double) -> Color {
         if percent < 50 { return .green }
-        if percent < 80 { return .yellow }
+        if percent < 80 { return .orange }
         return .red
     }
 
@@ -66,9 +67,9 @@ extension Color {
 
     /// Color based on RSCP (3G) signal strength thresholds.
     static func rscpColor(_ rscp: Double?) -> Color {
-        guard let rscp = rscp else { return .gray }
+        guard let rscp = rscp else { return .secondary }
         if rscp >= -75 { return .green }
-        if rscp >= -85 { return .yellow }
+        if rscp >= -85 { return .green }
         if rscp >= -95 { return .orange }
         return .red
     }
@@ -94,9 +95,9 @@ extension Color {
 
     /// Color based on Ec/Io (3G) thresholds.
     static func ecioColor(_ ecio: Double?) -> Color {
-        guard let ecio = ecio else { return .gray }
+        guard let ecio = ecio else { return .secondary }
         if ecio >= -6 { return .green }
-        if ecio >= -10 { return .yellow }
+        if ecio >= -10 { return .green }
         if ecio >= -15 { return .orange }
         return .red
     }

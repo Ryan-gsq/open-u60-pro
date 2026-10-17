@@ -10,6 +10,8 @@ final class SignalMonitorViewModel {
     var lteSignal: LTESignal = .empty
     var wcdmaSignal: WCDMASignal = .empty
     var operatorInfo: OperatorInfo = .empty
+    /// Nil hides the QoS readout: no data session, or an agent without the `bearer` field.
+    var bearer: BearerInfo?
     var history: [SignalSnapshot] = []
     var isLoading: Bool = false
     var lastUpdated: Date?
@@ -18,6 +20,13 @@ final class SignalMonitorViewModel {
     /// The live chart is the reason this screen exists, so it samples at the same cadence the
     /// dashboard does. The view stops the loop on disappear and while the app is backgrounded.
     nonisolated static let defaultPollInterval: TimeInterval = 2.0
+
+    /// What to call `bearer.qci`: on 5G SA the session is a PDU session, whose QoS identifier
+    /// is the 5QI; on LTE and NSA it is an EPS bearer with a QCI. Standardized values share one
+    /// table. `SignalActivityMode` also recognises the firmware's "NR5G-SA".
+    var qosLabel: String {
+        SignalActivityMode(networkType: operatorInfo.networkType, lteCarrierCount: nil) == .sa ? "5QI" : "QCI"
+    }
 
     private let client: AgentClient
     private let authManager: AuthManager
@@ -54,6 +63,8 @@ final class SignalMonitorViewModel {
             if lte != lteSignal { lteSignal = lte }
             if wcdma != wcdmaSignal { wcdmaSignal = wcdma }
             if op != operatorInfo { operatorInfo = op }
+            let newBearer = SignalParser.parseBearer(data)
+            if newBearer != bearer { bearer = newBearer }
 
             history.append(SignalSnapshot(
                 timestamp: Date(),

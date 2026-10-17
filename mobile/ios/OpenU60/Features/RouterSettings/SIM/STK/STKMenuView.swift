@@ -30,7 +30,7 @@ struct STKMenuView: View {
                     .background(Color(.systemBackground).opacity(0.85), in: RoundedRectangle(cornerRadius: 8))
             }
         }
-        .task { await viewModel.loadSTKMenu() }
+        .task { await viewModel.watchSTK() }
     }
 
     // MARK: - USSD
@@ -90,45 +90,56 @@ struct STKMenuView: View {
     // MARK: - STK
 
     private var stkSection: some View {
-        Group {
-            if viewModel.stkNotSupported {
-                Section("SIM Toolkit") {
-                    Label("Not available on this SIM", systemImage: "simcard")
-                        .foregroundStyle(.secondary)
-                }
-            } else if viewModel.hasSTKMenu {
-                Section {
-                    ForEach(viewModel.stkMenu.items) { item in
-                        Button {
-                            Task { await viewModel.selectSTKItem(item) }
-                        } label: {
-                            Label(item.label, systemImage: "list.bullet")
-                                .foregroundStyle(.primary)
-                        }
-                        .disabled(viewModel.isLoading)
-                    }
-
-                    if !viewModel.menuStack.isEmpty {
-                        Button {
-                            viewModel.goBackSTK()
-                        } label: {
-                            Label("Back", systemImage: "chevron.left")
-                        }
-                    }
-                } header: {
-                    Text(viewModel.stkMenu.title.isEmpty ? "SIM Toolkit" : viewModel.stkMenu.title)
-                } footer: {
-                    Text("Carrier-provided services from your SIM card")
-                }
-            } else if viewModel.message == nil && !viewModel.isLoading {
-                Section("SIM Toolkit") {
-                    Button {
-                        Task { await viewModel.loadSTKMenu() }
-                    } label: {
-                        Label("Retry Loading Menu", systemImage: "arrow.clockwise")
-                    }
-                }
+        Section {
+            if !viewModel.stkReason.isEmpty {
+                Text(viewModel.stkReason).foregroundStyle(.secondary)
             }
+            if !viewModel.stkText.isEmpty {
+                Text(viewModel.stkText).textSelection(.enabled)
+            }
+            ForEach(viewModel.stkMenu.items) { item in
+                Button(item.label) {
+                    Task { await viewModel.selectSTKItem(item) }
+                }
+                .disabled(viewModel.isLoading || viewModel.stkBusy)
+            }
+            if viewModel.stkType == "input" {
+                if viewModel.stkYesNo {
+                    HStack {
+                        Button("Yes") { Task { await viewModel.respondSTK(yes: true) } }
+                        Spacer()
+                        Button("No") { Task { await viewModel.respondSTK(yes: false) } }
+                    }
+                } else {
+                    Group {
+                        if viewModel.stkHidden {
+                            SecureField("SIM response", text: $viewModel.stkReply)
+                        } else {
+                            TextField("SIM response", text: $viewModel.stkReply)
+                        }
+                    }
+                    .keyboardType(viewModel.stkDigitsOnly ? .phonePad : .default)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    Text("Enter \(viewModel.stkMin)–\(viewModel.stkMax) characters")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Send Response") { Task { await viewModel.respondSTK() } }
+                }
+            } else if viewModel.stkType == "display" {
+                Button("Continue") { Task { await viewModel.respondSTK() } }
+            }
+            if !viewModel.stkRootMenu && viewModel.stkType != "status" {
+                Button("Back") { Task { await viewModel.goBackSTK() } }
+                Button("End SIM Session", role: .destructive) { Task { await viewModel.cancelSTK() } }
+            }
+            if viewModel.stkMenu.items.isEmpty && viewModel.stkType == "status" {
+                Button("Reload SIM Menu") { Task { await viewModel.loadSTKMenu() } }
+            }
+        } header: {
+            Text(viewModel.stkMenu.title.isEmpty ? "SIM Toolkit" : viewModel.stkMenu.title)
+        } footer: {
+            Text("Carrier-provided services from your SIM card")
         }
+        .disabled(viewModel.isLoading || viewModel.stkBusy)
     }
 }

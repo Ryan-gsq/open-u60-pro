@@ -8,12 +8,11 @@ struct DashboardView: View {
 
     @State private var signalMonitorVM: SignalMonitorViewModel?
     @State private var networkModeVM: NetworkModeViewModel?
-    @State private var showNetworkModeSheet = false
-    @State private var showBatteryDetailSheet = false
-    @State private var showCPUDetailSheet = false
+    @State private var detail: DashboardDetail?
+    @State private var showCPUDetails = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showAllDevices = true
     @State private var showWiFiShare = false
-    @State private var longPressCount = 0
 
     init(viewModel: DashboardViewModel, isAuthenticated: Bool, client: AgentClient, authManager: AuthManager) {
         self.viewModel = viewModel
@@ -26,58 +25,43 @@ struct DashboardView: View {
         let banners = bannerConfigs
         NavigationStack {
             ScrollView {
-                // Deliberately eager: WiFiShareCardView keeps the fetched credentials, the reveal
-                // toggle and the generated QR in its own @State, and a lazy stack is free to drop
-                // that subview once it leaves the realized window. Seven cards cost nothing to
-                // build up front.
-                VStack(spacing: 16) {
+                // Keep summary view identities stable while samples update and sheets open.
+                VStack(spacing: 12) {
                     ForEach(banners) { config in
                         SIMAlertBanner(config: config)
                             .transition(.move(edge: .top).combined(with: .opacity))
                     }
-                    OperatorCardScope(viewModel: viewModel)
-                        .onLongPressGesture {
-                            longPressCount += 1
-                            showNetworkModeSheet = true
-                        }
-                    NavigationLink {
-                        if let signalMonitorVM {
-                            SignalMonitorDestination(dashboard: viewModel, viewModel: signalMonitorVM)
-                        }
-                    } label: {
-                        SignalCardScope(viewModel: viewModel)
+                    Button { detail = .connection } label: {
+                        ConnectionOverview(viewModel: viewModel)
                     }
                     .buttonStyle(.plain)
-                    CellularCardScope(viewModel: viewModel)
-                    HStack(spacing: 16) {
-                        BatteryCardScope(viewModel: viewModel)
-                            .onLongPressGesture {
-                                longPressCount += 1
-                                showBatteryDetailSheet = true
-                            }
-                        CPUCardScope(viewModel: viewModel)
-                            .onLongPressGesture {
-                                longPressCount += 1
-                                showCPUDetailSheet = true
-                            }
+                    Button { detail = .traffic } label: {
+                        CellularCardScope(viewModel: viewModel, compact: true)
                     }
-                    WiFiCardScope(viewModel: viewModel, showWiFiShare: $showWiFiShare)
-                    if showWiFiShare {
-                        WiFiShareCardScope(
-                            viewModel: viewModel,
-                            client: client,
-                            authManager: authManager,
-                            isExpanded: $showWiFiShare
-                        )
-                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    .buttonStyle(.plain)
+                    SignalActivityControl()
+                    let healthLayout = dynamicTypeSize.isAccessibilitySize
+                        ? AnyLayout(VStackLayout(spacing: 12))
+                        : AnyLayout(HStackLayout(alignment: .top, spacing: 12))
+                    healthLayout {
+                        Button { detail = .battery } label: {
+                            BatteryCardScope(viewModel: viewModel)
+                        }
+                        .buttonStyle(.plain)
+                        Button { detail = .health } label: {
+                            HealthOverview(viewModel: viewModel)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    DevicesCardScope(viewModel: viewModel, showAllDevices: $showAllDevices)
+                    Button { detail = .wifi } label: {
+                        WiFiOverview(viewModel: viewModel)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding()
                 .animation(.easeInOut, value: banners)
             }
             .background(Color(.systemGroupedBackground))
-            .sensoryFeedback(.impact(weight: .medium), trigger: longPressCount)
             .task {
                 if signalMonitorVM == nil {
                     signalMonitorVM = SignalMonitorViewModel(client: client, authManager: authManager)
@@ -86,23 +70,13 @@ struct DashboardView: View {
                     networkModeVM = NetworkModeViewModel(client: client, authManager: authManager)
                 }
             }
-            .sheet(isPresented: $showNetworkModeSheet) {
-                NavigationStack {
-                    if let networkModeVM {
-                        NetworkModeView(viewModel: networkModeVM)
-                    }
-                }
-                .presentationDetents([.medium])
-            }
-            .sheet(isPresented: $showBatteryDetailSheet) {
-                BatteryDetailScope(viewModel: viewModel)
-                    .presentationDetents([.medium])
-            }
-            .sheet(isPresented: $showCPUDetailSheet) {
-                CPUDetailScope(viewModel: viewModel, client: client)
-                    .presentationDetents([.large, .medium])
+            .sheet(item: $detail) { selected in
+                dashboardDetail(selected)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
             }
             .navigationTitle("Dashboard")
+            .navigationBarTitleDisplayMode(.inline)
             .refreshable { await viewModel.refresh() }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -111,6 +85,65 @@ struct DashboardView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     connectionIndicator
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func dashboardDetail(_ selected: DashboardDetail) -> some View {
+        switch selected {
+        case .battery:
+            BatteryDetailScope(viewModel: viewModel)
+        case .health:
+            NavigationStack {
+                ScrollView {
+                    VStack(spacing: 12) {
+                        CPUCardScope(viewModel: viewModel)
+                        Button("CPU, memory & processes") { showCPUDetails = true }
+                        TemperatureCardScope(viewModel: viewModel)
+                    }.padding()
+                }
+                .background(Color(.systemGroupedBackground))
+                .sheet(isPresented: $showCPUDetails) {
+                    CPUDetailScope(viewModel: viewModel, client: client)
+                        .presentationDragIndicator(.visible)
+                }
+                .navigationTitle("CPU & temperatures")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { detail = nil } } }
+            }
+        case .connection:
+            NavigationStack {
+                if let signalMonitorVM {
+                    ConnectionSignalDetail(dashboard: viewModel, viewModel: signalMonitorVM,
+                                           networkModeViewModel: networkModeVM)
+                } else {
+                    ProgressView("Loading connection details…")
+                }
+            }
+        case .traffic, .wifi:
+            NavigationStack {
+                ScrollView {
+                    VStack(spacing: 12) {
+                        if selected == .traffic {
+                            CellularCardScope(viewModel: viewModel, compact: true)
+                            Text("These speeds show current cellular traffic across all connected devices. A speed test reports throughput over its test period; the live numbers change throughout that period.")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                        } else {
+                            WiFiCardScope(viewModel: viewModel, showWiFiShare: $showWiFiShare)
+                            Button(showWiFiShare ? "Hide Wi-Fi sharing" : "Share Wi-Fi") { showWiFiShare.toggle() }
+                            if showWiFiShare {
+                                WiFiShareCardScope(viewModel: viewModel, client: client,
+                                    authManager: authManager, isExpanded: $showWiFiShare)
+                            }
+                            DevicesCardScope(viewModel: viewModel, showAllDevices: $showAllDevices)
+                        }
+                    }.padding()
+                }
+                .background(Color(.systemGroupedBackground))
+                .navigationTitle(selected.rawValue)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { detail = nil } } }
             }
         }
     }
@@ -184,34 +217,9 @@ struct DashboardView: View {
 // dashboard to `battery`. Only a separate View type moves the read into its own invalidation
 // unit; passing the view model itself down reads nothing and so tracks nothing.
 
-private struct OperatorCardScope: View {
-    let viewModel: DashboardViewModel
-
-    var body: some View {
-        OperatorCardView(
-            operatorInfo: viewModel.operatorInfo,
-            nrSignal: viewModel.nrSignal,
-            lteSignal: viewModel.lteSignal
-        )
-    }
-}
-
-private struct SignalCardScope: View {
-    let viewModel: DashboardViewModel
-
-    var body: some View {
-        SignalCardView(
-            operatorInfo: viewModel.operatorInfo,
-            nrSignal: viewModel.nrSignal,
-            lteSignal: viewModel.lteSignal,
-            wcdmaSignal: viewModel.wcdmaSignal,
-            isAirplaneMode: viewModel.isAirplaneMode
-        )
-    }
-}
-
 private struct CellularCardScope: View {
     let viewModel: DashboardViewModel
+    var compact = false
 
     var body: some View {
         CellularCardView(
@@ -219,7 +227,10 @@ private struct CellularCardScope: View {
             wanIPv6: viewModel.wanIPv6,
             speed: viewModel.speed,
             trafficStats: viewModel.trafficStats,
-            isTrafficAvailable: viewModel.isTrafficAvailable
+            isTrafficAvailable: viewModel.isTrafficAvailable,
+            trafficUpdatedAt: viewModel.trafficUpdatedAt,
+            trafficSampleInterval: viewModel.trafficSampleInterval,
+            compact: compact
         )
     }
 }
@@ -228,7 +239,7 @@ private struct BatteryCardScope: View {
     let viewModel: DashboardViewModel
 
     var body: some View {
-        BatteryCardView(battery: viewModel.battery)
+        BatteryCardView(battery: viewModel.battery, compact: true)
     }
 }
 
@@ -236,7 +247,7 @@ private struct CPUCardScope: View {
     let viewModel: DashboardViewModel
 
     var body: some View {
-        CPUCardView(systemInfo: viewModel.systemInfo, thermal: viewModel.thermal)
+        CPUCardView(systemInfo: viewModel.systemInfo, thermal: viewModel.thermal, cpuAvailable: viewModel.cpuUpdatedAt != nil)
     }
 }
 
@@ -295,28 +306,38 @@ private struct CPUDetailScope: View {
     let client: AgentClient
 
     var body: some View {
-        CPUDetailSheet(systemInfo: viewModel.systemInfo, thermal: viewModel.thermal, client: client)
+        CPUDetailSheet(cpuAvailable: viewModel.cpuUpdatedAt != nil, systemInfo: viewModel.systemInfo, thermal: viewModel.thermal, client: client)
             // Killing bloat frees ~225 MB at once, and system info only reloads on the 60s tier.
             // Nothing inside a sheet can reach pull-to-refresh, so the sheet stack asks for one.
             .environment(\.processKillRefresh, { await viewModel.refresh() })
     }
 }
 
-// MARK: - Signal Monitor destination
+// MARK: - Connection & signal detail
 
-/// Holds the dashboard's signal-fetch suspension for exactly as long as the Signal Monitor is on
-/// screen. That screen polls `/api/network/signal` itself, so the dashboard must not poll it too.
-/// The flag keeps suspend and resume balanced per appearance: SwiftUI runs `onAppear` again when
-/// the user returns to this tab with the screen still pushed, and an unmatched call would leave
-/// the counter stuck.
-private struct SignalMonitorDestination: View {
+/// The combined sheet owns signal polling while visible. Keep the dashboard's fetch suspended
+/// for the same lifetime, balancing appearances when navigating to network mode or another tab.
+private struct ConnectionSignalDetail: View {
     let dashboard: DashboardViewModel
     let viewModel: SignalMonitorViewModel
+    let networkModeViewModel: NetworkModeViewModel?
 
+    @Environment(\.dismiss) private var dismiss
     @State private var isSuspended = false
 
     var body: some View {
-        SignalMonitorView(viewModel: viewModel)
+        SignalMonitorView(viewModel: viewModel) {
+            ConnectionAddresses(viewModel: dashboard)
+            if let networkModeViewModel {
+                NavigationLink("Network mode") { NetworkModeView(viewModel: networkModeViewModel) }
+            }
+        }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
             .onAppear {
                 guard !isSuspended else { return }
                 isSuspended = true
@@ -358,5 +379,132 @@ private struct SIMAlertBanner: View {
         .padding(12)
         .background(config.color.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(config.color.opacity(0.3), lineWidth: 1))
+    }
+}
+
+
+private struct TemperatureCardScope: View {
+    let viewModel: DashboardViewModel
+
+    var body: some View {
+        TemperatureCardView(thermal: viewModel.thermal, battery: viewModel.battery,
+            thermalUpdatedAt: viewModel.thermalUpdatedAt, batteryUpdatedAt: viewModel.batteryUpdatedAt)
+    }
+}
+
+private enum DashboardDetail: String, Identifiable {
+    case connection = "Connection & signal"
+    case traffic = "Live traffic"
+    case battery = "Battery"
+    case health = "CPU & temperatures"
+    case wifi = "Wi-Fi & devices"
+    var id: String { rawValue }
+}
+
+private struct OverviewHeading: View {
+    let title: String
+    let icon: String
+    var body: some View {
+        HStack {
+            Label(title, systemImage: icon).font(.subheadline.weight(.semibold))
+            Spacer(minLength: 4)
+            Image(systemName: "chevron.right").font(.caption2.weight(.semibold)).foregroundStyle(.tertiary)
+        }
+    }
+}
+
+private struct ConnectionOverview: View {
+    let viewModel: DashboardViewModel
+    var body: some View {
+        let info = viewModel.operatorInfo
+        let nr = viewModel.nrSignal
+        let lte = viewModel.lteSignal
+        CardView {
+            VStack(alignment: .leading, spacing: 10) {
+                OverviewHeading(title: "Connection & signal", icon: "antenna.radiowaves.left.and.right")
+                HStack(alignment: .firstTextBaseline) {
+                    Text(info.provider.isEmpty ? "No operator" : info.provider).font(.title3.bold())
+                    Spacer()
+                    Text(info.networkType.isEmpty ? "—" : info.displayNetworkType(nrConnected: nr.isConnected, lteSignal: lte))
+                        .font(.subheadline.weight(.semibold)).foregroundStyle(.blue)
+                }
+                HStack(spacing: 6) {
+                    Text(nr.isConnected ? "NR RSRP" : "LTE RSRP").font(.caption).foregroundStyle(.secondary)
+                    if let rsrp = nr.isConnected ? nr.rsrp : lte.rsrp {
+                        AnimatedNumber(value: Int(rsrp), font: .caption.weight(.semibold), suffix: " dBm")
+                    } else { Text("—").font(.caption) }
+                    Spacer()
+                    if info.roaming { Text("Roaming").font(.caption).foregroundStyle(.orange) }
+                    Text("Radio details").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Opens connection and signal details")
+    }
+}
+
+private struct HealthOverview: View {
+    let viewModel: DashboardViewModel
+    var body: some View {
+        CardView {
+            VStack(alignment: .leading, spacing: 10) {
+                OverviewHeading(title: "CPU & heat", icon: "cpu")
+                if viewModel.cpuUpdatedAt != nil {
+                    CPUUsageValue(value: viewModel.systemInfo.cpuUsagePercent)
+                } else { Text("—").font(.title3.bold()) }
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    VStack(spacing: 6) {
+                        temperature("CPU", value: viewModel.thermal.cpuTemp, date: viewModel.thermalUpdatedAt, now: context.date)
+                        temperature("Battery", value: viewModel.battery.temperature, date: viewModel.batteryUpdatedAt, now: context.date)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Opens CPU information and all temperature sensors")
+    }
+    private func temperature(_ label: String, value: Double?, date: Date?, now: Date) -> some View {
+        HStack {
+            Text(label).foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            TemperatureValueText(value: date.map { now.timeIntervalSince($0) < 10 } == true ? value : nil)
+        }.font(.caption)
+    }
+}
+
+private struct WiFiOverview: View {
+    let viewModel: DashboardViewModel
+    var body: some View {
+        CardView {
+            VStack(alignment: .leading, spacing: 10) {
+                OverviewHeading(title: "Wi-Fi & devices", icon: "wifi")
+                HStack(alignment: .firstTextBaseline) {
+                    Text(viewModel.wifiStatus.wifiOn ? "Wi-Fi on" : "Wi-Fi off")
+                        .font(.subheadline).foregroundStyle(viewModel.wifiStatus.wifiOn ? .green : .secondary)
+                    Spacer()
+                    AnimatedNumber(value: viewModel.connectedDevices.count, font: .title3.bold())
+                    Text("devices").font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Networks, sharing & connected devices")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Opens Wi-Fi networks and device list")
+    }
+}
+
+private struct ConnectionAddresses: View {
+    let viewModel: DashboardViewModel
+    var body: some View {
+        CardView(padding: 12) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("WAN addresses").font(.headline)
+                LabeledContent("IPv4", value: viewModel.wanIPv4.isEmpty ? "—" : viewModel.wanIPv4)
+                LabeledContent("IPv6", value: viewModel.wanIPv6.isEmpty ? "—" : viewModel.wanIPv6)
+            }.font(.caption).textSelection(.enabled)
+        }
     }
 }

@@ -2,6 +2,8 @@ import SwiftUI
 
 @main
 struct OpenU60App: App {
+    @State private var signalActivity: SignalActivityManager
+    @Environment(\.scenePhase) private var scenePhase
     @State private var authManager: AuthManager
     @State private var isAttemptingAutoLogin = true
     @AppStorage("gateway_ip") private var gatewayIP: String = "192.168.0.1"
@@ -13,6 +15,7 @@ struct OpenU60App: App {
         let savedIP = UserDefaults.standard.string(forKey: "gateway_ip") ?? "192.168.0.1"
         let agentClient = AgentClient(baseURL: "http://\(savedIP):9090")
         self.client = agentClient
+        _signalActivity = State(initialValue: SignalActivityManager(client: agentClient))
         _authManager = State(initialValue: AuthManager(client: agentClient))
 
         let navAppearance = UINavigationBarAppearance()
@@ -30,9 +33,23 @@ struct OpenU60App: App {
     var body: some Scene {
         WindowGroup {
             rootView
+                .environment(signalActivity)
+                .task(id: authManager.isAuthenticated) {
+                    if authManager.isAuthenticated { await signalActivity.resume() }
+                    else if signalActivity.activity != nil { await signalActivity.stop() }
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .active && authManager.isAuthenticated {
+                        Task { await signalActivity.resume() }
+                    }
+                }
+                .tint(.blue)
                 .preferredColorScheme(colorScheme)
                 .onChange(of: gatewayIP) {
-                    client.baseURL = "http://\(gatewayIP):9090"
+                    Task {
+                        await signalActivity.stop()
+                        client.baseURL = "http://\(gatewayIP):9090"
+                    }
                 }
         }
     }

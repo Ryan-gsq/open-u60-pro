@@ -19,3 +19,11 @@ swiftc -module-cache-path "$test_dir/cache" \
     "$models/DeviceModels.swift" "$models/RouterSettingsModels.swift" \
     mobile/ios/Tests/BatteryStatusTests.swift -o "$test_dir/battery-tests"
 "$test_dir/battery-tests"
+swiftc -module-cache-path "$test_dir/cache" \
+    mobile/ios/OpenU60/Core/Components/AnimatedNumber/NumberPresentation.swift \
+    mobile/ios/Tests/NumberPresentationTests.swift -o "$test_dir/reel-tests"
+"$test_dir/reel-tests"
+swiftc -module-cache-path "$test_dir/cache" \
+    "$models/SignalModels.swift" \
+    mobile/ios/Tests/BearerInfoTests.swift -o "$test_dir/bearer-tests"
+"$test_dir/bearer-tests"

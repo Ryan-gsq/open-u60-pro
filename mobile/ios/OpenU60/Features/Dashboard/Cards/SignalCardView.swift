@@ -55,7 +55,7 @@ struct SignalCardView: View, Equatable {
                 if showNR {
                     carrierRow(
                         icon: "cellularbars", tech: "5G NR",
-                        band: nrSignal.band, freq: BandConfig.nrFrequency(band: nrSignal.band),
+                        band: nrSignal.band,
                         technology: .nr, bandwidth: nrSignal.bandwidth,
                         isSCC: false, isPCC: !nrSignal.sccCarriers.isEmpty,
                         rsrp: nrSignal.rsrp, sinr: nrSignal.sinr,
@@ -64,7 +64,7 @@ struct SignalCardView: View, Equatable {
                     ForEach(nrSignal.sccCarriers) { scc in
                         carrierRow(
                             icon: "cellularbars", tech: "5G NR",
-                            band: scc.band, freq: BandConfig.nrFrequency(band: scc.band),
+                            band: scc.band,
                             technology: .nr, bandwidth: scc.bandwidth,
                             isSCC: true, anchorLabel: nil, rsrp: scc.rsrp, sinr: scc.sinr,
                             pci: scc.pci
@@ -77,7 +77,7 @@ struct SignalCardView: View, Equatable {
                     let lteCaActive = lteSignal.caState != "0" && !lteSignal.sccCarriers.isEmpty
                     carrierRow(
                         icon: "cellularbars", tech: "LTE",
-                        band: lteSignal.band, freq: BandConfig.lteFrequency(band: lteSignal.band),
+                        band: lteSignal.band,
                         technology: .lte, bandwidth: lteSignal.bandwidth,
                         isSCC: false, isPCC: !showNR && lteCaActive,
                         anchorLabel: showNR ? "Anchor" : nil,
@@ -88,7 +88,7 @@ struct SignalCardView: View, Equatable {
                         ForEach(lteSignal.sccCarriers) { scc in
                             carrierRow(
                                 icon: "cellularbars", tech: "LTE",
-                                band: scc.band, freq: BandConfig.lteFrequency(band: scc.band),
+                                band: scc.band,
                                 technology: .lte, bandwidth: scc.bandwidth,
                                 isSCC: true, anchorLabel: nil, rsrp: scc.rsrp, sinr: scc.sinr,
                                 pci: scc.pci
@@ -120,24 +120,20 @@ struct SignalCardView: View, Equatable {
 
     @ViewBuilder
     private func carrierRow(
-        icon: String, tech: String, band: String, freq: String?,
+        icon: String, tech: String, band: String,
         technology: BandTechnology, bandwidth: String,
         isSCC: Bool, isPCC: Bool = false, anchorLabel: String? = nil,
         rsrp: Double?, sinr: Double?, pci: String
     ) -> some View {
-        let spec = technology.spec(for: band)
+        let spec = SignalFormat.bandNumber(band).flatMap { technology.spec(for: $0) }
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Label {
                     HStack(spacing: 4) {
                         if band.isEmpty {
                             Text(tech)
-                        } else if let spec {
-                            Text("\(tech) \u{00B7} B\(band) (\(spec.commonName), \(spec.duplexMode.rawValue))")
-                        } else if let freq {
-                            Text("\(tech) \u{00B7} Band \(band) (\(freq))")
                         } else {
-                            Text("\(tech) \u{00B7} Band \(band)")
+                            Text("\(tech) \u{00B7} \(SignalFormat.band(band, technology: technology, isPCC: false))")
                         }
                     }
                 } icon: {

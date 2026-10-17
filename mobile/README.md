@@ -20,6 +20,7 @@ Native companion apps for the ZTE U60 Pro 5G mobile router. Connect to the `zte-
 | Guest WiFi | Full | Guest network enable/disable, SSID, timer |
 | SMS | Full | Read, send, delete SMS; mark as read |
 | SIM Management | Full | PIN verify/change/enable/disable, PUK unlock, SIM unlock |
+| 9eSIM B1 / eSIM | Application flows + connection | BLE scan/connect, profile list/actions/download/export UI and unit-tested controller; verified B1 wire/LPA adapter still required |
 | Mobile Network | Full | Data toggle, airplane mode, network scan, manual register |
 | Network Mode | Full | Auto/manual network selection |
 | APN Settings | Full | Auto/manual APN mode, add/edit/delete/activate profiles |
@@ -42,6 +43,7 @@ Native companion apps for the ZTE U60 Pro 5G mobile router. Connect to the `zte-
 
 - **Pattern**: MVVM
 - **Transport**: HTTP to `zte-agent` REST API (`http://<router>:9090/api/...`)
+- **B1 Bluetooth**: Direct native phone BLE transport; independent of the router agent. See [connection implementation and protocol handoff](docs/b1-bluetooth.md).
 - **Auth**: Token-based (password → bearer token)
 
 The iOS app communicates with `zte-agent`, a lightweight Rust HTTP server deployed on the router. The agent exposes dedicated typed REST endpoints that internally call the router's ubus subsystem and return JSON responses.
@@ -137,7 +139,7 @@ ios/OpenU60/
 
 ## Agent REST API
 
-The iOS app communicates exclusively through typed REST endpoints on `zte-agent`. Key endpoint groups:
+Router operations use typed REST endpoints on `zte-agent`. B1 Bluetooth uses the phone's native BLE APIs directly. Key router endpoint groups:
 
 | Group | Endpoints | Description |
 |---|---|---|
@@ -184,7 +186,7 @@ The app can decrypt and re-encrypt ZTE router configuration backup files (`.bin`
 
 ## Relation to zte-agent
 
-The mobile app connects to `zte-agent`, a lightweight Rust HTTP server deployed on the router. The agent runs directly on the device and exposes all router functionality through typed REST endpoints — the mobile app is a pure front-end with no direct ubus/AT/sysfs access.
+The mobile app connects to `zte-agent`, a lightweight Rust HTTP server deployed on the router. The agent runs directly on the device and exposes router functionality through typed REST endpoints. The phone has no direct ubus/AT/sysfs access; the B1 connection layer separately uses native Bluetooth to reach the card.
 
 ## License
 

@@ -11,7 +11,20 @@ final class STKViewModel {
 
     // STK state
     var stkMenu: STKMenu = .empty
-    var menuStack: [STKMenu] = []
+    var stkCommandID = ""
+    var stkType = "status"
+    var stkReason = ""
+    var stkText = ""
+    var stkReply = ""
+    var stkBusy = false
+    var stkRootMenu = true
+    var stkYesNo = false
+    var stkHidden = false
+    var stkDigitsOnly = false
+    var stkMin = 0
+    var stkMax = 0
+    private var stkRevision = 0
+    private var stkPollingStopped = false
     var stkNotSupported: Bool = false
 
     // Common
@@ -100,63 +113,102 @@ final class STKViewModel {
     // MARK: - STK
 
     func loadSTKMenu() async {
+        guard !isLoading else { return }
         isLoading = true
+        stkPollingStopped = false
         message = nil
-        stkNotSupported = false
-
+        stkRevision += 1
+        defer { isLoading = false }
         do {
-            let data = try await client.getJSON("/api/stk/menu")
-
-            if let error = STKParser.parseError(data) {
-                showMessage(error, isError: true)
-            } else if data["supported"] as? Bool == false {
-                stkNotSupported = true
-            } else {
-                stkMenu = STKParser.parseSTKMenu(data)
-                menuStack = []
-            }
+            applySTK(try await client.getJSON("/api/stk/menu"))
         } catch {
-            showMessage("STK not available", isError: true)
+            failSTK(error)
         }
+    }
 
-        isLoading = false
+    /// The view owns this task; navigating away cancels polling without selecting or ending a service.
+    func watchSTK() async {
+        await loadSTKMenu()
+        while !Task.isCancelled {
+            do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            guard !isLoading, !stkPollingStopped else { continue }
+            let revision = stkRevision
+            do {
+                let data = try await client.getJSON("/api/stk/session")
+                guard !Task.isCancelled, revision == stkRevision, !isLoading else { continue }
+                applySTK(data)
+            } catch {
+                guard !Task.isCancelled, revision == stkRevision else { continue }
+                failSTK(error)
+            }
+        }
     }
 
     func selectSTKItem(_ item: STKMenuItem) async {
-        isLoading = true
-
-        do {
-            let data = try await client.postJSON("/api/stk/select", body: ["item_id": item.id])
-
-            if let error = STKParser.parseError(data) {
-                showMessage(error, isError: true)
-            } else if data["supported"] as? Bool == false {
-                stkNotSupported = true
-            } else {
-                let responseType = data["type"] as? String ?? ""
-                if responseType == "menu" {
-                    let subMenu = STKParser.parseSTKMenu(data)
-                    if !subMenu.items.isEmpty {
-                        menuStack.append(stkMenu)
-                        stkMenu = subMenu
-                    }
-                } else {
-                    // Raw response or display text
-                    let rawData = data["data"] as? String ?? "No response"
-                    showMessage(rawData, isError: false)
-                }
-            }
-        } catch {
-            showMessage("Failed: \(error.localizedDescription)", isError: true)
-        }
-
-        isLoading = false
+        await stkAction("select", body: ["item_id": item.id])
     }
 
-    func goBackSTK() {
-        if let previous = menuStack.popLast() {
-            stkMenu = previous
+    func respondSTK(yes: Bool? = nil) async {
+        var body: [String: Any] = ["text": stkReply]
+        if let yes { body["yes"] = yes }
+        await stkAction("respond", body: body)
+    }
+
+    func goBackSTK() async { await stkAction("back") }
+    func cancelSTK() async { await stkAction("cancel") }
+
+    private func stkAction(_ action: String, body: [String: Any] = [:]) async {
+        guard !isLoading, !stkBusy, !stkCommandID.isEmpty else { return }
+        isLoading = true
+        message = nil
+        stkRevision += 1
+        defer { isLoading = false }
+        var payload = body
+        payload["command_id"] = stkCommandID
+        do {
+            applySTK(try await client.postJSON("/api/stk/\(action)", body: payload))
+        } catch {
+            // A timed-out selection may already have reached the SIM. Never replay it automatically.
+            failSTK(error)
         }
+    }
+
+    private func applySTK(_ data: [String: Any]) {
+        if let error = STKParser.parseError(data) {
+            stkMenu = .empty
+            stkCommandID = ""
+            stkPollingStopped = true
+            showMessage(error, isError: true)
+            return
+        }
+        let id = data["command_id"] as? String ?? ""
+        if id != stkCommandID { stkReply = "" }
+        stkCommandID = id
+        stkMenu = STKParser.parseSTKMenu(data)
+        stkType = data["type"] as? String ?? "status"
+        stkReason = data["reason"] as? String ?? ""
+        stkText = data["text"] as? String ?? ""
+        stkBusy = data["busy"] as? Bool ?? false
+        stkRootMenu = data["root_menu"] as? Bool ?? true
+        stkNotSupported = data["supported"] as? Bool == false
+        let input = data["input"] as? [String: Any] ?? [:]
+        stkYesNo = input["yes_no"] as? Bool ?? false
+        stkHidden = input["hidden"] as? Bool ?? false
+        stkDigitsOnly = input["digits_only"] as? Bool ?? false
+        stkMin = input["min"] as? Int ?? 0
+        stkMax = input["max"] as? Int ?? 0
+    }
+
+    private func failSTK(_ error: Error) {
+        stkMenu = .empty
+        stkCommandID = ""
+        stkType = "status"
+        stkText = ""
+        stkReply = ""
+        stkBusy = false
+        stkPollingStopped = true
+        stkReason = "Reload the SIM menu to reconnect."
+        showMessage(error.localizedDescription, isError: true)
     }
 
     // MARK: - Private

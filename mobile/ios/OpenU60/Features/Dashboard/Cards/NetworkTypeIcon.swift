@@ -15,9 +15,9 @@ struct NetworkTypeIcon: View {
         if isNoService {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: labelSize, weight: .bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(pillColor)
                 .frame(width: pillWidth, height: pillHeight)
-                .background(pillColor, in: Capsule())
+                .background(pillColor.opacity(0.12), in: Capsule())
                 .accessibilityLabel("No service")
         } else if isTwoLine {
             VStack(spacing: 0) {
@@ -26,16 +26,16 @@ struct NetworkTypeIcon: View {
                 Text(subtitle)
                     .font(.system(size: subtitleSize, weight: .semibold, design: .rounded))
             }
-            .foregroundStyle(.white)
+            .foregroundStyle(pillColor)
             .frame(width: pillWidth, height: twoLinePillHeight)
-            .background(pillColor, in: Capsule())
+            .background(pillColor.opacity(0.12), in: Capsule())
             .accessibilityElement(children: .combine)
         } else {
             Text(label)
                 .font(.system(size: labelSize, weight: .bold, design: .rounded))
-                .foregroundStyle(.white)
+                .foregroundStyle(pillColor)
                 .frame(width: pillWidth, height: pillHeight)
-                .background(pillColor, in: Capsule())
+                .background(pillColor.opacity(0.12), in: Capsule())
         }
     }
 
@@ -68,18 +68,10 @@ struct NetworkTypeIcon: View {
     }
 
     private var pillColor: Color {
-        switch networkType {
-        case "5G SA": return .blue
-        case "5G NSA": return .teal
-        case "4G+", "4G": return .green
-        default:
-            if isNoService { return .orange }
-            if networkType.contains("3G") || networkType.contains("WCDMA")
-                || networkType.contains("UMTS") || networkType.contains("GSM")
-                || networkType.contains("2G") {
-                return .orange
-            }
-            return .gray
-        }
+        if isNoService { return .orange }
+        let value = networkType.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty || value == "--" { return .secondary }
+        // Technology labels identify the radio; generation alone is not a warning.
+        return .blue
     }
 }
