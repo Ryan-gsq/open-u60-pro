@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "team_id": "ABCDE12345",
+  "key_id": "FGHIJ67890",
+  "bundle_id": "com.example.OpenU60",
+  "key_file": "/data/zte-agent-apns/AuthKey.p8",
+  "environment": "sandbox",
+  "interval_seconds": 15,
+  "stale_after_seconds": 30,
+  "push_priority": 5
+}

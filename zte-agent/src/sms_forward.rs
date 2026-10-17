@@ -2,6 +2,8 @@ use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+
+use crate::system::spawn_named;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,10 @@ const MAX_RETRIES: u32 = 3;
 const RETRY_DELAYS: [u64; 3] = [5, 15, 60];
 const INTER_RULE_DELAY_MS: u64 = 500;
 const INTER_SMS_DELAY_MS: u64 = 1000;
+/// Safety-net poll cadence when an SMS event could have been missed.
+const FALLBACK_POLL_SECS: u64 = 900;
+/// ... and while forwarding is disabled (the poll is a no-op then).
+const FALLBACK_POLL_DISABLED_SECS: u64 = 3600;
 
 // ── Data types ──────────────────────────────────────────────────────
 
@@ -561,8 +567,27 @@ impl SmsForwarder {
 
     /// Start the SMS forwarder with event-driven reception.
     /// Falls back to polling if the event channel disconnects.
+    ///
+    /// Everything runs on its own threads so `main()` reaches the HTTP server
+    /// immediately; the connectivity seed below can block for up to 10 s at boot.
     pub fn start(self: &Arc<Self>, sms_events: mpsc::Receiver<Value>, service_rx: mpsc::Receiver<Value>, wan_rx: mpsc::Receiver<Value>) {
-        // Seed initial connectivity state (retry if services aren't registered yet)
+        let this = Arc::clone(self);
+        spawn_named("sms-start", move || {
+            this.seed_connectivity();
+
+            let conn_self = Arc::clone(&this);
+            spawn_named("sms-svc", move || conn_self.service_monitor(service_rx));
+
+            let conn_self = Arc::clone(&this);
+            spawn_named("sms-wan", move || conn_self.wan_monitor(wan_rx));
+
+            let forwarder = Arc::clone(&this);
+            spawn_named("sms-events", move || forwarder.event_loop(sms_events));
+        });
+    }
+
+    /// Seed initial connectivity state (retry if services aren't registered yet).
+    fn seed_connectivity(&self) {
         for attempt in 1..=5 {
             let got_service = if !self.has_service.load(Ordering::Relaxed) {
                 if let Ok(data) = ubus::call("zte_nwinfo_api", "nwinfo_get_netinfo", Some("{}")) {
@@ -599,62 +624,40 @@ impl SmsForwarder {
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
-
-        let conn_self = Arc::clone(self);
-        std::thread::spawn(move || {
-            conn_self.connectivity_monitor(service_rx, wan_rx);
-        });
-
-        let forwarder = Arc::clone(self);
-        std::thread::spawn(move || {
-            forwarder.event_loop(sms_events);
-        });
     }
 
-    fn connectivity_monitor(&self, service_rx: mpsc::Receiver<Value>, wan_rx: mpsc::Receiver<Value>) {
-        loop {
-            let mut got_event = false;
-
-            // Check service events
-            match service_rx.try_recv() {
-                Ok(event) => {
-                    let network_type = event["network_type"].as_str().unwrap_or("");
-                    let has = !network_type.is_empty() && network_type != "NO_SERVICE" && !network_type.starts_with("LIMITED_SERVICE");
-                    let prev = self.has_service.swap(has, Ordering::Relaxed);
-                    if prev != has {
-                        eprintln!("[sms_forward] service state changed: {network_type} (has_service={has})");
-                    }
-                    got_event = true;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("[sms_forward] service_rx disconnected");
-                    return;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-
-            // Check WAN events
-            match wan_rx.try_recv() {
-                Ok(event) => {
-                    let wan_status = event["wan_status"].as_str().unwrap_or("");
-                    let connected = wan_status.starts_with("ipv4");
-                    let prev = self.wan_connected.swap(connected, Ordering::Relaxed);
-                    if prev != connected {
-                        eprintln!("[sms_forward] WAN state changed: {wan_status} (connected={connected})");
-                    }
-                    got_event = true;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("[sms_forward] wan_rx disconnected");
-                    return;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-
-            if !got_event {
-                std::thread::sleep(Duration::from_millis(500));
+    /// Blocks on the service-status event channel; no timer, zero wakeups at idle.
+    fn service_monitor(&self, service_rx: mpsc::Receiver<Value>) {
+        for event in service_rx.iter() {
+            let network_type = event["network_type"].as_str().unwrap_or("");
+            let has = !network_type.is_empty() && network_type != "NO_SERVICE" && !network_type.starts_with("LIMITED_SERVICE");
+            let prev = self.has_service.swap(has, Ordering::Relaxed);
+            if prev != has {
+                eprintln!("[sms_forward] service state changed: {network_type} (has_service={has})");
             }
         }
+        eprintln!("[sms_forward] service_rx disconnected");
+    }
+
+    /// Blocks on the WAN connect-status event channel; no timer, zero wakeups at idle.
+    fn wan_monitor(&self, wan_rx: mpsc::Receiver<Value>) {
+        for event in wan_rx.iter() {
+            let wan_status = event["wan_status"].as_str().unwrap_or("");
+            let connected = wan_status.starts_with("ipv4");
+            let prev = self.wan_connected.swap(connected, Ordering::Relaxed);
+            if prev != connected {
+                eprintln!("[sms_forward] WAN state changed: {wan_status} (connected={connected})");
+            }
+        }
+        eprintln!("[sms_forward] wan_rx disconnected");
+    }
+
+    /// How long the event loop may sleep before a safety-net poll: 15 min while
+    /// forwarding is active, 1 h while it is disabled (the poll is a no-op then).
+    fn fallback_poll_interval(&self) -> Duration {
+        let config = self.config.lock().unwrap();
+        let active = config.enabled && config.rules.iter().any(|r| r.enabled);
+        Duration::from_secs(if active { FALLBACK_POLL_SECS } else { FALLBACK_POLL_DISABLED_SECS })
     }
 
     fn init_watermark(&self) {
@@ -677,8 +680,8 @@ impl SmsForwarder {
         self.init_watermark();
 
         loop {
-            // Wait for event OR 5-min fallback timeout
-            match rx.recv_timeout(Duration::from_secs(300)) {
+            // Wait for an event, or run a safety-net poll after the fallback interval
+            match rx.recv_timeout(self.fallback_poll_interval()) {
                 Ok(event) => {
                     if event["wms_status"].as_str() != Some("new_sms_received") {
                         continue;

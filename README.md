@@ -274,6 +274,66 @@ u60-Pro-rs/
 | **SINR** (dB) | >= 20 | >= 10 | >= 0 | < 0 |
 | **RSRQ** (dB) | >= -10 | >= -15 | >= -20 | < -20 |
 
+## iOS Live Activities
+
+Show the modem's signal on your iPhone Lock Screen and Dynamic Island. The layout
+adapts to LTE, LTE carrier aggregation (4G+), and 5G, with signal bars, RSRP,
+SINR, and sample age. Readings describe the modem's cellular connection.
+
+<p align="center">
+  <img src="mobile/ios/screenshots/live-activity-lock-screen.png" alt="OpenU60 Lock Screen Live Activity showing 4G+ LTE carrier aggregation, -72 dBm RSRP, 9 dB SINR, and a 12-second sample age" width="430">
+</p>
+
+### Enable the feature
+
+1. **Prepare Apple signing.** Use your own Apple Developer team, an explicit app
+   bundle ID with Push Notifications enabled, a matching provisioning profile,
+   and an APNs authentication key (`AuthKey_<KEY_ID>.p8`). Update the app and
+   extension bundle IDs/signing in
+   [project.yml](mobile/ios/OpenU60/project.yml). The ActivityKit manager,
+   Live Activity extension, and Live Activities Info.plist flags are included.
+   The current iOS project targets iOS 17 or later.
+2. **Configure the modem.** Copy your `.p8` and an edited
+   [example configuration](zte-agent/config/live-activity.example.json) to
+   `/data/zte-agent-apns/`. Set `enabled` to `true`, fill in your Team ID, Key ID,
+   containing-app bundle ID, and key path. Match `environment` to the installed
+   build: `sandbox` for development, `production` for TestFlight/App Store.
+   Keep the directory root-owned with mode `700` and both files mode `600`.
+3. **Enable the agent sender.** Preserve the existing password and startup
+   settings, add the following environment variable to the agent launch script,
+   and restart only `zte-agent` to load the configuration:
+
+   ```sh
+   export ZTE_AGENT_LIVE_ACTIVITY_CONFIG=/data/zte-agent-apns/live-activity.private.json
+   ```
+
+4. **Start on the iPhone.** Install your signed app, connect to the modem, log in,
+   and tap **Dashboard → Live signal → Start**. Allow Live Activities in iPhone
+   Settings. Lock the phone to see the card, or expand the Dynamic Island on a
+   supported iPhone. Tap **Stop** in the app to end the session.
+
+The modem sends directly to Apple Push Notification service (APNs); no hosted
+backend is required. Both the modem and iPhone need internet access for push
+updates. Keep private keys out of Git and the app bundle; self-hosting developers
+use their own credentials. See the [full setup and API guide](zte-agent/docs/live-activity.md)
+for file provisioning, signing, and configuration details.
+
+### Freshness and recovery
+
+- The default send interval is **15 seconds**, with readings marked stale after
+  **30 seconds**. Apple controls delivery, so this is not a guaranteed refresh
+  rate. Sample age should reset when a newly sampled update reaches the phone.
+- Sessions last **one hour**. Currently the agent holds **one registration**;
+  starting an activity on another phone replaces it. Agent restarts clear that
+  registration; reopen the app to register again, or use Stop/Start if needed.
+- SIM removal/ready and WAN events trigger agent recovery. It verifies internet
+  access and UTC before resuming delivery, retaining an unexpired registration.
+- **Apple accepted an update** confirms submission, not phone delivery. During
+  physical testing after a SIM swap, agent sends recovered but the iPhone stayed
+  stale until Wi-Fi was toggled off/on. If this happens, reconnect the iPhone's
+  Wi-Fi and check sample age. Fully automatic phone-side recovery is not yet
+  verified; see the [SIM-swap test findings](zte-agent/docs/sim-swap-ubus-2026-09-15.md).
+
 ## License & Disclaimers
 
 This project is licensed under the [MIT License](LICENSE).

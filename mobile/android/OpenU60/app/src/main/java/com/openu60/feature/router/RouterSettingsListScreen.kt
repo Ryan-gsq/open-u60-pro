@@ -24,6 +24,7 @@ fun RouterSettingsListScreen(
     onNavigateToSignalDetect: () -> Unit,
     onNavigateToSIM: () -> Unit,
     onNavigateToSTK: () -> Unit,
+    onNavigateToB1Bluetooth: () -> Unit,
     onNavigateToWiFi: () -> Unit,
     onNavigateToGuestWiFi: () -> Unit,
     onNavigateToAPN: () -> Unit,
@@ -58,6 +59,7 @@ fun RouterSettingsListScreen(
             SettingsItem(Icons.Default.Radar, "Signal Detection", onClick = onNavigateToSignalDetect)
             SettingsItem(Icons.Default.SimCard, "SIM Card", onClick = onNavigateToSIM)
             SettingsItem(Icons.Default.Dialpad, "SIM Services (STK)", onClick = onNavigateToSTK)
+            SettingsItem(Icons.Default.Bluetooth, "9eSIM B1 Bluetooth", onClick = onNavigateToB1Bluetooth)
 
             Spacer(modifier = Modifier.height(8.dp))
 

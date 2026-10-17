@@ -1,5 +1,8 @@
 package com.openu60.core.model
 
+import java.util.Locale
+import kotlin.math.abs
+
 data class LTECarrier(
     val label: String = "",
     val pci: String = "",
@@ -147,6 +150,48 @@ data class SignalSnapshot(
                 nrRSRP = nrRSRP,
                 lteRSRP = lteRSRP,
             )
+        }
+    }
+}
+
+/**
+ * QoS the network granted on the data session: the QCI/5QI of the default bearer and the
+ * AMBR, the operator's rate cap, both as negotiated at session setup. The agent sends it as
+ * `bearer` on /api/network/signal: null while the data session is down, absent on agents
+ * that predate it.
+ */
+data class BearerInfo(
+    val qci: Int? = null,
+    val ambrDownlinkMbps: Double? = null,
+    val ambrUplinkMbps: Double? = null,
+) {
+    /** "2000 / 200 Mbps" (down / up), or null when the agent reported no AMBR. */
+    val ambrText: String?
+        get() {
+            if (ambrDownlinkMbps == null && ambrUplinkMbps == null) return null
+            val down = ambrDownlinkMbps?.let(::formatMbps) ?: "--"
+            val up = ambrUplinkMbps?.let(::formatMbps) ?: "--"
+            return "$down / $up Mbps"
+        }
+
+    companion object {
+        /**
+         * What to call [qci]: on 5G SA the session is a PDU session, whose QoS identifier is
+         * the 5QI; on LTE and NSA it is an EPS bearer with a QCI. Standardized values share
+         * one table. Same SA rule as the iOS SignalActivityMode, which unlike
+         * [OperatorInfo.networkMode] recognises the firmware's "NR5G-SA".
+         */
+        fun qosLabel(networkType: String): String {
+            val words = networkType.trim().uppercase().replace('_', ' ').replace('-', ' ')
+            val standalone = !words.contains("NSA") && (words == "SA" || words.endsWith(" SA"))
+            return if (standalone) "5QI" else "QCI"
+        }
+
+        /** Whole numbers without a decimal point, otherwise to the kbps: "2000", "8.64", "0.5". */
+        fun formatMbps(value: Double): String {
+            val rounded = Math.round(value * 1000) / 1000.0
+            if (rounded == Math.floor(rounded) && abs(rounded) < 1e15) return rounded.toLong().toString()
+            return String.format(Locale.ROOT, "%.3f", rounded).trimEnd('0')
         }
     }
 }
@@ -301,6 +346,30 @@ object SignalParser {
             else -> null
         }
         return result?.takeIf { it in -9000.0..9000.0 }?.takeIf { it != 0.0 }
+    }
+
+    /**
+     * The agent's `bearer` object. Null while the data session is down, on agents that
+     * predate it, and when it holds no usable value.
+     */
+    fun parseBearer(data: Map<String, Any?>): BearerInfo? {
+        val raw = data["bearer"] as? Map<*, *> ?: return null
+        val bearer = BearerInfo(
+            qci = positiveNumber(raw["qci"])?.toInt(),
+            ambrDownlinkMbps = positiveNumber(raw["ambr_dl_mbps"]),
+            ambrUplinkMbps = positiveNumber(raw["ambr_ul_mbps"]),
+        )
+        return bearer.takeIf { it != BearerInfo() }
+    }
+
+    /** Unlike [parseSignalDouble], no ±9000 sentinel cut-off: a 10 Gbps AMBR is 10000 Mbps. */
+    private fun positiveNumber(value: Any?): Double? {
+        val number = when (value) {
+            is Number -> value.toDouble()
+            is String -> value.trim().toDoubleOrNull()
+            else -> null
+        }
+        return number?.takeIf { it.isFinite() && it > 0 }
     }
 
     private fun stringVal(value: Any?): String = when (value) {

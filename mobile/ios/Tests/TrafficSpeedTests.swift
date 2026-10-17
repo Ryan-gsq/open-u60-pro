@@ -16,6 +16,24 @@ struct TrafficSpeedTests {
         precondition(DeviceParser.speedComponents(speed.downloadBytesPerSec).number == 420)
         precondition(DeviceParser.speedComponents(speed.uploadBytesPerSec).number == 40)
 
+        // Speed holds a FIXED fraction width at every scale, unlike `bytesComponents`. A live rate
+        // swings across decades every second, and because AnimatedNumber keys columns by place
+        // value, a moving fraction width inserts and removes columns instead of rolling them.
+        let low = DeviceParser.speedComponents(1_000) // 8 Kb/s
+        precondition(low.unit == " Kb/s" && low.number == 8 && low.decimalPlaces == 1)
+        let mid = DeviceParser.speedComponents(1_500_000) // 12 Mb/s
+        precondition(mid.unit == " Mb/s" && mid.number == 12 && mid.decimalPlaces == 1)
+        let high = DeviceParser.speedComponents(50_000_000) // 400 Mb/s
+        precondition(high.unit == " Mb/s" && high.number == 400 && high.decimalPlaces == 1)
+
+        // Rounding that reaches the next scale must promote the unit rather than render
+        // "1000 Kb/s", which would also add a digit column for a single sample.
+        let boundary = DeviceParser.speedComponents(124_999) // 999.992 Kb/s
+        precondition(boundary.unit == " Mb/s" && boundary.number == 1,
+                     "Rounding up to the scale threshold must promote the unit")
+        precondition(DeviceParser.speedComponents(0).unit == " b/s")
+        precondition(DeviceParser.formatSpeed(50_000_000) == "400.0Mb/s")
+
         // A delayed counter increase must not override an explicit idle sample.
         let idle = DeviceParser.parseWwandstTraffic([
             "real_rx_bytes": "349032301", "real_tx_bytes": "399697048",

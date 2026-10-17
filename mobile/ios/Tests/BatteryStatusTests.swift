@@ -25,6 +25,21 @@ struct BatteryStatusTests {
             precondition(battery.capacityPercent == nil)
             precondition(battery.capacityText == "—")
         }
+        precondition(DeviceParser.parseThermal([:]).cpuTemp == nil)
+        precondition(DeviceParser.parseBattery([:]).temperature == nil)
+        let zones = DeviceParser.parseThermal(["sensors": [
+            ["id": "16", "name": "cpuss-0", "temperature_c": 36.8],
+            ["id": "17", "name": "cpuss-1", "temperature_c": 38.4],
+            ["id": "33", "name": "sys-therm-5", "temperature_c": -40.96],
+            ["id": "39", "name": "battery", "temperature_c": 0.0]
+        ]])
+        precondition(zones.cpuTemp == 38.4)
+        precondition(zones.sensors[2].temperatureC == nil)
+        precondition(zones.sensors[3].temperatureC == 0, "Zero Celsius is valid")
+        precondition(DeviceParser.validTemperature(Double.nan) == nil)
+        precondition(DeviceParser.validTemperature(-273) == nil)
+        precondition(DeviceParser.parseKernelBattery(["temperature": 315]).temperature == 31.5)
+        print("Thermal parsing, hottest CPU selection and invalid sensor checks passed")
         print("Battery percentage and charge-stopped regression checks passed")
     }
 }

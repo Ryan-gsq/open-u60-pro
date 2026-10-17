@@ -22,10 +22,15 @@ data class SignalMonitorState(
     val lte: LTESignal = LTESignal.empty,
     val wcdma: WCDMASignal = WCDMASignal.empty,
     val operatorInfo: OperatorInfo = OperatorInfo.empty,
+    /** Null hides the QoS readout: no data session, or an agent without the `bearer` field. */
+    val bearer: BearerInfo? = null,
     val history: List<SignalSnapshot> = emptyList(),
     val isLoading: Boolean = false,
     val error: String? = null,
-)
+) {
+    /** What to call `bearer.qci` on the current network: "5QI" on 5G SA, "QCI" otherwise. */
+    val qosLabel: String get() = BearerInfo.qosLabel(operatorInfo.networkType)
+}
 
 @HiltViewModel
 class SignalMonitorViewModel @Inject constructor(
@@ -89,6 +94,7 @@ class SignalMonitorViewModel @Inject constructor(
                 lte = result.lte,
                 wcdma = result.wcdma,
                 operatorInfo = result.operatorInfo,
+                bearer = SignalParser.parseBearer(data),
                 history = newHistory,
                 isLoading = false,
             )

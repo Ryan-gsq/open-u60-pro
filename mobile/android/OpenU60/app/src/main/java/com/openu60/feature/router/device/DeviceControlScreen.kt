@@ -168,7 +168,7 @@ fun DeviceControlScreen(
                             Spacer(modifier = Modifier.height(4.dp))
                             if (state.chargeLimitEnabled) {
                                 Text(
-                                    "Charging stops at ${sliderValue.toInt()}% and resumes at ${sliderValue.toInt() - state.hysteresis}%.\n\n" +
+                                    "Charging stops at ${state.chargeLimit}% and resumes at ${state.chargeLimit - state.hysteresis}%.\n\n" +
                                         "The resume gap prevents the charger from rapidly switching on and off. " +
                                         "A smaller gap keeps the battery closer to your target but toggles more often. " +
                                         "A larger gap means fewer cycles but more swing.\n\nDefault: 5%",

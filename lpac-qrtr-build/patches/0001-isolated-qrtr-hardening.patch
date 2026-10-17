@@ -1,0 +1,598 @@
+--- a/driver/CMakeLists.txt
++++ b/driver/CMakeLists.txt
+@@ -5,6 +5,9 @@
+ option(LPAC_WITH_APDU_QMI_QRTR "Build QMI-over-QRTR backend for Qualcomm devices (requires libqrtr and libqmi headers)" OFF)
+ option(LPAC_WITH_APDU_UQMI "Build uQMI backend for Qualcomm devices (requires uqmi)" OFF)
+ option(LPAC_WITH_APDU_MBIM "Build MBIM backend for MBIM devices (requires libmbim)" OFF)
++if(LPAC_WITH_APDU_QMI)
++    message(FATAL_ERROR "This local hardening patch is validated for QRTR only; USB QMI is intentionally unavailable.")
++endif()
+ 
+ option(LPAC_WITH_HTTP_CURL "Build HTTP Curl interface" ON)
+ cmake_dependent_option(LPAC_WITH_HTTP_WINHTTP "Build HTTP WinHTTP interface (Win32 only)" ON WIN32 OFF)
+--- a/driver/apdu/qmi_common.c
++++ b/driver/apdu/qmi_common.c
+@@ -1,150 +1,118 @@
+ // SPDX-License-Identifier: MIT
+-/*
+- * Copyright (c) 2024, Luca Weiss <luca.weiss@fairphone.com>
+- */
++/* Copyright (c) 2024, Luca Weiss <luca.weiss@fairphone.com>
++ * Local QRTR-only build: explicit ownership and failure-safe teardown. */
++#include "qmi_common.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+-#include "qmi_common.h"
++static const char *detail(GError *error) { return error ? error->message : "no further detail"; }
++static gboolean connected(struct qmi_data *p) { return p && p->context && p->uimClient && p->deviceOpened; }
+ 
+-#include <stdio.h>
+-
+-int qmi_apdu_interface_transmit(struct euicc_ctx *ctx, uint8_t **rx, uint32_t *rx_len, const uint8_t *tx,
+-                                uint32_t tx_len) {
+-    struct qmi_data *qmi_priv = ctx->apdu.interface->userdata;
++int qmi_apdu_interface_transmit(struct euicc_ctx *ctx, uint8_t **rx, uint32_t *rx_len,
++                               const uint8_t *tx, uint32_t tx_len) {
++    struct qmi_data *p = ctx->apdu.interface->userdata;
+     g_autoptr(GError) error = NULL;
+-    g_autoptr(GArray) apdu_data = NULL;
+-
+-    /* Convert tx into request GArray */
+-    apdu_data = g_array_new(FALSE, FALSE, sizeof(guint8));
+-    for (uint32_t i = 0; i < tx_len; i++)
+-        g_array_append_val(apdu_data, tx[i]);
+-
+-    QmiMessageUimSendApduInput *input;
++    g_autoptr(GArray) data = NULL;
++    g_autoptr(QmiMessageUimSendApduInput) input = NULL;
++    g_autoptr(QmiMessageUimSendApduOutput) output = NULL;
++    if (!rx || !rx_len) return -1;
++    *rx = NULL; *rx_len = 0;
++    if (!connected(p) || p->lastChannelId <= 0 || !tx || !tx_len) return -1;
++    data = g_array_sized_new(FALSE, FALSE, sizeof(guint8), tx_len);
++    g_array_append_vals(data, tx, tx_len);
+     input = qmi_message_uim_send_apdu_input_new();
+-    qmi_message_uim_send_apdu_input_set_slot(input, qmi_priv->uimSlot, NULL);
+-    qmi_message_uim_send_apdu_input_set_channel_id(input, qmi_priv->lastChannelId, NULL);
+-    qmi_message_uim_send_apdu_input_set_apdu(input, apdu_data, NULL);
+-
+-    QmiMessageUimSendApduOutput *output;
+-    output = qmi_client_uim_send_apdu_sync(qmi_priv->uimClient, input, qmi_priv->context, &error);
+-
+-    qmi_message_uim_send_apdu_input_unref(input);
+-
+-    if (!qmi_message_uim_send_apdu_output_get_result(output, &error)) {
+-        fprintf(stderr, "error: send apdu operation failed: %s\n", error->message);
+-        return -1;
+-    }
+-
+-    GArray *apdu_res = NULL;
+-    if (!qmi_message_uim_send_apdu_output_get_apdu_response(output, &apdu_res, &error)) {
+-        fprintf(stderr, "error: get apdu response operation failed: %s\n", error->message);
+-        return -1;
+-    }
+-
+-    /* Convert response GArray into rx */
+-    *rx_len = apdu_res->len;
+-    *rx = malloc(*rx_len);
+-    if (!*rx)
+-        return -1;
+-    for (guint i = 0; i < apdu_res->len; i++)
+-        (*rx)[i] = apdu_res->data[i];
+-
+-    qmi_message_uim_send_apdu_output_unref(output);
+-
++    if (!qmi_message_uim_send_apdu_input_set_slot(input, p->uimSlot, &error) ||
++        !qmi_message_uim_send_apdu_input_set_channel_id(input, p->lastChannelId, &error) ||
++        !qmi_message_uim_send_apdu_input_set_apdu(input, data, &error)) goto failed;
++    output = qmi_client_uim_send_apdu_sync(p->uimClient, input, p->context, &error);
++    if (!output || !qmi_message_uim_send_apdu_output_get_result(output, &error)) goto failed;
++    GArray *response = NULL;
++    if (!qmi_message_uim_send_apdu_output_get_apdu_response(output, &response, &error) || !response) goto failed;
++    if (!response->len) return 0;
++    *rx = malloc(response->len);
++    if (!*rx) return -1;
++    memcpy(*rx, response->data, response->len);
++    *rx_len = response->len;
+     return 0;
++failed:
++    fprintf(stderr, "error: APDU failed: %s\n", detail(error));
++    return -1;
+ }
+ 
+ int qmi_apdu_interface_logic_channel_open(struct euicc_ctx *ctx, const uint8_t *aid, uint8_t aid_len) {
+-    struct qmi_data *qmi_priv = ctx->apdu.interface->userdata;
++    struct qmi_data *p = ctx->apdu.interface->userdata;
+     g_autoptr(GError) error = NULL;
+-    guint8 channel_id;
+-
+-    GArray *aid_data = g_array_new(FALSE, FALSE, sizeof(guint8));
+-    for (int i = 0; i < aid_len; i++)
+-        g_array_append_val(aid_data, aid[i]);
+-
+-    QmiMessageUimOpenLogicalChannelInput *input;
++    g_autoptr(GArray) data = NULL;
++    g_autoptr(QmiMessageUimOpenLogicalChannelInput) input = NULL;
++    g_autoptr(QmiMessageUimOpenLogicalChannelOutput) output = NULL;
++    guint8 channel;
++    gboolean attempted = FALSE;
++    if (!connected(p) || p->lastChannelId > 0 || p->channelStateUnknown || !aid || !aid_len) return -1;
++    data = g_array_sized_new(FALSE, FALSE, sizeof(guint8), aid_len);
++    g_array_append_vals(data, aid, aid_len);
+     input = qmi_message_uim_open_logical_channel_input_new();
+-    qmi_message_uim_open_logical_channel_input_set_slot(input, qmi_priv->uimSlot, NULL);
+-    qmi_message_uim_open_logical_channel_input_set_aid(input, aid_data, NULL);
+-
+-    QmiMessageUimOpenLogicalChannelOutput *output;
+-    output = qmi_client_uim_open_logical_channel_sync(qmi_priv->uimClient, input, qmi_priv->context, &error);
+-
+-    qmi_message_uim_open_logical_channel_input_unref(input);
+-    g_array_unref(aid_data);
+-
+-    if (!output) {
+-        fprintf(stderr, "error: send Open Logical Channel command failed: %s\n", error->message);
+-        return -1;
+-    }
+-
+-    if (!qmi_message_uim_open_logical_channel_output_get_result(output, &error)) {
+-        fprintf(stderr, "error: open logical channel operation failed: %s\n", error->message);
+-        return -1;
+-    }
+-
+-    if (!qmi_message_uim_open_logical_channel_output_get_channel_id(output, &channel_id, &error)) {
+-        fprintf(stderr, "error: get channel id operation failed: %s\n", error->message);
+-        return -1;
+-    }
+-    qmi_priv->lastChannelId = channel_id;
+-
+-    g_debug("Opened logical channel with id %d", channel_id);
+-
+-    qmi_message_uim_open_logical_channel_output_unref(output);
+-
+-    return channel_id;
++    if (!qmi_message_uim_open_logical_channel_input_set_slot(input, p->uimSlot, &error) ||
++        !qmi_message_uim_open_logical_channel_input_set_aid(input, data, &error)) goto failed;
++    attempted = TRUE;
++    output = qmi_client_uim_open_logical_channel_sync(p->uimClient, input, p->context, &error);
++    if (!output || !qmi_message_uim_open_logical_channel_output_get_result(output, &error) ||
++        !qmi_message_uim_open_logical_channel_output_get_channel_id(output, &channel, &error)) goto failed;
++    if (!channel) goto failed;
++    p->lastChannelId = channel;
++    return channel;
++failed:
++    if (attempted) p->channelStateUnknown = TRUE;
++    fprintf(stderr, "error: open logical channel failed: %s\n", detail(error));
++    return -1;
+ }
+ 
+-void qmi_apdu_interface_logic_channel_close(struct qmi_data *qmi_priv, const uint8_t channel) {
++void qmi_apdu_interface_logic_channel_close(struct qmi_data *p, uint8_t channel) {
+     g_autoptr(GError) error = NULL;
++    g_autoptr(QmiMessageUimLogicalChannelInput) input = NULL;
++    g_autoptr(QmiMessageUimLogicalChannelOutput) output = NULL;
++    if (!connected(p) || p->lastChannelId <= 0 || channel != p->lastChannelId) return;
++    /* Never retry a close blindly after a timeout; ownership is uncertain then. */
++    p->lastChannelId = -1;
++    input = qmi_message_uim_logical_channel_input_new();
++    if (!qmi_message_uim_logical_channel_input_set_slot(input, p->uimSlot, &error) ||
++        !qmi_message_uim_logical_channel_input_set_channel_id(input, channel, &error)) goto failed;
++    output = qmi_client_uim_logical_channel_sync(p->uimClient, input, p->context, &error);
++    if (!output || !qmi_message_uim_logical_channel_output_get_result(output, &error)) goto failed;
++    return;
++failed:
++    p->channelStateUnknown = TRUE;
++    fprintf(stderr, "error: close logical channel failed; card channel state unknown: %s\n", detail(error));
++}
+ 
+-    QmiMessageUimLogicalChannelInput *input;
+-    input = qmi_message_uim_logical_channel_input_new();
+-    qmi_message_uim_logical_channel_input_set_slot(input, qmi_priv->uimSlot, NULL);
+-    qmi_message_uim_logical_channel_input_set_channel_id(input, channel, NULL);
++void qmi_cleanup(struct qmi_data *p) {
++    if (connected(p) && p->lastChannelId > 0)
++        qmi_apdu_interface_logic_channel_close(p, p->lastChannelId);
++}
+ 
+-    QmiMessageUimLogicalChannelOutput *output;
+-    output = qmi_client_uim_logical_channel_sync(qmi_priv->uimClient, input, qmi_priv->context, &error);
+-
+-    qmi_message_uim_logical_channel_input_unref(input);
+-
+-    if (error) {
+-        fprintf(stderr, "error: send Close Logical Channel command failed: %s\n", error->message);
+-        return;
++void qmi_teardown(struct qmi_data *p) {
++    if (!p) return;
++    g_autoptr(GError) error = NULL;
++    qmi_cleanup(p);
++    if (p->uimClient) {
++        if (p->device && p->context &&
++            !qmi_device_release_client_sync(p->device, QMI_CLIENT(p->uimClient), p->context, &error))
++            fprintf(stderr, "error: release QMI client failed: %s\n", detail(error));
++        g_clear_error(&error);
++        g_clear_object(&p->uimClient);
+     }
+-
+-    if (!qmi_message_uim_logical_channel_output_get_result(output, &error)) {
+-        fprintf(stderr, "error: logical channel operation failed: %s\n", error->message);
+-        return;
+-    }
+-
+-    /* Mark channel as having been cleaned up */
+-    if (channel == qmi_priv->lastChannelId)
+-        qmi_priv->lastChannelId = -1;
+-
+-    g_debug("Closed logical channel with id %d", channel);
+-
+-    qmi_message_uim_logical_channel_output_unref(output);
++    if (p->device && p->deviceOpened && p->context &&
++        !qmi_device_close_sync(p->device, p->context, &error))
++        fprintf(stderr, "error: close QMI device failed: %s\n", detail(error));
++    g_clear_object(&p->device);
++    p->deviceOpened = FALSE;
++#ifdef LPAC_WITH_DRIVER_APDU_QMI_QRTR
++    g_clear_object(&p->qrtrBus);
++#endif
++    g_clear_pointer(&p->context, g_main_context_unref);
++    p->lastChannelId = -1;
+ }
+ 
+ void qmi_apdu_interface_disconnect(struct euicc_ctx *ctx) {
+-    struct qmi_data *qmi_priv = ctx->apdu.interface->userdata;
+-    g_autoptr(GError) error = NULL;
+-    QmiClient *client = QMI_CLIENT(qmi_priv->uimClient);
+-    QmiDevice *device = QMI_DEVICE(qmi_client_get_device(client));
+-
+-    qmi_device_release_client_sync(device, client, qmi_priv->context, &error);
+-    qmi_priv->uimClient = NULL;
+-
+-    g_main_context_unref(qmi_priv->context);
+-    qmi_priv->context = NULL;
++    qmi_teardown(ctx->apdu.interface->userdata);
+ }
+-
+-void qmi_cleanup(struct qmi_data *qmi_priv) {
+-    if (qmi_priv->lastChannelId <= 0)
+-        return;
+-    fprintf(stderr, "Cleaning up leaked APDU channel %d\n", qmi_priv->lastChannelId);
+-    qmi_apdu_interface_logic_channel_close(qmi_priv, qmi_priv->lastChannelId);
+-    qmi_priv->lastChannelId = -1;
+-}
+--- a/driver/apdu/qmi_common.h
++++ b/driver/apdu/qmi_common.h
+@@ -13,6 +13,9 @@
+     int uimSlot;
+     GMainContext *context;
+     QmiClientUim *uimClient;
++    QmiDevice *device;
++    gboolean deviceOpened;
++    gboolean channelStateUnknown;
+ #ifdef LPAC_WITH_DRIVER_APDU_QMI_QRTR
+     QrtrBus *qrtrBus;
+ #endif
+@@ -24,3 +27,4 @@
+ void qmi_apdu_interface_logic_channel_close(struct qmi_data *qmi_priv, uint8_t channel);
+ void qmi_apdu_interface_disconnect(struct euicc_ctx *ctx);
+ void qmi_cleanup(struct qmi_data *qmi_priv);
++void qmi_teardown(struct qmi_data *qmi_priv);
+--- a/driver/apdu/qmi_helpers.c
++++ b/driver/apdu/qmi_helpers.c
+@@ -90,6 +90,15 @@
+     return qmi_device_allocate_client_finish(device, result, error);
+ }
+ 
++gboolean qmi_device_close_sync(QmiDevice *device, GMainContext *context, GError **error) {
++    g_autoptr(GMainContextPusher) pusher = g_main_context_pusher_new(context);
++    g_autoptr(GAsyncResult) result = NULL;
++    qmi_device_close_async(device, 5, NULL, async_result_ready, &result);
++    while (result == NULL)
++        g_main_context_iteration(context, TRUE);
++    return qmi_device_close_finish(device, result, error);
++}
++
+ gboolean qmi_device_release_client_sync(QmiDevice *device, QmiClient *client, GMainContext *context, GError **error) {
+     g_autoptr(GMainContextPusher) pusher = NULL;
+     g_autoptr(GAsyncResult) result = NULL;
+--- a/driver/apdu/qmi_helpers.h
++++ b/driver/apdu/qmi_helpers.h
+@@ -24,6 +24,7 @@
+ #endif
+ 
+ gboolean qmi_device_open_sync(QmiDevice *device, QmiDeviceOpenFlags flags, GMainContext *context, GError **error);
++gboolean qmi_device_close_sync(QmiDevice *device, GMainContext *context, GError **error);
+ 
+ QmiClient *qmi_device_allocate_client_sync(QmiDevice *device, GMainContext *context, GError **error);
+ 
+--- a/driver/apdu/qmi_qrtr.c
++++ b/driver/apdu/qmi_qrtr.c
+@@ -1,121 +1,102 @@
+ // SPDX-License-Identifier: MIT
+-/*
+- * Copyright (c) 2024, Luca Weiss <luca.weiss@fairphone.com>
+- */
++/* Copyright (c) 2024, Luca Weiss <luca.weiss@fairphone.com>
++ * Local isolated-build hardening; see patches/ and off-device test report. */
+ #include "qmi_common.h"
+-
+ #include <driver.h>
+ #include <euicc/interface.h>
+ #include <lpac/utils.h>
+-
+-#include <libqrtr-glib.h>
+-#include <signal.h>
+-#include <stdbool.h>
++#include <errno.h>
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#define ENV_QRTR_NODE APDU_ENV_NAME(QMI_QRTR, NODE)
++
++/* Reject implicit defaults, signs, whitespace, partial parses and overflow. */
++static int explicit_uint(const char *name, unsigned long min, unsigned long max, unsigned long *out) {
++    const char *s = getenv(name);
++    if (!s || !*s) goto invalid;
++    for (const char *p = s; *p; p++)
++        if (*p < '0' || *p > '9') goto invalid;
++    errno = 0;
++    char *end;
++    unsigned long n = strtoul(s, &end, 10);
++    if (errno || *end || n < min || n > max) goto invalid;
++    *out = n;
++    return 0;
++invalid:
++    fprintf(stderr, "error: explicit %s required in range %lu..%lu; no default selected\n", name, min, max);
++    return -1;
++}
++
+ static int apdu_interface_connect(struct euicc_ctx *ctx) {
+-    struct qmi_data *qmi_priv = ctx->apdu.interface->userdata;
++    struct qmi_data *p = ctx->apdu.interface->userdata;
+     g_autoptr(GError) error = NULL;
+-    QrtrNode *node = NULL;
+-    QmiDevice *device = NULL;
+-    QmiClient *client = NULL;
+-    bool found = false;
+-
+-    qmi_priv->context = g_main_context_new();
+-
+-    qmi_priv->qrtrBus = qrtr_bus_new_sync(qmi_priv->context, &error);
+-    if (qmi_priv->qrtrBus == NULL) {
+-        fprintf(stderr, "error: connect to QRTR bus failed: %s\n", error->message);
+-        return -1;
+-    }
+-
+-    /* Find QRTR node for UIM service */
+-    for (GList *l = qrtr_bus_peek_nodes(qmi_priv->qrtrBus); l != NULL; l = l->next) {
+-        node = l->data;
+-
+-        if (node && qrtr_node_lookup_port(node, QMI_SERVICE_UIM) >= 0) {
+-            found = true;
+-            break;
++    unsigned long node_id, slot;
++    QrtrNode *selected = NULL;
++    if (!p || p->context || p->device || p->uimClient || p->channelStateUnknown) return -1;
++    if (explicit_uint(ENV_QRTR_NODE, 0, UINT32_MAX - 1UL, &node_id) ||
++        explicit_uint(ENV_UIM_SLOT, 1, UINT8_MAX, &slot)) return -1;
++    p->uimSlot = (int)slot;
++    p->context = g_main_context_new();
++    p->qrtrBus = qrtr_bus_new_sync(p->context, &error);
++    if (!p->qrtrBus) goto failed;
++    for (GList *l = qrtr_bus_peek_nodes(p->qrtrBus); l; l = l->next) {
++        QrtrNode *node = l->data;
++        if (node && qrtr_node_get_id(node) == node_id && qrtr_node_lookup_port(node, QMI_SERVICE_UIM) >= 0) {
++            if (selected) {
++                fprintf(stderr, "error: ambiguous selected QRTR node\n");
++                goto failed;
++            }
++            selected = node;
+         }
+     }
++    if (!selected) {
++        fprintf(stderr, "error: selected QRTR node has no visible UIM service; no fallback\n");
++        goto failed;
++    }
++    p->device = qmi_device_new_from_node_sync(selected, p->context, &error);
++    if (!p->device) goto failed;
++    if (!qmi_device_open_sync(p->device, QMI_DEVICE_OPEN_FLAGS_NONE, p->context, &error)) goto failed;
++    p->deviceOpened = TRUE;
++    p->uimClient = QMI_CLIENT_UIM(qmi_device_allocate_client_sync(p->device, p->context, &error));
++    if (!p->uimClient) goto failed;
++    return 0;
++failed:
++    fprintf(stderr, "error: QRTR connection failed: %s\n", error ? error->message : "no further detail");
++    qmi_teardown(p);
++    return -1;
++}
+ 
+-    if (!found) {
+-        fprintf(stderr, "error: find QRTR node with UIM service failed\n");
+-        return -1;
+-    }
++static void apdu_interface_logic_channel_close(struct euicc_ctx *ctx, uint8_t channel) {
++    qmi_apdu_interface_logic_channel_close(ctx->apdu.interface->userdata, channel);
++}
+ 
+-    device = qmi_device_new_from_node_sync(node, qmi_priv->context, &error);
+-    if (!device) {
+-        fprintf(stderr, "error: create QMI device from QRTR node failed: %s\n", error->message);
+-        return -1;
+-    }
+-
+-    qmi_device_open_sync(device, QMI_DEVICE_OPEN_FLAGS_NONE, qmi_priv->context, &error);
+-    if (error) {
+-        fprintf(stderr, "error: open QMI device failed: %s\n", error->message);
+-        return -1;
+-    }
+-
+-    client = qmi_device_allocate_client_sync(device, qmi_priv->context, &error);
+-    if (!client) {
+-        fprintf(stderr, "error: allocate QMI client failed: %s\n", error->message);
+-        return -1;
+-    }
+-
+-    qmi_priv->uimClient = QMI_CLIENT_UIM(client);
+-
++static int libapduinterface_init(struct euicc_apdu_interface *iface) {
++    memset(iface, 0, sizeof(*iface));
++    struct qmi_data *p = calloc(1, sizeof(*p));
++    if (!p) return -1;
++    p->lastChannelId = -1;
++    p->uimSlot = -1;
++    iface->connect = apdu_interface_connect;
++    iface->disconnect = qmi_apdu_interface_disconnect;
++    iface->logic_channel_open = qmi_apdu_interface_logic_channel_open;
++    iface->logic_channel_close = apdu_interface_logic_channel_close;
++    iface->transmit = qmi_apdu_interface_transmit;
++    iface->userdata = p;
+     return 0;
+ }
+ 
+-static void apdu_interface_logic_channel_close(struct euicc_ctx *ctx, uint8_t channel) {
+-    struct qmi_data *qmi_priv = ctx->apdu.interface->userdata;
+-    qmi_apdu_interface_logic_channel_close(qmi_priv, channel);
+-}
+-
+-static int libapduinterface_init(struct euicc_apdu_interface *ifstruct) {
+-    set_deprecated_env_name(ENV_UIM_SLOT, "UIM_SLOT");
+-
+-    struct qmi_data *qmi_priv;
+-
+-    qmi_priv = malloc(sizeof(struct qmi_data));
+-    if (!qmi_priv) {
+-        fprintf(stderr, "Failed allocating memory\n");
+-        return -1;
+-    }
+-
+-    memset(ifstruct, 0, sizeof(struct euicc_apdu_interface));
+-
+-    ifstruct->connect = apdu_interface_connect;
+-    ifstruct->disconnect = qmi_apdu_interface_disconnect;
+-    ifstruct->logic_channel_open = qmi_apdu_interface_logic_channel_open;
+-    ifstruct->logic_channel_close = apdu_interface_logic_channel_close;
+-    ifstruct->transmit = qmi_apdu_interface_transmit;
+-
+-    /*
+-     * Allow the user to select the SIM card slot via environment variable.
+-     * Use the primary SIM slot if not set.
+-     */
+-    qmi_priv->uimSlot = getenv_or_default(ENV_UIM_SLOT, (int)1);
+-
+-    ifstruct->userdata = qmi_priv;
+-
+-    return 0;
+-}
+-
+-static void libapduinterface_fini(struct euicc_apdu_interface *ifstruct) {
+-    struct qmi_data *qmi_priv = ifstruct->userdata;
+-
+-    qmi_cleanup(qmi_priv);
+-
+-    free(qmi_priv);
++static void libapduinterface_fini(struct euicc_apdu_interface *iface) {
++    if (!iface) return;
++    qmi_teardown(iface->userdata);
++    free(iface->userdata);
++    iface->userdata = NULL;
+ }
+ 
+ DRIVER_INTERFACE = {
+-    .type = DRIVER_APDU,
+-    .name = "qmi_qrtr",
+-    .init = (int (*)(void *))libapduinterface_init,
+-    .main = NULL,
++    .type = DRIVER_APDU, .name = "qmi_qrtr",
++    .init = (int (*)(void *))libapduinterface_init, .main = NULL,
+     .fini = (void (*)(void *))libapduinterface_fini,
+ };
+--- a/driver/euicc-driver-loader.c
++++ b/driver/euicc-driver-loader.c
+@@ -37,6 +37,9 @@
+ 
+ static const struct euicc_driver *_driver_apdu = NULL;
+ static const struct euicc_driver *_driver_http = NULL;
++static bool _apdu_initialized = false;
++static bool _http_initialized = false;
++void euicc_driver_fini(void);
+ 
+ struct euicc_apdu_interface euicc_driver_interface_apdu;
+ struct euicc_http_interface euicc_driver_interface_http;
+@@ -209,6 +212,8 @@
+         return NULL;
+     // runpath is not empty, so strtok shouldn't return NULL when first call.
+     char *tmp = strtok(runpath, ":");
++    if (tmp == NULL)
++        return NULL;
+     if (!strcmp(tmp, "$ORIGIN") || !strcmp(tmp, "@loader_path")) {
+         return get_origin();
+     } else {
+@@ -258,6 +263,10 @@
+     while ((entry = readdir(driver_dir)) != NULL) {
+         if (!strncmp(entry->d_name, "driver_", 7) && ends_with(entry->d_name, dynlib_suffix)) {
+             const struct euicc_driver *driver = find_driver_by_path(LPAC_DRIVER_HOME, entry->d_name);
++            if (driver == NULL) {
++                fprintf(stderr, "Failed to load driver %s\n", entry->d_name);
++                return false;
++            }
+             struct euicc_drivers_list *tmp = (struct euicc_drivers_list *)calloc(1, sizeof(struct euicc_drivers_list));
+             if (tmp == NULL) {
+                 return false;
+@@ -384,6 +393,8 @@
+ }
+ 
+ int euicc_driver_init(const char *apdu_driver_name, const char *http_driver_name) {
++    _apdu_initialized = false;
++    _http_initialized = false;
+     _driver_apdu = find_driver(DRIVER_APDU, apdu_driver_name);
+     if (_driver_apdu == NULL) {
+         fprintf(stderr, "No APDU driver found\n");
+@@ -400,22 +411,29 @@
+         fprintf(stderr, "APDU driver init failed\n");
+         return -1;
+     }
++    _apdu_initialized = true;
+ 
+     if (_driver_http->init(&euicc_driver_interface_http)) {
+         fprintf(stderr, "HTTP driver init failed\n");
+-        return -1;
+-    }
++        euicc_driver_fini();
++        return -1;
++    }
++    _http_initialized = true;
+ 
+     return 0;
+ }
+ 
+ void euicc_driver_fini() {
+-    if (_driver_apdu != NULL && _driver_apdu->fini != NULL) {
++    if (_apdu_initialized && _driver_apdu != NULL && _driver_apdu->fini != NULL) {
+         _driver_apdu->fini(&euicc_driver_interface_apdu);
+     }
+-    if (_driver_http != NULL && _driver_http->fini != NULL) {
++    if (_http_initialized && _driver_http != NULL && _driver_http->fini != NULL) {
+         _driver_http->fini(&euicc_driver_interface_http);
+     }
++    _apdu_initialized = false;
++    _http_initialized = false;
++    _driver_apdu = NULL;
++    _driver_http = NULL;
+ }
+ 
+ int euicc_driver_main_apdu(const int argc, char **argv) {
+--- a/driver/http/curl.c
++++ b/driver/http/curl.c
+@@ -88,8 +88,8 @@
+     libcurl._curl_easy_setopt(curl, CURLOPT_URL, url);
+     libcurl._curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_trans_write_callback);
+     libcurl._curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&responseData);
+-    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+-    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
++    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
++    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+     for (int i = 0; h[i] != NULL; i++) {
+         nheaders = libcurl._curl_slist_append(headers, h[i]);
+         if (nheaders == NULL) {

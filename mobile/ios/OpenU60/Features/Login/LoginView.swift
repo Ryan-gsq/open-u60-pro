@@ -63,6 +63,13 @@ struct LoginView: View {
                 }
                 .padding(.horizontal, 32)
 
+                NavigationLink {
+                    B1BluetoothView()
+                } label: {
+                    Label("9eSIM B1 Bluetooth", systemImage: "antenna.radiowaves.left.and.right")
+                }
+                .buttonStyle(.bordered)
+
                 Spacer()
                 Spacer()
             }

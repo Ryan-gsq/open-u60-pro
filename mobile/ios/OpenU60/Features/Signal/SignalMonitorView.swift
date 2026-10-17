@@ -1,16 +1,15 @@
 import SwiftUI
 import Charts
 
-struct SignalMonitorView: View {
-    var viewModel: SignalMonitorViewModel
+struct SignalMonitorView<ConnectionDetails: View>: View {
+    let viewModel: SignalMonitorViewModel
+    @ViewBuilder let connectionDetails: ConnectionDetails
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var isVisible = false
 
-    /// This screen stays alive on the Dashboard tab's navigation stack while the user is on
-    /// another tab, so foreground alone is not enough to resume: returning from the background
-    /// would restart a 2s poll of the heaviest endpoint in the app on a screen nobody is looking
-    /// at. Both conditions drive one key so the two handlers cannot disagree.
+    /// The sheet can remain alive while network mode is pushed or another tab is selected.
+    /// Poll only while both visible and foregrounded.
     private struct PollKey: Equatable {
         let foreground: Bool
         let visible: Bool
@@ -24,7 +23,7 @@ struct SignalMonitorView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 16) {
+            VStack(spacing: 10) {
                 let nr = viewModel.nrSignal
                 let lte = viewModel.lteSignal
                 let wcdma = viewModel.wcdmaSignal
@@ -32,7 +31,8 @@ struct SignalMonitorView: View {
                 let showLTE = viewModel.operatorInfo.showLTE(lte: lte)
                 let show3G = viewModel.operatorInfo.show3G(nr: nr, lte: lte, wcdma: wcdma)
 
-                SignalHistoryChart(history: viewModel.history, showLTE: showLTE, show3G: show3G)
+                OperatorCardView(operatorInfo: viewModel.operatorInfo, nrSignal: nr, lteSignal: lte, padding: 12)
+                    .equatable()
                 if showNR {
                     CellularPanel(data: .nr(nr)).equatable()
                 }
@@ -42,21 +42,27 @@ struct SignalMonitorView: View {
                 if show3G {
                     WCDMAPanel(signal: wcdma)
                 }
+                if let bearer = viewModel.bearer {
+                    DataSessionPanel(bearer: bearer, qosLabel: viewModel.qosLabel).equatable()
+                }
+                SignalHistoryChart(history: viewModel.history, showLTE: showLTE, show3G: show3G)
+                connectionDetails
             }
-            .padding()
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
         }
-        .navigationTitle("Signal Monitor")
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("Connection & signal")
         .refreshable { await viewModel.refresh() }
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .topBarLeading) {
                 LastUpdatedView(date: viewModel.lastUpdated)
             }
         }
         .onAppear { isVisible = true }
         .onDisappear {
             isVisible = false
-            // A pop tears the view down, so the state write above may never round-trip into an
-            // onChange. Stopping directly guarantees the loop dies with the screen.
+            // Dismissal can tear down the view before onChange runs.
             viewModel.stopPolling()
         }
         .onChange(of: pollKey, initial: true) { _, key in
@@ -69,6 +75,47 @@ struct SignalMonitorView: View {
     }
 }
 
+// MARK: - Data Session
+
+private struct DataSessionPanel: View, Equatable {
+    let bearer: BearerInfo
+    let qosLabel: String
+
+    var body: some View {
+        CardView(padding: 12) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Data Session")
+                    .font(.headline)
+
+                if let qci = bearer.qci {
+                    MetaRow(label: qosLabel, value: String(qci))
+                }
+                if let ambrText = bearer.ambrText {
+                    MetaRow(label: "AMBR", value: ambrText)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Rate cap")
+                        .accessibilityValue(ambrAccessibilityValue)
+
+                    Text("Down / up. Operator rate cap, set when the data session started. Not a speed test.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var ambrAccessibilityValue: String {
+        let down = bearer.ambrDownlinkMbps.map {
+            "\(BearerInfo.formatMbps($0)) megabits per second down"
+        } ?? "Down unavailable"
+        let up = bearer.ambrUplinkMbps.map {
+            "\(BearerInfo.formatMbps($0)) megabits per second up"
+        } ?? "Up unavailable"
+        return "\(down), \(up)"
+    }
+}
+
 // MARK: - RSRP History Chart
 
 private struct SignalHistoryChart: View {
@@ -77,7 +124,7 @@ private struct SignalHistoryChart: View {
     let show3G: Bool
 
     var body: some View {
-        CardView {
+        CardView(padding: 12) {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Signal History")
                     .font(.headline)
@@ -85,7 +132,7 @@ private struct SignalHistoryChart: View {
                 if history.isEmpty {
                     Text("Collecting data...")
                         .foregroundStyle(.secondary)
-                        .frame(height: 150)
+                        .frame(height: 110)
                         .frame(maxWidth: .infinity)
                 } else {
                     chart
@@ -145,7 +192,7 @@ private struct SignalHistoryChart: View {
                 AxisValueLabel(format: .dateTime.minute().second())
             }
         }
-        .frame(height: 200)
+        .frame(height: 160)
         .accessibilityLabel("Signal strength history")
     }
 }
@@ -233,7 +280,7 @@ private struct CellularPanel: View, Equatable {
     let data: CellularPanelData
 
     var body: some View {
-        CardView {
+        CardView(padding: 12) {
             VStack(alignment: .leading, spacing: 8) {
                 header
 
@@ -290,16 +337,7 @@ private struct CellularPanel: View, Equatable {
     }
 
     private var metrics: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 8) {
-                SignalMetricView(label: "RSRP", value: data.rsrp, unit: "dBm", color: Color.rsrpColor(data.rsrp))
-                SignalMetricView(label: "RSRQ", value: data.rsrq, unit: "dB", color: Color.rsrqColor(data.rsrq))
-            }
-            HStack(spacing: 8) {
-                SignalMetricView(label: "SINR", value: data.sinr, unit: "dB", color: Color.sinrColor(data.sinr))
-                SignalMetricView(label: "RSSI", value: data.rssi, unit: "dBm", color: .primary)
-            }
-        }
+        SignalMetricsGrid(rsrp: data.rsrp, rsrq: data.rsrq, sinr: data.sinr, rssi: data.rssi)
     }
 
     private var metadata: some View {
@@ -345,12 +383,8 @@ private struct SCCCarrierView: View {
                     .font(.caption2.monospacedDigit())
             }
             .foregroundStyle(.secondary)
-            HStack(spacing: 8) {
-                SignalMetricView(label: "RSRP", value: carrier.rsrp, unit: "dBm", color: Color.rsrpColor(carrier.rsrp))
-                SignalMetricView(label: "RSRQ", value: carrier.rsrq, unit: "dB", color: Color.rsrqColor(carrier.rsrq))
-                SignalMetricView(label: "SINR", value: carrier.sinr, unit: "dB", color: Color.sinrColor(carrier.sinr))
-                SignalMetricView(label: "RSSI", value: carrier.rssi, unit: "dBm", color: .primary)
-            }
+            SignalMetricsGrid(rsrp: carrier.rsrp, rsrq: carrier.rsrq,
+                              sinr: carrier.sinr, rssi: carrier.rssi)
         }
     }
 }
@@ -361,7 +395,7 @@ private struct WCDMAPanel: View {
     let signal: WCDMASignal
 
     var body: some View {
-        CardView {
+        CardView(padding: 12) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Label("WCDMA", systemImage: "antenna.radiowaves.left.and.right.circle")
@@ -389,21 +423,45 @@ private struct WCDMAPanel: View {
 /// The one place band and bandwidth strings are built. The three renderings deliberately
 /// differ: the metadata rows have room for duplex mode and the PCC marker, the SCC rows only
 /// for the common name.
-private enum SignalFormat {
+enum SignalFormat {
+    /// Firmware may send a number, an existing prefix, or a label such as "LTE BAND 3".
+    /// Normalize only for display; the model keeps the original modem value.
+    static func bandNumber(_ raw: String) -> String? {
+        let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ":_-"))
+        var value = raw.uppercased().trimmingCharacters(in: separators)
+        let prefixes = ["NR5G", "LTE", "BAND", "NR", "5G", "4G", "B", "N"]
+        while let prefix = prefixes.first(where: { value.hasPrefix($0) }) {
+            value.removeFirst(prefix.count)
+            value = value.trimmingCharacters(in: separators)
+        }
+        guard !value.isEmpty, value.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let number = Int(value), number > 0 else { return nil }
+        return String(number)
+    }
+
+    static func bandLabel(_ raw: String, technology: BandTechnology) -> String {
+        guard let number = bandNumber(raw) else { return "--" }
+        return (technology == .nr ? "n" : "B") + number
+    }
+
     static func band(_ band: String, technology: BandTechnology, isPCC: Bool) -> String {
-        guard !band.isEmpty else { return "--" }
+        guard let number = bandNumber(band) else { return "--" }
+        let label = bandLabel(number, technology: technology)
         let pccSuffix = isPCC ? " · PCC" : ""
-        guard let spec = technology.spec(for: band) else { return "B\(band)\(pccSuffix)" }
-        return "B\(band) (\(spec.commonName), \(spec.duplexMode.rawValue))\(pccSuffix)"
+        guard let spec = technology.spec(for: number) else { return "\(label)\(pccSuffix)" }
+        return "\(label) (\(spec.commonName), \(spec.duplexMode.rawValue))\(pccSuffix)"
     }
 
     static func carrierBand(_ band: String, technology: BandTechnology) -> String {
-        guard let spec = technology.spec(for: band) else { return "B\(band)" }
-        return "B\(band) (\(spec.commonName))"
+        guard let number = bandNumber(band) else { return "--" }
+        let label = bandLabel(number, technology: technology)
+        guard let spec = technology.spec(for: number) else { return label }
+        return "\(label) (\(spec.commonName))"
     }
 
     static func bandwidth(_ bandwidth: String, band: String, technology: BandTechnology) -> String {
-        if let value = bandwidthMHz(bandwidth), let spec = technology.spec(for: band) {
+        if let value = bandwidthMHz(bandwidth), let number = bandNumber(band),
+           let spec = technology.spec(for: number) {
             return "\(value) / \(spec.maxBandwidthMHz) MHz max"
         }
         return bandwidth.isEmpty ? "--" : bandwidth
@@ -432,10 +490,34 @@ private struct MetaRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(width: labelWidth, alignment: .leading)
-            Text(value.isEmpty ? "--" : value)
-                .font(.caption.monospacedDigit())
+            if let number = Int(value), String(number) == value {
+                AnimatedNumber(value: number, font: .caption)
+            } else {
+                Text(value.isEmpty ? "--" : value)
+                    .font(.caption.monospacedDigit())
+            }
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+private struct SignalMetricsGrid: View {
+    let rsrp: Double?
+    let rsrq: Double?
+    let sinr: Double?
+    let rssi: Double?
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    var body: some View {
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 8),
+                            count: dynamicTypeSize.isAccessibilitySize ? 2 : 4)
+        LazyVGrid(columns: columns, spacing: 6) {
+            SignalMetricView(label: "RSRP", value: rsrp, unit: "dBm", color: Color.rsrpColor(rsrp))
+            SignalMetricView(label: "RSRQ", value: rsrq, unit: "dB", color: Color.rsrqColor(rsrq))
+            SignalMetricView(label: "SINR", value: sinr, unit: "dB", color: Color.sinrColor(sinr))
+            SignalMetricView(label: "RSSI", value: rssi, unit: "dBm", color: .primary)
+        }
     }
 }
 
@@ -446,21 +528,27 @@ struct SignalMetricView: View {
     let color: Color
 
     var body: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 3) {
             Text(label)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            Text(value.map { "\(Int($0))" } ?? "--")
-                .font(.title3.monospacedDigit().bold())
-                .foregroundStyle(color)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-            Text(unit)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
+                if let value {
+                    AnimatedNumber(value: Int(value), font: .title3.bold(), textColor: color)
+                } else {
+                    Text("--")
+                        .font(.title3.monospacedDigit().bold())
+                        .foregroundStyle(.secondary)
+                }
+                Text(unit)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
         .accessibilityValue(value.map { "\(Int($0)) \(unit)" } ?? "Unavailable")

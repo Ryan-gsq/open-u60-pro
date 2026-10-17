@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -6,7 +7,9 @@ use serde_json::{json, Value};
 use crate::handlers::AppState;
 
 const STORAGE_PATH: &str = "/data/local/tmp/scheduler.json";
-const TICK_SECS: u64 = 30;
+/// Delay before the first tick after start, so past-due Once jobs do not fire
+/// while the system is still coming up.
+const BOOT_GRACE_SECS: u64 = 30;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Job {
@@ -71,6 +74,9 @@ struct ExecResult {
 
 pub struct Scheduler {
     data: Mutex<SchedulerData>,
+    /// Signalled after every save() from the HTTP handlers so the scheduler
+    /// thread, parked while no job is enabled, re-checks the job list.
+    changed: Condvar,
 }
 
 fn now_local() -> (i64, u8, u8, u8) {
@@ -81,6 +87,20 @@ fn now_local() -> (i64, u8, u8, u8) {
         let dow = ((tm.tm_wday + 6) % 7) as u8;
         (t as i64, tm.tm_hour as u8, tm.tm_min as u8, dow)
     }
+}
+
+/// Seconds to sleep so the next tick lands about one second after the next
+/// minute boundary. Recomputed from the wall clock before every sleep, so
+/// tick duration and sleep overshoot never accumulate into drift, and a
+/// clock step costs at most one extra or one late tick (never a skipped
+/// day, unlike sleeping until the next due HH:MM).
+fn next_tick_delay(now_ts: i64) -> Duration {
+    let sec = now_ts.rem_euclid(60);
+    Duration::from_secs((61 - sec).clamp(1, 61) as u64)
+}
+
+fn has_enabled_job(data: &SchedulerData) -> bool {
+    data.jobs.iter().any(|j| j.enabled)
 }
 
 fn parse_method(s: &str) -> Option<tiny_http::Method> {
@@ -175,17 +195,36 @@ impl Scheduler {
             .unwrap_or(SchedulerData { jobs: Vec::new() });
         Scheduler {
             data: Mutex::new(data),
+            changed: Condvar::new(),
         }
     }
 
     pub fn start(&self, state: Arc<AppState>) {
-        let state = Arc::clone(&state);
         std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(BOOT_GRACE_SECS));
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(TICK_SECS));
-                state.scheduler.tick(&state);
+                let scheduler = &state.scheduler;
+                scheduler.wait_for_enabled_job();
+                let (now_ts, _, _, _) = now_local();
+                std::thread::sleep(next_tick_delay(now_ts));
+                scheduler.tick(&state);
             }
         });
+    }
+
+    /// Parks the scheduler thread while no job is enabled. The HTTP handlers
+    /// call `changed.notify_all()` after every save, so creating or
+    /// re-enabling a job resumes the once-a-minute cadence.
+    fn wait_for_enabled_job(&self) {
+        let mut data = self.data.lock().unwrap();
+        if has_enabled_job(&data) {
+            return;
+        }
+        eprintln!("[scheduler] no enabled jobs, parking");
+        while !has_enabled_job(&data) {
+            data = self.changed.wait(data).unwrap();
+        }
+        eprintln!("[scheduler] enabled job found, resuming minute ticks");
     }
 
     fn tick(&self, state: &AppState) {
@@ -370,6 +409,7 @@ pub fn jobs_create(state: &AppState, body: &[u8]) -> (u16, Value) {
     let result = json!({"ok": true, "data": job});
     data.jobs.push(job);
     save(&data);
+    state.scheduler.changed.notify_all();
     (201, result)
 }
 
@@ -407,6 +447,7 @@ pub fn jobs_update(state: &AppState, body: &[u8]) -> (u16, Value) {
 
     let result = json!({"ok": true, "data": job.clone()});
     save(&data);
+    state.scheduler.changed.notify_all();
     (200, result)
 }
 
@@ -429,6 +470,7 @@ pub fn jobs_delete(state: &AppState, body: &[u8]) -> (u16, Value) {
     }
 
     save(&data);
+    state.scheduler.changed.notify_all();
     (200, json!({"ok": true}))
 }
 
@@ -455,5 +497,109 @@ pub fn jobs_toggle(state: &AppState, body: &[u8]) -> (u16, Value) {
     job.enabled = enabled;
     let result = json!({"ok": true, "data": job.clone()});
     save(&data);
+    state.scheduler.changed.notify_all();
     (200, result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn job(id: u32, enabled: bool) -> Job {
+        Job {
+            id,
+            name: format!("job-{id}"),
+            enabled,
+            schedule: Schedule::Once { at: 1_700_000_000 },
+            action: Action {
+                method: "GET".into(),
+                path: "/api/device".into(),
+                body: None,
+            },
+            restore: None,
+            last_run: None,
+            last_status: None,
+            last_error: None,
+            last_restore: None,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    fn scheduler_with(jobs: Vec<Job>) -> Scheduler {
+        Scheduler {
+            data: Mutex::new(SchedulerData { jobs }),
+            changed: Condvar::new(),
+        }
+    }
+
+    #[test]
+    fn next_tick_delay_lands_one_second_after_the_minute_boundary() {
+        // Two full minutes starting on a boundary (1_700_000_040 % 60 == 0).
+        let base: i64 = 1_700_000_040;
+        for now in base..base + 120 {
+            let delay = next_tick_delay(now).as_secs() as i64;
+            assert!((1..=61).contains(&delay), "now={now} delay={delay}");
+            assert_eq!((now + delay).rem_euclid(60), 1, "now={now} delay={delay}");
+        }
+    }
+
+    #[test]
+    fn next_tick_delay_spot_values() {
+        let base: i64 = 1_700_000_040;
+        assert_eq!(next_tick_delay(base).as_secs(), 61); // :00 -> next :01
+        assert_eq!(next_tick_delay(base + 1).as_secs(), 60); // :01 -> next :01
+        assert_eq!(next_tick_delay(base + 30).as_secs(), 31); // :30 -> :01
+        assert_eq!(next_tick_delay(base + 59).as_secs(), 2); // :59 -> :01
+    }
+
+    #[test]
+    fn next_tick_delay_handles_negative_timestamps() {
+        for now in -130i64..=0 {
+            let delay = next_tick_delay(now).as_secs() as i64;
+            assert!((1..=61).contains(&delay), "now={now} delay={delay}");
+            assert_eq!((now + delay).rem_euclid(60), 1, "now={now} delay={delay}");
+        }
+    }
+
+    #[test]
+    fn has_enabled_job_ignores_disabled_jobs() {
+        assert!(!has_enabled_job(&SchedulerData { jobs: vec![] }));
+        assert!(!has_enabled_job(&SchedulerData {
+            jobs: vec![job(1, false), job(2, false)]
+        }));
+        assert!(has_enabled_job(&SchedulerData {
+            jobs: vec![job(1, false), job(2, true)]
+        }));
+    }
+
+    #[test]
+    fn wait_for_enabled_job_returns_immediately_when_a_job_is_enabled() {
+        let scheduler = scheduler_with(vec![job(1, true)]);
+        scheduler.wait_for_enabled_job();
+    }
+
+    #[test]
+    fn wait_for_enabled_job_parks_until_notified() {
+        let scheduler = Arc::new(scheduler_with(vec![job(1, false)]));
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let scheduler = Arc::clone(&scheduler);
+            std::thread::spawn(move || {
+                scheduler.wait_for_enabled_job();
+                tx.send(()).unwrap();
+            })
+        };
+
+        // Still parked: nothing is enabled, so the worker cannot have returned.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(rx.try_recv().is_err());
+
+        // Enable a job and notify, exactly what the handlers do after save().
+        scheduler.data.lock().unwrap().jobs[0].enabled = true;
+        scheduler.changed.notify_all();
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("scheduler thread should resume after notify_all");
+        worker.join().unwrap();
+    }
 }

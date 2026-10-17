@@ -1,8 +1,8 @@
 import Foundation
 
 struct BatteryStatus: Equatable {
-    var capacity: Int = 0
-    var temperature: Double = 0.0
+    var capacity: Int = -1
+    var temperature: Double? = nil
     var charging: String = ""
     var chargeStatus: Int = 0
     var timeToFull: Int = -1      // minutes, -1 = unknown
@@ -17,9 +17,35 @@ struct BatteryStatus: Equatable {
     static let empty = BatteryStatus()
 }
 
-struct ThermalStatus: Equatable {
-    var cpuTemp: Double = 0.0
+struct TemperatureSensor: Equatable, Identifiable {
+    let id: String
+    let name: String
+    let temperatureC: Double?
 
+    var label: String {
+        if name.hasPrefix("cpuss-") { return "CPU sensor " + name.dropFirst(6) }
+        if name.hasPrefix("sys-therm-") { return "Board sensor " + name.dropFirst(10) }
+        switch name {
+        case "battery": return "Battery"
+        case "usb": return "USB"
+        case "pmx75_tz": return "Power chip · PMX75"
+        case "pmg1110_tz": return "Power chip · PMG1110"
+        case "pm7550ba_tz": return "Power chip · PM7550BA"
+        case "xo-therm": return "Crystal oscillator"
+        default: return name
+        }
+    }
+
+    var formattedTemperature: String {
+        temperatureC.map { String(format: "%.1f °C", $0) } ?? "—"
+    }
+}
+
+struct ThermalStatus: Equatable {
+    var cpuTemp: Double? = nil
+    var sensors: [TemperatureSensor] = []
+
+    var cpuTemperatureText: String { cpuTemp.map { String(format: "%.1f °C", $0) } ?? "—" }
     static let empty = ThermalStatus()
 }
 
@@ -140,18 +166,33 @@ struct USBStatus: Equatable {
 enum DeviceParser {
     static func parseBattery(_ data: [String: Any]) -> BatteryStatus {
         BatteryStatus(
-            capacity: asInt(data["battery_capacity"]) ?? 0,
-            temperature: asDouble(data["battery_temperature"]) ?? 0.0,
+            capacity: asInt(data["battery_capacity"]) ?? -1,
+            temperature: validTemperature(data["battery_temperature"]),
             charging: "",
             timeToFull: asInt(data["battery_time_to_full"]) ?? -1,
             timeToEmpty: asInt(data["battery_time_to_empty"]) ?? -1
         )
     }
 
+    static func parseKernelBattery(_ data: [String: Any]) -> BatteryStatus {
+        var battery = BatteryStatus()
+        battery.capacity = asInt(data["capacity"]) ?? -1
+        battery.temperature = asDouble(data["temperature"]).flatMap { validTemperature($0 / 10) }
+        battery.currentMA = asInt(data["current_ua"]).map { $0 / 1000 }
+        battery.voltageMV = asInt(data["voltage_uv"]).map { $0 / 1000 }
+        switch data["status"] as? String {
+        case "Charging", "Full": battery.charging = "charging"
+        case "Not charging": battery.charging = "stopped"
+        case "Discharging": battery.charging = "discharging"
+        default: break
+        }
+        return battery
+    }
+
     static func parseCharger(_ data: [String: Any], into battery: inout BatteryStatus, chargeControl: [String: Any]? = nil) {
         battery.chargeStatus = asInt(data["charge_status"]) ?? 0
         let chargerConnected = asInt(data["charger_connect"]) == 1
-        let chargingStopped = chargeControl?["charging_stopped"] as? Bool ?? false
+        let chargingStopped = chargeControl?["charging_stopped"] as? Bool ?? (data["direct_power_supply_mode"] as? String == "enable")
         if chargerConnected && chargingStopped {
             battery.charging = "stopped"
         } else if battery.chargeStatus == 1 {
@@ -161,8 +202,20 @@ enum DeviceParser {
         }
     }
 
+    static func validTemperature(_ value: Any?) -> Double? {
+        guard let number = asDouble(value), number.isFinite, (-40...150).contains(number) else { return nil }
+        return number
+    }
+
     static func parseThermal(_ data: [String: Any]) -> ThermalStatus {
-        ThermalStatus(cpuTemp: asDouble(data["cpuss_temp"]) ?? 0.0)
+        var seen = Set<String>()
+        let sensors = (data["sensors"] as? [[String: Any]] ?? []).compactMap { item -> TemperatureSensor? in
+            guard let id = item["id"] as? String, let name = item["name"] as? String,
+                  name != "zeroc", seen.insert(id).inserted else { return nil }
+            return TemperatureSensor(id: id, name: name, temperatureC: validTemperature(item["temperature_c"]))
+        }
+        let cpu = sensors.filter { $0.name.hasPrefix("cpuss-") }.compactMap(\.temperatureC).max()
+        return ThermalStatus(cpuTemp: cpu ?? validTemperature(data["cpuss_temp"]), sensors: sensors)
     }
 
     static func parseTraffic(_ data: [String: Any]) -> TrafficStats {
@@ -547,17 +600,33 @@ enum DeviceParser {
         return (v * factor).rounded() / factor
     }
 
+    private static let speedUnits = [" b/s", " Kb/s", " Mb/s", " Gb/s"]
+
+    /// Formats a byte rate as bits per second at a fixed single decimal place.
+    ///
+    /// Deliberately *not* `adaptiveDecimals`, unlike `bytesComponents`. Byte totals grow slowly
+    /// and monotonically, so scaling precision to their magnitude is stable. An instantaneous rate
+    /// does the opposite: measured samples off this device swing across decades every second
+    /// (9 Kb/s to 205 Kb/s within four samples). Adaptive precision there moves the *fraction*
+    /// width as well as the integer width, and since `AnimatedNumber` keys columns by place value,
+    /// every width change inserts or removes a column instead of rolling one. Measured against
+    /// captured samples that tripled the share of column changes that snap rather than roll,
+    /// from 13% to 39%. A fixed fraction width keeps the reels rolling.
     static func speedComponents(_ bytesPerSec: Double) -> FormattedValue {
-        let bits = bytesPerSec * 8.0
-        let gb = 1_000_000_000.0
-        let mb = 1_000_000.0
-        let kb = 1_000.0
-        let (raw, unit): (Double, String)
-        if bits >= gb { (raw, unit) = (bits / gb, " Gb/s") }
-        else if bits >= mb { (raw, unit) = (bits / mb, " Mb/s") }
-        else if bits >= kb { (raw, unit) = (bits / kb, " Kb/s") }
-        else { (raw, unit) = (bits, " b/s") }
-        return FormattedValue(number: roundTo(raw, decimals: 1), unit: unit, decimalPlaces: 1)
+        var raw = bytesPerSec * 8.0
+        var index = 0
+        while raw >= 1000, index < speedUnits.count - 1 {
+            raw /= 1000
+            index += 1
+        }
+        var number = roundTo(raw, decimals: 1)
+        // Rounding up can land exactly on the next unit's threshold. Promoting beats rendering
+        // "1000 Kb/s", which would also churn a whole extra digit column for one sample.
+        if number >= 1000, index < speedUnits.count - 1 {
+            index += 1
+            number = roundTo(number / 1000, decimals: 1)
+        }
+        return FormattedValue(number: number, unit: speedUnits[index], decimalPlaces: 1)
     }
 
     static func bytesComponents(_ bytes: UInt64) -> FormattedValue {

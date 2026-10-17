@@ -55,7 +55,7 @@ struct TabBarView: View {
 
             SettingsView(client: client)
                 .tabItem {
-                    Label("Settings", systemImage: "gear")
+                    Label("Settings", systemImage: "gearshape")
                 }
                 .tag(Tab.settings)
         }
@@ -72,6 +72,11 @@ struct TabBarView: View {
             } else {
                 usbVM.stopPolling()
             }
+        }
+        .onAppear {
+            // Reappearing with an unchanged poll key must resume loops stopped on disappear.
+            if dashboardPollKey.active { dashboardVM.startPolling(interval: pollInterval) }
+            if isForeground { usbVM.startPolling() }
         }
         .onDisappear {
             dashboardVM.stopPolling()

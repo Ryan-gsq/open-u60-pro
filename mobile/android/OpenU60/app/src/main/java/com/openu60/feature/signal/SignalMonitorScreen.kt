@@ -140,6 +140,20 @@ fun SignalMonitorScreen(
                     )
                 }
 
+                state.bearer?.let { bearer ->
+                    val ambrText = bearer.ambrText
+                    SignalPanel(
+                        title = "Data Session",
+                        rows = buildList {
+                            bearer.qci?.let { add(SignalRow(state.qosLabel, it.toString())) }
+                            ambrText?.let { add(SignalRow("AMBR", it)) }
+                        },
+                        caption = ambrText?.let {
+                            "Down / up. Operator rate cap, set when the data session started. Not a speed test."
+                        },
+                    )
+                }
+
                 // RSRP History chart
                 if (state.history.size > 1) {
                     RSRPHistoryCard(state.history)
@@ -165,6 +179,7 @@ private fun SignalPanel(
     badgeColor: Color = Color(0xFF2196F3),
     secondBadge: String? = null,
     sccCarriers: List<com.openu60.core.model.LTECarrier> = emptyList(),
+    caption: String? = null,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -228,6 +243,14 @@ private fun SignalPanel(
                         )
                     }
                 }
+            }
+            if (caption != null) {
+                Text(
+                    caption,
+                    modifier = Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             if (sccCarriers.isNotEmpty()) {
                 HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))

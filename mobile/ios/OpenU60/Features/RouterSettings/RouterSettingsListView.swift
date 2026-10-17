@@ -14,6 +14,7 @@ struct RouterSettingsListView: View {
         case signalDetection
         case sim
         case simServices
+        case b1Bluetooth
         case wifi
         case guestWiFi
         case apn
@@ -45,7 +46,7 @@ struct RouterSettingsListView: View {
                     }
 
                     NavigationLink(value: Route.smartTowerConnect) {
-                        Label("Smart Tower Connect", systemImage: "building.2")
+                        Label("Smart Tower Connect", systemImage: "antenna.radiowaves.left.and.right")
                     }
 
                     NavigationLink(value: Route.signalDetection) {
@@ -53,11 +54,14 @@ struct RouterSettingsListView: View {
                     }
 
                     NavigationLink(value: Route.sim) {
-                        Label("SIM Card", systemImage: "simcard.2")
+                        Label("SIM Card", systemImage: "simcard")
                     }
 
                     NavigationLink(value: Route.simServices) {
                         Label("SIM Services", systemImage: "phone.badge.waveform")
+                    }
+                    NavigationLink(value: Route.b1Bluetooth) {
+                        Label("9eSIM B1 Bluetooth", systemImage: "antenna.radiowaves.left.and.right")
                     }
                 }
 
@@ -67,7 +71,7 @@ struct RouterSettingsListView: View {
                     }
 
                     NavigationLink(value: Route.guestWiFi) {
-                        Label("Guest WiFi", systemImage: "wifi.exclamationmark")
+                        Label("Guest WiFi", systemImage: "person.2")
                     }
 
                     NavigationLink(value: Route.apn) {
@@ -85,7 +89,7 @@ struct RouterSettingsListView: View {
 
                 Section("Security") {
                     NavigationLink(value: Route.firewall) {
-                        Label("Firewall", systemImage: "flame")
+                        Label("Firewall", systemImage: "shield.lefthalf.filled")
                     }
 
                     NavigationLink(value: Route.telemetryBlocker) {
@@ -149,6 +153,8 @@ struct RouterSettingsListView: View {
             PushedModelHost(STKViewModel(client: client, authManager: authManager)) {
                 STKMenuView(viewModel: $0)
             }
+        case .b1Bluetooth:
+            B1BluetoothView()
         case .wifi:
             PushedModelHost(WiFiSettingsViewModel(client: client, authManager: authManager)) {
                 WiFiSettingsView(viewModel: $0)

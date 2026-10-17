@@ -1,2 +1,5 @@
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"
+# The router is an SDX75 with Cortex-A55 cores (CPU part 0xd05); release
+# artifacts are device-specific anyway.
+rustflags = ["-C", "target-cpu=cortex-a55"]

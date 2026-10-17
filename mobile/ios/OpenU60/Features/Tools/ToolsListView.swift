@@ -39,7 +39,7 @@ struct ToolsListView: View {
 
                 Section("Network Tools") {
                     NavigationLink(value: Route.speedTest) {
-                        Label("Speed Test", systemImage: "speedometer")
+                        Label("Speed Test", systemImage: "gauge.with.needle")
                     }
 
                     NavigationLink(value: Route.lanSpeedTest) {

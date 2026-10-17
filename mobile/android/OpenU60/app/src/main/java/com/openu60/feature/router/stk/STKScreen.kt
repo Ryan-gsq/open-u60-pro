@@ -20,7 +20,7 @@ fun STKScreen(
 ) {
     val state by viewModel.state.collectAsState()
 
-    LaunchedEffect(Unit) { viewModel.loadSTKMenu() }
+    LaunchedEffect(viewModel) { viewModel.watchSTK() }
 
     Scaffold(
         topBar = {
@@ -131,8 +131,8 @@ fun STKScreen(
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
                             )
-                            if (state.menuStack.isNotEmpty()) {
-                                TextButton(onClick = { viewModel.goBackSTK() }) { Text("Back") }
+                            if (!state.stkRootMenu && state.stkType != "status") {
+                                TextButton(enabled = !state.isLoading && !state.stkBusy, onClick = { viewModel.goBackSTK() }) { Text("Back") }
                             }
                         }
 
@@ -142,13 +142,52 @@ fun STKScreen(
                         }
 
                         Spacer(modifier = Modifier.height(8.dp))
-                        if (state.stkMenu.items.isEmpty() && !state.isLoading) {
-                            Text("No menu items available", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (state.stkReason.isNotEmpty()) {
+                            Text(state.stkReason, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (state.stkText.isNotEmpty()) Text(state.stkText)
+                        if (state.stkType == "input") {
+                            if (state.stkYesNo) {
+                                Row {
+                                    TextButton(enabled = !state.isLoading && !state.stkBusy,
+                                        onClick = { viewModel.respondSTK(true) }) { Text("Yes") }
+                                    TextButton(enabled = !state.isLoading && !state.stkBusy,
+                                        onClick = { viewModel.respondSTK(false) }) { Text("No") }
+                                }
+                            } else {
+                                OutlinedTextField(value = state.stkReply,
+                                    onValueChange = viewModel::updateStkReply,
+                                    label = { Text("SIM response") },
+                                    enabled = !state.isLoading && !state.stkBusy,
+                                    visualTransformation = if (state.stkHidden)
+                                        androidx.compose.ui.text.input.PasswordVisualTransformation()
+                                        else androidx.compose.ui.text.input.VisualTransformation.None,
+                                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                        keyboardType = if (state.stkDigitsOnly)
+                                            androidx.compose.ui.text.input.KeyboardType.Phone
+                                            else androidx.compose.ui.text.input.KeyboardType.Text),
+                                )
+                                Text("Enter ${state.stkMin}–${state.stkMax} characters")
+                                TextButton(enabled = !state.isLoading && !state.stkBusy,
+                                    onClick = { viewModel.respondSTK() }) { Text("Send Response") }
+                            }
+                        } else if (state.stkType == "display") {
+                            TextButton(enabled = !state.isLoading && !state.stkBusy,
+                                onClick = { viewModel.respondSTK() }) { Text("Continue") }
+                        }
+                        if (!state.stkRootMenu && state.stkType != "status") {
+                            TextButton(enabled = !state.isLoading && !state.stkBusy,
+                                onClick = { viewModel.cancelSTK() }) { Text("End SIM Session") }
+                        }
+                        if (state.stkType == "status") {
+                            TextButton(enabled = !state.isLoading && !state.stkBusy,
+                                onClick = { viewModel.loadSTKMenu() }) { Text("Reload SIM Menu") }
                         }
                         state.stkMenu.items.forEach { item ->
                             Card(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
                                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                                enabled = !state.isLoading && !state.stkBusy,
                                 onClick = { viewModel.selectSTKItem(item) },
                             ) {
                                 Text(

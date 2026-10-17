@@ -52,7 +52,7 @@ struct WiFiCardView: View {
 
                     if wifiStatus.guestEnabled {
                         HStack {
-                            Label("Guest", systemImage: "wifi.exclamationmark")
+                            Label("Guest", systemImage: "person.2")
                                 .font(.caption)
                             Spacer()
                             Text(wifiStatus.guestSsid)

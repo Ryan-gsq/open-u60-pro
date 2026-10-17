@@ -28,9 +28,23 @@ final class DashboardViewModel {
     var operatorInfo: OperatorInfo = .empty
     var battery: BatteryStatus = .empty
     var thermal: ThermalStatus = .empty
+    var thermalUpdatedAt: Date?
+    var batteryUpdatedAt: Date?
+    var cpuUpdatedAt: Date?
     var speed: TrafficSpeed = .zero
     var isTrafficAvailable = false
+    var trafficUpdatedAt: Date?
     var trafficStats: TrafficStats = .empty
+
+    /// Seconds between the last two *distinct* traffic samples.
+    ///
+    /// `/api/network/speeds` is a passthrough read of `real_rx_speed`, a field the ZTE daemon
+    /// refreshes on its own clock. Polling it on an independent ~1 s timer means the two clocks
+    /// beat against each other: a run of polls re-reads one publication (nothing to animate, the
+    /// number sits frozen), then a poll skips one (a double-size jump). Measuring the gap between
+    /// samples that actually changed lets the digit reels roll for as long as the value really
+    /// stood still, instead of a fixed duration that is right only at one cadence.
+    var trafficSampleInterval: TimeInterval = DashboardViewModel.defaultSampleInterval
     var wanIPv4: String = ""
     var wanIPv6: String = ""
     var wifiStatus: WifiStatus = .empty
@@ -48,6 +62,8 @@ final class DashboardViewModel {
     private let authManager: AuthManager
     private let poller = PollingLoop()
     private let trafficPoller = PollingLoop()
+    private let healthPoller = PollingLoop()
+    @ObservationIgnored private var healthInFlight: (id: UUID, task: Task<Bool, Never>)?
 
     /// Wall-clock cadence of the two slower tiers. Tick counts are derived from these and the
     /// user-configurable poll interval, so changing the interval in Settings keeps 10s/60s.
@@ -64,6 +80,13 @@ final class DashboardViewModel {
     @ObservationIgnored private var trafficInFlight: (id: Int, task: Task<Bool, Never>)?
     @ObservationIgnored private var trafficTier: TrafficTier = .wwandst
     @ObservationIgnored private var lastTrafficProbe: Date = .distantPast
+    @ObservationIgnored private var lastDistinctTrafficAt: Date?
+
+    /// Assumed cadence before two distinct samples have been seen, matching the poll interval.
+    private static let defaultSampleInterval: TimeInterval = 1
+    /// Bounds on the measured cadence. The floor rejects a burst of samples arriving back to back;
+    /// the ceiling keeps a backed-off poll or a resumed tab from reporting a minutes-long gap.
+    private static let sampleIntervalRange: ClosedRange<TimeInterval> = 0.25...8
 
     /// Non-zero while the Signal Monitor screen is pushed. That screen polls `/api/network/signal`
     /// itself, and the dashboard's own signal cards are hidden behind it, so fetching here too
@@ -109,11 +132,20 @@ final class DashboardViewModel {
         if !trafficPoller.isRunning {
             // A pre-pause baseline must not pair with a sample minutes later.
             previousTraffic = nil
+            // Likewise for the cadence: the pause itself is not a measurement interval.
+            lastDistinctTrafficAt = nil
+            trafficSampleInterval = Self.defaultSampleInterval
             // Follow the modem's approximately one-second publication cadence. Traffic has
             // its own clock; global refresh settings only affect the other dashboard tiers.
             trafficPoller.start(interval: .seconds(1), schedule: .fixedInterval) { [weak self] in
                 guard let self else { return .failure }
                 return await self.refreshTraffic() ? .success : .failure
+            }
+        }
+        if !healthPoller.isRunning {
+            healthPoller.start(interval: .seconds(2), schedule: .fixedInterval) { [weak self] in
+                guard let self else { return .failure }
+                return await self.refreshHealth() ? .success : .failure
             }
         }
         poller.start(interval: .seconds(base)) { [weak self] in
@@ -125,10 +157,14 @@ final class DashboardViewModel {
     func stopPolling() {
         poller.stop()
         trafficPoller.stop()
+        healthPoller.stop()
+        healthInFlight?.task.cancel()
+        healthInFlight = nil
+        // Pausing is not a failed read. Preserve the last sample and its age across tabs.
         trafficInFlight?.task.cancel()
         trafficInFlight = nil
-        isTrafficAvailable = false
         previousTraffic = nil
+        lastDistinctTrafficAt = nil
         inFlight?.task.cancel()
         inFlight = nil
     }
@@ -159,7 +195,9 @@ final class DashboardViewModel {
 
     /// Refresh the general dashboard tiers. Live traffic stays on its own modem cadence.
     func refresh() async {
-        await performRefresh(.all)
+        async let general = performRefresh(.all)
+        async let health = refreshHealth()
+        _ = await (general, health)
     }
 
     /// Serializes dashboard passes. A pass already in flight that covers everything the caller wants is that
@@ -193,14 +231,8 @@ final class DashboardViewModel {
         let slow = tiers.contains(.slow)
 
         async let signalResult = fetchSignal()
-        async let thermalResult = fetchThermal()
-        async let cpuUsage = fetchCpuUsage()
-        async let battCurrentResult = fetchBatteryCurrent()
-
-        async let batteryResult = fetchBattery(enabled: medium)
-        async let chargerResult = fetchCharger(enabled: medium)
-        async let chargeControlResult = fetchChargeControl(enabled: medium)
         async let deviceList = fetchDevices(enabled: medium)
+        async let batteryETA = fetchBatteryETA(enabled: medium)
 
         async let wanResult = fetchWAN(enabled: slow)
         async let wan6Result = fetchWAN6(enabled: slow)
@@ -210,12 +242,9 @@ final class DashboardViewModel {
         async let modemResult = fetchModemStatus(enabled: slow)
         async let mobileDataResult = fetchMobileDataStatus(enabled: slow)
 
-        let (signal, therm, cpuUse, battCurrent) = await (
-            signalResult, thermalResult, cpuUsage, battCurrentResult
-        )
-        let (bat, charger, chargeCtrl, devices) = await (
-            batteryResult, chargerResult, chargeControlResult, deviceList
-        )
+        let signal = await signalResult
+        let devices = await deviceList
+        let eta = await batteryETA
         let (wan, wan6, wifi, sys, sim, modemStatus, mobileDataOff) = await (
             wanResult, wan6Result, wifiResult, systemResult, simResult, modemResult, mobileDataResult
         )
@@ -223,8 +252,7 @@ final class DashboardViewModel {
         // Tab switch or teardown: leave every value as it was rather than half-applying a pass.
         if Task.isCancelled { return false }
 
-        let reachable = signal != nil || cpuUse != nil
-            || therm != nil || battCurrent.current != nil
+        let reachable = signal != nil || sys != nil || devices != nil
 
         if let (nr, lte, wcdma, op) = signal {
             if nr != nrSignal { nrSignal = nr }
@@ -245,21 +273,10 @@ final class DashboardViewModel {
             }
         }
 
-        var newBattery = battery
-        if let fresh = bat {
-            newBattery.capacity = fresh.capacity
-            newBattery.temperature = fresh.temperature
-            newBattery.timeToFull = fresh.timeToFull
-            newBattery.timeToEmpty = fresh.timeToEmpty
+        if let eta {
+            battery.timeToFull = eta.timeToFull
+            battery.timeToEmpty = eta.timeToEmpty
         }
-        if let chargerData = charger {
-            DeviceParser.parseCharger(chargerData, into: &newBattery, chargeControl: chargeCtrl)
-        }
-        if let ma = battCurrent.current { newBattery.currentMA = ma }
-        if let mv = battCurrent.voltage { newBattery.voltageMV = mv }
-        if newBattery != battery { battery = newBattery }
-
-        if let t = therm, t != thermal { thermal = t }
         if let devices, devices != connectedDevices { connectedDevices = devices }
 
         // Only a landed response may blank an address; a dropped poll must not.
@@ -269,10 +286,9 @@ final class DashboardViewModel {
         if let wifi, wifi != wifiStatus { wifiStatus = wifi }
 
         var newSystemInfo = sys ?? systemInfo
-        if let usage = cpuUse {
-            newSystemInfo.cpuUsagePercent = usage
-            newSystemInfo.cpuUsageIsEstimate = false
-        }
+        // CPU usage belongs to the independent health loop, never an older system response.
+        newSystemInfo.cpuUsagePercent = systemInfo.cpuUsagePercent
+        newSystemInfo.cpuUsageIsEstimate = systemInfo.cpuUsageIsEstimate
         if newSystemInfo != systemInfo { systemInfo = newSystemInfo }
 
         if let (pin, puk) = sim {
@@ -309,6 +325,7 @@ final class DashboardViewModel {
     private func fetchThermal() async -> ThermalStatus? {
         do {
             let data = try await client.getJSON("/api/device/thermal")
+            guard data["cpuss_temp"] != nil || data["sensors"] != nil else { return nil }
             return DeviceParser.parseThermal(data)
         } catch { return nil }
     }
@@ -327,14 +344,31 @@ final class DashboardViewModel {
             guard let traffic else {
                 self.isTrafficAvailable = false
                 self.previousTraffic = nil
-                self.speed = .zero
+                self.lastDistinctTrafficAt = nil
                 return false
             }
-            self.speed = DeviceParser.computeSpeed(
+            let now = Date()
+            // `TrafficStats.==` ignores the local receive timestamp, so this compares the modem's
+            // published measurement rather than the poll that fetched it. Only a changed sample
+            // marks real elapsed measurement time; timing re-reads instead would report a
+            // spuriously short cadence and shrink the animation back to a snap.
+            if self.previousTraffic != traffic {
+                if let last = self.lastDistinctTrafficAt {
+                    let range = Self.sampleIntervalRange
+                    self.trafficSampleInterval =
+                        min(max(now.timeIntervalSince(last), range.lowerBound), range.upperBound)
+                }
+                self.lastDistinctTrafficAt = now
+            }
+            // A re-read still republishes: for the counter-delta tiers, unchanged byte totals are
+            // a genuine idle measurement that has to reach zero rather than hold the last rate.
+            let speed = DeviceParser.computeSpeed(
                 previous: self.previousTraffic ?? traffic, current: traffic
             )
+            if speed != self.speed { self.speed = speed }
             self.previousTraffic = traffic
             self.trafficStats = traffic
+            self.trafficUpdatedAt = now
             self.isTrafficAvailable = true
             return true
         }
@@ -459,37 +493,68 @@ final class DashboardViewModel {
         }
     }
 
-    private func fetchBatteryCurrent() async -> (current: Int?, voltage: Int?) {
-        struct BatteryInfo: Decodable {
-            let current_ua: Int
-            let voltage_uv: Int
+    /// A separate, deduplicated task prevents slow general requests from blocking health.
+    private func refreshHealth() async -> Bool {
+        guard !Task.isCancelled else { return false }
+        if let existing = healthInFlight { return await existing.task.value }
+        let id = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            async let temperatures = self.updateTemperatures()
+            async let cpu = self.updateCPU()
+            async let battery = self.updateBattery()
+            let results = await (temperatures, cpu, battery)
+            return results.0 || results.1 || results.2
         }
-        do {
-            let info: BatteryInfo = try await client.get("/api/battery")
-            return (info.current_ua / 1000, info.voltage_uv / 1000)
-        } catch {
-            return (nil, nil)
+        healthInFlight = (id, task)
+        let result = await task.value
+        if healthInFlight?.id == id { healthInFlight = nil }
+        return result
+    }
+
+    private func updateTemperatures() async -> Bool {
+        let fresh = await fetchThermal()
+        guard !Task.isCancelled else { return false }
+        thermal = fresh ?? .empty
+        thermalUpdatedAt = fresh == nil ? nil : Date()
+        return fresh != nil
+    }
+
+    private func updateCPU() async -> Bool {
+        let usage = await fetchCpuUsage()
+        guard !Task.isCancelled else { return false }
+        let valid = usage.flatMap { $0.isFinite && (0...100).contains($0) ? $0 : nil }
+        systemInfo.cpuUsagePercent = valid ?? 0
+        systemInfo.cpuUsageIsEstimate = false
+        cpuUpdatedAt = valid == nil ? nil : Date()
+        return valid != nil
+    }
+
+    private func updateBattery() async -> Bool {
+        // Kernel temperature is tenths of a degree; thermal zones are millidegrees.
+        // Read current values on every health tick, not the slower firmware battery tier.
+        async let batteryResponse = try? client.getJSON("/api/battery")
+        async let chargerResponse = try? client.getJSON("/api/device/charger")
+        let (info, charger) = await (batteryResponse, chargerResponse)
+        guard !Task.isCancelled else { return false }
+        var fresh = info.map(DeviceParser.parseKernelBattery) ?? .empty
+        fresh.timeToFull = battery.timeToFull
+        fresh.timeToEmpty = battery.timeToEmpty
+        if info != nil, let charger {
+            DeviceParser.parseCharger(charger, into: &fresh)
         }
+        // Publish once: kernel Discharging may actually mean firmware Charge Stopped.
+        // Publishing both interpretations each tick makes the status blink.
+        if battery != fresh { battery = fresh }
+        batteryUpdatedAt = info == nil ? nil : Date()
+        return info != nil
     }
 
     // MARK: - Medium tier
 
-    private func fetchBattery(enabled: Bool) async -> BatteryStatus? {
-        guard enabled else { return nil }
-        do {
-            let data = try await client.getJSON("/api/device/battery-info")
-            return DeviceParser.parseBattery(data)
-        } catch { return nil }
-    }
-
-    private func fetchCharger(enabled: Bool) async -> [String: Any]? {
-        guard enabled else { return nil }
-        return try? await client.getJSON("/api/device/charger")
-    }
-
-    private func fetchChargeControl(enabled: Bool) async -> [String: Any]? {
-        guard enabled else { return nil }
-        return try? await client.getJSON("/api/device/charge-control")
+    private func fetchBatteryETA(enabled: Bool) async -> BatteryStatus? {
+        guard enabled, let data = try? await client.getJSON("/api/device/battery-info") else { return nil }
+        return DeviceParser.parseBattery(data)
     }
 
     private func fetchDevices(enabled: Bool) async -> [ConnectedDevice]? {

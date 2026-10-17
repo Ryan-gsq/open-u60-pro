@@ -84,6 +84,11 @@ impl SpeedTest {
             servers_cache: Arc::new(Mutex::new((Vec::new(), Instant::now() - CACHE_TTL))),
         }
     }
+
+    /// True while a test is in progress (the modem policies hold off).
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
 }
 
 // --- Server fetching ---

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "lpac-c7c8d4f.tar.gz",
+    "url": "https://codeload.github.com/estkme-group/lpac/tar.gz/c7c8d4f817ddfeab21d104870b4647439f9cfab7",
+    "sha256": "ec8c8cfc73624781113479b1e37d0dab1c7a6d66c227d28358c11de4b869f11e",
+    "bytes": 180544
+  },
+  {
+    "name": "alpine-main-index.tar.gz",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/aarch64/APKINDEX.tar.gz",
+    "sha256": "c1f9074312997aeb58fd043d2d7622aecb0ba3e192c3e85abb38790889eae48c",
+    "bytes": 501409
+  },
+  {
+    "name": "alpine-community-index.tar.gz",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/community/aarch64/APKINDEX.tar.gz",
+    "sha256": "53cbc7cf616c0c1435c6de92b6ff66c1aa0c8dc97255f8055420526cf0ce7a70",
+    "bytes": 2072488
+  },
+  {
+    "name": "cjson-4818f043.tar.gz",
+    "url": "https://codeload.github.com/CoelacanthusHex/cJSON/tar.gz/4818f043bda624b5738384eae3a0189b2bd1f5e1",
+    "sha256": "4a53a6d3b24d3d088c9d6f1790627fbcb4966c6bc51e4c44357a273abc938e21",
+    "bytes": 356399
+  }
+]

@@ -1,20 +1,74 @@
-use std::process::Command;
+use std::collections::HashMap;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::handlers::AppState;
+use crate::system::{arm_post_wifi_watchdog, try_spawn_named};
 use crate::ubus;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn uci_get_wireless(key: &str) -> String {
-    ubus::uci_get(&format!("wireless.{key}")).unwrap_or_default()
+/// One `uci show wireless` per request instead of one `uci get` per option
+/// (22 forks -> 1 on the status endpoint). Missing keys read as "".
+struct Wireless(HashMap<String, String>);
+
+impl Wireless {
+    /// Errors when `uci show wireless` fails (uci locked/busy, exec error), so
+    /// callers refuse the request instead of treating the config as empty:
+    /// an empty map would report blank settings as ok and make `wifi_set`
+    /// rewrite every submitted key.
+    fn load() -> Result<Self, String> {
+        Ok(Self::from_show(&ubus::uci_show("wireless")?))
+    }
+
+    fn from_show(show: &str) -> Self {
+        Wireless(ubus::uci_show_map(show))
+    }
+
+    fn get(&self, key: &str) -> String {
+        self.0.get(&format!("wireless.{key}")).cloned().unwrap_or_default()
+    }
+
+    /// The firmware keeps the master Wi-Fi switches in `wireless.zte_mbb.*`;
+    /// older builds used a separate `zte_mbb.wifi.*` config, read on demand.
+    fn mbb(&self, key: &str) -> String {
+        match self.0.get(&format!("wireless.zte_mbb.{key}")) {
+            Some(v) => v.clone(),
+            None => ubus::uci_get(&format!("zte_mbb.wifi.{key}")).unwrap_or_default(),
+        }
+    }
 }
 
-fn uci_get_mbb(key: &str) -> String {
-    ubus::uci_get(&format!("zte_mbb.{key}")).unwrap_or_default()
+/// Fire the firmware's Wi-Fi reload without blocking the request, reap the
+/// child when it finishes (the old `sh -c '... &'` form left zombies), and arm
+/// the stuck-script watchdog: the reload re-runs `zte_post_wifi.sh`, which
+/// spins forever when a radio is disabled but its SSID is not.
+fn reload_wifi_async() {
+    match Command::new("ubus")
+        .args(["call", "zwrt_wlan", "reload"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // A refused thread (EAGAIN under memory pressure) must not unwind
+            // the HTTP worker: the reload is already running, so just log and
+            // let the child linger as a zombie until the next reap.
+            let spawned = try_spawn_named("wifi-reload", move || {
+                let _ = child.wait();
+            });
+            if let Err(e) = spawned {
+                eprintln!("[wifi] cannot spawn wifi-reload: {e}");
+            }
+        }
+        Err(e) => eprintln!("[wifi] reload spawn failed: {e}"),
+    }
+    arm_post_wifi_watchdog(Duration::from_secs(150));
 }
 
 fn iw_info(iface: &str) -> (String, String) {
@@ -52,17 +106,18 @@ fn iw_info(iface: &str) -> (String, String) {
     (channel, bw)
 }
 
+/// Associated stations on `iface`: `iw <iface> station dump` directly (no
+/// `sh`/`grep` pipeline), counting the `Station <mac> (on <iface>)` headers.
 fn station_count(iface: &str) -> u64 {
-    let output = Command::new("sh")
-        .args(["-c", &format!("iw {iface} station dump 2>/dev/null | grep -c Station")])
+    Command::new("iw")
+        .args([iface, "station", "dump"])
         .output()
-        .ok();
-    output
-        .and_then(|o| {
+        .ok()
+        .map(|o| {
             String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u64>()
-                .ok()
+                .lines()
+                .filter(|l| l.starts_with("Station "))
+                .count() as u64
         })
         .unwrap_or(0)
 }
@@ -79,10 +134,15 @@ fn sanitize_uci_value(v: &str) -> String {
 
 pub fn wifi_status(_state: &AppState) -> (u16, Value) {
     let mut result = serde_json::Map::new();
+    let w = match Wireless::load() {
+        Ok(w) => w,
+        Err(e) => return (503, json!({"ok": false, "error": e})),
+    };
+    let uci_get_wireless = |key: &str| w.get(key);
 
-    // Global switches from zte_mbb
-    let mut wifi_onoff = uci_get_mbb("wifi.wifi_onoff");
-    let mut wifi6_switch = uci_get_mbb("wifi.wifi6_switch");
+    // Global switches
+    let mut wifi_onoff = w.mbb("wifi_onoff");
+    let mut wifi6_switch = w.mbb("wifi6_switch");
 
     // Fallback: if mbb UCI keys are missing, read from zwrt_wlan report
     if wifi_onoff.is_empty() || wifi6_switch.is_empty() {
@@ -192,6 +252,13 @@ pub fn wifi_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
     let mut only_txpower = true;
     let mut txpower_2g_val: Option<u32> = None;
     let mut txpower_5g_val: Option<u32> = None;
+    // Current values from one `uci show wireless` instead of a `uci get` per key.
+    // Refuse before writing anything if uci cannot be read: otherwise every
+    // submitted key would compare against "" and be rewritten.
+    let current_map = match Wireless::load() {
+        Ok(w) => w,
+        Err(e) => return (503, json!({"ok": false, "error": e})),
+    };
 
     for (key, value) in obj {
         let val_str = match value {
@@ -204,7 +271,7 @@ pub fn wifi_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
 
         // Check wireless UCI map
         if let Some(&(_, path)) = uci_map.iter().find(|&&(k, _)| k == key) {
-            let current = ubus::uci_get(path).unwrap_or_default();
+            let current = current_map.0.get(path).cloned().unwrap_or_default();
             if current != val_str {
                 if let Err(e) = ubus::uci_set_no_commit(path, &val_str) {
                     return (500, json!({"ok": false, "error": e}));
@@ -221,12 +288,24 @@ pub fn wifi_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
             continue;
         }
 
-        // Check mbb map
-        if let Some(&(_, path)) = mbb_map.iter().find(|&&(k, _)| k == key) {
-            let current = ubus::uci_get(path).unwrap_or_default();
+        // Check mbb map. This firmware keeps the switches in
+        // `wireless.zte_mbb.*`; older builds used a separate `zte_mbb` config.
+        if let Some(&(_, legacy_path)) = mbb_map.iter().find(|&&(k, _)| k == key) {
+            let wireless_path = format!("wireless.zte_mbb.{key}");
+            if let Some(current) = current_map.0.get(&wireless_path) {
+                if *current != val_str {
+                    if let Err(e) = ubus::uci_set_no_commit(&wireless_path, &val_str) {
+                        return (500, json!({"ok": false, "error": e}));
+                    }
+                    wireless_changed = true;
+                    only_txpower = false;
+                }
+                continue;
+            }
+            let current = ubus::uci_get(legacy_path).unwrap_or_default();
             if current != val_str {
                 // mbb keys are firmware-dependent; skip silently if missing
-                if ubus::uci_set_no_commit(path, &val_str).is_ok() {
+                if ubus::uci_set_no_commit(legacy_path, &val_str).is_ok() {
                     mbb_changed = true;
                     only_txpower = false;
                 }
@@ -267,9 +346,7 @@ pub fn wifi_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
 
     // Full reload needed
     if wireless_changed {
-        let _ = Command::new("sh")
-            .args(["-c", "ubus call zwrt_wlan reload >/dev/null 2>&1 &"])
-            .output();
+        reload_wifi_async();
     }
 
     (200, json!({"ok": true, "data": {"status": "ok"}}))
@@ -281,6 +358,11 @@ pub fn wifi_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
 
 pub fn guest_status(_state: &AppState) -> (u16, Value) {
     let mut result = serde_json::Map::new();
+    let w = match Wireless::load() {
+        Ok(w) => w,
+        Err(e) => return (503, json!({"ok": false, "error": e})),
+    };
+    let uci_get_wireless = |key: &str| w.get(key);
 
     result.insert("ssid".into(), json!(uci_get_wireless("guest_2g.ssid")));
     result.insert("key".into(), json!(uci_get_wireless("guest_2g.key")));
@@ -327,6 +409,13 @@ pub fn guest_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
         ("guest_active_time", &["wireless.guest_2g.guest_active_time", "wireless.guest_5g.guest_active_time"]),
     ];
 
+    // Refuse before writing anything if uci cannot read the config: a locked
+    // or failing uci would otherwise turn every `uci set` below into a silent
+    // skip and report "no changes".
+    if let Err(e) = Wireless::load() {
+        return (503, json!({"ok": false, "error": e}));
+    }
+
     let mut changed = false;
     for (key, value) in obj {
         let val_str = match value {
@@ -356,9 +445,40 @@ pub fn guest_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
         return (500, json!({"ok": false, "error": e}));
     }
 
-    let _ = Command::new("sh")
-        .args(["-c", "ubus call zwrt_wlan reload >/dev/null 2>&1 &"])
-        .output();
+    reload_wifi_async();
 
     (200, json!({"ok": true, "data": {"status": "ok"}}))
+}
+
+#[cfg(test)]
+mod wireless_tests {
+    use super::Wireless;
+
+    const SHOW: &str = "wireless.wifi0=wifi-device\nwireless.wifi0.disabled='0'\nwireless.main_2g.ssid='U60'\nwireless.zte_mbb=zte_mbb\nwireless.zte_mbb.wifi_onoff='1'\nwireless.zte_mbb.wifi6_switch='0'\n";
+
+    #[test]
+    fn master_switch_is_read_from_wireless_zte_mbb_when_present() {
+        let w = Wireless::from_show(SHOW);
+        // Presence of the key is what selects the `wireless.zte_mbb.*` path
+        // over the legacy `zte_mbb.wifi.*` fallback in wifi_set/mbb().
+        assert!(w.0.contains_key("wireless.zte_mbb.wifi_onoff"));
+        assert!(w.0.contains_key("wireless.zte_mbb.wifi6_switch"));
+        assert_eq!(w.mbb("wifi_onoff"), "1");
+        assert_eq!(w.mbb("wifi6_switch"), "0");
+        assert_eq!(w.get("main_2g.ssid"), "U60");
+        assert_eq!(w.get("wifi0.disabled"), "0");
+        // Options missing from a successful show read as "".
+        assert_eq!(w.get("main_5g.ssid"), "");
+    }
+
+    #[test]
+    fn empty_show_has_no_master_switch_key() {
+        // What a failed `uci show` used to be mistaken for: no switch key, so
+        // every lookup fell through to the legacy path. load() now errors
+        // instead of producing this map.
+        let w = Wireless::from_show("");
+        assert!(w.0.is_empty());
+        assert!(!w.0.contains_key("wireless.zte_mbb.wifi_onoff"));
+        assert_eq!(w.get("main_2g.ssid"), "");
+    }
 }
