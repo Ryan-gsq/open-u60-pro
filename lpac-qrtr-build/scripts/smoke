@@ -1,0 +1,21 @@
+#!/bin/sh
+# Deliberately limited deployment candidate: no command here can access a card.
+set -eu
+if [ "$#" -eq 1 ] && [ "$1" = version ]; then
+    :
+elif [ "$#" -eq 2 ] && [ "$1" = driver ] && [ "$2" = list ]; then
+    :
+else
+    echo 'Only version and driver list are permitted by this smoke launcher.' >&2
+    exit 64
+fi
+base=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$base"
+if ! sha256sum -c SHA256SUMS >/dev/null; then
+    echo 'Private bundle integrity check failed; nothing launched.' >&2
+    exit 65
+fi
+exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    LPAC_APDU=qmi_qrtr LPAC_HTTP=curl \
+    GIO_MODULE_DIR="$base/no-modules" GIO_USE_VFS=local GIO_USE_PROXY_RESOLVER=dummy \
+    "$base/ld-musl-aarch64.so.1" --library-path "$base/lib" "$base/lpac" "$@"

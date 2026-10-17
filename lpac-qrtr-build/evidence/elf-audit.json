@@ -1,0 +1,353 @@
+[
+  {
+    "path": "driver/driver_apdu_qmi_qrtr.so",
+    "machine": "AArch64",
+    "needed": [
+      "liblpac-utils.so",
+      "libeuicc-drivers.so.2",
+      "libeuicc.so",
+      "libqmi-glib.so.5",
+      "libqrtr-glib.so.0",
+      "libgio-2.0.so.0",
+      "libgobject-2.0.so.0",
+      "libglib-2.0.so.0",
+      "libintl.so.8",
+      "libc.so"
+    ],
+    "sha256": "581a5b092a398522a10e63e02c90d598da6ed233272eeadce409cbcd142c8953"
+  },
+  {
+    "path": "driver/driver_http_curl.so",
+    "machine": "AArch64",
+    "needed": [
+      "libeuicc-drivers.so.2",
+      "liblpac-utils.so",
+      "libcurl.so.4",
+      "libeuicc.so",
+      "libc.so"
+    ],
+    "sha256": "52346d3f10c1b44bc69706ea83d788a4eb8d948dcb3bf6bf4725006ade93bb83"
+  },
+  {
+    "path": "ld-musl-aarch64.so.1",
+    "machine": "AArch64",
+    "needed": [],
+    "sha256": "b5afeb0dcc9e22e92f1088566b0d1c1562ef567a4abebaf4b0fd14000800b8ed"
+  },
+  {
+    "path": "lib/libblkid.so.1",
+    "machine": "AArch64",
+    "needed": [
+      "libeconf.so.0",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "a481898570ed03ba81eb20b37d0cbddd0809ee63281f391950931e163f00ab76"
+  },
+  {
+    "path": "lib/libbrotlicommon.so.1",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "abdf1f7c44fabb16ca538c8650290f4cdc0727884f12c3bd713d8a16dc5a805f"
+  },
+  {
+    "path": "lib/libbrotlidec.so.1",
+    "machine": "AArch64",
+    "needed": [
+      "libbrotlicommon.so.1",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "fe1e44cd935e3f17eddbdd85cbd76b86891a15437b3146b2f678e2f0fbf6352e"
+  },
+  {
+    "path": "lib/libc.musl-aarch64.so.1",
+    "machine": "AArch64",
+    "needed": [],
+    "sha256": "b5afeb0dcc9e22e92f1088566b0d1c1562ef567a4abebaf4b0fd14000800b8ed"
+  },
+  {
+    "path": "lib/libc.so",
+    "machine": "AArch64",
+    "needed": [],
+    "sha256": "b5afeb0dcc9e22e92f1088566b0d1c1562ef567a4abebaf4b0fd14000800b8ed"
+  },
+  {
+    "path": "lib/libcares.so.2",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "0ab4280732a7bb17af13b0ff0d7924c5c12cde151cb324ed5d504d8c71c6aaea"
+  },
+  {
+    "path": "lib/libcrypto.so.3",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "911da5b5135cec3a520d294e56aefae5d753c9e1ed45aeabe8093d3ba986c284"
+  },
+  {
+    "path": "lib/libcurl.so.4",
+    "machine": "AArch64",
+    "needed": [
+      "libcares.so.2",
+      "libnghttp2.so.14",
+      "libidn2.so.0",
+      "libpsl.so.5",
+      "libssl.so.3",
+      "libcrypto.so.3",
+      "libzstd.so.1",
+      "libbrotlidec.so.1",
+      "libz.so.1",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "5b65583a71688ef716c2735f6728cb95c0fce4b3fdd5455bc4285d080472112d"
+  },
+  {
+    "path": "lib/libeconf.so.0",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "c63faf586cf1af77be63afea98a27b8361acf48da9d8bde645752c2a07005df2"
+  },
+  {
+    "path": "lib/libeuicc-driver-loader.so",
+    "machine": "AArch64",
+    "needed": [
+      "libeuicc-drivers.so.2",
+      "liblpac-utils.so",
+      "libeuicc.so",
+      "libc.so"
+    ],
+    "sha256": "26e4122325c4b315ce691af97fabb8b0715f472051cff7904c6393e425c58d7f"
+  },
+  {
+    "path": "lib/libeuicc-driver-loader.so.2",
+    "machine": "AArch64",
+    "needed": [
+      "libeuicc-drivers.so.2",
+      "liblpac-utils.so",
+      "libeuicc.so",
+      "libc.so"
+    ],
+    "sha256": "26e4122325c4b315ce691af97fabb8b0715f472051cff7904c6393e425c58d7f"
+  },
+  {
+    "path": "lib/libeuicc-drivers.so",
+    "machine": "AArch64",
+    "needed": [
+      "libc.so"
+    ],
+    "sha256": "05c19e6cbe9d4faf89ffd85e89a4e0ae5375c44ba830118f5135e087e942b767"
+  },
+  {
+    "path": "lib/libeuicc-drivers.so.2",
+    "machine": "AArch64",
+    "needed": [
+      "libc.so"
+    ],
+    "sha256": "05c19e6cbe9d4faf89ffd85e89a4e0ae5375c44ba830118f5135e087e942b767"
+  },
+  {
+    "path": "lib/libeuicc.so",
+    "machine": "AArch64",
+    "needed": [
+      "libc.so"
+    ],
+    "sha256": "1189c2987d5a63a59c58ed3ffed9fba320f8b637288bf2d3dce16af144fd878f"
+  },
+  {
+    "path": "lib/libffi.so.8",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "9e9631cbbd1e9f1de646dccbfe6357dabb085c07bf4eb0b870dba887a1f11053"
+  },
+  {
+    "path": "lib/libgio-2.0.so.0",
+    "machine": "AArch64",
+    "needed": [
+      "libglib-2.0.so.0",
+      "libgobject-2.0.so.0",
+      "libgmodule-2.0.so.0",
+      "libz.so.1",
+      "libmount.so.1",
+      "libintl.so.8",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "bf7d504a51313dc9b4b2525c520e6514ca3b4e3ab0c7e66bb790430bd08b4825"
+  },
+  {
+    "path": "lib/libglib-2.0.so.0",
+    "machine": "AArch64",
+    "needed": [
+      "libintl.so.8",
+      "libpcre2-8.so.0",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "9e83e58c752698949ab3e0a71ddd8065e7a0f6c9b0f804eb903209afcf22bb46"
+  },
+  {
+    "path": "lib/libgmodule-2.0.so.0",
+    "machine": "AArch64",
+    "needed": [
+      "libglib-2.0.so.0",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "844c57bd50980036656f9718b35b272e7c254cdcb1d81d40eebf7df5f6a831c5"
+  },
+  {
+    "path": "lib/libgobject-2.0.so.0",
+    "machine": "AArch64",
+    "needed": [
+      "libglib-2.0.so.0",
+      "libffi.so.8",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "d839fd5ddecb30d223eb907e3770d019595f4d5951d8cec96a242fdf11a69844"
+  },
+  {
+    "path": "lib/libidn2.so.0",
+    "machine": "AArch64",
+    "needed": [
+      "libunistring.so.5",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "061d65c20ac9f8cc73a6819579bd694fedd4f99ba4505a469a41872b3dfedd59"
+  },
+  {
+    "path": "lib/libintl.so.8",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "fa15293bf4eff041cf7fe07939a1731535f0f34cd31866bdf08abf7e74e4706f"
+  },
+  {
+    "path": "lib/liblpac-utils.so",
+    "machine": "AArch64",
+    "needed": [
+      "libeuicc.so",
+      "libc.so"
+    ],
+    "sha256": "f15b700f1f428e7240dd551fd354fed6158fd089c127acea598898f445bf1c3b"
+  },
+  {
+    "path": "lib/libmbim-glib.so.4",
+    "machine": "AArch64",
+    "needed": [
+      "libglib-2.0.so.0",
+      "libgio-2.0.so.0",
+      "libgobject-2.0.so.0",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "795b6f664cbf651a610a03540a24678b80a6217802a14b11722b891e9e093bdf"
+  },
+  {
+    "path": "lib/libmount.so.1",
+    "machine": "AArch64",
+    "needed": [
+      "libblkid.so.1",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "daf873baf79a129db49b8a90533ef3ea04f848a2274f0ddb5096334b468e26da"
+  },
+  {
+    "path": "lib/libnghttp2.so.14",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "bf3ab13a127218087d28e5ed4f5e80c15358dd64704d9ac22e32b3e946a7b132"
+  },
+  {
+    "path": "lib/libpcre2-8.so.0",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "96f12ce474c569cb775e322d40b3ff63c6879a35eed7b65e49c3b864ddfaccd0"
+  },
+  {
+    "path": "lib/libpsl.so.5",
+    "machine": "AArch64",
+    "needed": [
+      "libidn2.so.0",
+      "libunistring.so.5",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "717f8ee1c55658166e622a9a0e8b75e447948994af59d2fbdc7b2bbb9d240bba"
+  },
+  {
+    "path": "lib/libqmi-glib.so.5",
+    "machine": "AArch64",
+    "needed": [
+      "libglib-2.0.so.0",
+      "libgio-2.0.so.0",
+      "libgobject-2.0.so.0",
+      "libqrtr-glib.so.0",
+      "libmbim-glib.so.4",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "d2d560d39fc72eec93226294dd568acfa6a79b62ef9b11d588209d0b17d36ae3"
+  },
+  {
+    "path": "lib/libqrtr-glib.so.0",
+    "machine": "AArch64",
+    "needed": [
+      "libglib-2.0.so.0",
+      "libgio-2.0.so.0",
+      "libgobject-2.0.so.0",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "ce88fd281926f4d3feda198a50400dddb33bd751635fa1ecd5c9515d77c34e26"
+  },
+  {
+    "path": "lib/libssl.so.3",
+    "machine": "AArch64",
+    "needed": [
+      "libcrypto.so.3",
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "c2c68f2588b1c919d716d6bd998da35541e5f8ff415ad657f52ac4e8f61c929d"
+  },
+  {
+    "path": "lib/libunistring.so.5",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "8d909c55d18d0952308c364916c8e904d88d9a5cb795b8f25d989dbd53d85d84"
+  },
+  {
+    "path": "lib/libz.so.1",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "1dfd2166dd6124fbd4cbba54ea3d5b2de60e308c252de39d1369e71d301ddea4"
+  },
+  {
+    "path": "lib/libzstd.so.1",
+    "machine": "AArch64",
+    "needed": [
+      "libc.musl-aarch64.so.1"
+    ],
+    "sha256": "0261e625d796007a4688f12b5bea20ca8af9d6767d645286501245a0f0187699"
+  },
+  {
+    "path": "lpac",
+    "machine": "AArch64",
+    "needed": [
+      "libeuicc-driver-loader.so.2",
+      "liblpac-utils.so",
+      "libeuicc.so",
+      "libc.so"
+    ],
+    "sha256": "0836f261bfbda41356417ee16882c92a577609bbaa646345943728dcbd409c35"
+  }
+]
