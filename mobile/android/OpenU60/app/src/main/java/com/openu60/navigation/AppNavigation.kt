@@ -32,9 +32,9 @@ import com.openu60.feature.router.networkmode.NetworkModeScreen
 import com.openu60.feature.router.device.DeviceControlScreen
 import com.openu60.feature.router.lan.LANSettingsScreen
 import com.openu60.feature.router.sim.SIMScreen
-import com.openu60.feature.router.sim.b1.B1BluetoothScreen
 import com.openu60.feature.router.stc.STCScreen
 import com.openu60.feature.router.stk.STKScreen
+import com.openu60.feature.router.esim.RouterESimScreen
 import com.openu60.feature.router.qos.QoSScreen
 import com.openu60.feature.router.telemetry.TelemetryBlockerScreen
 import com.openu60.feature.router.vpn.VPNPassthroughScreen
@@ -64,7 +64,6 @@ import com.openu60.feature.tools.speedtest.SpeedTestScreen
 import com.openu60.feature.usb.USBModeScreen
 
 sealed class Screen(val route: String) {
-    data object B1Bluetooth : Screen("sim/b1_bluetooth")
     // Bottom tabs
     data object Dashboard : Screen("dashboard")
     data object SMSList : Screen("sms")
@@ -101,6 +100,7 @@ sealed class Screen(val route: String) {
     data object CellLock : Screen("router/cell_lock")
     data object SIM : Screen("router/sim")
     data object STK : Screen("router/stk")
+    data object RouterESim : Screen("router/esim")
     data object WiFiSettings : Screen("router/wifi")
     data object GuestWiFi : Screen("router/guest_wifi")
     data object APN : Screen("router/apn")
@@ -209,8 +209,8 @@ fun AppNavigation() {
                     onNavigateToSTC = { navController.navigate(Screen.STC.route) },
                     onNavigateToSignalDetect = { navController.navigate(Screen.SignalDetect.route) },
                     onNavigateToSIM = { navController.navigate(Screen.SIM.route) },
+                    onNavigateToRouterESim = { navController.navigate(Screen.RouterESim.route) },
                     onNavigateToSTK = { navController.navigate(Screen.STK.route) },
-                    onNavigateToB1Bluetooth = { navController.navigate(Screen.B1Bluetooth.route) },
                     onNavigateToWiFi = { navController.navigate(Screen.WiFiSettings.route) },
                     onNavigateToGuestWiFi = { navController.navigate(Screen.GuestWiFi.route) },
                     onNavigateToAPN = { navController.navigate(Screen.APN.route) },
@@ -318,11 +318,11 @@ fun AppNavigation() {
             composable(Screen.SIM.route) {
                 SIMScreen(onBack = { navController.popBackStack() })
             }
-            composable(Screen.B1Bluetooth.route) {
-                B1BluetoothScreen(onBack = { navController.popBackStack() })
-            }
             composable(Screen.STK.route) {
                 STKScreen(onBack = { navController.popBackStack() })
+            }
+            composable(Screen.RouterESim.route) {
+                RouterESimScreen(onBack = { navController.popBackStack() })
             }
             composable(Screen.WiFiSettings.route) {
                 WiFiSettingsScreen(onBack = { navController.popBackStack() })

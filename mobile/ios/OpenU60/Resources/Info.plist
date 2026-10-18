@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>NSCameraUsageDescription</key>
+    <string>OpenU60 uses the camera to scan eSIM QR codes.</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
@@ -33,8 +35,6 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>OpenU60 needs local network access to communicate with your ZTE router.</string>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>OpenU60 uses Bluetooth to discover your nearby 9eSIM B1 card, show its signal strength, and connect to its management services.</string>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>

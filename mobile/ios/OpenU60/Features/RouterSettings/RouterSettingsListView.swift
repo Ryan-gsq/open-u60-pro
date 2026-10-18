@@ -13,8 +13,8 @@ struct RouterSettingsListView: View {
         case smartTowerConnect
         case signalDetection
         case sim
+        case routerESim
         case simServices
-        case b1Bluetooth
         case wifi
         case guestWiFi
         case apn
@@ -57,11 +57,12 @@ struct RouterSettingsListView: View {
                         Label("SIM Card", systemImage: "simcard")
                     }
 
+                    NavigationLink(value: Route.routerESim) {
+                        Label("eSIM Profiles", systemImage: "simcard.2")
+                    }
+
                     NavigationLink(value: Route.simServices) {
                         Label("SIM Services", systemImage: "phone.badge.waveform")
-                    }
-                    NavigationLink(value: Route.b1Bluetooth) {
-                        Label("9eSIM B1 Bluetooth", systemImage: "antenna.radiowaves.left.and.right")
                     }
                 }
 
@@ -149,12 +150,14 @@ struct RouterSettingsListView: View {
             PushedModelHost(SIMViewModel(client: client, authManager: authManager)) {
                 SIMView(viewModel: $0)
             }
+        case .routerESim:
+            PushedModelHost(RouterESimViewModel(client: client, authManager: authManager)) {
+                RouterESimView(viewModel: $0)
+            }
         case .simServices:
             PushedModelHost(STKViewModel(client: client, authManager: authManager)) {
                 STKMenuView(viewModel: $0)
             }
-        case .b1Bluetooth:
-            B1BluetoothView()
         case .wifi:
             PushedModelHost(WiFiSettingsViewModel(client: client, authManager: authManager)) {
                 WiFiSettingsView(viewModel: $0)

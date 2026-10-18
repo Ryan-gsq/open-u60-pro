@@ -24,7 +24,6 @@ targets:
       - path: Resources
       - path: Shared
     dependencies:
-      - sdk: CoreBluetooth.framework
       - target: SignalLiveActivityExtension
     entitlements:
       path: Resources/OpenU60.entitlements
