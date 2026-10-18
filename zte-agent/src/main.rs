@@ -8,6 +8,7 @@ mod charge_policy;
 mod conn_watchdog;
 mod device_ext;
 pub mod doh;
+mod esim;
 mod event_bus;
 mod handlers;
 mod lan_test;
@@ -126,6 +127,10 @@ fn busy_check(state: &Arc<AppState>) -> Box<dyn Fn() -> Option<&'static str> + S
         use std::sync::atomic::Ordering;
         if state.speedtest.is_running() {
             return Some("speed test");
+        }
+        // The WAN is down for up to a minute while the modem attaches with a new profile.
+        if state.esim.recently_switched(conn_watchdog::unix_now()) {
+            return Some("eSIM profile switch");
         }
         // USSD prompts expire network-side within a few minutes; treat the
         // flag as stale after 3 min.

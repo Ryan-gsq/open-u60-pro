@@ -82,6 +82,10 @@ dependencies {
     // Encrypted SharedPreferences
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
+    // On-device QR scanning and Photo Picker imports
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
     // Charts (Vico)
     implementation("com.patrykandpatrick.vico:compose-m3:2.0.1")
 

@@ -20,7 +20,7 @@ Native companion apps for the ZTE U60 Pro 5G mobile router. Connect to the `zte-
 | Guest WiFi | Full | Guest network enable/disable, SSID, timer |
 | SMS | Full | Read, send, delete SMS; mark as read |
 | SIM Management | Full | PIN verify/change/enable/disable, PUK unlock, SIM unlock |
-| 9eSIM B1 / eSIM | Application flows + connection | BLE scan/connect, profile list/actions/download/export UI and unit-tested controller; verified B1 wire/LPA adapter still required |
+| eSIM Profiles | List, switch, add, delete | Profiles on an eSIM card in the router (e.g. 9eSIM B1): scan/import/paste an activation code, preview and confirm installation, switch with live reconnection status, delete inactive profiles, masked card identifiers and capacity. The agent runs lpac on the router; see [zte-agent/docs/esim.md](../zte-agent/docs/esim.md) |
 | Mobile Network | Full | Data toggle, airplane mode, network scan, manual register |
 | Network Mode | Full | Auto/manual network selection |
 | APN Settings | Full | Auto/manual APN mode, add/edit/delete/activate profiles |
@@ -43,7 +43,6 @@ Native companion apps for the ZTE U60 Pro 5G mobile router. Connect to the `zte-
 
 - **Pattern**: MVVM
 - **Transport**: HTTP to `zte-agent` REST API (`http://<router>:9090/api/...`)
-- **B1 Bluetooth**: Direct native phone BLE transport; independent of the router agent. See [connection implementation and protocol handoff](docs/b1-bluetooth.md).
 - **Auth**: Token-based (password → bearer token)
 
 The iOS app communicates with `zte-agent`, a lightweight Rust HTTP server deployed on the router. The agent exposes dedicated typed REST endpoints that internally call the router's ubus subsystem and return JSON responses.
@@ -139,7 +138,7 @@ ios/OpenU60/
 
 ## Agent REST API
 
-Router operations use typed REST endpoints on `zte-agent`. B1 Bluetooth uses the phone's native BLE APIs directly. Key router endpoint groups:
+Router operations use typed REST endpoints on `zte-agent`. Key router endpoint groups:
 
 | Group | Endpoints | Description |
 |---|---|---|
@@ -149,6 +148,7 @@ Router operations use typed REST endpoints on `zte-agent`. B1 Bluetooth uses the
 | `/api/modem/*` | status, online, data, airplane, network-mode, scan/*, register/*, schedule-reboot | Modem control |
 | `/api/sms/*` | list, capacity, send, delete, read | SMS management |
 | `/api/sim/*` | info, imei, pin/*, unlock, lock-trials | SIM management |
+| `/api/esim/*` | profiles, chip, enable, delete, download, download/confirm, download/cancel | eSIM profiles on the card in the router (lpac) |
 | `/api/cell/*` | lock/*, neighbors/*, band/*, stc/*, signal-detect/* | Cell & band locking |
 | `/api/router/*` | dns, lan, firewall/*, vpn, qos, domain-filter, apn/* | Router configuration |
 | `/api/usb/*` | status, mode, powerbank | USB management |

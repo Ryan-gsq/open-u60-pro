@@ -8,14 +8,14 @@
   {
     "name": "alpine-main-index.tar.gz",
     "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/aarch64/APKINDEX.tar.gz",
-    "sha256": "c1f9074312997aeb58fd043d2d7622aecb0ba3e192c3e85abb38790889eae48c",
-    "bytes": 501409
+    "sha256": "4fed296930cf15604d4af85474d04741e961975952b3341c151f47b5df462da8",
+    "bytes": 501418
   },
   {
     "name": "alpine-community-index.tar.gz",
     "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/community/aarch64/APKINDEX.tar.gz",
-    "sha256": "53cbc7cf616c0c1435c6de92b6ff66c1aa0c8dc97255f8055420526cf0ce7a70",
-    "bytes": 2072488
+    "sha256": "ef90ec8c4abd0d60116c76b0d127e65a636b275ce7f71b97def5b19515920cf3",
+    "bytes": 2072485
   },
   {
     "name": "cjson-4818f043.tar.gz",

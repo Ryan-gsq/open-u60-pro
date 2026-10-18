@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import hashlib, json, re, shutil, subprocess
+import hashlib, json, os, re, shutil, subprocess
 from pathlib import Path
 R = Path(__file__).resolve().parents[1]
 bundle = R / 'out' / 'bundle'
@@ -8,7 +8,11 @@ shutil.copytree(R / 'out/stage/executables', bundle, dirs_exist_ok=True)
 # Do not bundle fallback or interactive stdio APDU transports.
 for p in (bundle / 'driver').glob('*stdio*'):
     p.unlink()
-readelf = '/opt/homebrew/opt/llvm@21/bin/llvm-readelf'
+readelf = os.environ.get('READELF') or next(
+    (p for p in (shutil.which('aarch64-linux-musl-readelf'), shutil.which('llvm-readelf'),
+                 '/opt/homebrew/opt/llvm@21/bin/llvm-readelf', shutil.which('readelf')) if p and os.path.exists(p)), None)
+if not readelf:
+    raise SystemExit('readelf not found: set READELF (aarch64-linux-musl-readelf or llvm-readelf)')
 def elf(p):
     return p.is_file() and p.open('rb').read(4) == b'\x7fELF'
 def needed(p):

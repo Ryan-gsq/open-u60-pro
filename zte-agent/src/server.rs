@@ -8,6 +8,7 @@ use crate::at_terminal;
 use crate::cell;
 use crate::conn_watchdog;
 use crate::device_ext;
+use crate::esim;
 use crate::lan_test;
 use crate::scheduler;
 use crate::handlers::{self, AppState};
@@ -340,6 +341,17 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Post, "/api/stk/respond") => state.stk.request("respond", body),
         (&Method::Post, "/api/stk/cancel") => state.stk.request("cancel", body),
         (&Method::Post, "/api/stk/back") => state.stk.request("back", body),
+        // eSIM profiles (lpac)
+        (&Method::Get, "/api/esim/profiles") => esim::profiles(state),
+        (&Method::Get, "/api/esim/chip") => esim::chip(state),
+        (&Method::Post, "/api/esim/enable") => esim::enable(state, body),
+        (&Method::Get, "/api/esim/switch") => esim::switch_status(state),
+        (&Method::Post, "/api/esim/delete") => esim::delete(state, body),
+        (&Method::Post, "/api/esim/download") => esim::download_start(state, body),
+        (&Method::Get, "/api/esim/download") => esim::download_status(state),
+        (&Method::Delete, "/api/esim/download") => esim::download_dismiss(state),
+        (&Method::Post, "/api/esim/download/confirm") => esim::download_confirm(state, body),
+        (&Method::Post, "/api/esim/download/cancel") => esim::download_cancel(state),
         // DoH
         (&Method::Get, "/api/doh/status") => doh_status(state),
         (&Method::Put, "/api/doh/config") => doh_config_set(state, body),
