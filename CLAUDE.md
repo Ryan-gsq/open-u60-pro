@@ -89,5 +89,5 @@ ubus call zwrt_data get_wwaniface '{"source_module":"zte_topsw_data","cid":1}'
 - **Charge policy bug**: Wall mode `enable` STOPS charging, `disable` STARTS charging (inverted).
 - **procd respawn**: `kill -9` may trigger procd respawn. Use `/etc/init.d/<name> stop` instead.
 - **Touchscreen**: Sitronix at I2C `1-0055`, kernel module `sitronix-ts.ko` loaded by `/usr/bin/mtdev2tuio.sh`.
-- **eSIM**: No built-in eUICC. The user-tested 9eSIM B1 in the SIM slot is the baseline. Native phone BLE and application-level profile actions/download/export controllers and UI are implemented with unit tests. Production uses an explicit unavailable adapter until B1 authorization, framing and LPA integration are verified. See `mobile/docs/b1-bluetooth.md`. Current testing is coding/unit tests only; no Simulator or hardware checks were requested for the management work.
+- **eSIM**: No built-in eUICC. The user-tested 9eSIM B1 in the SIM slot is managed by the agent through lpac (QMI-over-QRTR, node 3, slot 1): list, switch, download, delete — see `zte-agent/docs/esim.md`. lpac is a private bundle in `/data/lpac` (recipe in `lpac-qrtr-build/`). The old phone-Bluetooth B1 code was removed. Do not reverse-engineer the qcril/RIL internals to forward SIM Toolkit screens.
 - **IMEI**: Hardware-locked (QFPROM fused), not modifiable.

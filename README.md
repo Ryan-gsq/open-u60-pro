@@ -48,7 +48,7 @@ config backup/decryption, network customization, and more.
 | **OS** | ZWRT (OpenWrt 23.05.4 r24012-d8dd03c46f) |
 | **Kernel** | Linux 5.15.170-perf, SMP PREEMPT, aarch64 |
 | **PMICs** | PMX75 + PM7550BA + PMG1110 |
-| **SIM** | Single nano-SIM (no eSIM) |
+| **SIM** | Single nano-SIM (no built-in eSIM; eSIM cards such as the 9eSIM B1 work in the slot) |
 | **NFC** | Quick device pairing |
 | **Bluetooth** | Qualcomm WCN7850 (BT 5.3+), UART transport — disabled (services stopped, module unloaded) |
 | **Clients** | Up to 64 (32 per radio) |
@@ -64,7 +64,7 @@ A lightweight Rust HTTP server that runs directly on the router (port 9090, LAN-
 cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 ```
 
-**143 endpoints across 16 categories:**
+**153 endpoints across 17 categories:**
 
 | Category | # | Capabilities |
 |---|---|---|
@@ -78,6 +78,7 @@ cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 | WiFi | 4 | Status, SSID/password/channel/TX power, guest WiFi |
 | USB | 3 | USB mode switching, powerbank control |
 | Telephony | 11 | Voice calls (dial/hangup/answer/DTMF/mute), USSD codes, SIM Toolkit menus |
+| eSIM | 10 | eSIM profiles via lpac: list, switch (verified card → modem → data), download from QR with preview/cancel, delete, card info |
 | Speed Test | 4 | Server list, run test, progress tracking |
 | DoH Proxy | 6 | DNS-over-HTTPS proxy, cache management |
 | LAN Test | 3 | WiFi ping, download/upload throughput measurement |
@@ -197,6 +198,18 @@ Enables ADB, builds and pushes the agent, creates boot scripts, and optionally s
 ```
 
 This builds, deploys the binary to the device via SSH (port 2222), updates the boot password, and restarts the agent.
+
+### eSIM profiles (optional)
+
+With an eSIM card in the SIM slot (tested with a [9eSIM B1](docs/9esim-b1.md)), the agent can list its profiles, switch between them, download new ones from an operator QR code and delete them. It uses [lpac](https://github.com/estkme-group/lpac), which is built separately and copied to the router once:
+
+```bash
+cd lpac-qrtr-build
+./make-bundle.sh          # needs python3, curl and the musl cross compiler from step 3
+./install-to-router.sh    # SSH to root@192.168.0.1:2222, installs to /data/lpac
+```
+
+Switching, downloading and deleting require an agent password. In the apps: Router → eSIM Profiles. API and behaviour: [`zte-agent/docs/esim.md`](zte-agent/docs/esim.md). The lpac patch is AGPL-3.0 (see [`lpac-qrtr-build/`](lpac-qrtr-build/)).
 
 ### Connect Mobile App
 
