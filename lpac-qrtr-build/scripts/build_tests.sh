@@ -4,7 +4,7 @@ R=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 export PKG_CONFIG_LIBDIR="$R/sysroot/usr/lib/pkgconfig:$R/sysroot/usr/share/pkgconfig"
 export PKG_CONFIG_SYSROOT_DIR="$R/sysroot"
 unset PKG_CONFIG_PATH
-PC="$R/host-tools/lib/python3.14/site-packages/pkgconf/.bin/pkgconf"
+PC=${PKGCONF:-$(ls -d "$R"/host-tools/lib/python3*/site-packages/pkgconf/.bin/pkgconf 2>/dev/null | head -1)}
 CC=/opt/homebrew/opt/musl-cross/bin/aarch64-linux-musl-gcc
 S="$R/work/lpac"
 COMMON="--sysroot=$R/sysroot -O0 -g -Wall -Wextra -DLPAC_WITH_DRIVER_APDU_QMI_QRTR -I$S/driver/apdu -I$S/driver -I$S/utils -I$S -I$R/sources/cJSON-4818f043bda624b5738384eae3a0189b2bd1f5e1/.. -I$R/out/stage/include"
