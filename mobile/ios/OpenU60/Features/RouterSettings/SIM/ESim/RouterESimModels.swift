@@ -72,9 +72,11 @@ struct RouterESimSwitchStatus: Decodable, Equatable {
     var startedAt: UInt64?
     var finishedAt: UInt64?
     var note: String?
+    /// Why data didn't connect, when the router knows: `roaming_off` or `data_off`.
+    var reason: String?
 
     private enum CodingKeys: String, CodingKey {
-        case state, generation, note
+        case state, generation, note, reason
         case targetICCID = "target_iccid"
         case startedAt = "started_at"
         case finishedAt = "finished_at"
@@ -99,7 +101,12 @@ struct RouterESimSwitchStatus: Decodable, Equatable {
     /// Why a finished switch did not reach `connected`.
     var outcomeNote: String? {
         switch state {
-        case "no_data": "The profile is active, but mobile data hasn't connected. Check the plan or coverage."
+        case "no_data":
+            switch reason {
+            case "roaming_off": "This profile roams on a local network and Data Roaming is off. Turn on Data Roaming in Mobile Network."
+            case "data_off": "The profile is active, but Mobile Data is off. Turn it on in Mobile Network."
+            default: "The profile is active, but mobile data hasn't connected. Check the plan or coverage."
+            }
         case "modem_unconfirmed": "The eSIM switched, but the router still uses the previous SIM. Restart the router to finish."
         case "card_unconfirmed": "The eSIM couldn't be read after the switch. Refresh in a moment."
         case "not_applied": "The switch didn't happen; the previous profile is still active."

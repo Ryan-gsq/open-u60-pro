@@ -95,6 +95,10 @@ struct RouterESimTests {
         }
         precondition(!RouterESimSwitchStatus(state: "reloading").cardConfirmed && RouterESimSwitchStatus(state: "connected").outcomeNote == nil)
         precondition(RouterESimSwitchStatus(state: "modem_unconfirmed").outcomeNote?.contains("Restart the router") == true)
+        let roaming = try! JSONDecoder().decode(RouterESimSwitchStatus.self, from: Data(#"{"state":"no_data","reason":"roaming_off","note":null}"#.utf8))
+        precondition(roaming.outcomeNote?.contains("Turn on Data Roaming") == true, "a roaming profile names the fix")
+        precondition(RouterESimSwitchStatus(state: "no_data", reason: "data_off").outcomeNote?.contains("Mobile Data is off") == true)
+        precondition(RouterESimSwitchStatus(state: "no_data").outcomeNote?.contains("plan or coverage") == true)
 
         print("RouterESimTests: identifiers, reconnection, activation codes, and download stages passed")
     }

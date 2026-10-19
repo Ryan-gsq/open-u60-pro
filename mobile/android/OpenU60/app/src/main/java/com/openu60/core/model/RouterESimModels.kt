@@ -110,6 +110,8 @@ data class RouterESimSwitchStatus(
     @SerialName("started_at") val startedAt: Long? = null,
     @SerialName("finished_at") val finishedAt: Long? = null,
     val note: String? = null,
+    /** Why data didn't connect, when the router knows: `roaming_off` or `data_off`. */
+    val reason: String? = null,
 ) {
     val isRunning: Boolean get() = state in setOf("reloading", "card_confirmed", "modem_confirmed")
 
@@ -129,7 +131,11 @@ data class RouterESimSwitchStatus(
     /** Why a finished switch did not reach `connected`. */
     val outcomeNote: String?
         get() = when (state) {
-            "no_data" -> "The profile is active, but mobile data hasn't connected. Check the plan or coverage."
+            "no_data" -> when (reason) {
+                "roaming_off" -> "This profile roams on a local network and Data Roaming is off. Turn on Data Roaming in Mobile Network."
+                "data_off" -> "The profile is active, but Mobile Data is off. Turn it on in Mobile Network."
+                else -> "The profile is active, but mobile data hasn't connected. Check the plan or coverage."
+            }
             "modem_unconfirmed" -> "The eSIM switched, but the router still uses the previous SIM. Restart the router to finish."
             "card_unconfirmed" -> "The eSIM couldn't be read after the switch. Refresh in a moment."
             "not_applied" -> "The switch didn't happen; the previous profile is still active."

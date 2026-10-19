@@ -119,6 +119,10 @@ class RouterESimParserTest {
         assertEquals(RouterESimConnectionPhase.CONNECTED, RouterESimSwitchStatus("connected").phase)
         assertEquals(RouterESimConnectionPhase.WAITING, RouterESimSwitchStatus("no_data").phase)
         assertTrue(RouterESimSwitchStatus("modem_unconfirmed").outcomeNote!!.contains("Restart the router"))
+        val roaming = json.decodeFromString<RouterESimSwitchStatus>("""{"state":"no_data","reason":"roaming_off","note":null}""")
+        assertTrue(roaming.outcomeNote!!.contains("Turn on Data Roaming"))
+        assertTrue(RouterESimSwitchStatus("no_data", reason = "data_off").outcomeNote!!.contains("Mobile Data is off"))
+        assertTrue(RouterESimSwitchStatus("no_data").outcomeNote!!.contains("plan or coverage"))
         assertEquals(RouterESimConnectionPhase.UNAVAILABLE, RouterESimSwitchStatus("not_applied").phase)
         assertFalse(RouterESimSwitchStatus("connected").isRunning)
     }
