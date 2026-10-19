@@ -21,7 +21,7 @@ OpenU60 app ──Wi‑Fi──▶ zte-agent ──▶ lpac ──QMI over QRTR�
 | eUICC firmware | 4.2.0 |
 | SGP.22 (RSP) version | 2.2.2 |
 | Profile package version | 2.3.1 (protection profile 1.0.0, GlobalPlatform 2.3.0, ETSI TS 102 241 9.2.0) |
-| Free storage | about 950 KB with three profiles installed |
+| Free storage | about 950 KB with three profiles installed; a travel profile took about 36 KB |
 | Capabilities | USIM, ISIM, CSIM; Milenage and TUAK; additional profiles and test profiles |
 | Management application | Default ISD-R AID (`A0000005591010FFFFFFFF8900000100`), no override needed |
 | Trusted root CI | One: GSMA RSP2 Root CI1 (key ID `81370f51…5bebfb`), for both verification and signing. Operators' servers use TLS certificates from this root, so lpac must trust it ([certificates](../lpac-qrtr-build/README.md#operator-server-certificates)) |
@@ -50,7 +50,7 @@ OpenU60 app ──Wi‑Fi──▶ zte-agent ──▶ lpac ──QMI over QRTR�
 | List profiles, card info | Works; about 0.3 s, no effect on the connection |
 | Switch profile | Works; over 20 switches between the three profiles on 2026-10-18, no reboot needed |
 | Switch verification | Works; the agent confirms card → modem identity → data connection (`GET /api/esim/switch`) |
-| Download from QR (with preview and cancel) | Implemented; tested only on its failure and cancel paths, not yet with a real operator QR code. TLS to real operator servers is verified (see receipts) |
+| Download from QR (with preview and cancel) | Works; a Klook travel eSIM installed from the app on 2026-10-19 (preview, confirm, 31 s in total, about 36 KB of card storage, install receipt delivered) |
 | Delete profile | Implemented; tested only on its refusal paths (the active profile and unknown profiles are refused), no profile deleted yet |
 | Rename (nickname) | Works; set, read back and cleared on the router on 2026-10-19 |
 | Operator receipts | Works; 35 receipts left by the switching tests were delivered to three operator servers in 76 s on 2026-10-19 |
