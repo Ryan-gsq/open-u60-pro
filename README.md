@@ -207,7 +207,7 @@ With an eSIM card in the SIM slot (tested with a [9eSIM B1](docs/9esim-b1.md)), 
 - **Switch** the active profile. The agent verifies each step (card → modem identity → mobile data) and reports why a switch didn't complete; it never switches back on its own. Internet returns in about 15–45 s; Wi‑Fi stays on.
 - **Add** a profile from the operator's QR code or activation code, with a preview of the operator and profile name before anything is written, and cancel.
 - **Rename** profiles (nicknames) and **delete** inactive ones.
-- **Operator receipts:** the card's add/remove notifications are sent to the operator's server one by one and retried while the router has mobile data.
+- **Operator receipts:** the card's add, switch and remove notifications are sent to the operator's server one by one, right after the change once data is up, and retried while the router has mobile data.
 - **Safety:**
   - one eSIM operation at a time;
   - checks that it's still the same card before any change;

@@ -65,6 +65,10 @@ const SWITCH_VERIFY_LIMIT: Duration = Duration::from_secs(150);
 const SWITCH_POLL: Duration = Duration::from_secs(3);
 /// One receipt (ES9+ HandleNotification) to one operator server.
 const RECEIPT_LIMIT: Duration = Duration::from_secs(45);
+/// Pause between "data connected" after a switch and sending its receipts (DNS and routes settle).
+const RECEIPT_AFTER_SWITCH: Duration = Duration::from_secs(5);
+/// Second try for receipts a switch left that failed on the first.
+const RECEIPT_SECOND_TRY: Duration = Duration::from_secs(30);
 /// Pending receipts are retried this often while the router has mobile data.
 const RECEIPT_RETRY: Duration = Duration::from_secs(600);
 /// After this many failed attempts a receipt is left on the card and reported, not retried.
@@ -776,7 +780,7 @@ fn verify_switch(inner: Arc<Inner>, target: String) {
         sw.card_confirmed_at = now;
         sw.state = "card_confirmed";
     }
-    loop {
+    let connected = loop {
         let now = unix_now();
         let mut sw = inner.switch.lock().unwrap();
         if sw.modem_confirmed_at == 0 && modem_iccid().is_some_and(|m| same_iccid(&m, &target)) {
@@ -787,17 +791,53 @@ fn verify_switch(inner: Arc<Inner>, target: String) {
             sw.connected_at = now;
             sw.finish("connected", now);
             eprintln!("[esim] switch to {} verified: card, modem, data", mask(&target));
-            return;
+            break true;
         }
         if started.elapsed() >= SWITCH_VERIFY_LIMIT {
             let outcome = if sw.modem_confirmed_at != 0 { "no_data" } else { "modem_unconfirmed" };
             sw.finish(outcome, now);
             eprintln!("[esim] switch to {} ended as {outcome}", mask(&target));
-            return;
+            break false;
         }
         drop(sw);
         std::thread::sleep(SWITCH_POLL);
+    };
+    receipts_after_switch(&inner, connected);
+}
+
+/// The switch left an enable and a disable receipt on the card. With data up, send them once
+/// traffic flows; otherwise list them so the count is right and leave them to the retry loop.
+fn receipts_after_switch(inner: &Arc<Inner>, connected: bool) {
+    if !connected {
+        if let Some(_guard) = acquire_soon(inner) {
+            let _ = list_receipts(inner);
+        }
+        ensure_receipt_retry(inner);
+        return;
     }
+    std::thread::sleep(RECEIPT_AFTER_SWITCH);
+    let sent_all = acquire_soon(inner).is_some_and(|_guard| send_receipts(inner));
+    // Right after the attach a request can still stall: one more try before the 10-minute loop.
+    if !sent_all {
+        std::thread::sleep(RECEIPT_SECOND_TRY);
+        if data_connected() {
+            if let Some(_guard) = acquire_soon(inner) {
+                send_receipts(inner);
+            }
+        }
+    }
+    ensure_receipt_retry(inner);
+}
+
+/// Background work takes the card when it's free within 10 s; the app usually re-reads the
+/// list as a switch completes.
+fn acquire_soon(inner: &Arc<Inner>) -> Option<BusyGuard> {
+    (0..10).find_map(|i| {
+        if i > 0 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        acquire(inner)
+    })
 }
 
 /// `Some(true)` when the modem reports the SIM ready; `None` if the firmware did not answer.
@@ -1098,17 +1138,24 @@ fn send_receipts(inner: &Arc<Inner>) -> bool {
         return false;
     }
     let now = unix_now();
-    let todo: Vec<u64> = {
+    let todo: Vec<(u64, String)> = {
         let mut r = inner.receipts.lock().unwrap();
         r.last_attempt_at = now;
         r.pending
             .iter()
             .flatten()
             .filter(|x| x.attempts < RECEIPT_MAX_ATTEMPTS)
-            .map(|x| x.seq)
+            .map(|x| (x.seq, x.address.clone()))
             .collect()
     };
-    for seq in todo {
+    // A server that failed (or hung until the limit) is skipped for the rest of this round, so
+    // one unreachable operator can't hold the card for 45 s per receipt.
+    let mut failed_servers = std::collections::HashSet::new();
+    let mut sent = 0;
+    for (seq, address) in todo {
+        if failed_servers.contains(&address) {
+            continue;
+        }
         let arg = seq.to_string();
         let result = lpac(&["notification", "process", "-r", &arg], RECEIPT_LIMIT, &|_| {}, None);
         let mut r = inner.receipts.lock().unwrap();
@@ -1118,15 +1165,20 @@ fn send_receipts(inner: &Arc<Inner>) -> bool {
                     p.retain(|x| x.seq != seq);
                 }
                 r.last_sent_at = unix_now();
+                sent += 1;
             }
             Err(e) => {
                 if let Some(x) = r.pending.iter_mut().flatten().find(|x| x.seq == seq) {
                     x.attempts += 1;
                     x.last_error = Some(e.message());
                 }
-                eprintln!("[esim] operator receipt {seq} not sent: {}", e.message());
+                eprintln!("[esim] operator receipt {seq} to {address} not sent: {}", e.message());
+                failed_servers.insert(address);
             }
         }
+    }
+    if sent > 0 {
+        eprintln!("[esim] sent {sent} operator receipt(s)");
     }
     let _ = list_receipts(inner);
     inner.receipts.lock().unwrap().pending.as_ref().is_some_and(Vec::is_empty)
