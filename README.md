@@ -64,7 +64,7 @@ A lightweight Rust HTTP server that runs directly on the router (port 9090, LAN-
 cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 ```
 
-**153 endpoints across 17 categories:**
+**156 endpoints across 17 categories:**
 
 | Category | # | Capabilities |
 |---|---|---|
@@ -78,7 +78,7 @@ cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 | WiFi | 4 | Status, SSID/password/channel/TX power, guest WiFi |
 | USB | 3 | USB mode switching, powerbank control |
 | Telephony | 11 | Voice calls (dial/hangup/answer/DTMF/mute), USSD codes, SIM Toolkit menus |
-| eSIM | 10 | eSIM profiles via lpac: list, switch (verified card → modem → data), download from QR with preview/cancel, delete, card info |
+| eSIM | 13 | eSIM profiles via lpac: list, switch (verified card → modem → data), rename, download from QR with preview/cancel, delete, operator receipts, card info |
 | Speed Test | 4 | Server list, run test, progress tracking |
 | DoH Proxy | 6 | DNS-over-HTTPS proxy, cache management |
 | LAN Test | 3 | WiFi ping, download/upload throughput measurement |
@@ -201,7 +201,21 @@ This builds, deploys the binary to the device via SSH (port 2222), updates the b
 
 ### eSIM profiles (optional)
 
-With an eSIM card in the SIM slot (tested with a [9eSIM B1](docs/9esim-b1.md)), the agent can list its profiles, switch between them, download new ones from an operator QR code and delete them. It uses [lpac](https://github.com/estkme-group/lpac), which is built separately and copied to the router once:
+With an eSIM card in the SIM slot (tested with a [9eSIM B1](docs/9esim-b1.md)), the agent manages its operator profiles through [lpac](https://github.com/estkme-group/lpac), the open-source GSMA SGP.22 eSIM manager:
+
+- **List** profiles and card details (EID, firmware, free space).
+- **Switch** the active profile. The agent verifies each step (card → modem identity → mobile data) and reports why a switch didn't complete; it never switches back on its own. Internet returns in about 15–45 s; Wi‑Fi stays on.
+- **Add** a profile from the operator's QR code or activation code, with a preview of the operator and profile name before anything is written, and cancel.
+- **Rename** profiles (nicknames) and **delete** inactive ones.
+- **Operator receipts:** the card's add/remove notifications are sent to the operator's server one by one and retried while the router has mobile data.
+- **Safety:**
+  - one eSIM operation at a time;
+  - checks that it's still the same card before any change;
+  - no switching while you have airplane mode on;
+  - downloads only with mobile data.
+  - operator servers are reached over TLS checked against the GSMA eSIM root certificate that the card trusts.
+
+lpac is built separately and copied to the router once:
 
 ```bash
 cd lpac-qrtr-build
@@ -209,7 +223,7 @@ cd lpac-qrtr-build
 ./install-to-router.sh    # SSH to root@192.168.0.1:2222, installs to /data/lpac
 ```
 
-Switching, downloading and deleting require an agent password. In the apps: Router → eSIM Profiles. API and behaviour: [`zte-agent/docs/esim.md`](zte-agent/docs/esim.md). The lpac patch is AGPL-3.0 (see [`lpac-qrtr-build/`](lpac-qrtr-build/)).
+Switching, adding, renaming and deleting require an agent password. In the apps: Router → eSIM Profiles. To run lpac by hand on the router, use `flock -n /tmp/lpac.lock …` so it never overlaps the agent (full command in [`lpac-qrtr-build/README.md`](lpac-qrtr-build/README.md#running-lpac-by-hand)). If you installed lpac before 2026-10-19, rebuild and reinstall it: older bundles can't reach the operators' servers. API and behaviour: [`zte-agent/docs/esim.md`](zte-agent/docs/esim.md). The lpac patch is AGPL-3.0 (see [`lpac-qrtr-build/`](lpac-qrtr-build/)).
 
 ### Connect Mobile App
 

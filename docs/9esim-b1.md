@@ -24,6 +24,7 @@ OpenU60 app ──Wi‑Fi──▶ zte-agent ──▶ lpac ──QMI over QRTR�
 | Free storage | about 950 KB with three profiles installed |
 | Capabilities | USIM, ISIM, CSIM; Milenage and TUAK; additional profiles and test profiles |
 | Management application | Default ISD-R AID (`A0000005591010FFFFFFFF8900000100`), no override needed |
+| Trusted root CI | One: GSMA RSP2 Root CI1 (key ID `81370f51…5bebfb`), for both verification and signing. Operators' servers use TLS certificates from this root, so lpac must trust it ([certificates](../lpac-qrtr-build/README.md#operator-server-certificates)) |
 | SIM Toolkit | Offers one menu item, "LPAe Menu" (the card's built-in profile switcher) |
 | Router | ZTE U60 Pro (MU5250), firmware `CN_ZTE_MU5250V1.0.0B27` |
 | lpac | Commit `c7c8d4f` plus [`lpac-qrtr-build/patches`](../lpac-qrtr-build/patches/), QMI-over-QRTR backend, QRTR node 3, SIM slot 1 |
@@ -49,9 +50,10 @@ OpenU60 app ──Wi‑Fi──▶ zte-agent ──▶ lpac ──QMI over QRTR�
 | List profiles, card info | Works; about 0.3 s, no effect on the connection |
 | Switch profile | Works; over 20 switches between the three profiles on 2026-10-18, no reboot needed |
 | Switch verification | Works; the agent confirms card → modem identity → data connection (`GET /api/esim/switch`) |
-| Download from QR (with preview and cancel) | Implemented; tested only on its failure and cancel paths, not yet with a real operator QR code |
+| Download from QR (with preview and cancel) | Implemented; tested only on its failure and cancel paths, not yet with a real operator QR code. TLS to real operator servers is verified (see receipts) |
 | Delete profile | Implemented; tested only on its refusal paths (the active profile and unknown profiles are refused), no profile deleted yet |
-| Rename (nickname) | Not exposed |
+| Rename (nickname) | Works; set, read back and cleared on the router on 2026-10-19 |
+| Operator receipts | Works; 35 receipts left by the switching tests were delivered to three operator servers in 76 s on 2026-10-19 |
 
 ## What to expect when switching
 
