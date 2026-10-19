@@ -43,6 +43,22 @@ shutil.copy2(R/'out/bounded', bundle/'bounded')
 shutil.copy2(R/'scripts/smoke', bundle/'smoke')
 (bundle/'smoke').chmod(0o755)
 (bundle/'no-modules').mkdir(exist_ok=True)
+# Trusted roots for the operators' SM-DP+ TLS certificates (passed to lpac as LPAC_HTTP_CA_FILE).
+roots = sorted((R / 'certs').glob('*.pem'))
+if not roots: raise SystemExit('certs/*.pem missing: lpac could not verify any SM-DP+ server')
+(bundle / 'gsma-ci.pem').write_text(''.join(x.read_text() for x in roots))
+# Build provenance for zte-agent's /api/esim/chip: no host or user names.
+import datetime
+lpac_src = sorted((R / 'sources').glob('lpac-*'))
+digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+info = {
+    'lpac_commit': lpac_src[-1].name.removeprefix('lpac-') if lpac_src else 'unknown',
+    'patch_sha256': digest(R / 'patches/0001-isolated-qrtr-hardening.patch'),
+    'alpine_pins_sha256': digest(R / 'evidence/alpine-packages.json'),
+    'ca_sha256': digest(bundle / 'gsma-ci.pem'),
+    'built_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+}
+(bundle / 'BUILDINFO').write_text(''.join(f'{k}={v}\n' for k, v in info.items()))
 checks = []
 for p in sorted(bundle.rglob('*')):
     if p.is_file() and p.name != 'SHA256SUMS': checks.append(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(bundle)}')

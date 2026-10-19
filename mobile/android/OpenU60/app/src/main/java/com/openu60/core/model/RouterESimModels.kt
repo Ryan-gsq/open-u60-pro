@@ -46,9 +46,113 @@ data class RouterESimProfileDto(
 )
 
 @Serializable
+data class RouterESimReadError(
+    val kind: String? = null,
+    val message: String? = null,
+    val at: Long? = null,
+)
+
+/**
+ * GET /api/esim/profiles. While a switch reloads the SIM, or another eSIM operation holds the
+ * card, the agent answers with its last good list marked `updating`; a failed read returns
+ * that list as `stale` with `error`.
+ */
+@Serializable
 data class RouterESimProfilesResponse(
     val profiles: List<RouterESimProfileDto> = emptyList(),
+    @SerialName("observed_at") val observedAt: Long = 0,
+    val generation: Long = 0,
+    @SerialName("agent_instance") val agentInstance: Long = 0,
+    val updating: Boolean = false,
+    val stale: Boolean = false,
+    val error: RouterESimReadError? = null,
+    @SerialName("pending_receipts") val pendingReceipts: Int? = null,
 )
+
+/** The list as accepted on screen, with its freshness markers. */
+data class RouterESimInventory(
+    val profiles: List<RouterESimProfile> = emptyList(),
+    val observedAt: Long = 0,
+    val generation: Long = 0,
+    val agentInstance: Long = 0,
+    val updating: Boolean = false,
+    val stale: Boolean = false,
+    val errorKind: String? = null,
+    val errorMessage: String? = null,
+    val pendingReceipts: Int? = null,
+) {
+    /** True when this answer predates the one shown (same agent run); older agents carry no counters. */
+    fun isOlderThan(shown: RouterESimInventory): Boolean {
+        if (agentInstance == 0L || agentInstance != shown.agentInstance) return false
+        if (generation != shown.generation) return generation < shown.generation
+        return observedAt < shown.observedAt
+    }
+
+    /** Text for a failed read; null when the list is current. */
+    val errorText: String?
+        get() {
+            val message = errorMessage ?: return null
+            return when (errorKind) {
+                "sim_reloading" -> "The eSIM is still settling after the switch."
+                "management_unavailable" -> "The eSIM's management app isn't responding ($message)."
+                "not_installed" -> "The eSIM manager (lpac) isn't installed on the router."
+                else -> message
+            }
+        }
+}
+
+/** GET /api/esim/switch: the agent's verified progress of the last switch. */
+@Serializable
+data class RouterESimSwitchStatus(
+    val state: String = "idle",
+    @SerialName("target_iccid") val targetICCID: String? = null,
+    val generation: Long? = null,
+    @SerialName("started_at") val startedAt: Long? = null,
+    @SerialName("finished_at") val finishedAt: Long? = null,
+    val note: String? = null,
+    /** Why data didn't connect, when the router knows: `roaming_off` or `data_off`. */
+    val reason: String? = null,
+) {
+    val isRunning: Boolean get() = state in setOf("card_busy", "reloading", "card_confirmed", "modem_confirmed")
+
+    /** The card is confirmed: a list read now shows the new active profile. */
+    val cardConfirmed: Boolean get() = state !in setOf("idle", "card_busy", "reloading", "card_unconfirmed")
+
+    val phase: RouterESimConnectionPhase
+        get() = when (state) {
+            "card_busy" -> RouterESimConnectionPhase.SWITCHING
+            "reloading" -> RouterESimConnectionPhase.RELOADING
+            "card_confirmed", "modem_confirmed" -> RouterESimConnectionPhase.REGISTERING
+            "connected" -> RouterESimConnectionPhase.CONNECTED
+            "no_data", "modem_unconfirmed", "card_unconfirmed" -> RouterESimConnectionPhase.WAITING
+            "not_applied" -> RouterESimConnectionPhase.UNAVAILABLE
+            else -> RouterESimConnectionPhase.CHECKING
+        }
+
+    /** Shown while the switch runs: the eSIM refused for now and the router keeps trying. */
+    val progressNote: String?
+        get() = if (state == "card_busy") "The eSIM is busy and refused the switch for now. The router keeps trying for up to 2½ minutes." else null
+
+    /** Why a finished switch did not reach `connected`. */
+    val outcomeNote: String?
+        get() = when (state) {
+            "no_data" -> when (reason) {
+                "roaming_off" -> "This profile roams on a local network and Data Roaming is off. Turn on Data Roaming in Mobile Network."
+                "data_off" -> "The profile is active, but Mobile Data is off. Turn it on in Mobile Network."
+                else -> "The profile is active, but mobile data hasn't connected. Check the plan or coverage."
+            }
+            "modem_unconfirmed" -> "The eSIM switched, but the router still uses the previous SIM. Restart the router to finish."
+            "card_unconfirmed" -> "The eSIM couldn't be read after the switch. Refresh in a moment."
+            "not_applied" ->
+                if (reason == "card_busy") "The eSIM stayed busy and didn't switch; the previous profile is still active. Try again in a few minutes."
+                else "The switch didn't happen; the previous profile is still active."
+            else -> null
+        }
+}
+
+/** GET /api/esim/notifications (only the count is used on screen). */
+@Serializable
+data class RouterESimNotifications(val count: Int? = null)
 
 @Serializable
 data class RouterESimChipResponse(
@@ -58,6 +162,18 @@ data class RouterESimChipResponse(
 )
 
 object RouterESimParser {
+    fun parseInventory(response: RouterESimProfilesResponse): RouterESimInventory = RouterESimInventory(
+        profiles = parseProfiles(response),
+        observedAt = response.observedAt,
+        generation = response.generation,
+        agentInstance = response.agentInstance,
+        updating = response.updating,
+        stale = response.stale,
+        errorKind = response.error?.kind,
+        errorMessage = response.error?.message,
+        pendingReceipts = response.pendingReceipts,
+    )
+
     fun parseProfiles(response: RouterESimProfilesResponse): List<RouterESimProfile> =
         response.profiles.mapNotNull { p ->
             val iccid = p.iccid

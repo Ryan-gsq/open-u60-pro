@@ -30,7 +30,116 @@ struct RouterESimChip: Equatable {
     static let empty = RouterESimChip()
 }
 
+/// GET /api/esim/profiles: the list plus how fresh it is. While a switch reloads the SIM, or
+/// another eSIM operation holds the card, the agent answers with its last good list marked
+/// `updating`; a failed read returns that list as `stale` with `error`.
+struct RouterESimInventory: Equatable {
+    var profiles: [RouterESimProfile] = []
+    var observedAt: UInt64 = 0
+    var generation: UInt64 = 0
+    var agentInstance: UInt64 = 0
+    var updating = false
+    var stale = false
+    var errorKind: String?
+    var errorMessage: String?
+    var pendingReceipts: Int?
+
+    /// True when this answer predates the one on screen (same agent run, older change counter
+    /// or older read) and must be ignored. Answers from older agents carry no counters.
+    func isOlder(than shown: RouterESimInventory) -> Bool {
+        guard agentInstance != 0, agentInstance == shown.agentInstance else { return false }
+        if generation != shown.generation { return generation < shown.generation }
+        return observedAt < shown.observedAt
+    }
+
+    /// Text for a failed read; `nil` when the list is current.
+    var errorText: String? {
+        guard let errorMessage else { return nil }
+        switch errorKind {
+        case "sim_reloading": return "The eSIM is still settling after the switch."
+        case "management_unavailable": return "The eSIM's management app isn't responding (\(errorMessage))."
+        case "not_installed": return "The eSIM manager (lpac) isn't installed on the router."
+        default: return errorMessage
+        }
+    }
+}
+
+/// GET /api/esim/switch: the agent's verified progress of the last switch.
+struct RouterESimSwitchStatus: Decodable, Equatable {
+    var state: String = "idle"
+    var targetICCID: String?
+    var generation: UInt64?
+    var startedAt: UInt64?
+    var finishedAt: UInt64?
+    var note: String?
+    /// Why data didn't connect, when the router knows: `roaming_off` or `data_off`.
+    var reason: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case state, generation, note, reason
+        case targetICCID = "target_iccid"
+        case startedAt = "started_at"
+        case finishedAt = "finished_at"
+    }
+
+    var isRunning: Bool { ["card_busy", "reloading", "card_confirmed", "modem_confirmed"].contains(state) }
+
+    /// The card is confirmed: a list read now shows the new active profile.
+    var cardConfirmed: Bool { !["idle", "card_busy", "reloading", "card_unconfirmed"].contains(state) }
+
+    var phase: RouterESimConnectionPhase {
+        switch state {
+        case "card_busy": .switching
+        case "reloading": .reloading
+        case "card_confirmed", "modem_confirmed": .registering
+        case "connected": .connected
+        case "no_data", "modem_unconfirmed", "card_unconfirmed": .waiting
+        case "not_applied": .unavailable
+        default: .checking
+        }
+    }
+
+    /// Shown while the switch runs: the eSIM refused for now and the router keeps trying.
+    var progressNote: String? {
+        state == "card_busy" ? "The eSIM is busy and refused the switch for now. The router keeps trying for up to 2½ minutes." : nil
+    }
+
+    /// Why a finished switch did not reach `connected`.
+    var outcomeNote: String? {
+        switch state {
+        case "no_data":
+            switch reason {
+            case "roaming_off": "This profile roams on a local network and Data Roaming is off. Turn on Data Roaming in Mobile Network."
+            case "data_off": "The profile is active, but Mobile Data is off. Turn it on in Mobile Network."
+            default: "The profile is active, but mobile data hasn't connected. Check the plan or coverage."
+            }
+        case "modem_unconfirmed": "The eSIM switched, but the router still uses the previous SIM. Restart the router to finish."
+        case "card_unconfirmed": "The eSIM couldn't be read after the switch. Refresh in a moment."
+        case "not_applied":
+            reason == "card_busy"
+                ? "The eSIM stayed busy and didn't switch; the previous profile is still active. Try again in a few minutes."
+                : "The switch didn't happen; the previous profile is still active."
+        default: nil
+        }
+    }
+}
+
 enum RouterESimParser {
+    static func parseInventory(_ data: [String: Any]) -> RouterESimInventory {
+        let error = data["error"] as? [String: Any]
+        return RouterESimInventory(
+            profiles: parseProfiles(data),
+            observedAt: asUInt64(data["observed_at"]),
+            generation: asUInt64(data["generation"]),
+            agentInstance: asUInt64(data["agent_instance"]),
+            updating: data["updating"] as? Bool ?? false,
+            stale: data["stale"] as? Bool ?? false,
+            errorKind: error?["kind"] as? String,
+            errorMessage: error?["message"] as? String,
+            pendingReceipts: asInt(data["pending_receipts"])
+        )
+    }
+
     static func parseProfiles(_ data: [String: Any]) -> [RouterESimProfile] {
         guard let items = data["profiles"] as? [[String: Any]] else { return [] }
         return items.compactMap { item in
@@ -52,6 +161,12 @@ enum RouterESimParser {
             firmware: data["firmware"] as? String ?? "",
             freeMemoryBytes: asInt(data["free_nvm_bytes"])
         )
+    }
+
+    private static func asUInt64(_ value: Any?) -> UInt64 {
+        if let n = value as? NSNumber { return n.uint64Value }
+        if let s = value as? String { return UInt64(s) ?? 0 }
+        return 0
     }
 
     private static func asInt(_ value: Any?) -> Int? {

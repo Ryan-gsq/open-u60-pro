@@ -458,7 +458,7 @@ object DeviceParser {
         is Int -> value
         is Long -> value.toInt()
         is Double -> value.toInt()
-        is String -> value.toIntOrNull()
+        is String -> value.trim().let { it.toIntOrNull() ?: it.toDoubleOrNull()?.toInt() }
         else -> null
     }
 
@@ -466,7 +466,7 @@ object DeviceParser {
         is Double -> value
         is Int -> value.toDouble()
         is Long -> value.toDouble()
-        is String -> value.toDoubleOrNull()
+        is String -> value.trim().toDoubleOrNull()
         else -> null
     }
 
@@ -474,14 +474,15 @@ object DeviceParser {
         is Long -> value
         is Int -> value.toLong()
         is Double -> value.toLong()
-        is String -> value.toLongOrNull()
+        is String -> value.trim().let { it.toLongOrNull() ?: it.toDoubleOrNull()?.toLong() }
         else -> null
     }
 
     fun asBool(value: Any?): Boolean = when (value) {
         is Boolean -> value
-        is String -> value == "1" || value.lowercase() == "true" || value.lowercase() == "on"
+        is String -> value.trim().lowercase().let { it == "true" || it == "on" || (it.toLongOrNull() ?: 0L) != 0L }
         is Int -> value != 0
+        is Long -> value != 0L
         else -> false
     }
 }

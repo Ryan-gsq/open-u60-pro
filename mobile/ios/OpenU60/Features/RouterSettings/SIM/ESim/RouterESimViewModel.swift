@@ -11,6 +11,16 @@ final class RouterESimViewModel {
     var messageIsError = false
     var pendingSwitch: RouterESimProfile?
     var pendingDelete: RouterESimProfile?
+    var pendingRename: RouterESimProfile?
+    var renameText = ""
+    /// The list as last accepted from the agent, with its freshness markers.
+    private(set) var inventory = RouterESimInventory()
+    /// A failed list read, shown with the list it failed to refresh; cleared only by a newer
+    /// clean read.
+    private(set) var listError: String?
+    /// Operator receipts waiting on the card (`nil` = unknown or an older agent).
+    private(set) var pendingReceipts: Int?
+    private(set) var receiptsSending = false
     private(set) var download = RouterESimDownloadStatus()
     private(set) var operationInFlight = false
     private(set) var downloadNote: String?
@@ -34,6 +44,10 @@ final class RouterESimViewModel {
     @ObservationIgnored private var nextStatusCheck = Date.distantPast
     @ObservationIgnored private var reconnectTracker: RouterESimReconnectTracker?
     @ObservationIgnored private var switchedAt: Date?
+    /// Following the agent's verified switch progress (`GET /api/esim/switch`); off for older
+    /// agents, which fall back to `reconnectTracker`.
+    @ObservationIgnored private var followSwitch = false
+    @ObservationIgnored private var switchListRead = false
 
     init(client: AgentClient, authManager: AuthManager) {
         self.client = client
@@ -60,6 +74,14 @@ final class RouterESimViewModel {
             await loadChip()
         }
         if !download.isBusy { _ = await refreshConnection() }
+    }
+
+    /// The list warning retries only the read; it must never replay a profile change.
+    func retryProfiles() async {
+        guard !blocksSwitching, !downloadInFlight else { return }
+        isLoading = true
+        defer { isLoading = false; hasLoaded = true }
+        await loadProfiles()
     }
 
     func startMonitoring() {
@@ -112,14 +134,16 @@ final class RouterESimViewModel {
                                       profileClass: $0.profileClass)
                 }
             }
-            reconnectTracker = RouterESimReconnectTracker(targetICCID: target.iccid)
-            switchedAt = Date()
-            connectionPhase = .reloading
-            try await Task.sleep(for: .seconds(3))
-            await loadProfiles()
+            beginFollowingSwitch(to: target)
         } catch {
             if error.isCancellation {
                 if reconnectTracker == nil { connectionPhase = .unavailable; switchingTo = nil }
+                return
+            }
+            if outcomeUnknown(error) {
+                // lpac failed or timed out, but the card may have switched: the agent checks.
+                beginFollowingSwitch(to: target)
+                showMessage("The router is checking whether the switch happened.", isError: false)
                 return
             }
             connectionPhase = .unavailable
@@ -128,6 +152,56 @@ final class RouterESimViewModel {
             switchedAt = nil
             showMessage("Switch failed: \(errorText(error))", isError: true)
         }
+    }
+
+    private func beginFollowingSwitch(to target: RouterESimProfile) {
+        reconnectTracker = RouterESimReconnectTracker(targetICCID: target.iccid)
+        switchedAt = Date()
+        followSwitch = true
+        switchListRead = false
+        connectionPhase = .reloading
+    }
+
+    func requestRename(_ profile: RouterESimProfile) {
+        guard !blocksSwitching else { return }
+        renameText = profile.nickname
+        pendingRename = profile
+    }
+
+    /// Takes the profile from the alert button (see `confirmSwitch(to:)`). An empty name clears
+    /// the nickname, so the operator's name shows again.
+    func confirmRename(_ target: RouterESimProfile, to name: String) async {
+        let nickname = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingRename = nil
+        guard nickname.utf8.count <= 64 else {
+            showMessage("Nicknames can be up to 64 bytes.", isError: true)
+            return
+        }
+        guard !blocksSwitching, nickname != target.nickname else { return }
+        operationInFlight = true
+        message = nil
+        defer { operationInFlight = false }
+        do {
+            while downloadInFlight { try await Task.sleep(for: .milliseconds(50)) }
+            _ = try await client.postJSON("/api/esim/nickname", body: ["iccid": target.iccid, "nickname": nickname])
+            await loadProfiles()
+            showMessage(nickname.isEmpty ? "Nickname cleared." : "Renamed to \(nickname).", isError: false)
+        } catch { if !error.isCancellation { showMessage(errorText(error), isError: true) } }
+    }
+
+    /// Sends the operator receipts waiting on the card now; the router keeps retrying the rest.
+    func sendReceipts() async {
+        guard !blocksSwitching, !receiptsSending else { return }
+        receiptsSending = true
+        defer { receiptsSending = false }
+        do {
+            _ = try await client.postJSON("/api/esim/notifications/process", body: [:])
+            try await Task.sleep(for: .seconds(8))
+            let data = try await client.getJSON("/api/esim/notifications")
+            if let count = data["count"] as? Int { pendingReceipts = count }
+            showMessage(pendingReceipts == 0 ? "Operator receipts sent."
+                        : "Some receipts couldn't be sent yet. The router keeps retrying.", isError: pendingReceipts != 0)
+        } catch { if !error.isCancellation { showMessage(errorText(error), isError: true) } }
     }
 
     func requestDelete(_ profile: RouterESimProfile) {
@@ -241,6 +315,9 @@ final class RouterESimViewModel {
         guard !statusInFlight, !isSwitching else { return true }
         statusInFlight = true
         defer { statusInFlight = false }
+        if followSwitch, let handled = await followSwitchStatus() {
+            return handled
+        }
         do {
             let sim = try await client.getJSON("/api/sim/info")
             let data = try await client.getJSON("/api/modem/data")
@@ -276,13 +353,77 @@ final class RouterESimViewModel {
         }
     }
 
+    /// One step of the agent's verified switch: card → modem identity → data. Returns `nil`
+    /// when the agent has no switch endpoint (older agent), so the tracker fallback runs.
+    private func followSwitchStatus() async -> Bool? {
+        let status: RouterESimSwitchStatus
+        do {
+            status = try await client.get("/api/esim/switch")
+        } catch {
+            guard !error.isCancellation else { return false }
+            if case AgentError.serverError(let text) = error, text.contains("not found") {
+                followSwitch = false
+                return nil
+            }
+            connectionNote = errorText(error)
+            return false
+        }
+        guard !Task.isCancelled, !isSwitching else { return false }
+        if status.state == "idle" {
+            // The agent restarted and lost the switch: fall back to watching the modem.
+            followSwitch = false
+            return nil
+        }
+        connectionPhase = status.phase
+        connectionNote = status.progressNote
+        if status.cardConfirmed && !switchListRead {
+            switchListRead = true
+            await loadProfiles()
+        }
+        if !status.isRunning {
+            followSwitch = false
+            reconnectTracker = nil
+            connectionNote = status.outcomeNote
+            await loadProfiles()
+        }
+        if connectionPhase == .connected { await readNetwork() }
+        return true
+    }
+
+    private func readNetwork() async {
+        guard let signal = try? await client.getJSON("/api/network/signal") else { return }
+        let (nr, lte, _, op) = SignalParser.parseNetInfo(signal)
+        operatorName = op.provider
+        networkType = op.networkType.isEmpty ? "" : op.displayNetworkType(nrConnected: nr.isConnected, lteSignal: lte)
+        signalBars = min(max(op.signalBar, 0), 5)
+    }
+
     private func loadProfiles() async {
         do {
-            profiles = RouterESimParser.parseProfiles(try await client.getJSON("/api/esim/profiles"))
+            let fresh = RouterESimParser.parseInventory(try await client.getJSON("/api/esim/profiles"))
+            // An answer older than what is shown, or the pre-switch list the agent serves while the
+            // SIM reloads, must not replace the switch target on screen.
+            guard !fresh.isOlder(than: inventory), !(fresh.updating && followSwitch) else { return }
+            inventory = fresh
+            profiles = fresh.profiles
+            pendingReceipts = fresh.pendingReceipts
+            listError = fresh.errorText.map { "\($0) Showing the list read at \(Self.clock(fresh.observedAt))." }
         } catch {
             guard !error.isCancellation else { return }
-            showMessage("Could not read eSIM profiles: \(errorText(error))", isError: true)
+            listError = "Couldn't read eSIM profiles: \(errorText(error))"
         }
+    }
+
+    private static func clock(_ unix: UInt64) -> String {
+        guard unix > 0 else { return "an earlier time" }
+        return Date(timeIntervalSince1970: TimeInterval(unix)).formatted(date: .omitted, time: .shortened)
+    }
+
+    /// The agent replies `outcome: "unknown"` when lpac failed or timed out mid-switch.
+    private func outcomeUnknown(_ error: Error) -> Bool {
+        guard case AgentError.serverError(let text) = error, let data = text.data(using: .utf8),
+              let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return envelope["outcome"] as? String == "unknown"
     }
 
     private func loadChip() async {

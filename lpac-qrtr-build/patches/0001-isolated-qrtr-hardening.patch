@@ -585,7 +585,16 @@
  int euicc_driver_main_apdu(const int argc, char **argv) {
 --- a/driver/http/curl.c
 +++ b/driver/http/curl.c
-@@ -88,8 +88,8 @@
+@@ -17,6 +17,8 @@
+ #    define CURLOPT_WRITEDATA 10001
+ #    define CURLOPT_SSL_VERIFYPEER 64
+ #    define CURLOPT_SSL_VERIFYHOST 81
++#    define CURLOPT_CAINFO 10065
++#    define CURLOPT_CAPATH 10097
+ #    define CURLOPT_HTTPHEADER 10023
+ #    define CURLOPT_POSTFIELDS 10015
+ #    define CURLOPT_POSTFIELDSIZE 60
+@@ -88,8 +90,15 @@
      libcurl._curl_easy_setopt(curl, CURLOPT_URL, url);
      libcurl._curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_trans_write_callback);
      libcurl._curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&responseData);
@@ -593,6 +602,112 @@
 -    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 +    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
 +    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
++    // SM-DP+ servers use TLS certificates from the GSMA eSIM root CI, not a web CA.
++    // LPAC_HTTP_CA_FILE names a file holding only the trusted CI roots; the system directory is ignored.
++    const char *ca_file = getenv("LPAC_HTTP_CA_FILE");
++    if (ca_file != NULL && ca_file[0] != '\0') {
++        libcurl._curl_easy_setopt(curl, CURLOPT_CAINFO, ca_file);
++        libcurl._curl_easy_setopt(curl, CURLOPT_CAPATH, (char *)NULL);
++    }
      for (int i = 0; h[i] != NULL; i++) {
          nheaders = libcurl._curl_slist_append(headers, h[i]);
          if (nheaders == NULL) {
+--- a/src/applet/profile/enable.c
++++ b/src/applet/profile/enable.c
+@@ -28,6 +28,7 @@
+ 
+     if (ret) {
+         const char *reason;
++        char unknown[32];
+         switch (ret) {
+         case 1:
+             reason = "iccid or aid not found";
+@@ -44,8 +45,15 @@
+         case -1:
+             reason = "internal error, maybe illegal iccid/aid coding";
+             break;
++        case 5:
++            reason = "cat busy";
++            break;
++        case 127:
++            reason = "undefined error";
++            break;
+         default:
+-            reason = "unknown";
++            snprintf(unknown, sizeof(unknown), "unknown result %d", ret);
++            reason = unknown;
+             break;
+         }
+         jprint_error("es10c_enable_profile", reason);
+--- a/src/applet/profile/disable.c
++++ b/src/applet/profile/disable.c
+@@ -28,6 +28,7 @@
+ 
+     if (ret) {
+         const char *reason;
++        char unknown[32];
+         switch (ret) {
+         case 1:
+             reason = "iccid or aid not found";
+@@ -41,8 +42,15 @@
+         case -1:
+             reason = "internal error, maybe illegal iccid/aid coding";
+             break;
++        case 5:
++            reason = "cat busy";
++            break;
++        case 127:
++            reason = "undefined error";
++            break;
+         default:
+-            reason = "unknown";
++            snprintf(unknown, sizeof(unknown), "unknown result %d", ret);
++            reason = unknown;
+             break;
+         }
+         jprint_error("es10c_disable_profile", reason);
+--- a/src/applet/profile/delete.c
++++ b/src/applet/profile/delete.c
+@@ -23,6 +23,7 @@
+ 
+     if (ret) {
+         const char *reason;
++        char unknown[32];
+         switch (ret) {
+         case 1:
+             reason = "iccid or aid not found";
+@@ -36,8 +37,12 @@
+         case -1:
+             reason = "internal error, maybe illegal iccid/aid coding";
+             break;
++        case 127:
++            reason = "undefined error";
++            break;
+         default:
+-            reason = "unknown";
++            snprintf(unknown, sizeof(unknown), "unknown result %d", ret);
++            reason = unknown;
+             break;
+         }
+         jprint_error("es10c_delete_profile", reason);
+--- a/src/applet/profile/nickname.c
++++ b/src/applet/profile/nickname.c
+@@ -28,12 +28,17 @@
+ 
+     if ((ret = es10c_set_nickname(&euicc_ctx, iccid, new_name))) {
+         const char *reason;
++        char unknown[32];
+         switch (ret) {
+         case 1:
+             reason = "iccid not found";
+             break;
++        case 127:
++            reason = "undefined error";
++            break;
+         default:
+-            reason = "unknown";
++            snprintf(unknown, sizeof(unknown), "unknown result %d", ret);
++            reason = unknown;
+             break;
+         }
+         jprint_error("es10c_set_nickname", reason);

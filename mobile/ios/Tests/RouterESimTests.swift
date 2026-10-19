@@ -69,6 +69,43 @@ struct RouterESimTests {
         precondition(install.isBusy && !install.canCancel && install.progressText == "Cancelling…")
         install.state = "done"
         precondition(!install.isBusy && !install.canCancel && install.progressText == "GOMO added.")
+        let inv = RouterESimParser.parseInventory(data(#"""
+        {"agent_instance":1792300000000,"generation":3,"observed_at":1792300100,"updating":false,"stale":true,
+         "error":{"kind":"sim_reloading","message":"euicc_init","at":1792300110},"pending_receipts":1,
+         "profiles":[{"class":"operational","iccid":"8963000000000000001","state":"enabled","provider":"SMART","name":"Operational","nickname":null}]}
+        """#))
+        precondition(inv.agentInstance == 1792300000000 && inv.generation == 3 && inv.observedAt == 1792300100)
+        precondition(inv.stale && !inv.updating && inv.pendingReceipts == 1 && inv.profiles.count == 1)
+        precondition(inv.errorText == "The eSIM is still settling after the switch.")
+        var older = inv; older.generation = 2
+        precondition(older.isOlder(than: inv) && !inv.isOlder(than: older))
+        var sameGenEarlier = inv; sameGenEarlier.observedAt -= 1
+        precondition(sameGenEarlier.isOlder(than: inv))
+        var otherRun = inv; otherRun.agentInstance += 1; otherRun.generation = 0
+        precondition(!otherRun.isOlder(than: inv), "A restarted agent's answer is never treated as older")
+        precondition(!RouterESimParser.parseInventory(["profiles": []]).isOlder(than: inv), "Older agents carry no counters")
+        precondition(RouterESimParser.parseInventory(data(#"{"profiles":[],"error":null,"pending_receipts":null}"#)).errorText == nil)
+
+        let sw = try! JSONDecoder().decode(RouterESimSwitchStatus.self, from: Data(#"{"state":"card_confirmed","target_iccid":"8963000000000000002","generation":4,"started_at":1,"card_confirmed_at":7,"finished_at":0,"note":null}"#.utf8))
+        precondition(sw.isRunning && sw.cardConfirmed && sw.phase == .registering && sw.targetICCID == "8963000000000000002")
+        for (state, phase, running) in [("reloading", RouterESimConnectionPhase.reloading, true), ("connected", .connected, false),
+                                        ("no_data", .waiting, false), ("modem_unconfirmed", .waiting, false), ("not_applied", .unavailable, false)] {
+            let st = RouterESimSwitchStatus(state: state)
+            precondition(st.phase == phase && st.isRunning == running, state)
+        }
+        precondition(!RouterESimSwitchStatus(state: "reloading").cardConfirmed && RouterESimSwitchStatus(state: "connected").outcomeNote == nil)
+        precondition(RouterESimSwitchStatus(state: "modem_unconfirmed").outcomeNote?.contains("Restart the router") == true)
+        let roaming = try! JSONDecoder().decode(RouterESimSwitchStatus.self, from: Data(#"{"state":"no_data","reason":"roaming_off","note":null}"#.utf8))
+        precondition(roaming.outcomeNote?.contains("Turn on Data Roaming") == true, "a roaming profile names the fix")
+        precondition(RouterESimSwitchStatus(state: "no_data", reason: "data_off").outcomeNote?.contains("Mobile Data is off") == true)
+        precondition(RouterESimSwitchStatus(state: "no_data").outcomeNote?.contains("plan or coverage") == true)
+        let busy = RouterESimSwitchStatus(state: "card_busy")
+        precondition(busy.isRunning && !busy.cardConfirmed && busy.phase == .switching, "a busy retry is still a switch in progress")
+        precondition(busy.progressNote?.contains("keeps trying") == true && busy.outcomeNote == nil)
+        precondition(RouterESimSwitchStatus(state: "not_applied", reason: "card_busy").outcomeNote?.contains("stayed busy") == true)
+        precondition(RouterESimSwitchStatus(state: "not_applied").outcomeNote?.contains("didn't happen") == true)
+        precondition(RouterESimSwitchStatus(state: "connected").progressNote == nil)
+
         print("RouterESimTests: identifiers, reconnection, activation codes, and download stages passed")
     }
 }

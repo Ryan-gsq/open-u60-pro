@@ -219,9 +219,9 @@ fun JsonObject.toMap(): Map<String, Any?> {
 
 fun JsonElement.toAny(): Any? = when (this) {
     is JsonNull -> null
-    is JsonPrimitive -> {
-        booleanOrNull ?: intOrNull ?: longOrNull ?: doubleOrNull ?: contentOrNull
-    }
+    // JSON strings stay strings: kotlinx's intOrNull/longOrNull also parse the leading number of
+    // "03:00", "2409:8a00::1" or "123456:ABC", and ICCIDs, IMSIs and phone numbers lose digits.
+    is JsonPrimitive -> if (isString) content else (booleanOrNull ?: intOrNull ?: longOrNull ?: doubleOrNull ?: contentOrNull)
     is JsonObject -> toMap()
     is JsonArray -> map { it.toAny() }
 }
