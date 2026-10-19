@@ -28,7 +28,16 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 
+      # The binary links the LGPL-2.1 euicc crate: its notice and license travel with it.
+      - name: Collect release files
+        run: |
+          mkdir dist
+          cp target/aarch64-unknown-linux-musl/release/zte-agent dist/
+          cp THIRD_PARTY_NOTICES.md dist/
+          cp euicc/LICENSE dist/LICENSE-LGPL-2.1.txt
+          cp LICENSE dist/LICENSE-MIT.txt
+
       - name: Upload binary to release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/aarch64-unknown-linux-musl/release/zte-agent
+          files: dist/*

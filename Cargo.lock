@@ -281,6 +281,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "euicc"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1805,10 +1814,12 @@ name = "zte-agent"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "euicc",
  "httpdate",
  "libc",
  "p256",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
