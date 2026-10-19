@@ -261,6 +261,24 @@ class RouterESimReconnectTracker(private val targetICCID: String) {
     }
 }
 
+/**
+ * A moved SIM identity re-reads the eSIM list. A change that arrives while a read, a switch or an
+ * operation runs waits for it to end instead of being dropped: the last change of a transition
+ * (`online`) has no later one to carry it.
+ */
+class RouterESimIdentityRead {
+    private var pending = false
+
+    fun changed() { pending = true }
+
+    /** True once per waiting change, as soon as the screen is not [busy]. */
+    fun take(busy: Boolean): Boolean {
+        if (!pending || busy) return false
+        pending = false
+        return true
+    }
+}
+
 /** Typed decoding preserves the SIM identifier's exact digits. */
 @Serializable
 data class RouterESimSIMStatus(

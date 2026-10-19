@@ -13,6 +13,8 @@ final class AgentClient {
     var postError: Error?
     var holdStatus = false
     var statusGate: CheckedContinuation<Void, Never>?
+    var holdProfiles = false
+    var profilesGate: CheckedContinuation<Void, Never>?
     var entries: [[String: Any]] = [
         ["iccid": "8963000000000000001", "provider": "Smart", "class": "operational", "state": "enabled"],
         ["iccid": "8963000000000000002", "provider": "GOMO", "class": "operational", "state": "disabled"]
@@ -25,6 +27,7 @@ final class AgentClient {
     }
     func getJSON(_ path: String) async throws -> [String: Any] {
         requests.append("GET " + path)
+        if path == "/api/esim/profiles" && holdProfiles { await withCheckedContinuation { profilesGate = $0 } }
         switch path {
         case "/api/esim/profiles": return inventoryMeta.merging(["profiles": entries]) { _, new in new }
         case "/api/esim/chip": return ["eid": "89000000000000000000000000000001", "firmware": "4.2.0"]
@@ -186,11 +189,22 @@ struct RouterESimFlowTests {
         let idleMark = watchClient.requests.count
         try? await Task.sleep(for: .milliseconds(1200))
         precondition(!watchClient.requests[idleMark...].contains("GET /api/esim/profiles"), "An unchanged identity reads nothing")
+        precondition(!watchVM.blocksSwitching)
+        watchClient.holdProfiles = true
         watchClient.identityRevision += 1
-        let reread = await soon { watchClient.requests[idleMark...].contains("GET /api/esim/profiles") }
-        precondition(reread, "A new SIM identity re-reads the list")
+        let reread = await soon { watchClient.profilesGate != nil }
+        precondition(reread && watchClient.requests[idleMark...].contains("GET /api/esim/profiles"), "A new SIM identity re-reads the list")
+        // The agent holds the card for that read: a switch confirmed now must wait, not hit a 409.
+        precondition(watchVM.blocksSwitching, "The identity-triggered list read marks the screen busy")
+        let otherProfile = watchVM.profiles.first(where: \.canEnable)!
+        await watchVM.confirmSwitch(to: otherProfile)
+        precondition(!watchClient.requests.contains("POST /api/esim/enable"), "No switch while the identity re-read holds the card")
+        watchClient.holdProfiles = false
+        watchClient.profilesGate?.resume()
+        watchClient.profilesGate = nil
         let rechecked = await soon { watchClient.requests[idleMark...].contains("GET /api/sim/info") }
         precondition(rechecked, "A new SIM identity checks the connection now")
+        precondition(!watchVM.isLoading, "The screen is free again after the re-read")
         watchVM.stopMonitoring()
         print("RouterESimFlowTests: request ordering, operation guards, installation safety, resume, deletion, errors, and identity re-reads passed")
     }

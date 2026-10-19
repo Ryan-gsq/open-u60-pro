@@ -183,4 +183,18 @@ class RouterESimParserTest {
         assertEquals(RouterESimConnectionPhase.UNAVAILABLE, RouterESimSwitchStatus("not_applied").phase)
         assertFalse(RouterESimSwitchStatus("connected").isRunning)
     }
+
+    @Test
+    fun identityChangeDuringAReadWaitsForItInsteadOfBeingDropped() {
+        val read = RouterESimIdentityRead()
+        assertFalse("no change, no read", read.take(busy = false))
+        read.changed()
+        assertFalse("the `online` change lands while a list read runs", read.take(busy = true))
+        assertFalse("still running", read.take(busy = true))
+        assertTrue("read once the screen is free", read.take(busy = false))
+        assertFalse("one change, one read", read.take(busy = false))
+        read.changed(); read.changed()
+        assertTrue("changes that pile up during a read need one read", read.take(busy = false))
+        assertFalse(read.take(busy = false))
+    }
 }

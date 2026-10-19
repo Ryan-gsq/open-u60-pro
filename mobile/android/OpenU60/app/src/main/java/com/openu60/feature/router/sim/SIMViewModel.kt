@@ -10,6 +10,7 @@ import com.openu60.core.network.AgentError
 import com.openu60.core.network.AuthManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,10 +44,7 @@ class SIMViewModel @Inject constructor(
         viewModelScope.launch {
             _state.value = _state.value.copy(isLoading = true, message = null)
             try {
-                val infoDeferred = async { agentClient.getJSON("/api/sim/info") }
-                val lockDeferred = async { agentClient.getJSON(LOCK_TRIALS_PATH) }
-                val simInfo = SIMParser.parseSIMInfo(infoDeferred.await())
-                val lockInfo = SIMParser.parseSIMLock(lockDeferred.await())
+                val (simInfo, lockInfo) = read { agentClient.getJSON(it) }
                 _state.value = _state.value.copy(simInfo = simInfo, lockInfo = lockInfo, isLoading = false)
             } catch (e: AgentError.Unauthorized) {
                 if (authManager.reauthenticate()) refresh() else setError(e.message)
@@ -141,5 +139,17 @@ class SIMViewModel @Inject constructor(
     companion object {
         /** The agent routes only lock-trials; a 404 here would fail the whole refresh. */
         internal const val LOCK_TRIALS_PATH = "/api/sim/lock-trials"
+
+        /**
+         * Reads SIM info and lock trials in parallel. The reads get their own scope so a failed
+         * one is thrown to the caller's catch: as direct children of the screen's launch it would
+         * cancel that launch and crash the app past the catch (identity changes refresh while the
+         * modem reloads the SIM, when these reads fail).
+         */
+        internal suspend fun read(get: suspend (String) -> Map<String, Any?>): Pair<SIMInfo, SIMLockInfo> = coroutineScope {
+            val info = async { get("/api/sim/info") }
+            val lock = async { get(LOCK_TRIALS_PATH) }
+            SIMParser.parseSIMInfo(info.await()) to SIMParser.parseSIMLock(lock.await())
+        }
     }
 }

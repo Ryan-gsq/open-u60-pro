@@ -100,7 +100,13 @@ final class RouterESimViewModel {
             if self.client.identityRevision != self.seenIdentityRevision {
                 self.seenIdentityRevision = self.client.identityRevision
                 self.nextStatusCheck = .distantPast
-                if !self.blocksSwitching { await self.loadProfiles() }
+                if !self.blocksSwitching {
+                    // Busy while the agent holds the card for the read, so a switch, rename or
+                    // delete waits for it instead of failing with "eSIM manager busy".
+                    self.isLoading = true
+                    defer { self.isLoading = false }
+                    await self.loadProfiles()
+                }
             }
             if self.download.isBusy || Date() >= self.nextDownloadCheck {
                 await self.pollDownload()
