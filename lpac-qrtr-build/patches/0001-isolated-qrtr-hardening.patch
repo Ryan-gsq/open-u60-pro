@@ -612,3 +612,102 @@
      for (int i = 0; h[i] != NULL; i++) {
          nheaders = libcurl._curl_slist_append(headers, h[i]);
          if (nheaders == NULL) {
+--- a/src/applet/profile/enable.c
++++ b/src/applet/profile/enable.c
+@@ -28,6 +28,7 @@
+ 
+     if (ret) {
+         const char *reason;
++        char unknown[32];
+         switch (ret) {
+         case 1:
+             reason = "iccid or aid not found";
+@@ -44,8 +45,15 @@
+         case -1:
+             reason = "internal error, maybe illegal iccid/aid coding";
+             break;
++        case 5:
++            reason = "cat busy";
++            break;
++        case 127:
++            reason = "undefined error";
++            break;
+         default:
+-            reason = "unknown";
++            snprintf(unknown, sizeof(unknown), "unknown result %d", ret);
++            reason = unknown;
+             break;
+         }
+         jprint_error("es10c_enable_profile", reason);
+--- a/src/applet/profile/disable.c
++++ b/src/applet/profile/disable.c
+@@ -28,6 +28,7 @@
+ 
+     if (ret) {
+         const char *reason;
++        char unknown[32];
+         switch (ret) {
+         case 1:
+             reason = "iccid or aid not found";
+@@ -41,8 +42,15 @@
+         case -1:
+             reason = "internal error, maybe illegal iccid/aid coding";
+             break;
++        case 5:
++            reason = "cat busy";
++            break;
++        case 127:
++            reason = "undefined error";
++            break;
+         default:
+-            reason = "unknown";
++            snprintf(unknown, sizeof(unknown), "unknown result %d", ret);
++            reason = unknown;
+             break;
+         }
+         jprint_error("es10c_disable_profile", reason);
+--- a/src/applet/profile/delete.c
++++ b/src/applet/profile/delete.c
+@@ -23,6 +23,7 @@
+ 
+     if (ret) {
+         const char *reason;
++        char unknown[32];
+         switch (ret) {
+         case 1:
+             reason = "iccid or aid not found";
+@@ -36,8 +37,12 @@
+         case -1:
+             reason = "internal error, maybe illegal iccid/aid coding";
+             break;
++        case 127:
++            reason = "undefined error";
++            break;
+         default:
+-            reason = "unknown";
++            snprintf(unknown, sizeof(unknown), "unknown result %d", ret);
++            reason = unknown;
+             break;
+         }
+         jprint_error("es10c_delete_profile", reason);
+--- a/src/applet/profile/nickname.c
++++ b/src/applet/profile/nickname.c
+@@ -28,12 +28,17 @@
+ 
+     if ((ret = es10c_set_nickname(&euicc_ctx, iccid, new_name))) {
+         const char *reason;
++        char unknown[32];
+         switch (ret) {
+         case 1:
+             reason = "iccid not found";
+             break;
++        case 127:
++            reason = "undefined error";
++            break;
+         default:
+-            reason = "unknown";
++            snprintf(unknown, sizeof(unknown), "unknown result %d", ret);
++            reason = unknown;
+             break;
+         }
+         jprint_error("es10c_set_nickname", reason);

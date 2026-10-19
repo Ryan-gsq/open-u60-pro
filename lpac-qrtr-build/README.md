@@ -47,7 +47,7 @@ Only the recipe is committed. The inputs and outputs (`downloads/`, `sources/`, 
 | `install-to-router.sh` | Copies `out/bundle` to the router's `/data/lpac`, checks the hashes and the version |
 | `scripts/fetch_sysroot.py` | Downloads the pinned Alpine packages and extracts them into `sysroot/` (no APK scripts run, nothing installed on the host); `--refresh-pins` re-resolves them from the current index |
 | `scripts/fetch_qemu.py` | Extracts QEMU Homebrew bottles into the workspace for VM tests |
-| `patches/0001-isolated-qrtr-hardening.patch` | Hardening of lpac's QRTR backend and TLS certificate checking for operator servers; apply to the lpac source in `work/lpac` |
+| `patches/0001-isolated-qrtr-hardening.patch` | Hardening of lpac's QRTR backend, TLS certificate checking for operator servers, and the card's result codes in profile errors (`cat busy`, `undefined error`, `unknown result N` instead of `unknown`); apply to the lpac source in `work/lpac` |
 | `certs/` | Trusted GSMA root CI certificates for the operators' TLS servers (bundled as `gsma-ci.pem`) |
 | `scripts/build.sh` | Configures and builds lpac with `aarch64-linux-musl-gcc` (`$CC`) and the `pkgconf` from `host-tools/` (`$PKGCONF`) |
 | `scripts/build_tests.sh`, `tests/` | Fault-injection and loader tests against patched and baseline drivers |
@@ -56,4 +56,4 @@ Only the recipe is committed. The inputs and outputs (`downloads/`, `sources/`, 
 
 ## License
 
-The patch modifies lpac files under `driver/`, which lpac licenses as AGPL-3.0-only (except the QMI files that carry an MIT SPDX header), so `patches/` is distributed under lpac's terms, not this repository's MIT license. The scripts and tests are MIT like the rest of the repository.
+The patch modifies lpac files under `driver/` and `src/`, which lpac licenses as AGPL-3.0-only (except the QMI files that carry an MIT SPDX header), so `patches/` is distributed under lpac's terms, not this repository's MIT license. The scripts and tests are MIT like the rest of the repository.
