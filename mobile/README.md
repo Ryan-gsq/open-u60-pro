@@ -20,7 +20,7 @@ Native companion apps for the ZTE U60 Pro 5G mobile router. Connect to the `zte-
 | Guest WiFi | Full | Guest network enable/disable, SSID, timer |
 | SMS | Full | Read, send, delete SMS; mark as read |
 | SIM Management | Full | PIN verify/change/enable/disable, PUK unlock, SIM unlock |
-| eSIM Profiles | List, switch, add, rename, delete | Profiles on an eSIM card in the router (e.g. 9eSIM B1): scan/import/paste an activation code, preview and confirm installation, switch with the router's verified progress (SIM reload → network → connected, or why it stopped), rename, delete inactive profiles, operator receipts with "Send now", masked card identifiers and capacity. The agent runs lpac on the router; see [zte-agent/docs/esim.md](../zte-agent/docs/esim.md) |
+| eSIM Profiles | List, switch, add, rename, delete | Profiles on an eSIM card in the router (e.g. 9eSIM B1): scan/import/paste an activation code, preview and confirm installation, switch with the router's verified progress (SIM reload → network → connected, or why it stopped), rename, delete inactive profiles, operator receipts with "Send now", masked card identifiers and capacity. The agent manages the card itself; see [zte-agent/docs/esim.md](../zte-agent/docs/esim.md) |
 | Mobile Network | Full | Data toggle, airplane mode, network scan, manual register |
 | Network Mode | Full | Auto/manual network selection |
 | APN Settings | Full | Auto/manual APN mode, add/edit/delete/activate profiles |
@@ -148,7 +148,7 @@ Router operations use typed REST endpoints on `zte-agent`. Key router endpoint g
 | `/api/modem/*` | status, online, data, airplane, network-mode, scan/*, register/*, schedule-reboot | Modem control |
 | `/api/sms/*` | list, capacity, send, delete, read | SMS management |
 | `/api/sim/*` | info, imei, pin/*, unlock, lock-trials | SIM management |
-| `/api/esim/*` | profiles, chip, enable, switch, nickname, delete, download, download/confirm, download/cancel, notifications, notifications/process | eSIM profiles on the card in the router (lpac) |
+| `/api/esim/*` | profiles, chip, enable, switch, nickname, delete, download, download/confirm, download/cancel, notifications, notifications/process | eSIM profiles on the card in the router |
 | `/api/cell/*` | lock/*, neighbors/*, band/*, stc/*, signal-detect/* | Cell & band locking |
 | `/api/router/*` | dns, lan, firewall/*, vpn, qos, domain-filter, apn/* | Router configuration |
 | `/api/usb/*` | status, mode, powerbank | USB management |

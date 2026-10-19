@@ -9,6 +9,8 @@ mod conn_watchdog;
 mod device_ext;
 pub mod doh;
 mod esim;
+mod esim_download;
+mod esim_native;
 mod event_bus;
 mod handlers;
 mod lan_test;
@@ -16,6 +18,7 @@ mod live_activity;
 mod modem_ext;
 mod network_ext;
 mod oos_policy;
+mod qrtr_uim;
 mod router;
 mod scheduler;
 mod server;
@@ -42,6 +45,12 @@ const DEFAULT_BIND: &str = "0.0.0.0:9090";
 const DEFAULT_THREADS: usize = 4;
 
 fn main() {
+    // Diagnostics: `zte-agent esim-native chip info` runs one native eSIM command and exits.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("esim-native") {
+        std::process::exit(esim_native::cli(&args[2..]));
+    }
+
     let bind = std::env::var("ZTE_AGENT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let threads: usize = std::env::var("ZTE_AGENT_THREADS")
         .ok()
@@ -129,7 +138,7 @@ fn busy_check(state: &Arc<AppState>) -> Box<dyn Fn() -> Option<&'static str> + S
             return Some("speed test");
         }
         // The WAN is down for up to a minute while the modem attaches with a new profile.
-        if state.esim.recently_switched(conn_watchdog::unix_now()) {
+        if state.esim.recently_switched() {
             return Some("eSIM profile switch");
         }
         // USSD prompts expire network-side within a few minutes; treat the

@@ -341,7 +341,7 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Post, "/api/stk/respond") => state.stk.request("respond", body),
         (&Method::Post, "/api/stk/cancel") => state.stk.request("cancel", body),
         (&Method::Post, "/api/stk/back") => state.stk.request("back", body),
-        // eSIM profiles (lpac)
+        // eSIM profiles
         (&Method::Get, "/api/esim/profiles") => esim::profiles(state),
         (&Method::Get, "/api/esim/chip") => esim::chip(state),
         (&Method::Post, "/api/esim/enable") => esim::enable(state, body),

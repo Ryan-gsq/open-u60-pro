@@ -1,36 +1,34 @@
-//! eSIM profile management with lpac (GSMA SGP.22 LPA: ES10 to the card over QMI-over-QRTR,
-//! ES9+ to the operator's SM-DP+ over HTTPS).
+//! eSIM profile management (GSMA SGP.22 LPA: ES10 to the card over QMI-over-QRTR, ES9+ to the
+//! operator's SM-DP+ over HTTPS).
 //!
-//! lpac is not part of this binary. It is a separately built private bundle (recipe in
-//! `lpac-qrtr-build/`) copied to `ZTE_AGENT_LPAC_DIR` (default `/data/lpac`). The agent runs at
-//! most one lpac process at a time, with a hard time limit, and only these commands:
-//! `chip info`, `profile list`, `profile enable <iccid> 1`, `profile delete <iccid>`,
-//! `profile nickname <iccid> [name]`, `profile download -p -a <code> [-c <code>]`,
-//! `notification list` and `notification process -r <seq>`. Every run holds the agent's flag
-//! and a `flock` on /tmp/lpac.lock, shared with lpac runs by hand.
+//! Everything runs in-process on the LGPL-2.1 `euicc` crate (a Rust translation of lpac's
+//! libeuicc) over the QRTR UIM transport: card commands and receipts in `esim_native`, profile
+//! download in `esim_download`. Card commands keep lpac's names and result format (`chip info`,
+//! `profile list`, `profile enable <iccid> 1`, `profile delete <iccid>`,
+//! `profile nickname <iccid> [name]`, `notification list`, `notification process -r <seq>`), the
+//! output the views below were verified against. One command at a time touches the card, with a
+//! hard time limit; each holds the agent's flag and a `flock` on /tmp/esim.lock, shared with
+//! `zte-agent esim-native` runs by hand.
 //!
-//! A download runs in the background. With preview on (the default) lpac stops after the
-//! operator's server has sent the profile metadata and waits for one answer character on
-//! stdin; the app shows the operator/profile name and answers through `/download/confirm`.
+//! A download runs in the background. With preview on (the default) it stops after the
+//! operator's server has sent the profile metadata; the app shows the operator/profile name and
+//! answers through `/download/confirm`.
 //!
 //! Verified on a U60 Pro with a 9eSIM B1 (2026-10-18): listing leaves the connection alone;
 //! enabling another profile (refresh flag set) makes the modem re-read the SIM, the firmware
 //! picks the APN from its ICCID list, and WAN is down for roughly 20–45 s while it reattaches.
 //!
 //! While the modem reloads the SIM (a few seconds after `enable`) the eUICC's management
-//! application cannot be selected: lpac fails in `euicc_init` with QMI error 80
+//! application cannot be selected: opening the channel (`euicc_init`) fails with QMI error 80
 //! (`SimFileNotFound`), seen live 3 times in 14 switches. So the agent keeps the last good
 //! profile list, answers reads from it while a switch reloads the SIM, and re-reads the card
 //! itself once the SIM is ready. Each switch is then verified step by step: card, modem
 //! identity (`get_sim_info`), data connection.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::process::CommandExt;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,39 +36,38 @@ use serde_json::{json, Value};
 
 use crate::cache;
 use crate::conn_watchdog::unix_now;
+use crate::esim_download::DownloadCtl;
 use crate::handlers::AppState;
 
-const DEFAULT_DIR: &str = "/data/lpac";
-/// Every card-only lpac command observed on the router finished in under 4 s.
+/// Every card-only command observed on the router finished in under 4 s.
 const CARD_LIMIT: Duration = Duration::from_secs(30);
 /// Downloads talk to the operator's server, wait for the user's confirmation and write the
 /// profile to the card.
 const DOWNLOAD_LIMIT: Duration = Duration::from_secs(300);
-/// An unanswered preview is declined so the server session is cancelled cleanly.
+/// An unanswered preview is cancelled (reason timeout) so the server session ends cleanly.
 const PREVIEW_LIMIT: Duration = Duration::from_secs(120);
-/// lpac only notices SIGINT between steps; a step blocked on the network is killed after this.
-const CANCEL_GRACE: Duration = Duration::from_secs(15);
 /// A finished download's result is reported for this long, then the status reads `idle` again.
 const RESULT_KEEP_SECS: u64 = 600;
-/// lpac prints one JSON line per message; profile icons make `profile list` the largest.
-const MAX_OUTPUT: u64 = 512 * 1024;
 /// After a switch the WAN is down while the modem reattaches; the connectivity policies hold off.
 pub const SWITCH_GUARD_SECS: u64 = 300;
 /// The firmware's SIM reload and radio restart take about 3–8 s after `enable`.
 const RELOAD_SETTLE: Duration = Duration::from_secs(5);
 /// How long the card may stay unreadable after a switch before it is reported unavailable.
-const CARD_CONFIRM_LIMIT: Duration = Duration::from_secs(60);
+const CARD_CONFIRM_LIMIT: Duration = Duration::from_secs(90);
 /// How long the modem has to load the new identity and connect data after a switch.
 const SWITCH_VERIFY_LIMIT: Duration = Duration::from_secs(150);
 const SWITCH_POLL: Duration = Duration::from_secs(3);
 /// A busy-refused enable is retried this often, for this long. With a Klook travel profile
-/// enabled the card answered `cat busy` for about two minutes from the first attempt, twice.
+/// enabled the card refused with catBusy for about two minutes from the first attempt, twice.
 const CARD_BUSY_GAP: Duration = Duration::from_secs(10);
 const CARD_BUSY_LIMIT: Duration = Duration::from_secs(240);
 /// One receipt (ES9+ HandleNotification) to one operator server.
 const RECEIPT_LIMIT: Duration = Duration::from_secs(45);
 /// Pause between "data connected" after a switch and sending its receipts (DNS and routes settle).
 const RECEIPT_AFTER_SWITCH: Duration = Duration::from_secs(5);
+/// How long receipts wait for the router's default route after the modem reports data (the
+/// route arrived 3-23 s later in the router's logs).
+const WAN_READY_LIMIT: Duration = Duration::from_secs(40);
 /// Second try for receipts a switch left that failed on the first.
 const RECEIPT_SECOND_TRY: Duration = Duration::from_secs(30);
 /// Pending receipts are retried this often while the router has mobile data.
@@ -81,21 +78,21 @@ const RECEIPT_MAX_ATTEMPTS: u32 = 10;
 const RECEIPT_MAX_ROUNDS: u32 = 24;
 /// SGP.22 profileNickname is a UTF8String of at most 64 bytes.
 const NICKNAME_MAX_BYTES: usize = 64;
-/// Shared with manual lpac runs over SSH (`flock -n /tmp/lpac.lock …`).
-const DEFAULT_LOCK_PATH: &str = "/tmp/lpac.lock";
+/// Shared with `zte-agent esim-native` runs by hand.
+const DEFAULT_LOCK_PATH: &str = "/tmp/esim.lock";
 
 pub struct Esim {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    /// lpac holds a logical channel to the card while it runs: never two at once.
+    /// A command holds a logical channel to the card while it runs: never two at once.
     busy: AtomicBool,
     /// Unix seconds of the last successful profile switch (0 = none).
     switched_at: AtomicU64,
     download: Mutex<Download>,
-    /// The running download's lpac: pid for cancel, stdin for the preview answer.
-    child: ChildIo,
+    /// The running download's decisions (preview answer, cancel).
+    control: DownloadControl,
     /// Last good profile list, and whether it may be out of date.
     inventory: Mutex<Inventory>,
     /// The last profile switch, verified card → modem → data.
@@ -104,13 +101,12 @@ struct Inner {
     instance: u64,
     /// Operator receipts (SGP.22 notifications) waiting on the card.
     receipts: Mutex<Receipts>,
-    /// File lock shared with lpac runs outside the agent.
+    /// File lock shared with `zte-agent esim-native` runs outside the agent.
     lock_path: PathBuf,
 }
 
 /// Pending operator receipts: install/enable/disable/delete notifications the card keeps until
-/// they reach the operator's server. lpac's `-a` stops at the first failure, so each receipt
-/// is sent on its own and counts its own attempts.
+/// they reach the operator's server. Each receipt is sent on its own and counts its own attempts.
 #[derive(Debug, Default)]
 struct Receipts {
     /// As last listed from the card (`None` = not listed yet).
@@ -139,7 +135,10 @@ impl Receipts {
         let merged = fresh
             .into_iter()
             .map(|mut r| {
-                if let Some(o) = old.iter().find(|o| o.seq == r.seq) {
+                let same = |o: &&Receipt| {
+                    o.seq == r.seq && o.address == r.address && o.operation == r.operation && o.iccid == r.iccid
+                };
+                if let Some(o) = old.iter().find(same) {
                     r.attempts = o.attempts;
                     r.last_error = o.last_error.clone();
                 }
@@ -221,7 +220,7 @@ struct Inventory {
 
 #[derive(Clone, Debug, PartialEq)]
 struct ReadError {
-    /// "sim_reloading", "management_unavailable", "read_failed" or "not_installed".
+    /// "sim_reloading", "management_unavailable", "read_failed", "busy" or "not_configured".
     kind: &'static str,
     message: String,
     at: u64,
@@ -317,35 +316,16 @@ impl Switch {
     }
 }
 
+/// Decisions for the running download; empty when none runs.
 #[derive(Default)]
-struct ChildIo {
-    /// 0 when no lpac runs. Held while signalling and while reaping, so a cancel can never
-    /// reach a pid that has been reaped and reused.
-    pid: Mutex<libc::pid_t>,
-    stdin: Mutex<Option<ChildStdin>>,
+struct DownloadControl {
+    tx: Mutex<Option<Sender<DownloadCtl>>>,
 }
 
-impl ChildIo {
-    /// Answers lpac's preview prompt (`y` installs, anything else cancels).
-    fn answer(&self, accept: bool) -> bool {
-        let mut slot = self.stdin.lock().unwrap();
-        let Some(stdin) = slot.as_mut() else { return false };
-        let ok = stdin.write_all(if accept { b"y\n" } else { b"n\n" }).is_ok();
-        *slot = None; // lpac reads one character; EOF afterwards
-        ok
-    }
-
-    /// SIGINT makes lpac cancel the session with the card and the server, then exit.
-    fn interrupt(&self) -> bool {
-        self.signal(libc::SIGINT)
-    }
-
-    /// Signals lpac's whole process group (it is spawned as a group leader).
-    fn signal(&self, sig: libc::c_int) -> bool {
-        let pid = self.pid.lock().unwrap();
-        // SAFETY: a non-zero pid is our lpac child, not yet reaped (see `pid`), so its group
-        // id is ours to signal.
-        *pid > 0 && unsafe { libc::kill(-*pid, sig) } == 0
+impl DownloadControl {
+    /// Hands `ctl` to the running download; false when none is running.
+    fn send(&self, ctl: DownloadCtl) -> bool {
+        self.tx.lock().unwrap().as_ref().is_some_and(|tx| tx.send(ctl).is_ok())
     }
 }
 
@@ -355,7 +335,7 @@ struct Download {
     /// "idle", "running", "confirm" (waiting for the user), "cancelling", "done", "failed" or
     /// "cancelled".
     state: &'static str,
-    /// Last lpac progress step, e.g. `es9p_get_bound_profile_package`.
+    /// Last progress step (lpac's names), e.g. `es9p_get_bound_profile_package`.
     step: String,
     provider: Option<String>,
     name: Option<String>,
@@ -377,10 +357,6 @@ impl Download {
         }
     }
 
-    fn is_cancelling(&self, started_at: u64) -> bool {
-        self.state == "cancelling" && self.started_at == started_at
-    }
-
     fn view(&self) -> Value {
         json!({
             "state": if self.state.is_empty() { "idle" } else { self.state },
@@ -394,25 +370,21 @@ impl Download {
         })
     }
 
-    /// Records a progress line; `es8p_metadata_parse` carries the operator's profile metadata.
-    fn progress(&mut self, line: &Value) {
-        if line["type"] != "progress" {
-            return;
-        }
-        // Cancelling the session is lpac's cleanup after a failure or cancel: keep the step that
-        // failed, so "failed at" names it.
-        if let Some(step) = line["payload"]["message"].as_str().filter(|s| !s.ends_with("_cancel_session")) {
+    /// Records a progress step; `es8p_metadata_parse` carries the operator's profile metadata.
+    fn progress(&mut self, step: &str, data: &Value) {
+        // Cancelling the session is the download's cleanup after a failure or cancel: keep the
+        // step that failed, so "failed at" names it.
+        if !step.ends_with("_cancel_session") {
             self.step = step.to_string();
             if step == "preview" && self.state == "running" {
                 self.state = "confirm";
             }
         }
-        let meta = &line["payload"]["data"];
-        if meta.is_object() {
-            if let Some(p) = meta["serviceProviderName"].as_str() {
+        if data.is_object() {
+            if let Some(p) = data["serviceProviderName"].as_str() {
                 self.provider = Some(p.to_string());
             }
-            if let Some(n) = meta["profileName"].as_str() {
+            if let Some(n) = data["profileName"].as_str() {
                 self.name = Some(n.to_string());
             }
         }
@@ -420,7 +392,7 @@ impl Download {
 }
 
 /// Released on drop, including when a download thread ends. Holds the shared file lock too,
-/// so an lpac started by hand over SSH (with `flock -n`) and the agent never overlap.
+/// so a `zte-agent esim-native` run by hand and the agent never overlap.
 struct BusyGuard {
     inner: Arc<Inner>,
     _lock: Option<std::fs::File>,
@@ -428,14 +400,27 @@ struct BusyGuard {
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
+        drop(self._lock.take());
+        *HELD_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.inner.busy.store(false, Ordering::Release);
     }
 }
 
+/// A second descriptor for the lock the current guard holds. `flock` belongs to the open file, so
+/// a card worker that outlives its caller keeps the card locked against CLI runs by holding its
+/// own copy (see `card`).
+static HELD_LOCK: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+/// Seconds on a monotonic clock (+1, so 0 can mean "never"). The router's wall clock jumps by
+/// hours when the network sets the time on attach; guards must not.
+fn mono_secs() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs() + 1
+}
+
 impl Esim {
     pub fn new() -> Self {
-        let lock = std::env::var("ZTE_AGENT_LPAC_LOCK").unwrap_or_else(|_| DEFAULT_LOCK_PATH.into());
-        Self::with_lock_path(PathBuf::from(lock))
+        Self::with_lock_path(lock_path())
     }
 
     fn with_lock_path(lock_path: PathBuf) -> Self {
@@ -444,7 +429,7 @@ impl Esim {
                 busy: AtomicBool::new(false),
                 switched_at: AtomicU64::new(0),
                 download: Mutex::new(Download::default()),
-                child: ChildIo::default(),
+                control: DownloadControl::default(),
                 inventory: Mutex::new(Inventory::default()),
                 switch: Mutex::new(Switch::default()),
                 instance: std::time::SystemTime::now()
@@ -465,11 +450,15 @@ impl Esim {
         self.inner.inventory.lock().unwrap().reloading
     }
 
-    /// Whether a profile switch happened within `SWITCH_GUARD_SECS` (busy guard for policies).
-    pub fn recently_switched(&self, now: u64) -> bool {
-        let at = self.inner.switched_at.load(Ordering::Relaxed);
-        at != 0 && now.saturating_sub(at) < SWITCH_GUARD_SECS
+    /// Whether a profile switch happened within `SWITCH_GUARD_SECS` (busy guard for policies),
+    /// on the monotonic clock.
+    pub fn recently_switched(&self) -> bool {
+        switched_within(self.inner.switched_at.load(Ordering::Relaxed), mono_secs())
     }
+}
+
+fn switched_within(at: u64, now: u64) -> bool {
+    at != 0 && now.saturating_sub(at) < SWITCH_GUARD_SECS
 }
 
 fn error(status: u16, message: &str) -> (u16, Value) {
@@ -484,11 +473,12 @@ fn acquire(inner: &Arc<Inner>) -> Option<BusyGuard> {
     let lock = match file_lock(&inner.lock_path) {
         Ok(lock) => lock,
         Err(()) => {
-            // Someone else (an lpac run by hand) holds the card.
+            // Someone else (a CLI run by hand) holds the card.
             inner.busy.store(false, Ordering::Release);
             return None;
         }
     };
+    *HELD_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = lock.as_ref().and_then(|f| f.try_clone().ok());
     Some(BusyGuard { inner: Arc::clone(inner), _lock: lock })
 }
 
@@ -553,7 +543,7 @@ pub fn profiles(state: &AppState) -> (u16, Value) {
             busy()
         };
     };
-    let result = lpac(&["profile", "list"], CARD_LIMIT, &|_| {}, None);
+    let result = card(&["profile", "list"], CARD_LIMIT);
     if result.is_ok() && inner.receipts.lock().unwrap().pending.is_none() {
         // First good read since the agent started: learn whether receipts are waiting.
         let _ = list_receipts(inner);
@@ -565,8 +555,9 @@ pub fn profiles(state: &AppState) -> (u16, Value) {
         Ok(data) => inv.record(profile_views(&data), now),
         Err(e) => {
             let kind = match &e {
-                LpacError::NotInstalled(_) => "not_installed",
-                LpacError::Failed(m) => classify(m, state.esim.recently_switched(now)),
+                CardError::Config(_) => "not_configured",
+                CardError::NotStarted(_) => "busy",
+                CardError::Failed(m) => classify(m, state.esim.recently_switched()),
             };
             inv.error = Some(ReadError { kind, message: e.message(), at: now });
             if inv.profiles.is_none() {
@@ -588,13 +579,16 @@ pub fn switch_status(state: &AppState) -> (u16, Value) {
     (200, json!({"ok": true, "data": view}))
 }
 
-/// GET /api/esim/chip — card identity and capacity, plus which lpac build is installed.
+/// GET /api/esim/chip — card identity and capacity.
 pub fn chip(state: &AppState) -> (u16, Value) {
     let inner = &state.esim.inner;
+    if state.esim.reloading() {
+        return reloading_reply();
+    }
     let Some(_guard) = state.esim.acquire() else {
         return busy();
     };
-    match lpac(&["chip", "info"], CARD_LIMIT, &|_| {}, None) {
+    match card(&["chip", "info"], CARD_LIMIT) {
         Ok(data) => {
             let changed = inner
                 .inventory
@@ -603,7 +597,6 @@ pub fn chip(state: &AppState) -> (u16, Value) {
                 .note_card(data["eidValue"].as_str().unwrap_or(""));
             let mut view = chip_view(&data);
             view["card_changed"] = json!(changed);
-            view["lpac"] = config().map(|c| build_info(&c.dir)).unwrap_or(Value::Null);
             (200, json!({"ok": true, "data": view}))
         }
         Err(e) => e.reply(),
@@ -613,7 +606,7 @@ pub fn chip(state: &AppState) -> (u16, Value) {
 /// Reads the card's EID (guard held) and refuses to continue if it is not the card the saved
 /// list belongs to.
 fn check_card(inner: &Arc<Inner>) -> Result<Value, (u16, Value)> {
-    let data = lpac(&["chip", "info"], CARD_LIMIT, &|_| {}, None).map_err(LpacError::reply)?;
+    let data = card(&["chip", "info"], CARD_LIMIT).map_err(CardError::reply)?;
     let eid = data["eidValue"].as_str().unwrap_or("");
     if inner.inventory.lock().unwrap().note_card(eid) {
         eprintln!("[esim] a different eSIM card is in the slot; saved list dropped");
@@ -622,31 +615,12 @@ fn check_card(inner: &Arc<Inner>) -> Result<Value, (u16, Value)> {
     Ok(data)
 }
 
-/// `BUILDINFO` (written by `bundle.py`) and the lpac binary's checksum from `SHA256SUMS`.
-fn build_info(dir: &Path) -> Value {
-    let info: serde_json::Map<String, Value> = std::fs::read_to_string(dir.join("BUILDINFO"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), json!(v.trim())))
-        .collect();
-    let lpac_sha256 = std::fs::read_to_string(dir.join("SHA256SUMS"))
-        .unwrap_or_default()
-        .lines()
-        .find_map(|l| l.strip_suffix("  lpac").map(str::to_string));
-    json!({
-        "build": if info.is_empty() { Value::Null } else { Value::Object(info) },
-        "lpac_sha256": lpac_sha256,
-    })
-}
-
 /// Parses `{"iccid": "..."}` for the mutating profile actions.
 fn iccid_body(body: &[u8]) -> Result<String, (u16, Value)> {
     let parsed: Value = serde_json::from_slice(body).map_err(|_| error(400, "invalid JSON"))?;
     parsed["iccid"]
         .as_str()
-        .filter(|s| valid_iccid(s))
-        .map(str::to_string)
+        .and_then(normalize_iccid)
         .ok_or_else(|| error(400, "iccid must be 18–20 digits"))
 }
 
@@ -680,7 +654,7 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
     if let Err(reply) = check_card(&state.esim.inner) {
         return reply;
     }
-    let list = match lpac(&["profile", "list"], CARD_LIMIT, &|_| {}, None) {
+    let list = match card(&["profile", "list"], CARD_LIMIT) {
         Ok(data) => profile_views(&data),
         Err(e) => return e.reply(),
     };
@@ -688,8 +662,11 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
     if let Err((status, message)) = check_enable_target(&list, &iccid) {
         return error(status, message);
     }
-    let result = lpac(&["profile", "enable", &iccid, "1"], CARD_LIMIT, &|_| {}, None);
+    let result = card(&["profile", "enable", &iccid, "1"], CARD_LIMIT);
     drop(guard);
+    if let Err(CardError::NotStarted(m)) = &result {
+        return error(409, m); // the card was never asked: nothing to verify
+    }
     if let Err(e) = &result {
         if card_busy(&e.message()) {
             return retry_while_busy(state, iccid, previous, list, e.message());
@@ -712,16 +689,16 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
         previous: previous.clone(),
         generation,
         started_at: now,
-        note: result.as_ref().err().map(|e| format!("lpac reported: {}", e.message())),
+        note: result.as_ref().err().map(|e| format!("enable error: {}", e.message())),
         ..Switch::default()
     };
-    inner.switched_at.store(now, Ordering::Relaxed);
+    inner.switched_at.store(mono_secs(), Ordering::Relaxed);
     state
         .cache
         .invalidate_with_settle(cache::SIM_INFO, cache::SETTLE_WINDOW);
     let worker = Arc::clone(inner);
     let target = iccid.clone();
-    if crate::system::try_spawn_named("esim-switch", move || verify_switch(worker, target)).is_err() {
+    if crate::system::try_spawn_named("esim-switch", move || verify_switch(worker, target, generation)).is_err() {
         let mut inv = inner.inventory.lock().unwrap();
         inv.reloading = false;
         inner.switch.lock().unwrap().finish("card_unconfirmed", now);
@@ -754,11 +731,11 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
 }
 
 /// The card answered the enable with a refusal that passes: SGP.22 catBusy (5, its SIM Toolkit
-/// is in a proactive session), undefinedError (127), or a code lpac doesn't name. Nothing
+/// is in a proactive session), undefinedError (127), or a code without a name. Nothing
 /// changed; seen with a roaming travel profile enabled, accepted again a couple of minutes later.
 fn card_busy(message: &str) -> bool {
     message.contains("es10c_enable_profile")
-        && ["cat busy", "undefined error", "unknown"].iter().any(|r| message.contains(r))
+        && ["catBusy", "undefinedError", "unknown result"].iter().any(|r| message.contains(r))
 }
 
 /// Answers a busy refusal with 202 and keeps trying in the background (`card_busy`), so the user
@@ -792,7 +769,7 @@ fn retry_while_busy(
     let cache = Arc::clone(&state.cache);
     let target = iccid.clone();
     let spawned = crate::system::try_spawn_named("esim-switch", move || {
-        retry_enable(worker, target, cache);
+        retry_enable(worker, target, cache, generation);
     });
     if spawned.is_err() {
         let mut sw = inner.switch.lock().unwrap();
@@ -814,7 +791,7 @@ fn retry_while_busy(
 /// Retries a busy-refused enable every `CARD_BUSY_GAP` for `CARD_BUSY_LIMIT`, then verifies the
 /// switch like a first-time success; a failure other than "busy" may still have switched the
 /// card, so it is verified too.
-fn retry_enable(inner: Arc<Inner>, target: String, cache: Arc<crate::cache::UbusCache>) {
+fn retry_enable(inner: Arc<Inner>, target: String, cache: Arc<crate::cache::UbusCache>, generation: u64) {
     let started = Instant::now();
     let mut attempt = 1;
     let mut last = String::new();
@@ -823,19 +800,25 @@ fn retry_enable(inner: Arc<Inner>, target: String, cache: Arc<crate::cache::Ubus
         attempt += 1;
         let result = {
             let Some(_guard) = acquire_soon(&inner) else { continue };
-            lpac(&["profile", "enable", &target, "1"], CARD_LIMIT, &|_| {}, None)
+            card(&["profile", "enable", &target, "1"], CARD_LIMIT)
         };
+        if !current(&inner, generation) {
+            return; // another switch took over
+        }
         let note = match result {
             Ok(_) => format!("the eSIM was busy; switched on attempt {attempt}"),
+            Err(CardError::NotStarted(m)) => {
+                last = m;
+                continue;
+            }
             Err(e) if card_busy(&e.message()) => {
                 last = e.message();
                 continue;
             }
-            Err(e) => format!("lpac reported: {}", e.message()),
+            Err(e) => format!("enable error: {}", e.message()),
         };
-        let now = unix_now();
         inner.inventory.lock().unwrap().reloading = true;
-        inner.switched_at.store(now, Ordering::Relaxed);
+        inner.switched_at.store(mono_secs(), Ordering::Relaxed);
         cache.invalidate_with_settle(cache::SIM_INFO, cache::SETTLE_WINDOW);
         {
             let mut sw = inner.switch.lock().unwrap();
@@ -843,28 +826,40 @@ fn retry_enable(inner: Arc<Inner>, target: String, cache: Arc<crate::cache::Ubus
             sw.note = Some(note);
         }
         eprintln!("[esim] enable {} accepted on attempt {attempt}", mask(&target));
-        verify_switch(inner, target);
+        verify_switch(inner, target, generation);
         return;
     }
     let mut sw = inner.switch.lock().unwrap();
+    if sw.generation != generation {
+        return;
+    }
     sw.reason = Some("card_busy");
     sw.note = Some(format!("the eSIM stayed busy for {} s ({last})", CARD_BUSY_LIMIT.as_secs()));
     sw.finish("not_applied", unix_now());
     eprintln!("[esim] switch to {} not applied: the eSIM stayed busy", mask(&target));
 }
 
+/// Whether `generation` is still the switch being reported (a newer switch supersedes it).
+fn current(inner: &Arc<Inner>, generation: u64) -> bool {
+    inner.switch.lock().unwrap().generation == generation
+}
+
 /// Background check after `enable`: waits for the SIM to reload, re-reads the card (retrying
 /// while the management application is not selectable), then checks that the modem loaded the
-/// new identity and that data connects.
-fn verify_switch(inner: Arc<Inner>, target: String) {
+/// new identity and that data connects. Writes only while `generation` is still the current
+/// switch, and never holds the switch lock across a ubus call.
+fn verify_switch(inner: Arc<Inner>, target: String, generation: u64) {
     let started = Instant::now();
     std::thread::sleep(RELOAD_SETTLE);
     let mut list = None;
     let mut last_error = String::from("the SIM did not report ready");
     while started.elapsed() < CARD_CONFIRM_LIMIT {
+        if !current(&inner, generation) {
+            return;
+        }
         if sim_ready() != Some(false) {
             if let Some(_guard) = acquire(&inner) {
-                match lpac(&["profile", "list"], CARD_LIMIT, &|_| {}, None) {
+                match card(&["profile", "list"], CARD_LIMIT) {
                     Ok(data) => {
                         list = Some(profile_views(&data));
                         break;
@@ -876,45 +871,77 @@ fn verify_switch(inner: Arc<Inner>, target: String) {
         std::thread::sleep(SWITCH_POLL);
     }
     let now = unix_now();
-    let mut inv = inner.inventory.lock().unwrap();
-    inv.reloading = false;
-    let Some(list) = list else {
-        inv.error = Some(ReadError { kind: "management_unavailable", message: last_error, at: now });
-        drop(inv);
-        eprintln!("[esim] switch check: card unreadable for {} s", CARD_CONFIRM_LIMIT.as_secs());
-        inner.switch.lock().unwrap().finish("card_unconfirmed", now);
-        return;
-    };
-    let enabled = enabled_iccid(&list);
-    inv.record(list, now);
-    drop(inv);
-    if enabled.as_deref() != Some(target.as_str()) {
-        eprintln!("[esim] switch check: {} is not enabled on the card", mask(&target));
-        inner.switch.lock().unwrap().finish("not_applied", now);
-        return;
-    }
-    {
-        let mut sw = inner.switch.lock().unwrap();
-        sw.card_confirmed_at = now;
-        sw.state = "card_confirmed";
+    let modem_has_target = || modem_iccid().is_some_and(|m| same_iccid(&m, &target));
+    match list {
+        Some(list) => {
+            let enabled = enabled_iccid(&list);
+            {
+                let mut inv = inner.inventory.lock().unwrap();
+                inv.reloading = false;
+                inv.record(list, now);
+            }
+            if enabled.as_deref() != Some(target.as_str()) {
+                eprintln!("[esim] switch check: {} is not enabled on the card", mask(&target));
+                let mut sw = inner.switch.lock().unwrap();
+                if sw.generation == generation {
+                    sw.finish("not_applied", now);
+                }
+                return;
+            }
+            let mut sw = inner.switch.lock().unwrap();
+            if sw.generation != generation {
+                return;
+            }
+            sw.card_confirmed_at = now;
+            sw.state = "card_confirmed";
+        }
+        None => {
+            {
+                let mut inv = inner.inventory.lock().unwrap();
+                inv.reloading = false;
+                inv.error = Some(ReadError { kind: "management_unavailable", message: last_error, at: now });
+            }
+            // The card stayed unreadable, but the modem loading the target is proof enough to
+            // keep checking data; otherwise report it and still look after the receipts.
+            if !modem_has_target() {
+                eprintln!("[esim] switch check: card unreadable for {} s", CARD_CONFIRM_LIMIT.as_secs());
+                let mut sw = inner.switch.lock().unwrap();
+                if sw.generation != generation {
+                    return;
+                }
+                sw.finish("card_unconfirmed", now);
+                drop(sw);
+                receipts_after_switch(&inner, false);
+                return;
+            }
+            eprintln!("[esim] switch check: card unreadable, but the modem loaded {}", mask(&target));
+        }
     }
     let connected = loop {
+        // Ask the firmware first, then publish under the lock.
+        let modem_ok = modem_has_target();
+        let data_ok = data_connected();
+        let out_of_time = started.elapsed() >= SWITCH_VERIFY_LIMIT;
+        let blocker = if out_of_time { data_blocker() } else { None };
         let now = unix_now();
         let mut sw = inner.switch.lock().unwrap();
-        if sw.modem_confirmed_at == 0 && modem_iccid().is_some_and(|m| same_iccid(&m, &target)) {
+        if sw.generation != generation {
+            return;
+        }
+        if sw.modem_confirmed_at == 0 && modem_ok {
             sw.modem_confirmed_at = now;
             sw.state = "modem_confirmed";
         }
-        if sw.modem_confirmed_at != 0 && data_connected() {
+        if sw.modem_confirmed_at != 0 && data_ok {
             sw.connected_at = now;
             sw.finish("connected", now);
             eprintln!("[esim] switch to {} verified: card, modem, data", mask(&target));
             break true;
         }
-        if started.elapsed() >= SWITCH_VERIFY_LIMIT {
+        if out_of_time {
             let outcome = if sw.modem_confirmed_at != 0 { "no_data" } else { "modem_unconfirmed" };
             if outcome == "no_data" {
-                sw.reason = data_blocker();
+                sw.reason = blocker;
             }
             sw.finish(outcome, now);
             eprintln!("[esim] switch to {} ended as {outcome}", mask(&target));
@@ -936,7 +963,14 @@ fn receipts_after_switch(inner: &Arc<Inner>, connected: bool) {
         ensure_receipt_retry(inner);
         return;
     }
+    // The modem reports data before the router has its default route, DNS and firewall.
+    wait_for_default_route(WAN_READY_LIMIT);
     std::thread::sleep(RECEIPT_AFTER_SWITCH);
+    if inner.inventory.lock().unwrap().reloading {
+        // A newer switch is reloading the SIM; its own check sends everything pending.
+        ensure_receipt_retry(inner);
+        return;
+    }
     let sent_all = acquire_soon(inner).is_some_and(|_guard| send_receipts(inner));
     // Right after the attach a request can still stall: one more try before the 10-minute loop.
     if !sent_all {
@@ -948,6 +982,25 @@ fn receipts_after_switch(inner: &Arc<Inner>, connected: bool) {
         }
     }
     ensure_receipt_retry(inner);
+}
+
+/// Waits until the kernel has an IPv4 default route (or `limit` passes).
+fn wait_for_default_route(limit: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if std::fs::read_to_string("/proc/net/route").is_ok_and(|t| has_default_route(&t)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// `/proc/net/route` has a row with destination 00000000 that is up (flag 0x1).
+fn has_default_route(table: &str) -> bool {
+    table.lines().skip(1).any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() > 3 && f[1] == "00000000" && u32::from_str_radix(f[3], 16).is_ok_and(|flags| flags & 1 == 1)
+    })
 }
 
 /// Background work takes the card when it's free within 10 s; the app usually re-reads the
@@ -1023,7 +1076,7 @@ fn radio_blocks_switch(operate_mode: Option<&str>, policy_state: Option<&str>) -
     !online && !matches!(policy_state, Some("lpm" | "probing"))
 }
 
-/// Firmware and lpac may differ in a trailing filler `F`.
+/// The firmware and the card may differ in a trailing filler `F`.
 fn same_iccid(a: &str, b: &str) -> bool {
     let trim = |s: &str| s.trim().trim_end_matches(['F', 'f']).to_string();
     !a.trim().is_empty() && trim(a) == trim(b)
@@ -1047,14 +1100,14 @@ pub fn delete(state: &AppState, body: &[u8]) -> (u16, Value) {
     if let Err(reply) = check_card(&state.esim.inner) {
         return reply;
     }
-    let list = match lpac(&["profile", "list"], CARD_LIMIT, &|_| {}, None) {
+    let list = match card(&["profile", "list"], CARD_LIMIT) {
         Ok(data) => profile_views(&data),
         Err(e) => return e.reply(),
     };
     if let Err((status, message)) = check_delete_target(&list, &iccid) {
         return error(status, message);
     }
-    if let Err(e) = lpac(&["profile", "delete", &iccid], CARD_LIMIT, &|_| {}, None) {
+    if let Err(e) = card(&["profile", "delete", &iccid], CARD_LIMIT) {
         return e.reply();
     }
     eprintln!("[esim] deleted profile {}", mask(&iccid));
@@ -1122,34 +1175,31 @@ pub fn download_start(state: &AppState, body: &[u8]) -> (u16, Value) {
         started_at: unix_now(),
         ..Download::default()
     };
-    let mut args: Vec<String> = vec!["profile".into(), "download".into()];
-    if preview {
-        args.push("-p".into());
-    }
-    args.extend(["-a".into(), code.into()]);
-    if let Some(c) = confirmation {
-        args.extend(["-c".into(), c.into()]);
-    }
+    let code = code.to_string();
+    let confirmation = confirmation.map(str::to_string);
     let spawned = crate::system::try_spawn_named("esim-download", move || {
         let _guard = guard;
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = lpac(
-            &refs,
+        let result = download(
+            &code,
+            confirmation.as_deref(),
+            preview,
             DOWNLOAD_LIMIT,
-            &|line| {
+            &|step, data| {
                 let asks = {
                     let mut d = inner.download.lock().unwrap();
-                    d.progress(line);
+                    d.progress(step, data);
                     d.state == "confirm"
                 };
                 if asks {
                     arm_preview_timeout(&inner);
                 }
             },
-            Some(&inner.child),
+            &inner.control,
         );
-        let notified = result.is_ok() && send_receipts(&inner);
-        if result.is_ok() {
+        // An install that started leaves an installation-result receipt, failed or not.
+        let installing = result.is_ok() || installing_step(&inner.download.lock().unwrap().step);
+        let notified = installing && send_receipts(&inner);
+        if installing {
             inner.inventory.lock().unwrap().generation += 1;
             ensure_receipt_retry(&inner);
         }
@@ -1158,15 +1208,17 @@ pub fn download_start(state: &AppState, body: &[u8]) -> (u16, Value) {
         match result {
             Ok(data) => {
                 d.state = "done";
+                d.error = None; // a Cancel that came too late to stop the install
                 d.iccid = data["iccid"].as_str().map(str::to_string);
                 eprintln!(
                     "[esim] downloaded profile {} (operator notified: {notified})",
                     d.iccid.as_deref().map(mask).unwrap_or_else(|| "?".into())
                 );
             }
-            Err(e) if d.state == "cancelling" || e.message().starts_with("cancelled") => {
+            // The download says itself whether it stopped on a user decision.
+            Err(e) if e.message().starts_with("cancelled") => {
                 d.state = "cancelled";
-                d.error = d.error.take().or(Some("cancelled".into()));
+                d.error = d.error.take().or_else(|| Some(e.message()));
                 eprintln!("[esim] download cancelled at {}", d.step);
             }
             Err(e) => {
@@ -1201,7 +1253,7 @@ pub fn download_confirm(state: &AppState, body: &[u8]) -> (u16, Value) {
     if d.state != "confirm" {
         return error(409, "no download is waiting for confirmation");
     }
-    if !inner.child.answer(accept) {
+    if !inner.control.send(if accept { DownloadCtl::Accept } else { DownloadCtl::Decline }) {
         return error(409, "the download is no longer waiting");
     }
     if accept {
@@ -1213,42 +1265,39 @@ pub fn download_confirm(state: &AppState, body: &[u8]) -> (u16, Value) {
     (200, json!({"ok": true, "data": d.view()}))
 }
 
-/// POST /api/esim/download/cancel — stops a running download.
+/// The install step (a prefix, so a sub-step such as `…:result` counts too).
+fn installing_step(step: &str) -> bool {
+    step.starts_with("es10b_load_bound_profile_package")
+}
+
+/// POST /api/esim/download/cancel — stops a running download at its next step; an ES9+ request
+/// already running ends within its timeout. At the preview it postpones, so the QR code stays
+/// usable.
 pub fn download_cancel(state: &AppState) -> (u16, Value) {
     let inner = &state.esim.inner;
     let mut d = inner.download.lock().unwrap();
-    let sent = match d.state {
-        "confirm" => inner.child.answer(false),
-        "running" => inner.child.interrupt(),
-        _ => return error(409, "no download is running"),
-    };
-    if !sent {
+    if d.state == "running" && installing_step(&d.step) {
+        return error(409, "the profile is being installed and can't be cancelled now");
+    }
+    if !matches!(d.state, "confirm" | "running") {
+        return error(409, "no download is running");
+    }
+    if !inner.control.send(DownloadCtl::Cancel) {
         return error(409, "the download cannot be cancelled now");
     }
     d.state = "cancelling";
     d.error = Some("cancelled".into());
-    let view = d.view();
-    let started = d.started_at;
-    drop(d);
-    let inner = Arc::clone(inner);
-    let _ = crate::system::try_spawn_named("esim-cancel", move || {
-        std::thread::sleep(CANCEL_GRACE);
-        if inner.download.lock().unwrap().is_cancelling(started) {
-            eprintln!("[esim] download did not stop after SIGINT; killing lpac");
-            inner.child.signal(libc::SIGKILL);
-        }
-    });
-    (200, json!({"ok": true, "data": view}))
+    (200, json!({"ok": true, "data": d.view()}))
 }
 
-/// Declines the preview if the user has not answered within `PREVIEW_LIMIT`.
+/// Cancels the preview (reason timeout) if the user has not answered within `PREVIEW_LIMIT`.
 fn arm_preview_timeout(inner: &Arc<Inner>) {
     let inner = Arc::clone(inner);
     let started = inner.download.lock().unwrap().started_at;
     let _ = crate::system::try_spawn_named("esim-preview", move || {
         std::thread::sleep(PREVIEW_LIMIT);
         let mut d = inner.download.lock().unwrap();
-        if d.state == "confirm" && d.started_at == started && inner.child.answer(false) {
+        if d.state == "confirm" && d.started_at == started && inner.control.send(DownloadCtl::PreviewTimeout) {
             d.state = "cancelling";
             d.error = Some("not confirmed within 2 minutes".into());
         }
@@ -1274,7 +1323,7 @@ pub fn download_dismiss(state: &AppState) -> (u16, Value) {
 
 /// Lists the receipts waiting on the card (guard held) and merges them into the saved state.
 fn list_receipts(inner: &Arc<Inner>) -> Result<usize, String> {
-    let data = lpac(&["notification", "list"], CARD_LIMIT, &|_| {}, None).map_err(|e| e.message())?;
+    let data = card(&["notification", "list"], CARD_LIMIT).map_err(|e| e.message())?;
     let fresh = receipt_views(&data);
     let n = fresh.len();
     inner.receipts.lock().unwrap().merge(fresh, unix_now());
@@ -1308,7 +1357,12 @@ fn send_receipts(inner: &Arc<Inner>) -> bool {
             continue;
         }
         let arg = seq.to_string();
-        let result = lpac(&["notification", "process", "-r", &arg], RECEIPT_LIMIT, &|_| {}, None);
+        let result = card(&["notification", "process", "-r", &arg], RECEIPT_LIMIT);
+        if let Err(CardError::NotStarted(m)) = &result {
+            // Nothing was attempted: stop the round without counting it against the receipt.
+            eprintln!("[esim] operator receipts postponed: {m}");
+            break;
+        }
         let mut r = inner.receipts.lock().unwrap();
         match result {
             Ok(_) => {
@@ -1423,7 +1477,10 @@ pub fn nickname(state: &AppState, body: &[u8]) -> (u16, Value) {
         Err(reply) => return reply,
     };
     let parsed: Value = serde_json::from_slice(body).unwrap_or_default();
-    let name = parsed["nickname"].as_str().unwrap_or("").trim().to_string();
+    let Some(raw) = parsed.get("nickname").and_then(Value::as_str) else {
+        return error(400, "nickname must be a string (\"\" clears it)");
+    };
+    let name = raw.trim().to_string();
     if let Err(message) = check_nickname(&name) {
         return error(400, message);
     }
@@ -1436,7 +1493,7 @@ pub fn nickname(state: &AppState, body: &[u8]) -> (u16, Value) {
     if let Err(reply) = check_card(&state.esim.inner) {
         return reply;
     }
-    let list = match lpac(&["profile", "list"], CARD_LIMIT, &|_| {}, None) {
+    let list = match card(&["profile", "list"], CARD_LIMIT) {
         Ok(data) => profile_views(&data),
         Err(e) => return e.reply(),
     };
@@ -1447,7 +1504,7 @@ pub fn nickname(state: &AppState, body: &[u8]) -> (u16, Value) {
     if !name.is_empty() {
         args.push(name.as_str());
     }
-    if let Err(e) = lpac(&args, CARD_LIMIT, &|_| {}, None) {
+    if let Err(e) = card(&args, CARD_LIMIT) {
         return e.reply();
     }
     let updated: Vec<Value> = list
@@ -1522,26 +1579,29 @@ fn check_activation_code(code: &str) -> Result<bool, &'static str> {
         return Err(BAD);
     };
     let parts: Vec<&str> = rest.split('$').collect();
-    if parts.len() < 3 || parts.len() > 5 || parts[0] != "1" {
+    if parts.len() < 3 || parts[0] != "1" {
         return Err(BAD);
     }
     let server_ok = !parts[1].is_empty()
         && parts[1]
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'));
-    if !server_ok {
+    if !server_ok || parts[1].len() > 255 {
         return Err("the activation code's server address is invalid");
     }
-    // lpac accepts only letters, digits and '-' in the matching ID.
+    // Matching IDs use only letters, digits and '-' (SGP.22 section 4.1).
     if !parts[2].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
         return Err("the activation code's matching ID is invalid");
     }
     Ok(parts.get(4) == Some(&"1"))
 }
 
-fn valid_iccid(s: &str) -> bool {
+/// The card's form of an ICCID: digits only. The modem pads an odd-length ICCID with `F`, which
+/// is accepted and dropped (a 20-digit ICCID never has one).
+fn normalize_iccid(s: &str) -> Option<String> {
     let digits = s.strip_suffix(['F', 'f']).unwrap_or(s);
-    (18..=20).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+    let range = if digits.len() == s.len() { 18..=20 } else { 18..=19 };
+    (range.contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())).then(|| digits.to_string())
 }
 
 /// Last four digits only, for logs.
@@ -1551,7 +1611,7 @@ fn mask(iccid: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// lpac output → API views
+// Card command results → API views
 // ---------------------------------------------------------------------------
 
 /// Keeps the fields the app needs; drops icons (base64 images, often several KB).
@@ -1568,7 +1628,8 @@ fn profile_views(data: &Value) -> Vec<Value> {
                         "nickname": p["profileNickname"],
                         "provider": p["serviceProviderName"],
                         "name": p["profileName"],
-                        "class": p["profileClass"],
+                        // SGP.22 ProfileClass DEFAULT operational: an absent tag means operational.
+                        "class": p["profileClass"].as_str().unwrap_or("operational"),
                     })
                 })
                 .collect()
@@ -1588,240 +1649,153 @@ fn chip_view(data: &Value) -> Value {
     })
 }
 
-/// The final `{"type":"lpa",...}` line carries the result; earlier lines are progress reports.
-fn parse_output(stdout: &str) -> Result<Value, String> {
-    let result = stdout
-        .lines()
-        .rev()
-        .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
-        .find(|v| v["type"] == "lpa")
-        .ok_or("lpac printed no result")?;
-    let payload = &result["payload"];
-    if payload["code"].as_i64() == Some(0) {
-        return Ok(payload["data"].clone());
-    }
-    let message = payload["message"].as_str().unwrap_or("lpac error");
-    Err(match payload["data"].as_str() {
-        Some(reason) if !reason.is_empty() => format!("{message}: {reason}"),
-        _ => message.to_string(),
-    })
-}
-
 // ---------------------------------------------------------------------------
-// Running lpac
+// Running card commands
 // ---------------------------------------------------------------------------
 
-enum LpacError {
-    NotInstalled(String),
+enum CardError {
+    /// `ZTE_AGENT_ESIM_QRTR_NODE` or `ZTE_AGENT_ESIM_UIM_SLOT` is invalid.
+    Config(String),
     Failed(String),
+    /// The command never reached the card (an earlier one still holds it, or no worker thread):
+    /// not a card outcome.
+    NotStarted(String),
 }
 
-impl LpacError {
+impl CardError {
     fn message(&self) -> String {
         match self {
-            LpacError::NotInstalled(m) | LpacError::Failed(m) => m.clone(),
+            CardError::Config(m) | CardError::Failed(m) | CardError::NotStarted(m) => m.clone(),
         }
     }
 
     fn reply(self) -> (u16, Value) {
         match self {
-            LpacError::NotInstalled(m) => error(503, &m),
-            LpacError::Failed(m) => error(502, &m),
+            CardError::Config(m) => error(503, &m),
+            CardError::Failed(m) => error(502, &m),
+            CardError::NotStarted(m) => error(409, &m),
         }
     }
 }
 
-struct Config {
-    dir: PathBuf,
-    node: String,
-    slot: String,
+/// The card lock (`ZTE_AGENT_ESIM_LOCK`, default /tmp/esim.lock), shared with the CLI.
+pub(crate) fn lock_path() -> PathBuf {
+    PathBuf::from(std::env::var("ZTE_AGENT_ESIM_LOCK").unwrap_or_else(|_| DEFAULT_LOCK_PATH.into()))
 }
 
-fn config() -> Result<Config, LpacError> {
-    let dir = PathBuf::from(std::env::var("ZTE_AGENT_LPAC_DIR").unwrap_or_else(|_| DEFAULT_DIR.into()));
+/// QRTR node of the modem's UIM service and the SIM slot holding the eSIM
+/// (`ZTE_AGENT_ESIM_QRTR_NODE`, default 3; `ZTE_AGENT_ESIM_UIM_SLOT`, default 1).
+pub(crate) fn card_target() -> Result<(u32, u8), String> {
     let number = |name: &str, default: &str| {
         let v = std::env::var(name).unwrap_or_else(|_| default.into());
-        if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(LpacError::NotInstalled(format!("{name} must be a number")));
-        }
-        Ok(v)
+        Some(v).filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())).and_then(|v| v.parse::<u32>().ok())
     };
-    Ok(Config {
-        node: number("ZTE_AGENT_LPAC_QRTR_NODE", "3")?,
-        slot: number("ZTE_AGENT_LPAC_UIM_SLOT", "1")?,
-        dir,
-    })
+    let node = number("ZTE_AGENT_ESIM_QRTR_NODE", "3").ok_or("ZTE_AGENT_ESIM_QRTR_NODE must be a number")?;
+    let slot = number("ZTE_AGENT_ESIM_UIM_SLOT", "1")
+        .and_then(|s| u8::try_from(s).ok())
+        .filter(|s| *s >= 1)
+        .ok_or("ZTE_AGENT_ESIM_UIM_SLOT must be 1-255")?;
+    Ok((node, slot))
 }
 
-/// The bundle runs as root with access to the SIM: refuse files others could have replaced.
-fn check_bundle(dir: &Path) -> Result<(), LpacError> {
-    let missing = || {
-        LpacError::NotInstalled(format!(
-            "lpac is not installed (expected a bundle in {})",
-            dir.display()
-        ))
-    };
-    let euid = unsafe { libc::geteuid() };
-    for rel in ["", "lpac", "ld-musl-aarch64.so.1", "lib", "driver"] {
-        let path = dir.join(rel);
-        let meta = std::fs::symlink_metadata(&path).map_err(|_| missing())?;
-        if meta.file_type().is_symlink() || meta.uid() != euid || meta.mode() & 0o022 != 0 {
-            return Err(LpacError::NotInstalled(format!(
-                "{} must be owned by the agent user and not group/world-writable",
-                path.display()
-            )));
+/// Runs a profile download (`esim_download`) on the caller's (download) thread, which holds the
+/// card for the whole session. `progress(step, data)` gets each step; decisions arrive through
+/// `control`.
+fn download(
+    code: &str,
+    confirmation: Option<&str>,
+    preview: bool,
+    limit: Duration,
+    progress: &dyn Fn(&str, &Value),
+    control: &DownloadControl,
+) -> Result<Value, CardError> {
+    let (node, slot) = card_target().map_err(CardError::Config)?;
+    // A card command that outlived its limit may still hold the card: nothing else may start.
+    if CARD_WORKER_RUNNING.load(Ordering::SeqCst) {
+        return Err(CardError::NotStarted("the previous eSIM command is still finishing".into()));
+    }
+    let code = crate::esim_download::parse_activation_code(code).map_err(|e| CardError::Failed(e.to_string()))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Clears the control channel however the download ends.
+    struct Clear<'a>(&'a DownloadControl);
+    impl Drop for Clear<'_> {
+        fn drop(&mut self) {
+            *self.0.tx.lock().unwrap() = None;
         }
     }
-    Ok(())
+    let _clear = Clear(control);
+    *control.tx.lock().unwrap() = Some(tx);
+    let deadline = Instant::now() + limit;
+    // The card session outlives the procedure's deadline a little, so a stop at the deadline can
+    // still cancel the card session and tell the server.
+    let mut card = crate::esim_native::session(node, slot, deadline + CLEANUP_ALLOWANCE).map_err(CardError::Failed)?;
+    let mut http = crate::esim_native::Es9pHttp { timeout: Duration::from_secs(30) };
+    let mut report = |step: &str, data: Value| progress(step, &data);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::esim_download::download(&mut card, &mut http, &code, confirmation, preview, &rx, &mut report, deadline)
+    }))
+    .unwrap_or_else(|_| Err("the eSIM download stopped unexpectedly".into()))
+    .map_err(CardError::Failed)
 }
 
-/// Runs lpac with `args`, calling `on_line` for every JSON line it prints (progress reports),
-/// and returns the data of the final result line. At `limit` lpac gets SIGINT, which makes a
-/// download cancel its session with the card and the server; SIGKILL follows 15 s later.
-fn lpac(
-    args: &[&str],
-    limit: Duration,
-    on_line: &(dyn Fn(&Value) + Sync),
-    io: Option<&ChildIo>,
-) -> Result<Value, LpacError> {
-    lpac_in(&config()?, args, limit, on_line, io)
-}
+/// Time after a download's deadline for cancelling the sessions.
+const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(30);
 
-fn lpac_in(
-    cfg: &Config,
-    args: &[&str],
-    limit: Duration,
-    on_line: &(dyn Fn(&Value) + Sync),
-    io: Option<&ChildIo>,
-) -> Result<Value, LpacError> {
-    check_bundle(&cfg.dir)?;
-    let dir = &cfg.dir;
-    let mut child = Command::new(dir.join("ld-musl-aarch64.so.1"))
-        .arg("--library-path")
-        .arg(dir.join("lib"))
-        .arg(dir.join("lpac"))
-        .args(args)
-        .current_dir(dir)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("LC_ALL", "C")
-        .env("LPAC_APDU", "qmi_qrtr")
-        .env("LPAC_APDU_QMI_QRTR_NODE", &cfg.node)
-        .env("LPAC_APDU_QMI_UIM_SLOT", &cfg.slot)
-        .env("LPAC_HTTP", "curl")
-        // Operators' SM-DP+ servers chain to the GSMA eSIM root CI, which no web CA list holds.
-        .env("LPAC_HTTP_CA_FILE", dir.join("gsma-ci.pem"))
-        .env("GIO_MODULE_DIR", dir.join("no-modules"))
-        .env("GIO_USE_VFS", "local")
-        .env("GIO_USE_PROXY_RESOLVER", "dummy")
-        .stdin(if io.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| LpacError::Failed(format!("cannot start lpac: {e}")))?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let pid = child.id() as libc::pid_t;
-    if let Some(io) = io {
-        *io.stdin.lock().unwrap() = child.stdin.take();
-        *io.pid.lock().unwrap() = pid;
+/// Set while a card command's worker thread runs.
+static CARD_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Past the command's own limit before the caller stops waiting for a worker.
+const WORKER_GRACE: Duration = Duration::from_secs(5);
+
+/// Runs one card command (`esim_native::run`) on a worker thread, so a stalled modem (QRTR flow
+/// control can block a send indefinitely) can't hold the caller past `limit`.
+fn card(args: &[&str], limit: Duration) -> Result<Value, CardError> {
+    let (node, slot) = card_target().map_err(CardError::Config)?;
+    if CARD_WORKER_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err(CardError::NotStarted("the previous eSIM command is still finishing".into()));
     }
-    // Drain both pipes while waiting so a large profile list can never block lpac.
-    let (status, out, err) = std::thread::scope(|s| {
-        // Past MAX_OUTPUT the rest is read and discarded, so lpac never blocks on a full pipe.
-        let out = s.spawn(move || {
-            let mut text = String::new();
-            if let Some(pipe) = stdout {
-                let mut reader = BufReader::new(pipe.take(MAX_OUTPUT));
-                for line in reader.by_ref().lines().map_while(Result::ok) {
-                    if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
-                        on_line(&v);
-                    }
-                    text.push_str(&line);
-                    text.push('\n');
-                }
-                let _ = std::io::copy(&mut reader.into_inner().into_inner(), &mut std::io::sink());
-            }
-            text
-        });
-        let err = s.spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut p) = stderr {
-                let _ = p.by_ref().take(MAX_OUTPUT).read_to_end(&mut buf);
-                let _ = std::io::copy(&mut p, &mut std::io::sink());
-            }
-            buf
-        });
-        let started = Instant::now();
-        let mut interrupted = false;
-        let status = loop {
-            let polled = match io {
-                Some(io) => {
-                    let mut slot = io.pid.lock().unwrap();
-                    let polled = child.try_wait();
-                    if !matches!(polled, Ok(None)) {
-                        *slot = 0;
-                    }
-                    polled
-                }
-                None => child.try_wait(),
-            };
-            match polled {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) if started.elapsed() < limit => {}
-                Ok(None) if !interrupted => {
-                    // SAFETY: `pid` is our own child, not yet reaped (try_wait returned None),
-                    // and leads its own process group.
-                    unsafe { libc::kill(-pid, libc::SIGINT) };
-                    interrupted = true;
-                }
-                Ok(None) if started.elapsed() < limit + Duration::from_secs(15) => {}
-                _ => {
-                    let slot = io.map(|io| io.pid.lock().unwrap());
-                    // SAFETY: as above; the group goes too, so no helper keeps the pipes open.
-                    unsafe { libc::kill(-pid, libc::SIGKILL) };
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(mut slot) = slot {
-                        *slot = 0;
-                    }
-                    break None;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        // Anything lpac left in its group (no helper is expected) would hold the pipes open
-        // and stall the readers; the leader is reaped, so the group id is still ours.
-        // SAFETY: ESRCH when the group is empty, which is the normal case.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
-        if let Some(io) = io {
-            *io.stdin.lock().unwrap() = None;
+    // Clears the flag however the worker ends, panics included.
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            CARD_WORKER_RUNNING.store(false, Ordering::SeqCst);
         }
-        let status = if interrupted { None } else { status };
-        (
-            status,
-            out.join().unwrap_or_default(),
-            err.join().unwrap_or_default(),
-        )
+    }
+    let running = Running;
+    // The worker's own copy of the card lock: if the caller stops waiting, CLI runs stay locked
+    // out until the worker really ends.
+    let lock = HELD_LOCK.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|f| f.try_clone().ok());
+    let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = crate::system::try_spawn_named("esim-card", move || {
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::esim_native::run(&refs, node, slot, limit)
+        }))
+        .unwrap_or_else(|_| Err("the eSIM worker stopped unexpectedly".into()));
+        // The card session is closed: release the claims before the caller can start the next
+        // command, so it never sees "still finishing".
+        drop(lock);
+        drop(running);
+        let _ = tx.send(result);
     });
-    let Some(status) = status else {
-        return Err(LpacError::Failed(format!(
-            "lpac did not finish within {} s",
-            limit.as_secs()
-        )));
-    };
-    match parse_output(&out) {
-        Ok(data) => Ok(data),
-        Err(message) => {
-            let detail = String::from_utf8_lossy(&err);
-            let detail = detail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-            eprintln!("[esim] lpac {} failed ({status}): {message}", args[..2.min(args.len())].join(" "));
-            Err(LpacError::Failed(if detail.is_empty() {
-                message
-            } else {
-                format!("{message} ({})", detail.trim())
-            }))
+    if spawned.is_err() {
+        // The closure (and with it `running`) was dropped, which cleared the flag.
+        return Err(CardError::NotStarted("could not start the eSIM worker".into()));
+    }
+    let op = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+    match rx.recv_timeout(limit + WORKER_GRACE) {
+        Ok(Ok(data)) => Ok(data),
+        Ok(Err(e)) => {
+            eprintln!("[esim] {op} failed: {e}");
+            Err(CardError::Failed(e))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("[esim] {op}: worker stopped without an answer");
+            Err(CardError::Failed("the eSIM worker stopped unexpectedly".into()))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!("[esim] {op} did not finish within {} s", limit.as_secs());
+            Err(CardError::Failed(format!("eSIM command did not finish within {} s", limit.as_secs())))
         }
     }
 }
@@ -1832,8 +1806,13 @@ mod tests {
 
     const LIST: &str = r#"{"type":"lpa","payload":{"code":0,"message":"success","data":[{"iccid":"8963000000000000001","isdpAid":"A0000005591010FFFFFFFF8900001000","profileState":"enabled","profileNickname":"Smart","serviceProviderName":"SMART","profileName":"Operational","iconType":"png","icon":"iVBORw0KGgo=","profileClass":"operational"},{"iccid":"8963000000000000002","isdpAid":"A0000005591010FFFFFFFF8900001100","profileState":"disabled","profileNickname":null,"serviceProviderName":"GOMO","profileName":"Globe Philippines ODC","iconType":"none","icon":null,"profileClass":"operational"},{"iccid":"8963000000000000003","isdpAid":"A0000005591010FFFFFFFF8900001200","profileState":"disabled","profileNickname":null,"serviceProviderName":"Test","profileName":"Test","iconType":"none","icon":null,"profileClass":"test"}]}}"#;
 
+    /// The data of a result line in lpac's format, which `esim_native` reproduces.
+    fn data(line: &str) -> Value {
+        serde_json::from_str::<Value>(line).unwrap()["payload"]["data"].clone()
+    }
+
     fn list() -> Vec<Value> {
-        profile_views(&parse_output(LIST).unwrap())
+        profile_views(&data(LIST))
     }
 
     #[test]
@@ -1847,24 +1826,6 @@ mod tests {
         assert_eq!(p[1]["nickname"], Value::Null);
         assert!(p.iter().all(|v| v.get("icon").is_none()));
         assert_eq!(enabled_iccid(&p).as_deref(), Some("8963000000000000001"));
-    }
-
-    #[test]
-    fn result_is_the_last_lpa_line_after_progress_reports() {
-        let out = "{\"type\":\"progress\",\"payload\":{\"code\":0,\"message\":\"es10b\",\"data\":null}}\n\
-                   {\"type\":\"lpa\",\"payload\":{\"code\":0,\"message\":\"success\",\"data\":null}}\n";
-        assert_eq!(parse_output(out).unwrap(), Value::Null);
-    }
-
-    #[test]
-    fn failures_carry_lpac_reason() {
-        let out = r#"{"type":"lpa","payload":{"code":-1,"message":"es10c_enable_profile","data":"profile not in disabled state"}}"#;
-        assert_eq!(
-            parse_output(out).unwrap_err(),
-            "es10c_enable_profile: profile not in disabled state"
-        );
-        assert!(parse_output("").is_err());
-        assert!(parse_output("garbage\n").is_err());
     }
 
     #[test]
@@ -1904,15 +1865,17 @@ mod tests {
     #[test]
     fn download_progress_tracks_step_and_metadata() {
         let mut d = Download { state: "running", ..Download::default() };
-        d.progress(&json!({"type":"progress","payload":{"code":0,"message":"es9p_initiate_authentication","data":"smdp.example.com"}}));
+        d.progress("es9p_initiate_authentication", &json!("smdp.example.com"));
         assert_eq!(d.step, "es9p_initiate_authentication");
-        d.progress(&json!({"type":"progress","payload":{"code":0,"message":"es8p_metadata_parse","data":{"iccid":"8963000000000000004","serviceProviderName":"GOMO","profileName":"Globe"}}}));
+        d.progress(
+            "es8p_metadata_parse",
+            &json!({"iccid":"8963000000000000004","serviceProviderName":"GOMO","profileName":"Globe"}),
+        );
         assert_eq!(d.provider.as_deref(), Some("GOMO"));
         assert_eq!(d.name.as_deref(), Some("Globe"));
-        d.progress(&json!({"type":"lpa","payload":{"code":0,"message":"success","data":null}}));
-        assert_eq!(d.step, "es8p_metadata_parse", "result lines are not progress");
-        d.progress(&json!({"type":"progress","payload":{"code":0,"message":"es9p_authenticate_client","data":null}}));
-        d.progress(&json!({"type":"progress","payload":{"code":0,"message":"es9p_cancel_session","data":null}}));
+        d.progress("es9p_authenticate_client", &Value::Null);
+        d.progress("es10b_cancel_session", &Value::Null);
+        d.progress("es9p_cancel_session", &Value::Null);
         assert_eq!(d.step, "es9p_authenticate_client", "cleanup does not hide the failing step");
         assert_eq!(Download::default().view()["state"], "idle");
     }
@@ -1920,7 +1883,7 @@ mod tests {
     #[test]
     fn preview_prompt_moves_a_running_download_to_confirm() {
         let mut d = Download { state: "running", ..Download::default() };
-        d.progress(&json!({"type":"progress","payload":{"code":0,"message":"preview","data":"y/n"}}));
+        d.progress("preview", &Value::Null);
         assert_eq!(d.state, "confirm");
         assert_eq!(d.view()["state"], "confirm");
     }
@@ -1938,20 +1901,20 @@ mod tests {
     }
 
     #[test]
-    fn answering_or_cancelling_without_a_child_does_nothing() {
-        let io = ChildIo::default();
-        assert!(!io.answer(true));
-        assert!(!io.interrupt());
+    fn decisions_without_a_running_download_go_nowhere() {
+        let control = DownloadControl::default();
+        assert!(!control.send(DownloadCtl::Accept));
+        assert!(!control.send(DownloadCtl::Cancel));
     }
 
     #[test]
     fn iccid_validation() {
-        assert!(valid_iccid("8963000000000000001"));
-        assert!(valid_iccid("896300000000000000F"));
-        assert!(valid_iccid("89630000000000000012"));
-        assert!(!valid_iccid("89630000000000001"));
-        assert!(!valid_iccid("8963000000000000001; reboot"));
-        assert!(!valid_iccid(""));
+        assert!(normalize_iccid("8963000000000000001").is_some());
+        assert!(normalize_iccid("896300000000000000F").is_some());
+        assert!(normalize_iccid("89630000000000000012").is_some());
+        assert!(normalize_iccid("89630000000000001").is_none());
+        assert!(normalize_iccid("8963000000000000001; reboot").is_none());
+        assert!(normalize_iccid("").is_none());
     }
 
     #[test]
@@ -2051,19 +2014,6 @@ mod tests {
     }
 
     #[test]
-    fn build_info_reads_buildinfo_and_the_lpac_checksum() {
-        let dir = std::env::temp_dir().join(format!("zte-agent-buildinfo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(build_info(&dir)["build"], Value::Null);
-        std::fs::write(dir.join("BUILDINFO"), "lpac_commit=c7c8d4f\npatch_sha256=abc\n").unwrap();
-        std::fs::write(dir.join("SHA256SUMS"), "111  bounded\n222  lpac\n333  lib/liblpac.so\n").unwrap();
-        let v = build_info(&dir);
-        assert_eq!(v["build"]["lpac_commit"], "c7c8d4f");
-        assert_eq!(v["lpac_sha256"], "222");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn busy_guard_is_exclusive_and_released_on_drop() {
         let e = Esim::with_lock_path(temp_lock("busy"));
         let g = e.acquire().expect("first");
@@ -2072,16 +2022,105 @@ mod tests {
         assert!(e.acquire().is_some());
     }
 
+    /// The card commands' data and errors go through the views' parsers.
+    #[test]
+    fn card_output_feeds_the_views() {
+        use crate::esim_native::{info2_json, notification_json, profile_json};
+        let p = euicc::es10c::ProfileInfo {
+            iccid: "8963000000000000001".into(),
+            isdp_aid: "a0000005591010ffffffff8900001000".into(),
+            profile_state: Some("enabled"),
+            profile_nickname: None,
+            service_provider_name: Some("SMART".into()),
+            profile_name: Some("Operational".into()),
+            profile_class: Some("operational"),
+            ..Default::default()
+        };
+        let views = profile_views(&json!([profile_json(&p)]));
+        assert_eq!(views[0]["iccid"], "8963000000000000001");
+        assert_eq!(views[0]["state"], "enabled");
+        assert_eq!(views[0]["provider"], "SMART");
+        assert_eq!(views[0]["class"], "operational");
+        assert_eq!(views[0]["nickname"], Value::Null);
+        assert_eq!(enabled_iccid(&views).as_deref(), Some("8963000000000000001"));
+
+        let info = euicc::info2::EuiccInfo2 {
+            euicc_firmware_ver: Some("4.2.0".into()),
+            svn: Some("2.2.2".into()),
+            profile_version: Some("2.3.1".into()),
+            ext_card_resource: Some(euicc::info2::ExtCardResource {
+                installed_application: 3,
+                free_non_volatile_memory: 971752,
+                free_volatile_memory: 16574,
+            }),
+            ..Default::default()
+        };
+        let chip = chip_view(&json!({"eidValue": "89000000000000000000000000000001", "EUICCInfo2": info2_json(&info)}));
+        assert_eq!(chip["eid"], "89000000000000000000000000000001");
+        assert_eq!(chip["firmware"], "4.2.0");
+        assert_eq!(chip["free_nvm_bytes"], 971752);
+        let no_info = chip_view(&json!({"eidValue": "89000000000000000000000000000001", "EUICCInfo2": null}));
+        assert_eq!(no_info["eid"], "89000000000000000000000000000001", "card check still works without card details");
+
+        let n = euicc::es10b::NotificationMetadata {
+            seq_number: 131,
+            profile_management_operation: Some("enable"),
+            notification_address: Some(" glo.prod.ondemandconnectivity.com\n".into()),
+            iccid: Some("8963000000000000001".into()),
+        };
+        let receipts = receipt_views(&json!([notification_json(&n)]));
+        assert_eq!(receipts[0].seq, 131);
+        assert_eq!(receipts[0].operation, "enable");
+        assert_eq!(receipts[0].address, "glo.prod.ondemandconnectivity.com", "address trimmed");
+
+        // Errors: a SIM reload while opening the channel, and a busy card.
+        let reload = "euicc_init: open logical channel failed: QMI error 80 SimFileNotFound";
+        assert_eq!(classify(reload, true), "sim_reloading");
+        assert_eq!(classify(reload, false), "management_unavailable");
+        assert!(card_busy("es10c_enable_profile: catBusy"));
+    }
+
+    #[test]
+    fn audit_fixes_for_iccids_receipts_routes_and_class() {
+        // The modem's padded form is accepted and looked up as the card's form.
+        assert_eq!(normalize_iccid("8963000000000000005F").as_deref(), Some("8963000000000000005"));
+        assert_eq!(normalize_iccid("89630000000000000027").as_deref(), Some("89630000000000000027"));
+        assert!(normalize_iccid("89630000000000000027F").is_none(), "20 digits never carry a filler");
+        assert!(normalize_iccid("8963000000000000x01").is_none());
+        // A profile without a class tag is operational (SGP.22 default) and can be enabled.
+        let views = profile_views(&json!([{"iccid": "8963000000000000001", "profileState": "disabled"}]));
+        assert_eq!(views[0]["class"], "operational");
+        assert!(check_enable_target(&views, "8963000000000000001").is_ok());
+        // Receipts keep attempt counts only for the same receipt, not a reused sequence number.
+        let receipt = |seq, address: &str| Receipt {
+            seq,
+            operation: "enable".into(),
+            address: address.into(),
+            iccid: None,
+            attempts: 0,
+            last_error: None,
+        };
+        let mut r = Receipts::default();
+        r.merge(vec![receipt(5, "a.example")], 1);
+        r.pending.as_mut().unwrap()[0].attempts = 7;
+        r.merge(vec![receipt(5, "b.example")], 2);
+        assert_eq!(r.pending.as_ref().unwrap()[0].attempts, 0, "another card's receipt 5");
+        // The router's default route.
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                     rmnet_data0\t00000000\t0100A8C0\t0003\t0\t0\t0\t00000000\n";
+        assert!(has_default_route(table));
+        assert!(!has_default_route("Iface\tDestination\tGateway \tFlags\nbr-lan\t0000A8C0\t00000000\t0001\n"));
+    }
+
     #[test]
     fn busy_refusals_are_retried_and_other_refusals_are_not() {
-        assert!(card_busy("es10c_enable_profile: unknown"), "older lpac bundles");
-        assert!(card_busy("es10c_enable_profile: cat busy"));
-        assert!(card_busy("es10c_enable_profile: undefined error"));
+        assert!(card_busy("es10c_enable_profile: catBusy"));
+        assert!(card_busy("es10c_enable_profile: undefinedError"));
         assert!(card_busy("es10c_enable_profile: unknown result 6"));
-        assert!(!card_busy("es10c_enable_profile: disallowed by policy"));
-        assert!(!card_busy("es10c_enable_profile: internal error, maybe illegal iccid/aid coding"));
-        assert!(!card_busy("es10c_delete_profile: cat busy"));
-        assert!(!card_busy("lpac did not finish within 30 s"));
+        assert!(!card_busy("es10c_enable_profile: disallowedByPolicy"));
+        assert!(!card_busy("es10c_enable_profile: unexpected card response (no result code)"));
+        assert!(!card_busy("es10c_delete_profile: catBusy"));
+        assert!(!card_busy("eSIM command did not finish within 30 s"));
     }
 
     #[test]
@@ -2101,10 +2140,12 @@ mod tests {
     #[test]
     fn switch_guard_expires() {
         let e = Esim::new();
-        assert!(!e.recently_switched(1_000));
-        e.inner.switched_at.store(1_000, Ordering::Relaxed);
-        assert!(e.recently_switched(1_000 + SWITCH_GUARD_SECS - 1));
-        assert!(!e.recently_switched(1_000 + SWITCH_GUARD_SECS));
+        assert!(!e.recently_switched());
+        e.inner.switched_at.store(mono_secs(), Ordering::Relaxed);
+        assert!(e.recently_switched());
+        assert!(switched_within(1_000, 1_000 + SWITCH_GUARD_SECS - 1));
+        assert!(!switched_within(1_000, 1_000 + SWITCH_GUARD_SECS));
+        assert!(!switched_within(0, 5), "never switched");
     }
 
     #[test]
@@ -2152,83 +2193,6 @@ mod tests {
         let mut sw = Switch { state: "reloading", target: "8963000000000000001".into(), ..Switch::default() };
         sw.finish("connected", 9);
         assert_eq!((sw.view()["state"].as_str(), sw.finished_at), (Some("connected"), 9));
-    }
-
-    /// A bundle whose "loader" is a shell script standing in for lpac.
-    fn fake_bundle(script: &str) -> Config {
-        use std::os::unix::fs::PermissionsExt;
-        static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "zte-agent-lpac-test-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        for sub in ["lib", "driver"] {
-            std::fs::create_dir_all(dir.join(sub)).unwrap();
-            std::fs::set_permissions(dir.join(sub), std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        std::fs::write(dir.join("lpac"), "").unwrap();
-        std::fs::set_permissions(dir.join("lpac"), std::fs::Permissions::from_mode(0o644)).unwrap();
-        let ld = dir.join("ld-musl-aarch64.so.1");
-        std::fs::write(&ld, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&ld, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Config { dir, node: "3".into(), slot: "1".into() }
-    }
-
-    fn run_fake(script: &str, limit: Duration) -> Result<Value, LpacError> {
-        let cfg = fake_bundle(script);
-        let result = lpac_in(&cfg, &["profile", "list"], limit, &|_| {}, None);
-        let _ = std::fs::remove_dir_all(&cfg.dir);
-        result
-    }
-
-    const OK_LINE: &str = r#"echo '{"type":"lpa","payload":{"code":0,"message":"success","data":[]}}'"#;
-
-    #[test]
-    fn heavy_stderr_and_stdout_beyond_the_cap_do_not_block_lpac() {
-        let script = format!(
-            "head -c 2000000 /dev/zero | tr '\\0' x >&2\nhead -c 1000000 /dev/zero | tr '\\0' y\necho\n{OK_LINE}"
-        );
-        let started = Instant::now();
-        let result = run_fake(&script, Duration::from_secs(20));
-        assert!(started.elapsed() < Duration::from_secs(15), "drained, not timed out");
-        // The result line came after the cap, so it was discarded: still never a false success.
-        assert!(result.is_err());
-        assert!(run_fake(&format!("head -c 2000000 /dev/zero | tr '\\0' x >&2\n{OK_LINE}"), Duration::from_secs(20)).is_ok());
-    }
-
-    #[test]
-    fn lpac_trusts_the_bundled_gsma_roots_for_operator_servers() {
-        let cfg = fake_bundle(r#"echo "{\"type\":\"lpa\",\"payload\":{\"code\":0,\"message\":\"success\",\"data\":\"$LPAC_HTTP_CA_FILE\"}}""#);
-        let result = lpac_in(&cfg, &["notification", "list"], Duration::from_secs(10), &|_| {}, None);
-        let data = result.map_err(|e| e.message().to_string()).unwrap();
-        assert_eq!(data, json!(cfg.dir.join("gsma-ci.pem").to_str().unwrap()));
-        let _ = std::fs::remove_dir_all(&cfg.dir);
-    }
-
-    #[test]
-    fn exiting_without_a_result_is_a_failure() {
-        let e = run_fake("exit 0", Duration::from_secs(10)).unwrap_err();
-        assert!(e.message().contains("no result"), "{}", e.message());
-        let progress_only = r#"echo '{"type":"progress","payload":{"code":0,"message":"es10b","data":null}}'"#;
-        assert!(run_fake(progress_only, Duration::from_secs(10)).is_err());
-    }
-
-    #[test]
-    fn output_after_the_result_is_still_drained() {
-        let script = format!("{OK_LINE}\necho '{{\"type\":\"progress\",\"payload\":{{\"code\":0,\"message\":\"cleanup\"}}}}'\nexit 0");
-        assert!(run_fake(&script, Duration::from_secs(10)).is_ok());
-    }
-
-    #[test]
-    fn a_hung_lpac_and_its_helpers_are_stopped_at_the_limit() {
-        // The helper keeps stdout open: only a process-group signal ends it.
-        let started = Instant::now();
-        let e = run_fake("sleep 60 &\nsleep 60", Duration::from_secs(1)).unwrap_err();
-        assert!(e.message().contains("did not finish"), "{}", e.message());
-        assert!(started.elapsed() < Duration::from_secs(20), "took {:?}", started.elapsed());
     }
 
     #[test]
