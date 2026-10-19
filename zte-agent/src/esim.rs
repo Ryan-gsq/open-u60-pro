@@ -285,6 +285,8 @@ struct Switch {
     connected_at: u64,
     finished_at: u64,
     note: Option<String>,
+    /// Why data didn't connect, when the firmware shows it: `roaming_off` or `data_off`.
+    reason: Option<&'static str>,
 }
 
 impl Switch {
@@ -305,6 +307,7 @@ impl Switch {
             "connected_at": self.connected_at,
             "finished_at": self.finished_at,
             "note": self.note,
+            "reason": self.reason,
         })
     }
 }
@@ -797,6 +800,9 @@ fn verify_switch(inner: Arc<Inner>, target: String) {
         }
         if started.elapsed() >= SWITCH_VERIFY_LIMIT {
             let outcome = if sw.modem_confirmed_at != 0 { "no_data" } else { "modem_unconfirmed" };
+            if outcome == "no_data" {
+                sw.reason = data_blocker();
+            }
             sw.finish(outcome, now);
             eprintln!("[esim] switch to {} ended as {outcome}", mask(&target));
             break false;
@@ -864,6 +870,36 @@ fn data_connected() -> bool {
     .ok()
     .and_then(|v| v["connect_status"].as_str().map(str::to_string))
     .is_some_and(|s| s.contains("connected") && !s.contains("disconnected"))
+}
+
+/// Why data is down when the firmware says so: a profile from another country (SIM and network
+/// MCC differ, as with travel eSIMs) while data roaming is off, or mobile data switched off.
+fn data_blocker() -> Option<&'static str> {
+    let wwan = crate::ubus::call(
+        "zwrt_data",
+        "get_wwaniface",
+        Some(r#"{"source_module":"zte_topsw_data","cid":1}"#),
+    )
+    .ok()?;
+    let sim_mcc = crate::ubus::call("zwrt_zte_mdm.api", "get_sim_info", Some("{}"))
+        .ok()
+        .and_then(|v| v["mdm_mcc"].as_str().map(str::to_string));
+    let net_mcc = crate::ubus::call("zte_nwinfo_api", "nwinfo_get_netinfo", None)
+        .ok()
+        .map(|v| v["rmcc"].to_string().trim_matches('"').to_string());
+    blocker(&wwan, sim_mcc.as_deref(), net_mcc.as_deref())
+}
+
+fn blocker(wwan: &Value, sim_mcc: Option<&str>, net_mcc: Option<&str>) -> Option<&'static str> {
+    let flag = |k: &str| wwan[k].as_i64().or_else(|| wwan[k].as_str().and_then(|s| s.parse().ok()));
+    let abroad = matches!((sim_mcc, net_mcc), (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() && b != "null" && a.trim() != b.trim());
+    if abroad && flag("roam_enable") == Some(0) {
+        Some("roaming_off")
+    } else if flag("enable") == Some(0) {
+        Some("data_off")
+    } else {
+        None
+    }
 }
 
 /// A switch while the user parked the modem would change the card but never attach. When the
@@ -1921,6 +1957,20 @@ mod tests {
         assert!(e.acquire().is_none());
         drop(g);
         assert!(e.acquire().is_some());
+    }
+
+    #[test]
+    fn a_roaming_profile_with_roaming_off_is_named_as_the_reason() {
+        let wwan = |enable: i64, roam: i64| json!({"enable": enable, "roam_enable": roam});
+        // Travel eSIM: Singapore SIM on a Philippine network, roaming off (firmware turns data off).
+        assert_eq!(blocker(&wwan(0, 0), Some("525"), Some("515")), Some("roaming_off"));
+        assert_eq!(blocker(&wwan(1, 1), Some("525"), Some("515")), None);
+        // Home network: roaming doesn't matter, data switched off does.
+        assert_eq!(blocker(&wwan(1, 0), Some("515"), Some("515")), None);
+        assert_eq!(blocker(&wwan(0, 0), Some("515"), Some("515")), Some("data_off"));
+        // Unknown network MCC: no roaming claim.
+        assert_eq!(blocker(&wwan(1, 0), Some("525"), None), None);
+        assert_eq!(blocker(&json!({"enable": "1", "roam_enable": "0"}), Some("525"), Some("515")), Some("roaming_off"));
     }
 
     #[test]
