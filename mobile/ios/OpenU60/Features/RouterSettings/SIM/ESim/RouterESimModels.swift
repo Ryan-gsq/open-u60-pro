@@ -101,7 +101,7 @@ struct RouterESimSwitchStatus: Decodable, Equatable {
 
     /// Shown while the switch runs: the eSIM refused for now and the router keeps trying.
     var progressNote: String? {
-        state == "card_busy" ? "The eSIM is busy and refused the switch for now. The router keeps trying for up to 2½ minutes." : nil
+        state == "card_busy" ? "The eSIM is busy and refused the switch for now. The router keeps trying for up to 4 minutes." : nil
     }
 
     /// Why a finished switch did not reach `connected`.
