@@ -63,10 +63,10 @@ const CARD_CONFIRM_LIMIT: Duration = Duration::from_secs(60);
 /// How long the modem has to load the new identity and connect data after a switch.
 const SWITCH_VERIFY_LIMIT: Duration = Duration::from_secs(150);
 const SWITCH_POLL: Duration = Duration::from_secs(3);
-/// A busy-refused enable is retried this often, for this long (the card stayed busy for about
-/// two minutes with a roaming travel profile enabled).
+/// A busy-refused enable is retried this often, for this long. With a Klook travel profile
+/// enabled the card answered `cat busy` for about two minutes from the first attempt, twice.
 const CARD_BUSY_GAP: Duration = Duration::from_secs(10);
-const CARD_BUSY_LIMIT: Duration = Duration::from_secs(150);
+const CARD_BUSY_LIMIT: Duration = Duration::from_secs(240);
 /// One receipt (ES9+ HandleNotification) to one operator server.
 const RECEIPT_LIMIT: Duration = Duration::from_secs(45);
 /// Pause between "data connected" after a switch and sending its receipts (DNS and routes settle).

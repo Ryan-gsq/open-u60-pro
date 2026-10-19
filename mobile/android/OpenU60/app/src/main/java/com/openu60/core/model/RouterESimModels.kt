@@ -131,7 +131,7 @@ data class RouterESimSwitchStatus(
 
     /** Shown while the switch runs: the eSIM refused for now and the router keeps trying. */
     val progressNote: String?
-        get() = if (state == "card_busy") "The eSIM is busy and refused the switch for now. The router keeps trying for up to 2½ minutes." else null
+        get() = if (state == "card_busy") "The eSIM is busy and refused the switch for now. The router keeps trying for up to 4 minutes." else null
 
     /** Why a finished switch did not reach `connected`. */
     val outcomeNote: String?
