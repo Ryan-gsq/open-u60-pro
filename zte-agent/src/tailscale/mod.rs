@@ -27,6 +27,8 @@ const SOCK: &str = "/tmp/tailscale/tailscaled.sock";
 const LOG_FILE: &str = "/tmp/tailscaled.log";
 
 const POLL_SECS: u64 = 30;
+/// WAN-reconnect events closer together than this get one health check.
+const WAN_DEBOUNCE: Duration = Duration::from_secs(30);
 const CLI_TIMEOUT_SECS: u64 = 20;
 /// Shorter than CLI_TIMEOUT_SECS so GET /status can't stall mobile clients
 /// for long when the daemon is wedged.
@@ -311,22 +313,23 @@ impl TailscaleManager {
     pub fn start_wan_watch(self: &Arc<Self>, rx: mpsc::Receiver<Value>) {
         let mgr = Arc::clone(self);
         thread::spawn(move || {
-            let mut last_handled: i64 = 0;
+            let mut last_handled: Option<Instant> = None;
             for payload in rx.iter() {
-                // Only react to reconnects, not disconnects (same event shape
-                // sms_forward parses: "ipv4", "ipv4v6", ...)
+                // Only react to reconnects (any `*_connected`, IPv6-only
+                // included), not disconnects.
                 let wan_status = payload["wan_status"].as_str().unwrap_or("");
-                if !wan_status.starts_with("ipv4") {
+                if !wan_connected(wan_status) {
                     continue;
                 }
                 if !mgr.running.load(Ordering::SeqCst) || mgr.paused.load(Ordering::SeqCst) {
                     continue;
                 }
                 // Debounce bursts of WAN events
-                if unix_now() - last_handled < 30 {
+                if debounced(last_handled, Instant::now()) {
                     continue;
                 }
-                last_handled = unix_now();
+                last_handled = Some(Instant::now());
+                eprintln!("[tailscale] WAN reconnect ({wan_status}): checking health in 20 s");
                 // Give the data path time to settle, then check health (fresh
                 // status — the cache may predate the flap)
                 thread::sleep(Duration::from_secs(20));
@@ -1010,12 +1013,20 @@ fn pref_args_for(cfg: &TsConfig, verb: &str) -> Vec<String> {
     args
 }
 
-/// `connect_status` of `zwrt_data get_wwaniface` with a data session up. The
-/// firmware reports `ipv4_connected` / `ipv6_connected` / `ipv4_ipv6_connected`
-/// (and `disconnected` / `connecting`, which must not match); older notes
-/// show a bare `connected`.
+/// `connect_status` of `zwrt_data get_wwaniface` (or `wan_status` of
+/// `router_event_wan_connect_status`) with a data session up. The firmware
+/// reports `ipv4_connected` / `ipv6_connected` / `ipv4_ipv6_connected` (and
+/// `disconnected` / `ipv4_disconnected` / `connecting`, which must not match);
+/// older notes show a bare `connected`.
 fn wan_connected(status: &str) -> bool {
     status == "connected" || status.ends_with("_connected")
+}
+
+/// WAN reconnects within [`WAN_DEBOUNCE`] of the last handled one share its
+/// health check. Monotonic: the carrier's NITZ wall-clock jump (+8 h, landing
+/// right at reconnect) must not suppress the checks that follow.
+fn debounced(last: Option<Instant>, now: Instant) -> bool {
+    last.is_some_and(|t| now.saturating_duration_since(t) < WAN_DEBOUNCE)
 }
 
 /// WAN probe schedule for the 90-tick startup gate: three quick probes, then
@@ -1547,6 +1558,16 @@ mod tests {
         ] {
             assert!(!wan_connected(s), "{s}");
         }
+    }
+
+    #[test]
+    fn wan_watch_debounce_is_monotonic() {
+        let start = Instant::now();
+        assert!(!debounced(None, start));
+        assert!(debounced(Some(start), start + Duration::from_secs(10)));
+        assert!(!debounced(Some(start), start + Duration::from_secs(31)));
+        // A `now` that reads earlier than the stamp still debounces, never panics.
+        assert!(debounced(Some(start + Duration::from_secs(1)), start));
     }
 
     #[test]

@@ -274,6 +274,15 @@ impl LiveActivity {
         let cache = Arc::clone(&app.cache);
         crate::system::spawn_named("la-push", move || service.run(cache));
     }
+    /// Moves on every SIM/WAN recovery event: the push thread drops its APNs connection when
+    /// this differs from the value it connected under.
+    fn network_revision(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .recovery
+            .revision()
+    }
     /// Sleep on changes or the next deadline. No polling, signing, or modem reads while idle.
     fn wait_for_attempt(
         &self,
@@ -338,19 +347,7 @@ impl LiveActivity {
         let Some(provider) = &self.provider else {
             return;
         };
-        let client = match reqwest::blocking::Client::builder()
-            .https_only(true)
-            .http2_prior_knowledge()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            // No SO_KEEPALIVE: an idle APNs connection after a session must not wake the radio.
-            .tcp_keepalive(None)
-            .tcp_keepalive_interval(None)
-            .tcp_keepalive_retries(None)
-            .build()
-        {
+        let mut client = match apns_client() {
             Ok(client) => client,
             Err(_) => {
                 self.state
@@ -365,9 +362,22 @@ impl LiveActivity {
         let mut next = Instant::now();
         let mut failures: u32 = 0;
         let mut observed_generation = 0;
+        let mut client_revision = self.network_revision();
+        let mut reconnect = false;
         loop {
             let (activity, generation, clock) =
                 self.wait_for_attempt(&mut next, &mut observed_generation, &mut failures);
+            // The pooled HTTP/2 connection outlives a SIM or WAN change on a socket that is now
+            // black-holed; start a fresh one rather than wait minutes for it to time out.
+            let revision = self.network_revision();
+            if reconnect || revision != client_revision {
+                if let Ok(fresh) = apns_client() {
+                    client = fresh;
+                    eprintln!("[live_activity] new APNs connection after network change");
+                }
+                client_revision = revision;
+                reconnect = false;
+            }
             if jwt.is_empty() || clock < jwt_issued || clock - jwt_issued >= 3000 {
                 jwt = provider_token(provider, clock);
                 jwt_issued = clock;
@@ -398,6 +408,7 @@ impl LiveActivity {
                 }
                 _ => Outcome::Retry("signal read failed"),
             };
+            reconnect = matches!(result, Outcome::Retry("APNs transport failed"));
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.generation != generation {
                 continue;
@@ -421,6 +432,20 @@ impl LiveActivity {
             next = Instant::now() + retry_delay(provider.config.interval_seconds, failures);
         }
     }
+}
+fn apns_client() -> reqwest::Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .https_only(true)
+        .http2_prior_knowledge()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        // No SO_KEEPALIVE: an idle APNs connection after a session must not wake the radio.
+        .tcp_keepalive(None)
+        .tcp_keepalive_interval(None)
+        .tcp_keepalive_retries(None)
+        .build()
 }
 fn retry_delay(interval: u64, failures: u32) -> Duration {
     // 30s, 60s, 120s ... up to one hour for the normal 15-second interval.
@@ -711,6 +736,36 @@ mod tests {
         );
         assert!(matches!(result, Outcome::Retry("APNs transport failed")));
         assert!(before.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn apns_client_builds_and_only_network_events_move_the_revision() {
+        assert!(apns_client().is_ok());
+        let service = test_service();
+        let body =
+            serde_json::to_vec(&json!({"push_token":"ab".repeat(40),"expires_at":now()+3600}))
+                .unwrap();
+        assert_eq!(service.register(&body).0, 200);
+        assert_eq!(service.register(&body).0, 200);
+        assert_eq!(
+            service.network_revision(),
+            0,
+            "registration keeps the connection"
+        );
+        service.recovery_event(
+            "router_event_wan_connect_status",
+            &json!({"wan_status":"disconnected"}),
+        );
+        assert_eq!(service.network_revision(), 1);
+        service.recovery_event("zte_agent.sim_identity", &json!({"phase":"changed"}));
+        service.recovery_event(
+            "network.interface",
+            &json!({"interface":"lan","action":"ifup"}),
+        );
+        assert_eq!(service.unregister().0, 200);
+        assert_eq!(service.network_revision(), 1, "non-network events keep it");
+        service.recovery_event("zte_agent.sim_identity", &json!({"phase":"leaving"}));
+        assert_eq!(service.network_revision(), 2);
     }
 
     #[test]

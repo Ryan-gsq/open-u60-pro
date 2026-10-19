@@ -70,6 +70,9 @@ impl Recovery {
     pub fn reprobe(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
     #[cfg(test)]
     pub fn verified(epoch: u64) -> Self {
         Self {
@@ -88,6 +91,13 @@ fn event_label(name: &str, value: &Value) -> Option<&'static str> {
             "ipv4_connected" | "ipv6_connected" | "connected" | "ipv4_ipv6_connected" => {
                 Some("wan_up")
             }
+            _ => None,
+        },
+        // The agent's own SIM identity tracker (sim_identity::EVENT). Only the edges that move
+        // reachability: leaving pauses, online asks for a fresh probe. changed and stalled do not.
+        "zte_agent.sim_identity" => match value["phase"].as_str()? {
+            "leaving" => Some("sim_leaving"),
+            "online" => Some("sim_online"),
             _ => None,
         },
         "network.interface"
@@ -111,7 +121,7 @@ impl LiveActivity {
             .recovery
             .utc()
     }
-    fn recovery_event(&self, name: &str, value: &Value) {
+    pub(super) fn recovery_event(&self, name: &str, value: &Value) {
         let Some(label) = event_label(name, value) else {
             return;
         };
@@ -224,6 +234,9 @@ impl LiveActivity {
                     last_ok = Some(Instant::now());
                 }
                 Err(message) => {
+                    if failures == 0 {
+                        eprintln!("[live_activity] probe failed: {message}; retrying with backoff");
+                    }
                     state.recovery.error = Some(message);
                     if !state.recovery.paused {
                         state.generation = state.generation.wrapping_add(1);
@@ -384,6 +397,51 @@ mod tests {
         assert_eq!(state.recovery.last_event, Some("wan_up"));
         assert_eq!(state.recovery.revision, 2);
         assert!(state.recovery.paused);
+    }
+    #[test]
+    fn identity_phases_pause_and_reprobe_and_other_phases_are_ignored() {
+        let identity = |phase: Value| event_label("zte_agent.sim_identity", &phase);
+        assert_eq!(identity(json!({"phase":"leaving"})), Some("sim_leaving"));
+        assert_eq!(identity(json!({"phase":"online"})), Some("sim_online"));
+        for ignored in [
+            json!({"phase":"changed"}),
+            json!({"phase":"stalled"}),
+            json!({"phase":""}),
+            json!({"epoch":1}),
+        ] {
+            assert_eq!(identity(ignored), None);
+        }
+        // The firmware's own switch signal is left to the tracker, not mapped here.
+        assert_eq!(
+            event_label(
+                "zwrt_card_state_event",
+                &json!({"sim_states":"sim not ready","slot_state":"switch_slot_begin"})
+            ),
+            None
+        );
+        let service = super::super::tests::test_service();
+        let body =
+            serde_json::to_vec(&json!({"push_token":"ab".repeat(40),"expires_at":now()+3600}))
+                .unwrap();
+        assert_eq!(service.register(&body).0, 200);
+        service.recovery_event("zte_agent.sim_identity", &json!({"phase":"leaving"}));
+        service.recovery_event(
+            "router_event_wan_connect_status",
+            &json!({"wan_status":"ipv4_connected"}),
+        );
+        service.recovery_event("zte_agent.sim_identity", &json!({"phase":"online"}));
+        let generation = {
+            let state = service.state.lock().unwrap();
+            assert!(state.recovery.paused);
+            assert!(state.activity.is_some());
+            assert_eq!(state.recovery.revision, 3);
+            assert_eq!(state.recovery.last_event, Some("sim_online"));
+            state.generation
+        };
+        service.recovery_event("zte_agent.sim_identity", &json!({"phase":"online"}));
+        let state = service.state.lock().unwrap();
+        assert_eq!(state.recovery.revision, 3);
+        assert_eq!(state.generation, generation);
     }
     #[test]
     fn offline_probe_backoff_is_bounded_and_starts_at_thirty_seconds() {
