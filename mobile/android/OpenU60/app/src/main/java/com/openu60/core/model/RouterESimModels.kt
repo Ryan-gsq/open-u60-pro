@@ -113,13 +113,14 @@ data class RouterESimSwitchStatus(
     /** Why data didn't connect, when the router knows: `roaming_off` or `data_off`. */
     val reason: String? = null,
 ) {
-    val isRunning: Boolean get() = state in setOf("reloading", "card_confirmed", "modem_confirmed")
+    val isRunning: Boolean get() = state in setOf("card_busy", "reloading", "card_confirmed", "modem_confirmed")
 
     /** The card is confirmed: a list read now shows the new active profile. */
-    val cardConfirmed: Boolean get() = state !in setOf("idle", "reloading", "card_unconfirmed")
+    val cardConfirmed: Boolean get() = state !in setOf("idle", "card_busy", "reloading", "card_unconfirmed")
 
     val phase: RouterESimConnectionPhase
         get() = when (state) {
+            "card_busy" -> RouterESimConnectionPhase.SWITCHING
             "reloading" -> RouterESimConnectionPhase.RELOADING
             "card_confirmed", "modem_confirmed" -> RouterESimConnectionPhase.REGISTERING
             "connected" -> RouterESimConnectionPhase.CONNECTED
@@ -127,6 +128,10 @@ data class RouterESimSwitchStatus(
             "not_applied" -> RouterESimConnectionPhase.UNAVAILABLE
             else -> RouterESimConnectionPhase.CHECKING
         }
+
+    /** Shown while the switch runs: the eSIM refused for now and the router keeps trying. */
+    val progressNote: String?
+        get() = if (state == "card_busy") "The eSIM is busy and refused the switch for now. The router keeps trying for up to 2½ minutes." else null
 
     /** Why a finished switch did not reach `connected`. */
     val outcomeNote: String?
@@ -138,7 +143,9 @@ data class RouterESimSwitchStatus(
             }
             "modem_unconfirmed" -> "The eSIM switched, but the router still uses the previous SIM. Restart the router to finish."
             "card_unconfirmed" -> "The eSIM couldn't be read after the switch. Refresh in a moment."
-            "not_applied" -> "The switch didn't happen; the previous profile is still active."
+            "not_applied" ->
+                if (reason == "card_busy") "The eSIM stayed busy and didn't switch; the previous profile is still active. Try again in a few minutes."
+                else "The switch didn't happen; the previous profile is still active."
             else -> null
         }
 }

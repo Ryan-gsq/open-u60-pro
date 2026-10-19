@@ -82,13 +82,14 @@ struct RouterESimSwitchStatus: Decodable, Equatable {
         case finishedAt = "finished_at"
     }
 
-    var isRunning: Bool { ["reloading", "card_confirmed", "modem_confirmed"].contains(state) }
+    var isRunning: Bool { ["card_busy", "reloading", "card_confirmed", "modem_confirmed"].contains(state) }
 
     /// The card is confirmed: a list read now shows the new active profile.
-    var cardConfirmed: Bool { !["idle", "reloading", "card_unconfirmed"].contains(state) }
+    var cardConfirmed: Bool { !["idle", "card_busy", "reloading", "card_unconfirmed"].contains(state) }
 
     var phase: RouterESimConnectionPhase {
         switch state {
+        case "card_busy": .switching
         case "reloading": .reloading
         case "card_confirmed", "modem_confirmed": .registering
         case "connected": .connected
@@ -96,6 +97,11 @@ struct RouterESimSwitchStatus: Decodable, Equatable {
         case "not_applied": .unavailable
         default: .checking
         }
+    }
+
+    /// Shown while the switch runs: the eSIM refused for now and the router keeps trying.
+    var progressNote: String? {
+        state == "card_busy" ? "The eSIM is busy and refused the switch for now. The router keeps trying for up to 2½ minutes." : nil
     }
 
     /// Why a finished switch did not reach `connected`.
@@ -109,7 +115,10 @@ struct RouterESimSwitchStatus: Decodable, Equatable {
             }
         case "modem_unconfirmed": "The eSIM switched, but the router still uses the previous SIM. Restart the router to finish."
         case "card_unconfirmed": "The eSIM couldn't be read after the switch. Refresh in a moment."
-        case "not_applied": "The switch didn't happen; the previous profile is still active."
+        case "not_applied":
+            reason == "card_busy"
+                ? "The eSIM stayed busy and didn't switch; the previous profile is still active. Try again in a few minutes."
+                : "The switch didn't happen; the previous profile is still active."
         default: nil
         }
     }

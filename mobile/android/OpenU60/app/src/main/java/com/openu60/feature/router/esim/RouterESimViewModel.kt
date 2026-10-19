@@ -400,7 +400,7 @@ class RouterESimViewModel @Inject constructor(
         }
         if (_state.value.isSwitching) return true
         if (status.state == "idle") { followSwitch = false; return false }
-        _state.value = _state.value.copy(connectionPhase = status.phase, connectionNote = null)
+        _state.value = _state.value.copy(connectionPhase = status.phase, connectionNote = status.progressNote)
         if (status.cardConfirmed && !switchListRead) {
             switchListRead = true
             withReauth { loadProfiles() }

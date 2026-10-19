@@ -375,7 +375,7 @@ final class RouterESimViewModel {
             return nil
         }
         connectionPhase = status.phase
-        connectionNote = nil
+        connectionNote = status.progressNote
         if status.cardConfirmed && !switchListRead {
             switchListRead = true
             await loadProfiles()

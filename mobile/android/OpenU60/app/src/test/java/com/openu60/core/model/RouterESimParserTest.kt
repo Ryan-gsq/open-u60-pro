@@ -123,6 +123,12 @@ class RouterESimParserTest {
         assertTrue(roaming.outcomeNote!!.contains("Turn on Data Roaming"))
         assertTrue(RouterESimSwitchStatus("no_data", reason = "data_off").outcomeNote!!.contains("Mobile Data is off"))
         assertTrue(RouterESimSwitchStatus("no_data").outcomeNote!!.contains("plan or coverage"))
+        val busy = RouterESimSwitchStatus("card_busy")
+        assertTrue(busy.isRunning && !busy.cardConfirmed)
+        assertEquals(RouterESimConnectionPhase.SWITCHING, busy.phase)
+        assertTrue(busy.progressNote!!.contains("keeps trying"))
+        assertTrue(RouterESimSwitchStatus("not_applied", reason = "card_busy").outcomeNote!!.contains("stayed busy"))
+        assertTrue(RouterESimSwitchStatus("not_applied").outcomeNote!!.contains("didn't happen"))
         assertEquals(RouterESimConnectionPhase.UNAVAILABLE, RouterESimSwitchStatus("not_applied").phase)
         assertFalse(RouterESimSwitchStatus("connected").isRunning)
     }

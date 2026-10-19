@@ -99,6 +99,12 @@ struct RouterESimTests {
         precondition(roaming.outcomeNote?.contains("Turn on Data Roaming") == true, "a roaming profile names the fix")
         precondition(RouterESimSwitchStatus(state: "no_data", reason: "data_off").outcomeNote?.contains("Mobile Data is off") == true)
         precondition(RouterESimSwitchStatus(state: "no_data").outcomeNote?.contains("plan or coverage") == true)
+        let busy = RouterESimSwitchStatus(state: "card_busy")
+        precondition(busy.isRunning && !busy.cardConfirmed && busy.phase == .switching, "a busy retry is still a switch in progress")
+        precondition(busy.progressNote?.contains("keeps trying") == true && busy.outcomeNote == nil)
+        precondition(RouterESimSwitchStatus(state: "not_applied", reason: "card_busy").outcomeNote?.contains("stayed busy") == true)
+        precondition(RouterESimSwitchStatus(state: "not_applied").outcomeNote?.contains("didn't happen") == true)
+        precondition(RouterESimSwitchStatus(state: "connected").progressNote == nil)
 
         print("RouterESimTests: identifiers, reconnection, activation codes, and download stages passed")
     }
