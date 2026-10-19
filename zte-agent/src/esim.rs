@@ -63,6 +63,10 @@ const CARD_CONFIRM_LIMIT: Duration = Duration::from_secs(60);
 /// How long the modem has to load the new identity and connect data after a switch.
 const SWITCH_VERIFY_LIMIT: Duration = Duration::from_secs(150);
 const SWITCH_POLL: Duration = Duration::from_secs(3);
+/// A busy-refused enable is retried this often, for this long (the card stayed busy for about
+/// two minutes with a roaming travel profile enabled).
+const CARD_BUSY_GAP: Duration = Duration::from_secs(10);
+const CARD_BUSY_LIMIT: Duration = Duration::from_secs(150);
 /// One receipt (ES9+ HandleNotification) to one operator server.
 const RECEIPT_LIMIT: Duration = Duration::from_secs(45);
 /// Pause between "data connected" after a switch and sending its receipts (DNS and routes settle).
@@ -285,7 +289,8 @@ struct Switch {
     connected_at: u64,
     finished_at: u64,
     note: Option<String>,
-    /// Why data didn't connect, when the firmware shows it: `roaming_off` or `data_off`.
+    /// Why the switch didn't complete, when known: `roaming_off` or `data_off` (no data), or
+    /// `card_busy` (not applied: the eSIM kept refusing).
     reason: Option<&'static str>,
 }
 
@@ -658,6 +663,9 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
     if state.esim.reloading() {
         return reloading_reply();
     }
+    if state.esim.inner.switch.lock().unwrap().state == "card_busy" {
+        return error(409, "the router is still retrying the last switch while the eSIM is busy");
+    }
     let mode = crate::ubus::uci_get("zte_nwinfo.sys_info.operate_mode").ok();
     let policy = state.oos_policy.status();
     if radio_blocks_switch(mode.as_deref(), policy["state"].as_str()) {
@@ -682,6 +690,11 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
     }
     let result = lpac(&["profile", "enable", &iccid, "1"], CARD_LIMIT, &|_| {}, None);
     drop(guard);
+    if let Err(e) = &result {
+        if card_busy(&e.message()) {
+            return retry_while_busy(state, iccid, previous, list, e.message());
+        }
+    }
     let inner = &state.esim.inner;
     let now = unix_now();
     // Even a failed or timed-out enable may have switched the card: the background check reads
@@ -738,6 +751,106 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
             (status, body)
         }
     }
+}
+
+/// The card answered the enable with a refusal that passes: SGP.22 catBusy (5, its SIM Toolkit
+/// is in a proactive session), undefinedError (127), or a code lpac doesn't name. Nothing
+/// changed; seen with a roaming travel profile enabled, accepted again a couple of minutes later.
+fn card_busy(message: &str) -> bool {
+    message.contains("es10c_enable_profile")
+        && ["cat busy", "undefined error", "unknown"].iter().any(|r| message.contains(r))
+}
+
+/// Answers a busy refusal with 202 and keeps trying in the background (`card_busy`), so the user
+/// doesn't have to. The SIM didn't reload, so the saved list stays current.
+fn retry_while_busy(
+    state: &AppState,
+    iccid: String,
+    previous: Option<String>,
+    list: Vec<Value>,
+    message: String,
+) -> (u16, Value) {
+    let inner = &state.esim.inner;
+    let now = unix_now();
+    let generation = {
+        let mut inv = inner.inventory.lock().unwrap();
+        inv.record(list, now);
+        inv.generation += 1;
+        inv.generation
+    };
+    *inner.switch.lock().unwrap() = Switch {
+        state: "card_busy",
+        target: iccid.clone(),
+        previous: previous.clone(),
+        generation,
+        started_at: now,
+        note: Some(format!("the eSIM refused while busy ({message}); retrying")),
+        ..Switch::default()
+    };
+    eprintln!("[esim] enable {} refused while busy ({message}); retrying", mask(&iccid));
+    let worker = Arc::clone(inner);
+    let cache = Arc::clone(&state.cache);
+    let target = iccid.clone();
+    let spawned = crate::system::try_spawn_named("esim-switch", move || {
+        retry_enable(worker, target, cache);
+    });
+    if spawned.is_err() {
+        let mut sw = inner.switch.lock().unwrap();
+        sw.reason = Some("card_busy");
+        sw.finish("not_applied", now);
+    }
+    (
+        202,
+        json!({"ok": true, "data": {
+            "enabled_iccid": null,
+            "previous_iccid": previous,
+            "reconnecting": false,
+            "retrying": true,
+            "generation": generation,
+        }}),
+    )
+}
+
+/// Retries a busy-refused enable every `CARD_BUSY_GAP` for `CARD_BUSY_LIMIT`, then verifies the
+/// switch like a first-time success; a failure other than "busy" may still have switched the
+/// card, so it is verified too.
+fn retry_enable(inner: Arc<Inner>, target: String, cache: Arc<crate::cache::UbusCache>) {
+    let started = Instant::now();
+    let mut attempt = 1;
+    let mut last = String::new();
+    while started.elapsed() < CARD_BUSY_LIMIT {
+        std::thread::sleep(CARD_BUSY_GAP);
+        attempt += 1;
+        let result = {
+            let Some(_guard) = acquire_soon(&inner) else { continue };
+            lpac(&["profile", "enable", &target, "1"], CARD_LIMIT, &|_| {}, None)
+        };
+        let note = match result {
+            Ok(_) => format!("the eSIM was busy; switched on attempt {attempt}"),
+            Err(e) if card_busy(&e.message()) => {
+                last = e.message();
+                continue;
+            }
+            Err(e) => format!("lpac reported: {}", e.message()),
+        };
+        let now = unix_now();
+        inner.inventory.lock().unwrap().reloading = true;
+        inner.switched_at.store(now, Ordering::Relaxed);
+        cache.invalidate_with_settle(cache::SIM_INFO, cache::SETTLE_WINDOW);
+        {
+            let mut sw = inner.switch.lock().unwrap();
+            sw.state = "reloading";
+            sw.note = Some(note);
+        }
+        eprintln!("[esim] enable {} accepted on attempt {attempt}", mask(&target));
+        verify_switch(inner, target);
+        return;
+    }
+    let mut sw = inner.switch.lock().unwrap();
+    sw.reason = Some("card_busy");
+    sw.note = Some(format!("the eSIM stayed busy for {} s ({last})", CARD_BUSY_LIMIT.as_secs()));
+    sw.finish("not_applied", unix_now());
+    eprintln!("[esim] switch to {} not applied: the eSIM stayed busy", mask(&target));
 }
 
 /// Background check after `enable`: waits for the SIM to reload, re-reads the card (retrying
@@ -1957,6 +2070,18 @@ mod tests {
         assert!(e.acquire().is_none());
         drop(g);
         assert!(e.acquire().is_some());
+    }
+
+    #[test]
+    fn busy_refusals_are_retried_and_other_refusals_are_not() {
+        assert!(card_busy("es10c_enable_profile: unknown"), "older lpac bundles");
+        assert!(card_busy("es10c_enable_profile: cat busy"));
+        assert!(card_busy("es10c_enable_profile: undefined error"));
+        assert!(card_busy("es10c_enable_profile: unknown result 6"));
+        assert!(!card_busy("es10c_enable_profile: disallowed by policy"));
+        assert!(!card_busy("es10c_enable_profile: internal error, maybe illegal iccid/aid coding"));
+        assert!(!card_busy("es10c_delete_profile: cat busy"));
+        assert!(!card_busy("lpac did not finish within 30 s"));
     }
 
     #[test]
