@@ -4,11 +4,12 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use crate::system::spawn_named;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::conn_watchdog::wan_connected_from_status;
 use crate::handlers::AppState;
 use crate::ubus;
 
@@ -24,6 +25,16 @@ const INTER_SMS_DELAY_MS: u64 = 1000;
 const FALLBACK_POLL_SECS: u64 = 900;
 /// ... and while forwarding is disabled (the poll is a no-op then).
 const FALLBACK_POLL_DISABLED_SECS: u64 = 3600;
+/// While forwards are held, the event loop wakes this often to retry them.
+const PENDING_RECHECK_SECS: u64 = 15;
+/// A WAN that just came up must stay up this long before forwards go out
+/// over it, so a forward does not race the attach.
+const WAN_SETTLE: Duration = Duration::from_secs(10);
+/// While forwards are held and the WAN looks down, re-read `get_wwaniface`
+/// at most this often in case a connect event was missed.
+const WAN_REFRESH: Duration = Duration::from_secs(60);
+/// A held forward still blocked after this long is settled as failed.
+const PENDING_MAX_AGE_SECS: i64 = 86_400;
 
 // ── Data types ──────────────────────────────────────────────────────
 
@@ -148,6 +159,9 @@ pub struct ForwardLogEntry {
     pub content: String,
     #[serde(default)]
     pub date: String,
+    /// Held while the link was down; `flush_pending` retries it.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 // ── SMS message from ubus ───────────────────────────────────────────
@@ -530,6 +544,101 @@ fn is_transient_error(err: &str) -> bool {
     !err.contains("(permanent error)")
 }
 
+// ── Held forwards ───────────────────────────────────────────────────
+
+/// Why a forward to `dest` cannot go out right now, or `None` when the link
+/// it needs is up. The text never says "(permanent error)": the forward is
+/// held and retried, not dropped.
+fn blocker(wan_ready: bool, has_service: bool, dest: &ForwardDestination) -> Option<&'static str> {
+    match dest {
+        ForwardDestination::Sms { .. } => {
+            (!has_service).then_some("no cellular service; held for retry")
+        }
+        _ => (!wan_ready).then_some("no WAN connectivity; held for retry"),
+    }
+}
+
+/// A forward that failed transiently while its link is down (it was running
+/// when the link dropped) is held rather than settled as failed.
+fn hold_after_failure(result: &Result<(), String>, blocked: bool) -> bool {
+    blocked && matches!(result, Err(e) if is_transient_error(e))
+}
+
+/// Log text for a forward held after a transient failure.
+fn held_error(err: &str) -> String {
+    format!("{err}; held for retry")
+}
+
+/// What `flush_pending` does with a held entry: `Ok(destination)` to try it
+/// again, or `Err(reason)` to settle it as failed.
+fn pending_action(
+    entry: &ForwardLogEntry,
+    config: &SmsForwardConfig,
+    now: i64,
+) -> Result<ForwardDestination, &'static str> {
+    if !config.enabled {
+        return Err("forwarding disabled while held");
+    }
+    let rule = config
+        .rules
+        .iter()
+        .find(|r| r.id == entry.rule_id)
+        .ok_or("rule no longer exists")?;
+    if !rule.enabled {
+        return Err("rule disabled while held");
+    }
+    if now.saturating_sub(entry.timestamp) > PENDING_MAX_AGE_SECS {
+        return Err("held for over 24 h without a link");
+    }
+    Ok(rule.destination.clone())
+}
+
+/// Write a held forward's outcome back to its log entry, found by
+/// (sms_id, rule_id, pending) rather than by index: `process_new_messages`
+/// may have pushed and drained the log while the forward ran. An entry that
+/// stays held keeps its timestamp, so the 24 h limit counts from the hold.
+fn update_pending(
+    log: &mut [ForwardLogEntry],
+    (sms_id, rule_id): (u64, u32),
+    error: Option<String>,
+    pending: bool,
+    now: i64,
+) -> bool {
+    let Some(entry) = log
+        .iter_mut()
+        .find(|e| e.pending && e.sms_id == sms_id && e.rule_id == rule_id)
+    else {
+        return false;
+    };
+    entry.success = error.is_none();
+    entry.error = error;
+    entry.pending = pending;
+    if !pending {
+        entry.timestamp = now;
+    }
+    true
+}
+
+/// Safety-net poll interval: 15 min while forwarding is active, 1 h while it
+/// is disabled (the poll is a no-op then).
+fn fallback_interval(active: bool) -> Duration {
+    Duration::from_secs(if active {
+        FALLBACK_POLL_SECS
+    } else {
+        FALLBACK_POLL_DISABLED_SECS
+    })
+}
+
+/// How long the event loop may sleep: the pending recheck while forwards are
+/// held, otherwise the safety-net poll interval. Nothing held, no extra wakeups.
+fn loop_timeout(pending: bool, fallback: Duration) -> Duration {
+    if pending {
+        Duration::from_secs(PENDING_RECHECK_SECS)
+    } else {
+        fallback
+    }
+}
+
 // ── Time helper ─────────────────────────────────────────────────────
 
 fn now_ts() -> i64 {
@@ -543,6 +652,8 @@ pub struct SmsForwarder {
     state: Mutex<ForwardState>,
     has_service: AtomicBool,
     wan_connected: AtomicBool,
+    /// When the WAN last came up (monotonic); `None` while it is down.
+    wan_up_at: Mutex<Option<Instant>>,
 }
 
 impl SmsForwarder {
@@ -562,6 +673,7 @@ impl SmsForwarder {
             state: Mutex::new(state),
             has_service: AtomicBool::new(false),
             wan_connected: AtomicBool::new(false),
+            wan_up_at: Mutex::new(None),
         }
     }
 
@@ -604,13 +716,12 @@ impl SmsForwarder {
             };
 
             let got_wan = if !self.wan_connected.load(Ordering::Relaxed) {
-                if let Ok(data) = ubus::call("zwrt_data", "get_wwaniface", Some(r#"{"source_module":"zte_topsw_data","cid":1}"#)) {
-                    let connected = data["connect_status"].as_str().map(|s| s.starts_with("ipv4")).unwrap_or(false);
-                    self.wan_connected.store(connected, Ordering::Relaxed);
-                    eprintln!("[sms_forward] initial WAN state: connected={connected}");
-                    connected
-                } else {
-                    false
+                match self.refresh_wan() {
+                    Some(connected) => {
+                        eprintln!("[sms_forward] initial WAN state: connected={connected}");
+                        connected
+                    }
+                    None => false,
                 }
             } else {
                 true
@@ -643,21 +754,64 @@ impl SmsForwarder {
     fn wan_monitor(&self, wan_rx: mpsc::Receiver<Value>) {
         for event in wan_rx.iter() {
             let wan_status = event["wan_status"].as_str().unwrap_or("");
-            let connected = wan_status.starts_with("ipv4");
-            let prev = self.wan_connected.swap(connected, Ordering::Relaxed);
-            if prev != connected {
+            let connected = wan_connected_from_status(wan_status);
+            if self.set_wan(connected) {
                 eprintln!("[sms_forward] WAN state changed: {wan_status} (connected={connected})");
             }
         }
         eprintln!("[sms_forward] wan_rx disconnected");
     }
 
+    /// Record the WAN state; `true` when it changed. A change stamps
+    /// `wan_up_at` (set on up, cleared on down) for the settle window.
+    fn set_wan(&self, connected: bool) -> bool {
+        let mut up_at = self.wan_up_at.lock().unwrap();
+        let changed = self.wan_connected.swap(connected, Ordering::Relaxed) != connected;
+        if changed {
+            *up_at = connected.then(Instant::now);
+        }
+        changed
+    }
+
+    /// One `get_wwaniface` read applied through `set_wan`: the boot seed, and
+    /// the backstop for a missed connect event while forwards are held.
+    /// `None` when the read fails.
+    fn refresh_wan(&self) -> Option<bool> {
+        let data = ubus::call(
+            "zwrt_data",
+            "get_wwaniface",
+            Some(r#"{"source_module":"zte_topsw_data","cid":1}"#),
+        )
+        .ok()?;
+        let connected = data["connect_status"]
+            .as_str()
+            .is_some_and(wan_connected_from_status);
+        self.set_wan(connected);
+        Some(connected)
+    }
+
+    /// The WAN is up and has stayed up for `WAN_SETTLE`.
+    fn wan_ready(&self) -> bool {
+        let up_at = self.wan_up_at.lock().unwrap();
+        self.wan_connected.load(Ordering::Relaxed)
+            && up_at.is_some_and(|t| t.elapsed() >= WAN_SETTLE)
+    }
+
+    /// Why a forward to `dest` must be held right now, or `None`.
+    fn link_blocker(&self, dest: &ForwardDestination) -> Option<&'static str> {
+        let has_service = self.has_service.load(Ordering::Relaxed);
+        blocker(self.wan_ready(), has_service, dest)
+    }
+
+    fn has_pending(&self) -> bool {
+        self.state.lock().unwrap().log.iter().any(|e| e.pending)
+    }
+
     /// How long the event loop may sleep before a safety-net poll: 15 min while
     /// forwarding is active, 1 h while it is disabled (the poll is a no-op then).
     fn fallback_poll_interval(&self) -> Duration {
         let config = self.config.lock().unwrap();
-        let active = config.enabled && config.rules.iter().any(|r| r.enabled);
-        Duration::from_secs(if active { FALLBACK_POLL_SECS } else { FALLBACK_POLL_DISABLED_SECS })
+        fallback_interval(config.enabled && config.rules.iter().any(|r| r.enabled))
     }
 
     fn init_watermark(&self) {
@@ -679,9 +833,13 @@ impl SmsForwarder {
     fn event_loop(&self, rx: mpsc::Receiver<Value>) {
         self.init_watermark();
 
+        let mut last_poll = Instant::now();
+        let mut last_refresh = Instant::now();
         loop {
-            // Wait for an event, or run a safety-net poll after the fallback interval
-            match rx.recv_timeout(self.fallback_poll_interval()) {
+            // Wait for an event; wake every PENDING_RECHECK_SECS while forwards
+            // are held, otherwise only for the safety-net poll
+            let fallback = self.fallback_poll_interval();
+            match rx.recv_timeout(loop_timeout(self.has_pending(), fallback)) {
                 Ok(event) => {
                     if event["wms_status"].as_str() != Some("new_sms_received") {
                         continue;
@@ -697,8 +855,12 @@ impl SmsForwarder {
                     self.process_new_messages(last_id);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.recheck_pending(&mut last_refresh);
                     // Fallback poll for any missed events
-                    self.poll_once();
+                    if last_poll.elapsed() >= fallback {
+                        last_poll = Instant::now();
+                        self.poll_once();
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     eprintln!("[sms_forward] event channel disconnected, falling back to polling");
@@ -728,9 +890,26 @@ impl SmsForwarder {
         }
     }
 
+    /// While forwards are held: re-read the WAN state if it still looks down
+    /// (at most every `WAN_REFRESH`), then retry or settle them.
+    fn recheck_pending(&self, last_refresh: &mut Instant) {
+        if !self.has_pending() {
+            return;
+        }
+        if !self.wan_connected.load(Ordering::Relaxed) && last_refresh.elapsed() >= WAN_REFRESH {
+            *last_refresh = Instant::now();
+            if self.refresh_wan() == Some(true) {
+                eprintln!("[sms_forward] WAN found connected on re-read (event missed)");
+            }
+        }
+        self.flush_pending();
+    }
+
     /// Pure polling fallback if event bus dies entirely.
     fn poll_loop(&self) {
+        let mut last_refresh = Instant::now();
         loop {
+            self.recheck_pending(&mut last_refresh);
             self.poll_once();
             let interval = self.config.lock().unwrap().poll_interval_secs.max(10);
             std::thread::sleep(Duration::from_secs(interval));
@@ -783,26 +962,14 @@ impl SmsForwarder {
                     continue;
                 }
 
-                // Pre-forward connectivity check
-                let connectivity_err = match &rule.destination {
-                    ForwardDestination::Sms { .. } => {
-                        if !self.has_service.load(Ordering::Relaxed) {
-                            Some("no cellular service (permanent error)".to_string())
-                        } else {
-                            None
-                        }
-                    }
-                    _ => {
-                        if !self.wan_connected.load(Ordering::Relaxed) {
-                            Some("no WAN connectivity (permanent error)".to_string())
-                        } else {
-                            None
-                        }
-                    }
-                };
-
-                if let Some(err) = connectivity_err {
-                    eprintln!("[sms_forward] skipping forward for SMS {} -> {}: {err}", sms.id, destination_type_name(&rule.destination));
+                // Pre-forward connectivity check: hold the forward while its
+                // link is down; flush_pending retries it once the link is back
+                if let Some(reason) = self.link_blocker(&rule.destination) {
+                    eprintln!(
+                        "[sms_forward] skipping forward for SMS {} -> {}: {reason}",
+                        sms.id,
+                        destination_type_name(&rule.destination)
+                    );
                     let entry = ForwardLogEntry {
                         timestamp: now_ts(),
                         sms_id: sms.id,
@@ -811,10 +978,11 @@ impl SmsForwarder {
                         rule_name: rule.name.clone(),
                         destination_type: destination_type_name(&rule.destination).to_string(),
                         success: false,
-                        error: Some(err),
+                        error: Some(reason.to_string()),
                         rule_id: rule.id,
                         content: sms.content.clone(),
                         date: sms.date.clone(),
+                        pending: true,
                     };
                     let mut state = self.state.lock().unwrap();
                     state.log.push(entry);
@@ -831,6 +999,9 @@ impl SmsForwarder {
                 }
 
                 let result = forward_with_retry(&rule.destination, sms, &agent);
+                // A forward that was running when the link dropped is held too
+                let blocked = self.link_blocker(&rule.destination).is_some();
+                let pending = hold_after_failure(&result, blocked);
 
                 if result.is_err() {
                     all_succeeded = false;
@@ -844,10 +1015,13 @@ impl SmsForwarder {
                     rule_name: rule.name.clone(),
                     destination_type: destination_type_name(&rule.destination).to_string(),
                     success: result.is_ok(),
-                    error: result.err(),
+                    error: result
+                        .err()
+                        .map(|e| if pending { held_error(&e) } else { e }),
                     rule_id: rule.id,
                     content: sms.content.clone(),
                     date: sms.date.clone(),
+                    pending,
                 };
 
                 let mut state = self.state.lock().unwrap();
@@ -896,6 +1070,73 @@ impl SmsForwarder {
         let mut state = self.state.lock().unwrap();
         state.last_forwarded_id = max_processed_id;
         save_state(&state);
+    }
+
+    /// Retry the held forwards whose link is back and settle the ones that can
+    /// no longer go out. Runs only on the sms-events thread (or the polling
+    /// fallback that replaces it), so two flushes never overlap.
+    fn flush_pending(&self) {
+        let held: Vec<ForwardLogEntry> = self
+            .state
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .filter(|e| e.pending)
+            .cloned()
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+
+        let config = self.config.lock().unwrap().clone();
+        let agent = http_agent();
+
+        for entry in held {
+            let id = entry.sms_id;
+            let (error, pending) = match pending_action(&entry, &config, now_ts()) {
+                Err(reason) => {
+                    let kind = &entry.destination_type;
+                    eprintln!("[sms_forward] held SMS {id} -> {kind}: dropped ({reason})");
+                    (Some(reason.to_string()), false)
+                }
+                Ok(dest) => {
+                    if self.link_blocker(&dest).is_some() {
+                        continue;
+                    }
+                    // Rebuild the SMS from the held copy in the log entry
+                    let sms = DecodedSms {
+                        id,
+                        sender: entry.sender.clone(),
+                        content: entry.content.clone(),
+                        date: entry.date.clone(),
+                    };
+                    let result = forward_with_retry(&dest, &sms, &agent);
+                    let pending = hold_after_failure(&result, self.link_blocker(&dest).is_some());
+                    let kind = destination_type_name(&dest);
+                    std::thread::sleep(Duration::from_millis(INTER_RULE_DELAY_MS));
+                    match result {
+                        Ok(()) => {
+                            eprintln!("[sms_forward] held SMS {id} -> {kind}: sent");
+                            (None, false)
+                        }
+                        Err(e) if pending => {
+                            eprintln!("[sms_forward] held SMS {id} -> {kind}: still held: {e}");
+                            (Some(held_error(&e)), true)
+                        }
+                        Err(e) => {
+                            eprintln!("[sms_forward] held SMS {id} -> {kind}: failed: {e}");
+                            (Some(e), false)
+                        }
+                    }
+                }
+            };
+
+            let key = (id, entry.rule_id);
+            let mut state = self.state.lock().unwrap();
+            update_pending(&mut state.log, key, error, pending, now_ts());
+            save_state(&state);
+        }
     }
 }
 
@@ -1353,6 +1594,7 @@ pub fn retry_forward(state: &AppState, body: &[u8]) -> (u16, Value) {
             Ok(()) => {
                 entry.success = true;
                 entry.error = None;
+                entry.pending = false;
                 entry.timestamp = now_ts();
             }
             Err(e) => {
@@ -1366,5 +1608,244 @@ pub fn retry_forward(state: &AppState, body: &[u8]) -> (u16, Value) {
     match result {
         Ok(()) => (200, json!({"ok": true, "data": {"status": "sent"}})),
         Err(e) => (502, json!({"ok": false, "error": e})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn forwarder() -> SmsForwarder {
+        SmsForwarder {
+            config: Mutex::new(SmsForwardConfig::default()),
+            state: Mutex::new(ForwardState::default()),
+            has_service: AtomicBool::new(false),
+            wan_connected: AtomicBool::new(false),
+            wan_up_at: Mutex::new(None),
+        }
+    }
+
+    fn http_destinations() -> Vec<ForwardDestination> {
+        vec![
+            ForwardDestination::Telegram {
+                bot_token: "token".into(),
+                chat_id: "chat".into(),
+                silent: false,
+            },
+            ForwardDestination::Webhook {
+                url: "https://example.invalid/hook".into(),
+                method: default_method(),
+                headers: Vec::new(),
+            },
+            ForwardDestination::Ntfy {
+                url: "https://example.invalid".into(),
+                topic: "topic".into(),
+                token: None,
+            },
+            ForwardDestination::Discord {
+                webhook_url: "https://example.invalid/discord".into(),
+            },
+            ForwardDestination::Slack {
+                webhook_url: "https://example.invalid/slack".into(),
+            },
+        ]
+    }
+
+    fn sms_destination() -> ForwardDestination {
+        ForwardDestination::Sms {
+            forward_number: "12345".into(),
+        }
+    }
+
+    fn rule(id: u32, enabled: bool) -> ForwardRule {
+        ForwardRule {
+            id,
+            name: format!("rule {id}"),
+            enabled,
+            filter: SmsFilter::All,
+            destination: ForwardDestination::Slack {
+                webhook_url: "https://example.invalid/slack".into(),
+            },
+        }
+    }
+
+    fn entry(sms_id: u64, rule_id: u32, pending: bool, timestamp: i64) -> ForwardLogEntry {
+        ForwardLogEntry {
+            timestamp,
+            sms_id,
+            sender: "sender".into(),
+            content_preview: "body".into(),
+            rule_name: format!("rule {rule_id}"),
+            destination_type: "slack".into(),
+            success: false,
+            error: Some("no WAN connectivity; held for retry".into()),
+            rule_id,
+            content: "body".into(),
+            date: String::new(),
+            pending,
+        }
+    }
+
+    /// WAN flag after feeding one `router_event_wan_connect_status` payload
+    /// through the real monitor.
+    fn wan_after(status: &str) -> bool {
+        let f = forwarder();
+        let (tx, rx) = mpsc::channel();
+        tx.send(json!({ "wan_status": status })).unwrap();
+        drop(tx);
+        f.wan_monitor(rx);
+        f.wan_connected.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn wan_status_parse() {
+        let up = [
+            "ipv6_connected",
+            "ipv4_connected",
+            "ipv4_ipv6_connected",
+            "connected",
+        ];
+        for up in up {
+            assert!(wan_after(up), "{up} should count as WAN up");
+        }
+        for down in ["disconnected", "ipv4_disconnected", "connecting"] {
+            assert!(!wan_after(down), "{down} should count as WAN down");
+        }
+    }
+
+    #[test]
+    fn blocker_matrix() {
+        // Args: (wan_ready, has_service, dest)
+        for dest in http_destinations() {
+            assert_eq!(blocker(true, true, &dest), None);
+            assert_eq!(blocker(true, false, &dest), None, "service is not needed");
+            assert!(blocker(false, true, &dest).is_some());
+        }
+        let sms = sms_destination();
+        assert_eq!(blocker(true, true, &sms), None);
+        assert_eq!(blocker(false, true, &sms), None, "WAN is not needed");
+        assert!(blocker(true, false, &sms).is_some());
+
+        let http = &http_destinations()[0];
+        let texts = [blocker(false, false, &sms), blocker(false, false, http)];
+        for text in texts.into_iter().map(Option::unwrap) {
+            assert!(!text.contains("(permanent error)"), "{text}");
+            assert!(is_transient_error(text));
+        }
+    }
+
+    #[test]
+    fn wan_settle() {
+        let f = forwarder();
+        let dest = &http_destinations()[0];
+        assert!(f.set_wan(true));
+        assert!(!f.set_wan(true), "no change, no re-stamp");
+        assert!(!f.wan_ready(), "just came up");
+
+        *f.wan_up_at.lock().unwrap() = Instant::now().checked_sub(Duration::from_secs(5));
+        assert!(!f.wan_ready());
+        assert!(f.link_blocker(dest).is_some());
+
+        *f.wan_up_at.lock().unwrap() = Instant::now().checked_sub(Duration::from_secs(11));
+        assert!(f.wan_ready());
+        assert_eq!(f.link_blocker(dest), None);
+
+        assert!(f.set_wan(false));
+        assert!(f.wan_up_at.lock().unwrap().is_none());
+        assert!(!f.wan_ready());
+    }
+
+    #[test]
+    fn pending_after_failure() {
+        let transient: Result<(), String> =
+            Err("telegram: io: timed out (failed after 3 retries)".into());
+        let permanent: Result<(), String> = Err("telegram: HTTP 400 (permanent error)".into());
+        assert!(hold_after_failure(&transient, true));
+        assert!(!hold_after_failure(&permanent, true));
+        assert!(!hold_after_failure(&transient, false));
+        assert!(!hold_after_failure(&Ok(()), true));
+    }
+
+    #[test]
+    fn pending_action() {
+        let now = 1_800_000_000;
+        let config = SmsForwardConfig {
+            enabled: true,
+            rules: vec![rule(1, true), rule(2, false)],
+            ..SmsForwardConfig::default()
+        };
+
+        let action = |entry: &ForwardLogEntry, config: &SmsForwardConfig| {
+            super::pending_action(entry, config, now)
+        };
+
+        let held = entry(7, 1, true, now - 60);
+        let dest = action(&held, &config).unwrap();
+        assert_eq!(destination_type_name(&dest), "slack");
+
+        let missing = entry(7, 3, true, now);
+        assert!(action(&missing, &config).is_err(), "missing rule");
+        let disabled = entry(7, 2, true, now);
+        assert!(action(&disabled, &config).is_err(), "disabled rule");
+        let off = SmsForwardConfig {
+            enabled: false,
+            ..config.clone()
+        };
+        assert!(action(&held, &off).is_err(), "forwarding off");
+        let stale = entry(7, 1, true, now - PENDING_MAX_AGE_SECS - 1);
+        assert!(action(&stale, &config).is_err(), "older than 24 h");
+    }
+
+    #[test]
+    fn flush_update_by_key() {
+        let mut log = vec![
+            entry(1, 1, false, 10),
+            entry(2, 2, false, 20),
+            entry(2, 1, true, 30),
+            entry(2, 2, true, 40),
+            entry(3, 2, true, 50),
+        ];
+        // A new message drains the oldest entry while the flush forwards
+        log.drain(..1);
+        let json = |e: &ForwardLogEntry| serde_json::to_value(e).unwrap();
+        let before: Vec<Value> = log.iter().map(json).collect();
+
+        assert!(update_pending(&mut log, (2, 2), None, false, 99));
+        assert!(log[2].success && !log[2].pending && log[2].error.is_none());
+        assert_eq!(log[2].timestamp, 99);
+        for i in [0, 1, 3] {
+            assert_eq!(json(&log[i]), before[i], "entry {i} changed");
+        }
+
+        // Still held: the error is updated, the hold timestamp kept
+        let error = Some("x; held for retry".to_string());
+        assert!(update_pending(&mut log, (3, 2), error, true, 99));
+        assert!(log[3].pending && !log[3].success);
+        assert_eq!(log[3].timestamp, 50);
+
+        // Nothing pending under this key any more
+        assert!(!update_pending(&mut log, (2, 2), None, false, 99));
+    }
+
+    #[test]
+    fn state_backcompat() {
+        let old = r#"{"last_forwarded_id":7,"log":[{"timestamp":1,"sms_id":7,
+            "sender":"s","content_preview":"p","rule_name":"r",
+            "destination_type":"telegram","success":false,
+            "error":"no WAN connectivity (permanent error)","rule_id":1}]}"#;
+        let state: ForwardState = serde_json::from_str(old).unwrap();
+        assert!(!state.log[0].pending);
+        let saved = serde_json::to_value(&state.log[0]).unwrap();
+        assert_eq!(saved["pending"], false);
+    }
+
+    #[test]
+    fn loop_timeout() {
+        let timeout = |pending, active| super::loop_timeout(pending, fallback_interval(active));
+        let secs = Duration::from_secs;
+        assert_eq!(timeout(true, true), secs(15));
+        assert_eq!(timeout(true, false), secs(15));
+        assert_eq!(timeout(false, true), secs(900));
+        assert_eq!(timeout(false, false), secs(3600));
     }
 }
