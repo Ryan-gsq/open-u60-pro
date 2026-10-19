@@ -104,7 +104,11 @@ fun RouterESimScreen(onBack: () -> Unit, viewModel: RouterESimViewModel = hiltVi
             icon = { Icon(Icons.Default.SwapHoriz, null) },
             title = { Text("Switch to ${target.displayName}?") },
             text = {
-                Text("The router disconnects from ${state.enabledProfile?.displayName ?: "the current profile"} and connects with ${target.displayName}. Internet is down for about a minute. Wi-Fi stays on.")
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("The router disconnects from ${state.enabledProfile?.displayName ?: "the current profile"} and connects with ${target.displayName}. Internet is down for about a minute. Wi-Fi stays on.")
+                    // Advisory only: the switch itself is unchanged.
+                    state.inventory.switchWarnings(target).forEach { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
             },
             confirmButton = { TextButton(onClick = viewModel::confirmSwitch, enabled = !state.blocksSwitching) { Text("Switch to ${target.displayName}") } },
             dismissButton = { TextButton(onClick = viewModel::dismissSwitch) { Text("Cancel") } },

@@ -11,6 +11,8 @@ data class RouterESimProfile(
     val nickname: String = "",
     val isEnabled: Boolean = false,
     val profileClass: String = "",
+    /** The agent's read-only pre-switch check: `manual_apn`, `roaming_off`. */
+    val switchWarnings: List<String> = emptyList(),
 ) {
     /** The nickname when set, otherwise the operator's profile name. */
     val displayName: String
@@ -43,6 +45,7 @@ data class RouterESimProfileDto(
     val provider: String? = null,
     val name: String? = null,
     @SerialName("class") val profileClass: String? = null,
+    @SerialName("switch_warnings") val switchWarnings: List<String>? = null,
 )
 
 @Serializable
@@ -67,6 +70,16 @@ data class RouterESimProfilesResponse(
     val stale: Boolean = false,
     val error: RouterESimReadError? = null,
     @SerialName("pending_receipts") val pendingReceipts: Int? = null,
+    /** Counts card reads in this agent run; unlike observed_at it ignores the router's clock jumps. */
+    @SerialName("observed_seq") val observedSeq: Long = 0,
+    @SerialName("manual_apn") val manualApn: RouterESimManualApn? = null,
+)
+
+/** The router's enabled manual APN entry (null while the APN mode is automatic). */
+@Serializable
+data class RouterESimManualApn(
+    val name: String = "",
+    val apn: String = "",
 )
 
 /** The list as accepted on screen, with its freshness markers. */
@@ -80,12 +93,29 @@ data class RouterESimInventory(
     val errorKind: String? = null,
     val errorMessage: String? = null,
     val pendingReceipts: Int? = null,
+    val observedSeq: Long = 0,
+    val manualApn: RouterESimManualApn? = null,
 ) {
     /** True when this answer predates the one shown (same agent run); older agents carry no counters. */
     fun isOlderThan(shown: RouterESimInventory): Boolean {
         if (agentInstance == 0L || agentInstance != shown.agentInstance) return false
         if (generation != shown.generation) return generation < shown.generation
+        if (observedSeq != 0L && shown.observedSeq != 0L) return observedSeq < shown.observedSeq
         return observedAt < shown.observedAt
+    }
+
+    /** Advisory lines for the switch dialog; unknown codes are skipped. */
+    fun switchWarnings(target: RouterESimProfile): List<String> {
+        val codes = profiles.firstOrNull { it.iccid == target.iccid }?.switchWarnings ?: target.switchWarnings
+        return codes.mapNotNull { code ->
+            when (code) {
+                "manual_apn" -> manualApn?.let {
+                    "The router is set to the manual APN “${it.apn}”. If ${target.displayName} needs a different APN, change it in Mobile Network after switching, or it may have no data."
+                }
+                "roaming_off" -> "${target.displayName} looks like a travel (roaming) profile and Data Roaming is off, so it will have no data until you turn Data Roaming on."
+                else -> null
+            }
+        }
     }
 
     /** Text for a failed read; null when the list is current. */
@@ -171,6 +201,8 @@ object RouterESimParser {
         errorKind = response.error?.kind,
         errorMessage = response.error?.message,
         pendingReceipts = response.pendingReceipts,
+        observedSeq = response.observedSeq,
+        manualApn = response.manualApn,
     )
 
     fun parseProfiles(response: RouterESimProfilesResponse): List<RouterESimProfile> =
@@ -184,6 +216,7 @@ object RouterESimParser {
                 nickname = p.nickname.orEmpty(),
                 isEnabled = p.state == "enabled",
                 profileClass = p.profileClass.orEmpty(),
+                switchWarnings = p.switchWarnings.orEmpty(),
             )
         }
 

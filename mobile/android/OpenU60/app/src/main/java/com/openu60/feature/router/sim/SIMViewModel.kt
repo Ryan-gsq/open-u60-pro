@@ -13,6 +13,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -33,12 +34,17 @@ class SIMViewModel @Inject constructor(
     private val _state = MutableStateFlow(SIMState())
     val state: StateFlow<SIMState> = _state.asStateFlow()
 
+    init {
+        // A switched profile, a swapped SIM or a restarted agent: show the new card without a pull.
+        viewModelScope.launch { agentClient.identityRevision.drop(1).collect { refresh() } }
+    }
+
     fun refresh() {
         viewModelScope.launch {
             _state.value = _state.value.copy(isLoading = true, message = null)
             try {
                 val infoDeferred = async { agentClient.getJSON("/api/sim/info") }
-                val lockDeferred = async { agentClient.getJSON("/api/sim/lock") }
+                val lockDeferred = async { agentClient.getJSON(LOCK_TRIALS_PATH) }
                 val simInfo = SIMParser.parseSIMInfo(infoDeferred.await())
                 val lockInfo = SIMParser.parseSIMLock(lockDeferred.await())
                 _state.value = _state.value.copy(simInfo = simInfo, lockInfo = lockInfo, isLoading = false)
@@ -130,5 +136,10 @@ class SIMViewModel @Inject constructor(
 
     private fun setError(msg: String?) {
         _state.value = _state.value.copy(isLoading = false, message = msg ?: "Unknown error", messageIsError = true)
+    }
+
+    companion object {
+        /** The agent routes only lock-trials; a 404 here would fail the whole refresh. */
+        internal const val LOCK_TRIALS_PATH = "/api/sim/lock-trials"
     }
 }

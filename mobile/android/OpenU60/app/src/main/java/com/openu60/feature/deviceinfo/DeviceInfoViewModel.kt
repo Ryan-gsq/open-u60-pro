@@ -13,6 +13,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -33,6 +34,8 @@ class DeviceInfoViewModel @Inject constructor(
 
     init {
         refresh()
+        // The ICCID, IMSI, number and WAN addresses change with the SIM.
+        viewModelScope.launch { agentClient.identityRevision.drop(1).collect { refresh() } }
     }
 
     fun refresh() {

@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -72,6 +73,12 @@ class RouterESimViewModel @Inject constructor(
     /** Following the agent's verified switch (GET /api/esim/switch); off for older agents. */
     private var followSwitch = false
     private var switchListRead = false
+
+    init {
+        // A switch from the card menu, a SIM swap or an agent restart: check the connection now
+        // and re-read the list (skipped while a switch or download runs).
+        viewModelScope.launch { agentClient.identityRevision.drop(1).collect { nextStatusCheck = 0L; retryProfiles() } }
+    }
 
     fun refresh() {
         if (_state.value.isLoading || _state.value.isSwitching || _state.value.operationInFlight || downloadInFlight) return
