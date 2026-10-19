@@ -585,7 +585,16 @@
  int euicc_driver_main_apdu(const int argc, char **argv) {
 --- a/driver/http/curl.c
 +++ b/driver/http/curl.c
-@@ -88,8 +88,8 @@
+@@ -17,6 +17,8 @@
+ #    define CURLOPT_WRITEDATA 10001
+ #    define CURLOPT_SSL_VERIFYPEER 64
+ #    define CURLOPT_SSL_VERIFYHOST 81
++#    define CURLOPT_CAINFO 10065
++#    define CURLOPT_CAPATH 10097
+ #    define CURLOPT_HTTPHEADER 10023
+ #    define CURLOPT_POSTFIELDS 10015
+ #    define CURLOPT_POSTFIELDSIZE 60
+@@ -88,8 +90,15 @@
      libcurl._curl_easy_setopt(curl, CURLOPT_URL, url);
      libcurl._curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_trans_write_callback);
      libcurl._curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&responseData);
@@ -593,6 +602,13 @@
 -    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 +    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
 +    libcurl._curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
++    // SM-DP+ servers use TLS certificates from the GSMA eSIM root CI, not a web CA.
++    // LPAC_HTTP_CA_FILE names a file holding only the trusted CI roots; the system directory is ignored.
++    const char *ca_file = getenv("LPAC_HTTP_CA_FILE");
++    if (ca_file != NULL && ca_file[0] != '\0') {
++        libcurl._curl_easy_setopt(curl, CURLOPT_CAINFO, ca_file);
++        libcurl._curl_easy_setopt(curl, CURLOPT_CAPATH, (char *)NULL);
++    }
      for (int i = 0; h[i] != NULL; i++) {
          nheaders = libcurl._curl_slist_append(headers, h[i]);
          if (nheaders == NULL) {
