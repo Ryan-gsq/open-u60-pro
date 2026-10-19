@@ -391,7 +391,9 @@ impl Download {
         if line["type"] != "progress" {
             return;
         }
-        if let Some(step) = line["payload"]["message"].as_str() {
+        // Cancelling the session is lpac's cleanup after a failure or cancel: keep the step that
+        // failed, so "failed at" names it.
+        if let Some(step) = line["payload"]["message"].as_str().filter(|s| !s.ends_with("_cancel_session")) {
             self.step = step.to_string();
             if step == "preview" && self.state == "running" {
                 self.state = "confirm";
@@ -1760,6 +1762,9 @@ mod tests {
         assert_eq!(d.name.as_deref(), Some("Globe"));
         d.progress(&json!({"type":"lpa","payload":{"code":0,"message":"success","data":null}}));
         assert_eq!(d.step, "es8p_metadata_parse", "result lines are not progress");
+        d.progress(&json!({"type":"progress","payload":{"code":0,"message":"es9p_authenticate_client","data":null}}));
+        d.progress(&json!({"type":"progress","payload":{"code":0,"message":"es9p_cancel_session","data":null}}));
+        assert_eq!(d.step, "es9p_authenticate_client", "cleanup does not hide the failing step");
         assert_eq!(Download::default().view()["state"], "idle");
     }
 
