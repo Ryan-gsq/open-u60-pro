@@ -141,7 +141,7 @@ final class RouterESimViewModel {
                 return
             }
             if outcomeUnknown(error) {
-                // lpac failed or timed out, but the card may have switched: the agent checks.
+                // The card command failed or timed out, but the card may have switched: the agent checks.
                 beginFollowingSwitch(to: target)
                 showMessage("The router is checking whether the switch happened.", isError: false)
                 return
@@ -419,7 +419,7 @@ final class RouterESimViewModel {
         return Date(timeIntervalSince1970: TimeInterval(unix)).formatted(date: .omitted, time: .shortened)
     }
 
-    /// The agent replies `outcome: "unknown"` when lpac failed or timed out mid-switch.
+    /// The agent replies `outcome: "unknown"` when the card command failed or timed out mid-switch.
     private func outcomeUnknown(_ error: Error) -> Bool {
         guard case AgentError.serverError(let text) = error, let data = text.data(using: .utf8),
               let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }

@@ -3,7 +3,7 @@ package com.openu60.core.model
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
-/** One profile on the eSIM in the router (GET /api/esim/profiles; the agent runs lpac). */
+/** One profile on the eSIM in the router (GET /api/esim/profiles). */
 data class RouterESimProfile(
     val iccid: String,
     val provider: String = "",
@@ -95,7 +95,6 @@ data class RouterESimInventory(
             return when (errorKind) {
                 "sim_reloading" -> "The eSIM is still settling after the switch."
                 "management_unavailable" -> "The eSIM's management app isn't responding ($message)."
-                "not_installed" -> "The eSIM manager (lpac) isn't installed on the router."
                 else -> message
             }
         }

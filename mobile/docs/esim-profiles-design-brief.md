@@ -8,7 +8,7 @@ OpenU60 is the companion app (iOS SwiftUI + Android Jetpack Compose) for a ZTE U
 3. **Add** a profile — scan the operator's eSIM QR code (or paste the code), preview, confirm, download
 4. **Remove** a profile
 
-Everything runs on the router (its agent uses the open-source eSIM manager "lpac"); the phone only talks to the router agent over the router's Wi-Fi. There is **no Bluetooth** flow (the old "9eSIM B1 Bluetooth" screen was removed — do not design one).
+Everything runs on the router (its agent is the eSIM manager); the phone only talks to the router agent over the router's Wi-Fi. There is **no Bluetooth** flow (the old "9eSIM B1 Bluetooth" screen was removed — do not design one).
 
 The router side is finished and live-tested. This brief covers the mobile UI.
 
@@ -54,7 +54,7 @@ Only one eSIM operation runs at a time. While a download runs, list/switch/delet
 Load profiles, then chip info (sequentially). Active profile clearly marked. Show card info (EID masked by default with reveal/copy, firmware, free memory). Pull-to-refresh / refresh button.
 
 ### Reading the list during and after a switch (agent behaviour since esim-6)
-- `GET /api/esim/profiles` also returns `observed_at`, `generation`, `agent_instance`, `updating`, `stale` and `error` (`{kind, message, at}`; kind `sim_reloading` / `management_unavailable` / `read_failed` / `not_installed`).
+- `GET /api/esim/profiles` also returns `observed_at`, `generation`, `agent_instance`, `updating`, `stale` and `error` (`{kind, message, at}`; kind `sim_reloading` / `management_unavailable` / `read_failed` / `busy` / `not_configured`).
 - While a switch reloads the SIM (5–60 s) the agent answers from its last good list with `updating: true` and never touches the card, so the old "Could not read eSIM profiles: euicc_init … SimFileNotFound" error no longer appears for that window. Show such a list as "updating…", with the switch target as pending.
 - A failed read still returns the last good list (`stale: true`) plus `error`: show the list as "last read <time>" with the error scoped to the list. **Clear the list error only when a newer response has `error: null`** — never because the network connected.
 - Ignore any response whose (`agent_instance`, `generation`, `observed_at`) is older than what is on screen.

@@ -56,7 +56,6 @@ Typical timing: internet back in **15–45 s**.
 - Error kinds and their copy:
   - `sim_reloading`: "The eSIM is still settling after the switch."
   - `management_unavailable`: "The eSIM's management app isn't responding."
-  - `not_installed`: "The eSIM manager (lpac) isn't installed on the router."
   - otherwise: the raw message.
 - The error clears **only** when a newer clean read arrives, never because the network connected.
 - **Try again** re-reads the list only. It never repeats a switch.
@@ -128,7 +127,7 @@ The download start reply also includes `free_nvm_bytes` (free eSIM storage). It'
 
 ## 6. Optional: card details
 
-`GET /api/esim/chip` now also returns `lpac.build` (lpac commit, build time) and `lpac.lpac_sha256`. This is for an "About / diagnostics" row at most; not needed on the main screen.
+`GET /api/esim/chip` returns the card's EID, firmware, SGP.22 version and free memory. This is for an "About / diagnostics" row at most; not needed on the main screen. (It no longer reports an lpac build: the agent manages the card itself since 2026-10-19.)
 
 ---
 

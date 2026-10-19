@@ -1,6 +1,6 @@
 import Foundation
 
-/// One profile on the eSIM in the router (GET /api/esim/profiles; the agent runs lpac).
+/// One profile on the eSIM in the router (GET /api/esim/profiles).
 struct RouterESimProfile: Identifiable, Equatable {
     let iccid: String
     let provider: String
@@ -58,7 +58,6 @@ struct RouterESimInventory: Equatable {
         switch errorKind {
         case "sim_reloading": return "The eSIM is still settling after the switch."
         case "management_unavailable": return "The eSIM's management app isn't responding (\(errorMessage))."
-        case "not_installed": return "The eSIM manager (lpac) isn't installed on the router."
         default: return errorMessage
         }
     }
