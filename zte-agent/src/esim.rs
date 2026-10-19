@@ -615,7 +615,13 @@ impl SwitchCheck {
             roaming_off,
             loaded_iccid: text(&sim["sim_iccid"]),
             sim_mcc: text(&sim["mdm_mcc"]),
-            net_mcc: state.cache.netinfo(cache::NETINFO_TTL).ok().and_then(|n| text(&n["rmcc"])),
+            // Unregistered, the firmware reports MCC 0: no network country to compare with.
+            net_mcc: state
+                .cache
+                .netinfo(cache::NETINFO_TTL)
+                .ok()
+                .and_then(|n| text(&n["rmcc"]))
+                .filter(|m| real_mcc(m)),
         }
     }
 
@@ -655,6 +661,11 @@ impl SwitchCheck {
     }
 }
 
+/// A real 3-digit MCC (not the 0 the firmware reports while unregistered).
+fn real_mcc(mcc: &str) -> bool {
+    mcc.len() == 3 && mcc.bytes().all(|b| b.is_ascii_digit()) && mcc != "000"
+}
+
 /// A firmware number that may come as a number or a string.
 fn int(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.trim().parse().ok())
@@ -675,6 +686,8 @@ fn enabled_manual_apn(list: &Value) -> Option<(String, String)> {
 
 /// The ITU country code in an ICCID (`89` + E.164 code, ITU-T E.118). E.164 codes are
 /// prefix-free: 1 and 7 are one digit, the assigned two-digit ones are listed, the rest are three.
+/// Two issuer conventions differ: US issuers pad the code (`8901…`) and Canadian ones use their
+/// MCC (`89302…`); other leading zeros are not guessed at.
 fn iccid_country(iccid: &str) -> Option<&str> {
     const TWO: [&str; 44] = [
         "20", "27", "30", "31", "32", "33", "34", "36", "39", "40", "41", "43", "44", "45", "46", "47",
@@ -684,6 +697,15 @@ fn iccid_country(iccid: &str) -> Option<&str> {
     let digits = iccid.trim().strip_prefix("89")?;
     if digits.len() < 3 || !digits[..3].bytes().all(|b| b.is_ascii_digit()) {
         return None;
+    }
+    if digits.starts_with("01") {
+        return Some("1");
+    }
+    if digits.starts_with('0') {
+        return None;
+    }
+    if digits.starts_with("302") {
+        return Some("302");
     }
     Some(match &digits[..1] {
         "1" | "7" => &digits[..1],
@@ -909,8 +931,9 @@ fn retry_while_busy(
     let cache = Arc::clone(&state.cache);
     let identity = Arc::clone(&state.sim_identity);
     let target = iccid.clone();
+    let outgoing = previous.clone();
     let spawned = crate::system::try_spawn_named("esim-switch", move || {
-        retry_enable(worker, target, cache, identity, generation);
+        retry_enable(worker, target, outgoing, cache, identity, generation);
     });
     if spawned.is_err() {
         let mut sw = inner.switch.lock().unwrap();
@@ -935,6 +958,7 @@ fn retry_while_busy(
 fn retry_enable(
     inner: Arc<Inner>,
     target: String,
+    previous: Option<String>,
     cache: Arc<crate::cache::UbusCache>,
     identity: Arc<crate::sim_identity::SimIdentity>,
     generation: u64,
@@ -970,7 +994,7 @@ fn retry_enable(
         };
         inner.inventory.lock().unwrap().reloading = true;
         inner.switched_at.store(mono_secs(), Ordering::Relaxed);
-        identity.agent_switch_started(generation, None);
+        identity.agent_switch_started(generation, previous.as_deref());
         cache.invalidate_with_settle(cache::SIM_INFO, cache::SETTLE_WINDOW);
         {
             let mut sw = inner.switch.lock().unwrap();
@@ -2378,6 +2402,10 @@ mod tests {
         assert_eq!(iccid_country("8970000000000000001"), Some("7"));
         assert_eq!(iccid_country("8985212000000000001"), Some("852"));
         assert_eq!(iccid_country("8988216000000000001"), Some("882"));
+        assert_eq!(iccid_country("8901410000000000001"), Some("1"), "AT&T pads the code");
+        assert_eq!(iccid_country("8901260000000000001"), Some("1"), "so does T-Mobile US");
+        assert_eq!(iccid_country("8930272000000000001"), Some("302"), "Canadian issuers use the MCC");
+        assert_eq!(iccid_country("8900100000000000001"), None);
         assert_eq!(iccid_country("8863000000000000001"), None);
         assert_eq!(iccid_country("89"), None);
         assert_eq!(iccid_country("89x1000000000000001"), None);
@@ -2392,6 +2420,9 @@ mod tests {
         assert_eq!(target_roams(ph, Some(sg), Some("525"), Some("515")), None);
         assert_eq!(target_roams(sg, Some(sg), Some("525"), Some("515")), Some(true));
         assert_eq!(target_roams(sg, Some(ph), None, Some("515")), None);
+        // Unregistered (rmcc 0): no network country, no guess either way.
+        assert!(!real_mcc("0") && !real_mcc("000") && real_mcc("515"));
+        assert_eq!(target_roams(ph, Some(ph), Some("515"), None), None);
     }
 
     #[test]

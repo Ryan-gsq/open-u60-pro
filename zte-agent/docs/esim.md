@@ -104,10 +104,10 @@ ICCIDs and the EID are digit strings longer than 64-bit integers can hold: clien
 
 ### Before switching
 
-`GET /api/esim/profiles` warns about what a switch would run into, read-only (the agent never changes these settings):
+`GET /api/esim/profiles` warns about what a switch would run into, read-only (the agent never changes these settings). While a switch reloads the SIM (`updating: true`) the reply carries neither `switch_warnings` nor `manual_apn`.
 
-- `manual_apn: {name, apn}` when the router is in manual APN mode, and `manual_apn` in `switch_warnings` of every profile: the new profile would dial that APN too (seen live: a travel profile's `e-ideas`, then `gomo.ph`, carried over to the next profile).
-- `roaming_off` in `switch_warnings` when data roaming is off and the profile looks like one from another country. This is a heuristic: it compares the country code in the ICCIDs (`89` + E.164 code) with the loaded profile, and whether that profile is at home (its MCC equals the network's). Next to a roaming profile, only profiles from the same country are flagged.
+- `manual_apn: {name, apn}` when the router is in manual APN mode, and `manual_apn` in `switch_warnings` of each disabled operational profile: the new profile would dial that APN too (seen live: a travel profile's `e-ideas`, then `gomo.ph`, carried over to the next profile).
+- `roaming_off` in `switch_warnings` when data roaming is off and the profile looks like one from another country. This is a heuristic: it compares the country code in the ICCIDs (`89` + E.164 code; US issuers' `8901…` counts as 1 and Canadian `89302…` as 302) with the loaded profile, and whether that profile is at home (its MCC equals the network's). Without a registered network there is no `roaming_off`. Next to a roaming profile, only profiles from the same country are flagged.
 
 `observed_seq` counts good reads of the card. Clients order lists of the same `generation` by it rather than by `observed_at`, because the router's clock jumps by hours when the network sets the time after an attach.
 
@@ -119,7 +119,7 @@ The agent tracks the loaded SIM's identity by its ICCID, whether it changes thro
 |---|---|
 | `leaving` | The firmware's `switch_slot_begin` or `sim hot remove`, or the agent's own switch; carries the outgoing identity |
 | `changed` | A ready SIM with a different ICCID; `epoch` goes up by one |
-| `online` | After the change, a default route, DNS, no WAN script running and 8 s without WAN events (`settled: true`), or a default route for 30 s (`settled: false`). `identity_changed: false` when the same SIM came back |
+| `online` | After the change, a default route, DNS, a WAN-up event if the ICCID changed, no WAN script running and 8 s without WAN events (`settled: true`), or a default route for 30 s (`settled: false`). `identity_changed: false` when the same SIM came back |
 | `stalled` | No `online` 150 s after `leaving`; `reason`: `sim_not_ready`, `no_wan`, `roaming_off` or `data_off`. A later `online` can still follow |
 
 Payload: `phase`, `epoch`, `source` (`agent`, `card`, `hotswap` or `unknown`), `generation` (the switch's, for agent switches), `plmn` (`515-02`), `operator`, `iccid_tail` (last 4 digits), `since_leaving_ms`, and `identity_changed`/`settled` or `reason`. It never carries the full ICCID, the IMSI, the phone number, an IP address or the APN.

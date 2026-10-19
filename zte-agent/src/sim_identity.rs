@@ -131,6 +131,9 @@ pub struct Machine {
     known: Option<Identity>,
     epoch: u64,
     armed_at: Option<Instant>,
+    /// The firmware already started the armed switch: the agent's own `AgentStarted`, which can
+    /// arrive late (the card call may run up to its time limit), only attributes it.
+    claimed_at: Option<Instant>,
     transition: Option<Transition>,
     seed_tries: u32,
     next_seed: Option<Instant>,
@@ -146,10 +149,17 @@ impl Machine {
     pub fn step(&mut self, input: Input, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
         match input {
-            Input::AgentArm => self.armed_at = Some(now),
+            Input::AgentArm => {
+                self.armed_at = Some(now);
+                self.claimed_at = None;
+            }
             Input::AgentDisarm => self.armed_at = None,
             Input::AgentStarted { generation, previous } => {
                 self.armed_at = None;
+                let claimed = self
+                    .claimed_at
+                    .take()
+                    .is_some_and(|t| now.saturating_duration_since(t) < ARM_WINDOW);
                 if self.known.is_none() {
                     // The card's previous profile: an agent switch before the first read counts.
                     if let Some(iccid) = previous.filter(|s| !s.trim().is_empty()) {
@@ -163,6 +173,8 @@ impl Machine {
                         t.source = "agent";
                         t.generation = Some(generation);
                     }
+                    // The firmware's signals already opened (and maybe closed) this switch.
+                    _ if claimed => {}
                     _ => self.leave("agent", Some(generation), now, &mut out),
                 }
             }
@@ -190,17 +202,18 @@ impl Machine {
         out
     }
 
-    /// A SIM read is due.
+    /// A SIM read is due: one asked for by an event, a seeding retry, or a transition's poll.
     pub fn wants_read(&self, now: Instant) -> bool {
-        if self.read_requested {
-            return true;
-        }
-        if self.known.is_none() {
-            return self.next_seed.is_some_and(|t| now >= t);
-        }
-        self.transition
-            .as_ref()
-            .is_some_and(|t| t.resolved.is_none() && !t.stalled && now >= t.next_read)
+        self.read_requested
+            || self.seed_due(now)
+            || self
+                .transition
+                .as_ref()
+                .is_some_and(|t| t.resolved.is_none() && !t.stalled && now >= t.next_read)
+    }
+
+    fn seed_due(&self, now: Instant) -> bool {
+        self.known.is_none() && self.next_seed.is_some_and(|t| now >= t)
     }
 
     /// A network check is due.
@@ -288,15 +301,24 @@ impl Machine {
             next_read: now + POLL,
             next_gate: now,
         });
+        if source == "agent" && generation.is_none() {
+            self.claimed_at = Some(now);
+        }
         self.armed_at = None;
         let known = self.known.clone();
         out.push(Output::Event(self.payload("leaving", known.as_ref(), now, Map::new())));
     }
 
     fn identity(&mut self, id: Identity, now: Instant, out: &mut Vec<Output>) {
+        let unresolved = self.transition.as_ref().is_some_and(|t| t.resolved.is_none());
         let Some(known) = &mut self.known else {
-            self.known = Some(id.clone());
-            out.push(Output::Seeded(id));
+            if !unresolved {
+                self.known = Some(id.clone());
+                out.push(Output::Seeded(id));
+                return;
+            }
+            // Something left before the first read: the identity that arrives counts as new.
+            self.change(id, now, out);
             return;
         };
         if crate::esim::same_iccid(&known.iccid, &id.iccid) {
@@ -314,9 +336,17 @@ impl Machine {
             }
             return;
         }
+        self.change(id, now, out);
+    }
+
+    fn change(&mut self, id: Identity, now: Instant, out: &mut Vec<Output>) {
         self.epoch += 1;
         self.known = Some(id);
         let source = if self.armed(now) { "agent" } else { "unknown" };
+        if source == "agent" {
+            self.claimed_at = Some(now);
+            self.armed_at = None;
+        }
         match &mut self.transition {
             Some(t) if t.resolved.is_none() => {}
             _ => {
@@ -380,7 +410,8 @@ impl Machine {
 
     fn after_read(&mut self, now: Instant) {
         self.read_requested = false;
-        if self.known.is_none() {
+        // Only a seeding retry counts against the seeding budget, not a transition's poll.
+        if self.seed_due(now) {
             self.seed_tries += 1;
             self.next_seed = (self.seed_tries < SEED_TRIES).then(|| now + SEED_RETRY);
         }
@@ -875,6 +906,45 @@ mod tests {
         assert_eq!(m.next_wake(now), None);
         m.step(Input::Card(json!({"sim_states": "sim not ready"})), now);
         assert!(m.wants_read(now), "a card event asks again");
+    }
+
+    #[test]
+    fn an_unseeded_transition_polls_without_spinning_and_counts_the_new_identity() {
+        let t0 = Instant::now();
+        let s = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut m = Machine::new(t0);
+        m.step(Input::Sim(None), t0);
+        m.step(begin(), s(1));
+        for now in [s(4), s(5), s(10), s(29)] {
+            assert!(m.next_wake(now).is_some_and(|w| w > now) || m.wants_read(now) || m.wants_gate(now), "{:?}", now - t0);
+            if m.wants_read(now) {
+                m.step(Input::Sim(None), now);
+            }
+        }
+        assert_eq!(m.seed_tries, 1, "transition polls don't use up the seeding budget");
+        let out = events(m.step(ready(B), s(30)));
+        assert_eq!(phases(&out), ["changed"]);
+        assert_eq!(out[0]["epoch"], 1);
+    }
+
+    #[test]
+    fn a_late_agent_call_after_online_does_not_open_a_second_switch() {
+        let t0 = Instant::now();
+        let s = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut m = seeded(t0);
+        let mut all = Vec::new();
+        all.extend(events(m.step(Input::AgentArm, t0)));
+        all.extend(events(m.step(begin(), s(1))));
+        all.extend(events(m.step(ready(B), s(5))));
+        all.extend(events(m.step(Input::Wan(Some(true)), s(15))));
+        all.extend(events(m.step(Input::Gate(OPEN), s(24))));
+        all.extend(events(m.step(Input::AgentStarted { generation: 9, previous: Some(A.into()) }, s(35))));
+        assert_eq!(phases(&all), ["leaving", "changed", "online"]);
+        assert!(m.transition.is_none());
+        // The next switch, with no firmware signal before the call returns, still opens one.
+        m.step(Input::AgentArm, s(100));
+        let out = events(m.step(Input::AgentStarted { generation: 10, previous: None }, s(101)));
+        assert_eq!(phases(&out), ["leaving"]);
     }
 
     #[test]
