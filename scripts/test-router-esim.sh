@@ -15,3 +15,7 @@ swiftc -module-cache-path "$test_dir/cache" \
     mobile/ios/OpenU60/Features/RouterSettings/SIM/ESim/RouterESimViewModel.swift \
     mobile/ios/Tests/RouterESimFlowTests.swift -o "$test_dir/router-esim-flow-tests"
 "$test_dir/router-esim-flow-tests"
+swiftc -module-cache-path "$test_dir/cache" \
+    mobile/ios/OpenU60/Core/Models/RouterSettingsModels.swift \
+    mobile/ios/Tests/MobileNetworkTests.swift -o "$test_dir/mobile-network-tests"
+"$test_dir/mobile-network-tests"

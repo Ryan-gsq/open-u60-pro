@@ -122,12 +122,14 @@ final class MobileNetworkViewModel {
 
         do {
             if selectedConnectMode != config.connectMode || selectedRoaming != config.isRoamingEnabled {
-                let _ = try await client.putJSON("/api/modem/data", body: [
-                    "cid": 1,
-                    "connect_mode": selectedConnectMode,
-                    "roam_enable": selectedRoaming ? 1 : 0,
-                    "enable": config.dataEnabled
-                ])
+                let _ = try await client.putJSON("/api/modem/data", body: config.connectionBody(
+                    connectMode: selectedConnectMode,
+                    roaming: selectedRoaming
+                ))
+                if selectedRoaming && !config.isRoamingEnabled {
+                    config.dataEnabled = 1
+                    selectedDataEnabled = true
+                }
             }
 
             if selectedNetSelectMode != config.netSelectMode {
