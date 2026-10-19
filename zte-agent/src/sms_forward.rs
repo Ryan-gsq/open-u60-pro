@@ -748,16 +748,29 @@ fn settle_pending(
         && log.iter().filter(|e| e.sms_id == sms_id).all(|e| e.success)
 }
 
+/// SMS ids with a held forward.
+fn held_ids(log: &[ForwardLogEntry]) -> std::collections::HashSet<u64> {
+    log.iter().filter(|e| e.pending).map(|e| e.sms_id).collect()
+}
+
+/// Entries that trimming and clearing keep: a held entry is the only copy of
+/// its forward, and a failed sibling of a held entry is what stops the
+/// post-forward actions (delete, mark read) once the held one goes out.
+fn keep_entry(e: &ForwardLogEntry, held: &std::collections::HashSet<u64>) -> bool {
+    e.pending || (!e.success && held.contains(&e.sms_id))
+}
+
 /// Push a log entry and trim the log to `MAX_LOG_ENTRIES`, oldest settled
-/// entries first: a held entry is the only copy of its forward.
+/// entries first (see `keep_entry`).
 fn push_log(log: &mut Vec<ForwardLogEntry>, entry: ForwardLogEntry) {
     log.push(entry);
     let mut excess = log.len().saturating_sub(MAX_LOG_ENTRIES);
     if excess == 0 {
         return;
     }
+    let held = held_ids(log);
     log.retain(|e| {
-        let drop = excess > 0 && !e.pending;
+        let drop = excess > 0 && !keep_entry(e, &held);
         if drop {
             excess -= 1;
         }
@@ -1817,7 +1830,8 @@ pub fn log_clear(state: &AppState) -> (u16, Value) {
 /// Clear the log but keep held forwards: each entry is the only copy of its
 /// forward, which `flush_pending` still sends or settles.
 fn clear_log(log: &mut Vec<ForwardLogEntry>) {
-    log.retain(|e| e.pending);
+    let held = held_ids(log);
+    log.retain(|e| keep_entry(e, &held));
 }
 
 /// POST /api/sms/forward/retry — Retry a failed forward log entry
@@ -2369,6 +2383,25 @@ mod tests {
         clear_log(&mut log);
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].sms_id, 2);
+    }
+
+    /// A failed rule of an SMS whose other rule is held stays in the log, so
+    /// the held one going out later doesn't run delete/mark-read for it.
+    #[test]
+    fn failed_sibling_of_a_held_forward_survives_clear_and_trim() {
+        let mut log = vec![entry(9, 1, false, 1), entry(9, 2, true, 1)];
+        clear_log(&mut log);
+        assert_eq!(log.len(), 2, "the failure is kept while rule 2 is held");
+        assert!(!settle_pending(&mut log, (9, 2), None, false, 9), "rule 1 failed");
+
+        let mut log = vec![entry(9, 1, false, 1), entry(9, 2, true, 1)];
+        for id in 10..10 + MAX_LOG_ENTRIES as u64 {
+            let mut done = entry(id, 1, false, id as i64);
+            done.success = true;
+            push_log(&mut log, done);
+        }
+        assert!(log.iter().any(|e| e.sms_id == 9 && e.rule_id == 1), "trimmed after newer settled entries");
+        assert!(!settle_pending(&mut log, (9, 2), None, false, 9));
     }
 
     /// The post-forward actions become due when a held forward goes out and
