@@ -12,9 +12,21 @@ final class AgentClient {
     var suspendThermal = false
     var chargerDelay = false
     var kernelStatus = "Discharging"
+    var identityRevision = 0
+    /// Answers every read but traffic at once, so whole dashboard passes complete.
+    var quickFixtures = false
+    /// Moves `identityRevision` on the next signal read, as a newly stamped SIM identity does.
+    var bumpOnSignal = false
 
     func getJSON(_ path: String) async throws -> [String: Any] {
         paths.append(path)
+        if quickFixtures && path != "/api/network/speeds" {
+            if path == "/api/network/signal" && bumpOnSignal {
+                bumpOnSignal = false
+                identityRevision += 1
+            }
+            return [:]
+        }
         if healthFixtures {
             if path == "/api/device/thermal" {
                 if suspendThermal { return try await withCheckedThrowingContinuation { pendingThermals.append($0) } }
@@ -40,6 +52,7 @@ final class AgentClient {
 
     func get<T: Decodable>(_ path: String) async throws -> T {
         paths.append(path)
+        if quickFixtures { throw AgentError.serverError("No fixture") }
         if healthFixtures && path == "/api/cpu" {
             if failHealth { throw AgentError.timeout }
             return try JSONDecoder().decode(T.self, from: Data("{\"cores\":[0],\"overall\":0}".utf8))
@@ -227,6 +240,40 @@ struct DashboardTrafficTests {
         healthModel.stopPolling()
         while !healthClient.pending.isEmpty { healthClient.answer(0) }
         print("Health refresh independence, zero CPU, unit conversion, failure, recovery and cancellation passed")
+
+        // A new SIM identity makes the slow tier (WAN addresses, SIM state, mobile data) stale at
+        // once; the next full read must not wait for the slow tier's 60 s turn.
+        let identityClient = AgentClient()
+        identityClient.quickFixtures = true
+        let identityModel = DashboardViewModel(client: identityClient, authManager: AuthManager())
+        let wanReads = { identityClient.paths.filter { $0 == "/api/network/wan" }.count }
+        let signalReads = { identityClient.paths.filter { $0 == "/api/network/signal" }.count }
+        identityModel.startPolling(interval: 0.5)
+        try await eventually { identityModel.lastUpdated != nil }
+        try await eventually(acrossPolls) { signalReads() >= 2 }
+        precondition(wanReads() == 1, "Fast passes leave the slow tier alone")
+        let mark = identityClient.paths.count
+        identityClient.bumpOnSignal = true
+        try await eventually(acrossPolls) {
+            let after = identityClient.paths[mark...]
+            return after.contains("/api/network/wan") && after.contains("/api/network/wan6") && after.contains("/api/sim/info")
+        }
+        precondition(wanReads() == 2)
+        var settled = signalReads()
+        try await eventually(acrossPolls) { signalReads() >= settled + 3 }
+        precondition(wanReads() == 2, "One identity change costs one full pass")
+        // A full pass that reveals the change ran its slow reads alongside the revealing one, so
+        // they may predate it: one more full pass follows, then none.
+        identityModel.stopPolling()
+        identityClient.bumpOnSignal = true
+        identityModel.startPolling(interval: 0.5)
+        try await eventually(acrossPolls) { wanReads() == 4 }
+        settled = signalReads()
+        try await eventually(acrossPolls) { signalReads() >= settled + 3 }
+        precondition(wanReads() == 4, "A change revealed by a full pass costs exactly one more")
+        identityModel.stopPolling()
+        while !identityClient.pending.isEmpty { identityClient.answer(0) }
+        print("Identity-driven slow tier refresh passed")
         let fixed = try await measureCadence(.fixedInterval)
         let afterCompletion = try await measureCadence(.afterCompletion)
         precondition(afterCompletion - fixed > 0.2,

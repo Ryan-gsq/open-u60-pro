@@ -40,6 +40,13 @@ final class SIMViewModel {
         self.authManager = authManager
     }
 
+    /// Moves when the router changes SIM identity or switch phase; the view re-reads on it.
+    var identityRevision: Int { client.identityRevision }
+
+    /// Keeps `identityRevision` current while this screen is up: the dashboard poller that
+    /// would otherwise notice a switch is paused on the Router tab.
+    func watchIdentity() async { await client.watchSimIdentity() }
+
     var isPinEnabled: Bool {
         simInfo.pinStatus == "1"
     }

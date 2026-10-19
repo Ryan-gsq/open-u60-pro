@@ -136,7 +136,8 @@ struct RouterESimView: View {
             Button("Switch to \(profile.displayName)") { Task { await viewModel.confirmSwitch(to: profile) } }
             Button("Cancel", role: .cancel) {}
         } message: { profile in
-            Text("The router disconnects from \(viewModel.enabledProfile?.displayName ?? "the current profile") and connects with \(profile.displayName). Internet is down for about a minute. Wi-Fi stays on.")
+            Text((["The router disconnects from \(viewModel.enabledProfile?.displayName ?? "the current profile") and connects with \(profile.displayName). Internet is down for about a minute. Wi-Fi stays on."]
+                  + viewModel.inventory.switchWarnings(for: profile)).joined(separator: "\n\n"))
         }
     }
 

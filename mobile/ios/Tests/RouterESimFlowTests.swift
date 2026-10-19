@@ -5,6 +5,7 @@ import Foundation
 final class AgentClient {
     var requests: [String] = []
     var bodies: [[String: Any]] = []
+    var identityRevision = 0
     var status: [String: Any] = ["state": "idle"]
     var switchStatus: [String: Any] = ["state": "idle"]
     var inventoryMeta: [String: Any] = [:]
@@ -169,6 +170,28 @@ struct RouterESimFlowTests {
         precondition(switchClient.requests.last == "GET /api/esim/profiles" && switchClient.bodies.last?["nickname"] as? String == "Travel")
         await switchVM.confirmRename(target, to: String(repeating: "x", count: 65))
         precondition(switchVM.messageIsError && switchClient.bodies.last?["nickname"] as? String == "Travel", "Over-long names never reach the router")
-        print("RouterESimFlowTests: request ordering, operation guards, installation safety, resume, deletion, and errors passed")
+        // A moved SIM identity (a switch from the card's menu, a swapped card) re-reads the list and
+        // the connection on the next monitor tick, not at the 12 s connection check.
+        let watchClient = AgentClient()
+        let watchVM = RouterESimViewModel(client: watchClient, authManager: AuthManager())
+        await watchVM.refresh()
+        watchVM.startMonitoring()
+        func soon(_ condition: () -> Bool) async -> Bool {
+            for _ in 0..<250 where !condition() { try? await Task.sleep(for: .milliseconds(10)) }
+            return condition()
+        }
+        let checksBefore = watchClient.requests.filter { $0 == "GET /api/network/signal" }.count
+        let checked = await soon { watchClient.requests.filter { $0 == "GET /api/network/signal" }.count > checksBefore }
+        precondition(checked, "Monitoring starts with a connection check")
+        let idleMark = watchClient.requests.count
+        try? await Task.sleep(for: .milliseconds(1200))
+        precondition(!watchClient.requests[idleMark...].contains("GET /api/esim/profiles"), "An unchanged identity reads nothing")
+        watchClient.identityRevision += 1
+        let reread = await soon { watchClient.requests[idleMark...].contains("GET /api/esim/profiles") }
+        precondition(reread, "A new SIM identity re-reads the list")
+        let rechecked = await soon { watchClient.requests[idleMark...].contains("GET /api/sim/info") }
+        precondition(rechecked, "A new SIM identity checks the connection now")
+        watchVM.stopMonitoring()
+        print("RouterESimFlowTests: request ordering, operation guards, installation safety, resume, deletion, errors, and identity re-reads passed")
     }
 }

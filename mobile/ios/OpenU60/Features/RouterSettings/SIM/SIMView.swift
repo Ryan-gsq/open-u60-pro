@@ -163,7 +163,8 @@ struct SIMView: View {
                     .background(Color(.systemBackground).opacity(0.85), in: RoundedRectangle(cornerRadius: 8))
             }
         }
-        .task { await viewModel.refresh() }
+        .task(id: viewModel.identityRevision) { await viewModel.refresh() }
+        .task { await viewModel.watchIdentity() }
         .sheet(isPresented: $viewModel.showChangePinSheet) {
             ChangePinSheet(viewModel: viewModel)
         }

@@ -48,6 +48,8 @@ final class RouterESimViewModel {
     /// agents, which fall back to `reconnectTracker`.
     @ObservationIgnored private var followSwitch = false
     @ObservationIgnored private var switchListRead = false
+    /// The client's SIM identity revision this screen last re-read for.
+    @ObservationIgnored private var seenIdentityRevision = 0
 
     init(client: AgentClient, authManager: AuthManager) {
         self.client = client
@@ -88,9 +90,18 @@ final class RouterESimViewModel {
         guard !statusPoller.isRunning else { return }
         nextStatusCheck = .distantPast
         nextDownloadCheck = .distantPast
+        seenIdentityRevision = client.identityRevision
         statusPoller.start(interval: .seconds(1)) { [weak self] in
             guard let self else { return .failure }
             guard !self.isLoading, !self.isSwitching, !self.operationInFlight else { return .success }
+            // The connection check's own reads carry the router's SIM identity. When it moved
+            // (a switch from the card's menu, a swapped card, or the WAN coming up), check now
+            // and re-read the list unless a switch or download owns the card.
+            if self.client.identityRevision != self.seenIdentityRevision {
+                self.seenIdentityRevision = self.client.identityRevision
+                self.nextStatusCheck = .distantPast
+                if !self.blocksSwitching { await self.loadProfiles() }
+            }
             if self.download.isBusy || Date() >= self.nextDownloadCheck {
                 await self.pollDownload()
                 self.nextDownloadCheck = Date().addingTimeInterval(30)
@@ -131,7 +142,7 @@ final class RouterESimViewModel {
                 profiles = profiles.map {
                     RouterESimProfile(iccid: $0.iccid, provider: $0.provider, name: $0.name,
                                       nickname: $0.nickname, isEnabled: $0.iccid == target.iccid,
-                                      profileClass: $0.profileClass)
+                                      profileClass: $0.profileClass, switchWarnings: $0.switchWarnings)
                 }
             }
             beginFollowingSwitch(to: target)

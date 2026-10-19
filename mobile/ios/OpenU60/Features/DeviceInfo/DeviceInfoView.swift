@@ -35,7 +35,8 @@ struct DeviceInfoView: View {
                 ProgressView()
             }
         }
-        .task { await viewModel.refresh() }
+        .task(id: viewModel.identityRevision) { await viewModel.refresh() }
+        .task { await viewModel.watchIdentity() }
     }
 
     // MARK: - Rows

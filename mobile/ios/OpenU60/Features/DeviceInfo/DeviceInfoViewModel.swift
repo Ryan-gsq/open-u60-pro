@@ -16,6 +16,13 @@ final class DeviceInfoViewModel {
         self.authManager = authManager
     }
 
+    /// Moves when the router changes SIM identity or switch phase; the view re-reads on it.
+    var identityRevision: Int { client.identityRevision }
+
+    /// Keeps `identityRevision` current while this screen is up: the dashboard poller that
+    /// would otherwise notice a switch is paused on the Tools tab.
+    func watchIdentity() async { await client.watchSimIdentity() }
+
     func refresh() async {
         isLoading = true
         error = nil
@@ -30,6 +37,9 @@ final class DeviceInfoViewModel {
         let (simInfo, imeiData, wanStatus, wan6Status, lanStatus, signalInfo) =
             await (simTask, imeiTask, wanTask, wan6Task, lanTask, signalTask)
 
+        // Superseded by the re-read a newer SIM identity starts, or the screen closed: the
+        // reads that were cut off came back empty and must not blank the rows.
+        guard !Task.isCancelled else { return }
         identity = DeviceParser.parseIdentity(
             simInfo: simInfo ?? [:],
             imeiData: imeiData ?? [:],

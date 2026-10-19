@@ -76,6 +76,8 @@ final class DashboardViewModel {
     @ObservationIgnored private var slowEvery = 30
     @ObservationIgnored private var refreshGeneration = 0
     @ObservationIgnored private var inFlight: (tiers: PollTiers, id: Int, task: Task<Bool, Never>)?
+    /// The client's SIM identity revision the slow tier was last read for.
+    @ObservationIgnored private var seenIdentityRevision = 0
     @ObservationIgnored private var trafficGeneration = 0
     @ObservationIgnored private var trafficInFlight: (id: Int, task: Task<Bool, Never>)?
     @ObservationIgnored private var trafficTier: TrafficTier = .wwandst
@@ -229,6 +231,7 @@ final class DashboardViewModel {
 
         let medium = tiers.contains(.medium)
         let slow = tiers.contains(.slow)
+        let revisionAtStart = client.identityRevision
 
         async let signalResult = fetchSignal()
         async let deviceList = fetchDevices(enabled: medium)
@@ -297,6 +300,22 @@ final class DashboardViewModel {
         }
         if let dataOff = mobileDataOff, dataOff != isMobileDataOff {
             isMobileDataOff = dataOff
+        }
+
+        // The router moved to another SIM, or its WAN came up on one: the WAN addresses, SIM
+        // state and mobile data are stale now, not at the slow tier's next turn. A slow pass
+        // only covers a move it started after, since its own reads ran alongside the one that
+        // revealed it. Not awaited: this pass is the in-flight one the full pass queues behind.
+        // Skipped once polling has stopped, since a restart opens with a full pass anyway.
+        let revision = client.identityRevision
+        if revision != seenIdentityRevision {
+            seenIdentityRevision = revision
+            if !(slow && revisionAtStart == revision) {
+                Task { [weak self] in
+                    guard let self, self.poller.isRunning else { return }
+                    await self.performRefresh(.all)
+                }
+            }
         }
 
         if reachable { lastUpdated = Date() }

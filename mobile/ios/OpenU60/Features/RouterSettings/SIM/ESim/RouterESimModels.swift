@@ -8,6 +8,9 @@ struct RouterESimProfile: Identifiable, Equatable {
     let nickname: String
     let isEnabled: Bool
     let profileClass: String
+    /// Codes for what may go wrong after switching to this profile (`manual_apn`,
+    /// `roaming_off`); the agent sends them only for profiles that can be switched to.
+    var switchWarnings: [String] = []
 
     var id: String { iccid }
 
@@ -30,12 +33,21 @@ struct RouterESimChip: Equatable {
     static let empty = RouterESimChip()
 }
 
+/// The router's manual APN while manual APN mode is on (`manual_apn` on GET /api/esim/profiles).
+struct RouterESimManualAPN: Equatable {
+    var name: String
+    var apn: String
+}
+
 /// GET /api/esim/profiles: the list plus how fresh it is. While a switch reloads the SIM, or
 /// another eSIM operation holds the card, the agent answers with its last good list marked
 /// `updating`; a failed read returns that list as `stale` with `error`.
 struct RouterESimInventory: Equatable {
     var profiles: [RouterESimProfile] = []
     var observedAt: UInt64 = 0
+    /// Counts the agent's card reads. Unlike `observedAt` it never follows the router's clock,
+    /// which jumps hours when the modem first attaches.
+    var observedSeq: UInt64 = 0
     var generation: UInt64 = 0
     var agentInstance: UInt64 = 0
     var updating = false
@@ -43,12 +55,15 @@ struct RouterESimInventory: Equatable {
     var errorKind: String?
     var errorMessage: String?
     var pendingReceipts: Int?
+    var manualAPN: RouterESimManualAPN?
 
     /// True when this answer predates the one on screen (same agent run, older change counter
-    /// or older read) and must be ignored. Answers from older agents carry no counters.
+    /// or older read) and must be ignored. Answers from older agents carry no counters, and
+    /// read times are compared only when either side lacks the read counter.
     func isOlder(than shown: RouterESimInventory) -> Bool {
         guard agentInstance != 0, agentInstance == shown.agentInstance else { return false }
         if generation != shown.generation { return generation < shown.generation }
+        if observedSeq != 0, shown.observedSeq != 0 { return observedSeq < shown.observedSeq }
         return observedAt < shown.observedAt
     }
 
@@ -59,6 +74,26 @@ struct RouterESimInventory: Equatable {
         case "sim_reloading": return "The eSIM is still settling after the switch."
         case "management_unavailable": return "The eSIM's management app isn't responding (\(errorMessage))."
         default: return errorMessage
+        }
+    }
+}
+
+extension RouterESimInventory {
+    /// Advisory sentences for the switch dialog, from the codes this list carries for `target`.
+    /// Codes this app doesn't know are skipped.
+    func switchWarnings(for target: RouterESimProfile) -> [String] {
+        let codes = profiles.first(where: { $0.iccid == target.iccid })?.switchWarnings ?? target.switchWarnings
+        let name = target.displayName
+        return codes.compactMap { code in
+            switch code {
+            case "manual_apn":
+                guard let apn = manualAPN?.apn else { return nil }
+                return "The router is set to the manual APN “\(apn)”. If \(name) needs a different APN, change it in Mobile Network after switching, or it may have no data."
+            case "roaming_off":
+                return "\(name) looks like a travel (roaming) profile and Data Roaming is off, so it will have no data until you turn Data Roaming on."
+            default:
+                return nil
+            }
         }
     }
 }
@@ -129,13 +164,15 @@ enum RouterESimParser {
         return RouterESimInventory(
             profiles: parseProfiles(data),
             observedAt: asUInt64(data["observed_at"]),
+            observedSeq: asUInt64(data["observed_seq"]),
             generation: asUInt64(data["generation"]),
             agentInstance: asUInt64(data["agent_instance"]),
             updating: data["updating"] as? Bool ?? false,
             stale: data["stale"] as? Bool ?? false,
             errorKind: error?["kind"] as? String,
             errorMessage: error?["message"] as? String,
-            pendingReceipts: asInt(data["pending_receipts"])
+            pendingReceipts: asInt(data["pending_receipts"]),
+            manualAPN: parseManualAPN(data["manual_apn"])
         )
     }
 
@@ -149,9 +186,16 @@ enum RouterESimParser {
                 name: item["name"] as? String ?? "",
                 nickname: item["nickname"] as? String ?? "",
                 isEnabled: (item["state"] as? String) == "enabled",
-                profileClass: item["class"] as? String ?? ""
+                profileClass: item["class"] as? String ?? "",
+                switchWarnings: (item["switch_warnings"] as? [Any])?.compactMap { $0 as? String } ?? []
             )
         }
+    }
+
+    /// `null` (manual APN mode off) and older agents both read as `nil`.
+    static func parseManualAPN(_ value: Any?) -> RouterESimManualAPN? {
+        guard let item = value as? [String: Any] else { return nil }
+        return RouterESimManualAPN(name: item["name"] as? String ?? "", apn: item["apn"] as? String ?? "")
     }
 
     static func parseChip(_ data: [String: Any]) -> RouterESimChip {
