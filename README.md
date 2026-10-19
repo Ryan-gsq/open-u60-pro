@@ -78,7 +78,7 @@ cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 | WiFi | 4 | Status, SSID/password/channel/TX power, guest WiFi |
 | USB | 3 | USB mode switching, powerbank control |
 | Telephony | 11 | Voice calls (dial/hangup/answer/DTMF/mute), USSD codes, SIM Toolkit menus |
-| eSIM | 13 | eSIM profiles via lpac: list, switch (verified card → modem → data), rename, download from QR with preview/cancel, delete, operator receipts, card info |
+| eSIM | 13 | eSIM profiles (built-in SGP.22 LPA): list, switch (verified card → modem → data), rename, download from QR with preview/cancel, delete, operator receipts, card info |
 | Speed Test | 4 | Server list, run test, progress tracking |
 | DoH Proxy | 6 | DNS-over-HTTPS proxy, cache management |
 | LAN Test | 3 | WiFi ping, download/upload throughput measurement |
@@ -125,6 +125,31 @@ The official ZTE stack's top memory consumers:
 | `zte_topsw_diag` | 7.1 MB | Diagnostics/logging |
 
 zte-agent provides equivalent API access to the same underlying ubus/AT services using **0.35% of the memory** -- freeing ~224 MB of RAM for actual routing and WiFi workloads.
+
+## Why a Built-In eSIM Manager Instead of lpac?
+
+The eSIM feature first ran [lpac](https://github.com/estkme-group/lpac), the open-source eSIM manager, as a separate program on the router. To reach the card through the modem, lpac needs its own copy of GLib, libqmi, libqrtr, curl, OpenSSL and their dependencies (31 shared libraries in all), so it had to be cross-built into a 23.5 MB bundle and installed next to the agent. The agent then started a new lpac process for every card command, including every profile list the app asked for.
+
+`zte-agent` now has the same eSIM code built in: lpac's card library translated to Rust ([`euicc/`](euicc/)) plus a small driver that talks to the modem directly. It adds about 130 KB to the agent.
+
+Measured on the router (U60 Pro, 9eSIM B1, 2026-10-19):
+
+| | Built into zte-agent | lpac bundle |
+|---|---|---|
+| **Install** | Nothing extra | Separate 23.5 MB bundle in `/data/lpac` (own musl loader + 31 shared libraries), built with a 1.4 GB cross-build setup |
+| **Size on the router** | ~130 KB inside the agent binary | 23.5 MB |
+| **Per card command** | A thread in the agent: ~2–3 ms CPU, no extra memory | A new process: ~20 ms CPU, ~10.7 MB peak memory |
+| **`chip info`** | 0.15 s | 0.26 s |
+| **`profile list`** | 0.25 s | 0.27 s (the card itself sets the pace) |
+| **Operator server TLS** | Checked against the GSMA eSIM root only, host name checked, no redirects or proxy | Not checked by upstream lpac (`CURLOPT_SSL_VERIFYPEER` off); needed a patch |
+| **Cancelling a download** | Cancel tells the operator "postponed", so the QR code stays usable; a timeout is reported as a timeout | Every stop is reported as "rejected by the user" |
+| **Busy card** | Named (`catBusy`, `undefinedError`), so the agent knows to retry | "unknown" until patched |
+| **Stopping a stuck command** | Time limit per step, inside the agent | SIGINT, then SIGKILL after 15 s |
+| **License** | Agent MIT; eSIM library LGPL-2.1 | lpac's command-line tool is AGPL-3.0 |
+
+The results are the same as lpac's. On the router, `chip info`, `profile list` and `notification list` gave identical output. About 1 million generated cases matched the C library. A download sends byte-for-byte the same card commands and server requests. Delete, download, switching and receipts have been tested on a real card (see [`zte-agent/docs/esim.md`](zte-agent/docs/esim.md)).
+
+lpac is still the better tool elsewhere. It supports many card readers and modems (PC/SC, AT, MBIM, QMI) and more commands, such as SM-DS discovery, and it gets upstream fixes. The agent covers only what the app needs on this router, through the modem's QMI over QRTR, and is pinned to lpac commit `c7c8d4f`: upstream fixes have to be ported by hand. For a USB card reader on a computer, use lpac.
 
 ## Device Impact
 
@@ -201,7 +226,7 @@ This builds, deploys the binary to the device via SSH (port 2222), updates the b
 
 ### eSIM profiles (optional)
 
-With an eSIM card in the SIM slot (tested with a [9eSIM B1](docs/9esim-b1.md)), the agent manages its operator profiles through [lpac](https://github.com/estkme-group/lpac), the open-source GSMA SGP.22 eSIM manager:
+With an eSIM card in the SIM slot (tested with a [9eSIM B1](docs/9esim-b1.md)), the agent manages its operator profiles itself, as a GSMA SGP.22 eSIM manager built in (its card code is a Rust translation of [lpac](https://github.com/estkme-group/lpac)'s library); nothing else needs installing ([why not lpac](#why-a-built-in-esim-manager-instead-of-lpac)):
 
 - **List** profiles and card details (EID, firmware, free space).
 - **Switch** the active profile. The agent verifies each step (card → modem identity → mobile data) and reports why a switch didn't complete; it never switches back on its own. Internet returns in about 15–45 s; Wi‑Fi stays on.
@@ -215,15 +240,7 @@ With an eSIM card in the SIM slot (tested with a [9eSIM B1](docs/9esim-b1.md)), 
   - downloads only with mobile data.
   - operator servers are reached over TLS checked against the GSMA eSIM root certificate that the card trusts.
 
-lpac is built separately and copied to the router once:
-
-```bash
-cd lpac-qrtr-build
-./make-bundle.sh          # needs python3, curl and the musl cross compiler from step 3
-./install-to-router.sh    # SSH to root@192.168.0.1:2222, installs to /data/lpac
-```
-
-Switching, adding, renaming and deleting require an agent password. In the apps: Router → eSIM Profiles. To run lpac by hand on the router, use `flock -n /tmp/lpac.lock …` so it never overlaps the agent (full command in [`lpac-qrtr-build/README.md`](lpac-qrtr-build/README.md#running-lpac-by-hand)). If you installed lpac before 2026-10-19, rebuild and reinstall it: older bundles can't reach the operators' servers. API and behaviour: [`zte-agent/docs/esim.md`](zte-agent/docs/esim.md). The lpac patch is AGPL-3.0 (see [`lpac-qrtr-build/`](lpac-qrtr-build/)).
+Switching, adding, renaming and deleting require an agent password. In the apps: Router → eSIM Profiles. For diagnostics on the router, `/data/zte-agent esim-native chip info` (or `profile list`) prints one card command's result; it waits for nothing and answers busy while the agent uses the card. API and behaviour: [`zte-agent/docs/esim.md`](zte-agent/docs/esim.md). An lpac bundle in `/data/lpac` from earlier versions is no longer used and can be deleted.
 
 ### Connect Mobile App
 
@@ -363,7 +380,11 @@ for file provisioning, signing, and configuration details.
 
 ## License & Disclaimers
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](LICENSE), except:
+
+- `euicc/` (the eSIM card library linked into zte-agent) is a Rust translation of [lpac](https://github.com/estkme-group/lpac)'s libeuicc and stays under the **LGPL-2.1-only** ([`euicc/LICENSE`](euicc/LICENSE)).
+
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists everything the zte-agent binary contains and is published with every release.
 
 **Disclaimer:** This software is provided "as is", without warranty of any kind. Use it at your own risk. The authors are not responsible for any damage to your device, voided warranties, or other consequences arising from the use of this software.
 

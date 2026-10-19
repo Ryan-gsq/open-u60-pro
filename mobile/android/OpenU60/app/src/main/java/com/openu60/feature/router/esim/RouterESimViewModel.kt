@@ -165,7 +165,7 @@ class RouterESimViewModel @Inject constructor(
                 throw e
             } catch (e: Exception) {
                 if (outcomeUnknown(e)) {
-                    // lpac failed or timed out, but the card may have switched: the agent checks.
+                    // The card command failed or timed out, but the card may have switched: the agent checks.
                     beginFollowingSwitch(target)
                     _state.value = _state.value.copy(message = "The router is checking whether the switch happened.", messageIsError = false)
                     return@launch
@@ -448,7 +448,7 @@ class RouterESimViewModel @Inject constructor(
         if (unix <= 0) "an earlier time"
         else java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(unix * 1000))
 
-    /** The agent replies `outcome: "unknown"` when lpac failed or timed out mid-switch. */
+    /** The agent replies `outcome: "unknown"` when the card command failed or timed out mid-switch. */
     private fun outcomeUnknown(error: Exception): Boolean {
         val text = (error.message ?: return false).removePrefix("Server error: ")
         return runCatching { Json.parseToJsonElement(text).jsonObject["outcome"]?.jsonPrimitive?.contentOrNull }.getOrNull() == "unknown"
