@@ -70,6 +70,14 @@ struct RouterESimFlowTests {
         precondition(client.requests.count == beforeBlockedRetry, "A list retry must respect the download's exclusive card access")
         vm.requestSwitch(to: other); vm.requestDelete(other)
         precondition(vm.pendingSwitch == nil && vm.pendingDelete == nil, "Download excludes switch/delete")
+        let postsWhileBusy = client.bodies.count
+        await vm.confirmSwitch(to: other)
+        precondition(client.bodies.count == postsWhileBusy && vm.message == RouterESimViewModel.busyText && !vm.messageIsError,
+                     "A switch confirmed while the card is in use says so instead of vanishing")
+        vm.message = nil
+        await vm.confirmDelete(other)
+        precondition(client.bodies.count == postsWhileBusy && vm.message == RouterESimViewModel.busyText && !vm.messageIsError,
+                     "A delete confirmed while the card is in use says so instead of vanishing")
         let readsBeforeRefresh = client.requests.filter { $0 == "GET /api/esim/profiles" }.count
         client.status = client.postResult
         await vm.refresh()
@@ -194,14 +202,22 @@ struct RouterESimFlowTests {
         watchClient.identityRevision += 1
         let reread = await soon { watchClient.profilesGate != nil }
         precondition(reread && watchClient.requests[idleMark...].contains("GET /api/esim/profiles"), "A new SIM identity re-reads the list")
-        // The agent holds the card for that read: a switch confirmed now must wait, not hit a 409.
+        // The agent holds the card for that read: a switch confirmed now must wait, not hit a 409
+        // and not be dropped.
         precondition(watchVM.blocksSwitching, "The identity-triggered list read marks the screen busy")
         let otherProfile = watchVM.profiles.first(where: \.canEnable)!
-        await watchVM.confirmSwitch(to: otherProfile)
-        precondition(!watchClient.requests.contains("POST /api/esim/enable"), "No switch while the identity re-read holds the card")
+        let gatedSwitch = Task { await watchVM.confirmSwitch(to: otherProfile) }
+        try? await Task.sleep(for: .milliseconds(350))
+        precondition(!watchClient.requests.contains { $0.hasPrefix("POST ") }, "No POST while the identity re-read holds the card")
+        precondition(watchVM.message == nil, "A waiting switch is neither dropped nor reported busy")
         watchClient.holdProfiles = false
         watchClient.profilesGate?.resume()
         watchClient.profilesGate = nil
+        await gatedSwitch.value
+        precondition(watchClient.requests.filter { $0.hasPrefix("POST ") } == ["POST /api/esim/enable"]
+                     && watchClient.bodies.last?["iccid"] as? String == otherProfile.iccid,
+                     "The switch confirmed during the re-read runs exactly once after it")
+        precondition(watchVM.message != RouterESimViewModel.busyText, "A switch that ran is not reported busy")
         let rechecked = await soon { watchClient.requests[idleMark...].contains("GET /api/sim/info") }
         precondition(rechecked, "A new SIM identity checks the connection now")
         precondition(!watchVM.isLoading, "The screen is free again after the re-read")

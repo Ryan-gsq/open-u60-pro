@@ -43,6 +43,8 @@ data class ForwardLogEntry(
     val destinationType: String,
     val success: Boolean,
     val error: String? = null,
+    /** Held while the router had no link; the agent retries it on its own. */
+    val pending: Boolean = false,
 )
 
 object SMSForwardParser {
@@ -152,6 +154,7 @@ object SMSForwardParser {
             destinationType = data["destination_type"] as? String ?: "",
             success = data["success"] as? Boolean ?: false,
             error = data["error"] as? String,
+            pending = data["pending"] as? Boolean ?: false,
         )
     }
 

@@ -225,8 +225,7 @@ class SMSForwardViewModel @Inject constructor(
         viewModelScope.launch {
             _state.value = _state.value.copy(isLoading = true, message = null)
             try {
-                val data = agentClient.getJSONArray("/api/sms/forward/log")
-                val log = data.mapNotNull { SMSForwardParser.parseLogEntry(it) }
+                val log = loadLog()
                 _state.value = _state.value.copy(log = log, isLoading = false)
             } catch (e: AgentError.Unauthorized) {
                 if (authManager.reauthenticate()) fetchLog() else setError(e.message)
@@ -236,13 +235,18 @@ class SMSForwardViewModel @Inject constructor(
         }
     }
 
+    private suspend fun loadLog(): List<ForwardLogEntry> =
+        agentClient.getJSONArray("/api/sms/forward/log").mapNotNull { SMSForwardParser.parseLogEntry(it) }
+
     fun clearLog() {
         viewModelScope.launch {
             _state.value = _state.value.copy(isLoading = true, message = null)
             try {
                 agentClient.postJSON("/api/sms/forward/log/clear")
+                // Held forwards survive a clear: show the entries the agent kept.
+                val log = loadLog()
                 _state.value = _state.value.copy(
-                    log = emptyList(),
+                    log = log,
                     isLoading = false,
                     message = "Log cleared",
                     messageIsError = false,

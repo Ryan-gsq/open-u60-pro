@@ -114,17 +114,30 @@ private fun LogEntryItem(entry: ForwardLogEntry) {
                         maxLines = 2,
                     )
                 }
+                // Why the forward is held (e.g. no WAN); not a failure.
+                if (entry.pending && entry.error != null) {
+                    Text(
+                        entry.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         },
         trailingContent = {
-            if (entry.success) {
-                Text(
+            when {
+                entry.success -> Text(
                     "OK",
                     color = MaterialTheme.colorScheme.primary,
                     style = MaterialTheme.typography.labelSmall,
                 )
-            } else {
-                Text(
+                // Held while the router had no link; the agent sends it on its own.
+                entry.pending -> Text(
+                    "Held, will retry",
+                    color = MaterialTheme.colorScheme.tertiary,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+                else -> Text(
                     entry.error ?: "Failed",
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.labelSmall,

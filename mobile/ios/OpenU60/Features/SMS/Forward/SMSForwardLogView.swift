@@ -20,9 +20,16 @@ struct SMSForwardLogView: View {
                         Text(entry.sender)
                             .font(.headline)
                         Spacer()
-                        Image(systemName: entry.success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(entry.success ? .green : .red)
-                            .accessibilityLabel(entry.success ? "Forwarded" : "Failed")
+                        if entry.pending {
+                            // Held while the router had no link; the agent sends it on its own.
+                            Label("Held, will retry", systemImage: "clock.arrow.circlepath")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        } else {
+                            Image(systemName: entry.success ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundStyle(entry.success ? .green : .red)
+                                .accessibilityLabel(entry.success ? "Forwarded" : "Failed")
+                        }
                     }
                     Text("\(entry.ruleName) → \(entry.destinationType)")
                         .font(.caption)
@@ -33,7 +40,7 @@ struct SMSForwardLogView: View {
                     if let error = entry.error {
                         Text(error)
                             .font(.caption)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(entry.pending ? Color.secondary : Color.red)
                     }
                     Text(formatTimestamp(entry.timestamp))
                         .font(.caption2)
@@ -41,7 +48,8 @@ struct SMSForwardLogView: View {
                 }
                 .padding(.vertical, 2)
                 .swipeActions(edge: .trailing) {
-                    if !entry.success {
+                    // The agent refuses a manual retry of a held entry (it would send twice).
+                    if !entry.success && !entry.pending {
                         Button {
                             Task { await viewModel.retryForward(index: index) }
                         } label: {

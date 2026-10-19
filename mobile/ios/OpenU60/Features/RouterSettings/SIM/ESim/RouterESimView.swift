@@ -521,6 +521,8 @@ private struct ESimMessageCard: View {
     let canRetry: Bool
     let retry: () -> Void
     private var housekeeping: Bool { message.localizedCaseInsensitiveContains("receipts") }
+    /// A switch or delete that found the card still in use: a notice, not a result.
+    private var busy: Bool { message == RouterESimViewModel.busyText }
     private var guidance: String? {
         let text = message.lowercased()
         if text.contains("agent password required") { return "Set the router agent password in Agent Settings, then try your action again." }
@@ -532,10 +534,10 @@ private struct ESimMessageCard: View {
     var body: some View {
         CardView(padding: 16) {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: housekeeping ? "paperplane" : (isError ? "exclamationmark.circle" : "checkmark.circle.fill"))
+                Image(systemName: busy ? "hourglass" : housekeeping ? "paperplane" : (isError ? "exclamationmark.circle" : "checkmark.circle.fill"))
                     .font(.title3).foregroundStyle(isError && !housekeeping ? .orange : Color.eSimAccent)
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(housekeeping ? "Operator receipts" : (isError ? "Can’t complete this right now" : "Profile updated")).font(.subheadline.weight(.semibold))
+                    Text(busy ? "eSIM in use" : housekeeping ? "Operator receipts" : (isError ? "Can’t complete this right now" : "Profile updated")).font(.subheadline.weight(.semibold))
                     Text(message).font(.subheadline).foregroundStyle(.secondary).textSelection(.enabled)
                     if let guidance { Text(guidance).font(.caption).foregroundStyle(.secondary) }
                     if isError && !housekeeping {
