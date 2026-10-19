@@ -88,7 +88,7 @@ pub struct Esim {
 struct Inner {
     /// A command holds a logical channel to the card while it runs: never two at once.
     busy: AtomicBool,
-    /// Unix seconds of the last successful profile switch (0 = none).
+    /// `mono_secs()` of the last successful profile switch (0 = none).
     switched_at: AtomicU64,
     download: Mutex<Download>,
     /// The running download's decisions (preview answer, cancel).
@@ -209,6 +209,9 @@ fn receipt_views(data: &Value) -> Vec<Receipt> {
 struct Inventory {
     profiles: Option<Vec<Value>>,
     observed_at: u64,
+    /// Counts good reads, so clients can order lists without the wall clock (it jumps by hours
+    /// when the network sets the time on attach).
+    observed_seq: u64,
     /// Bumped whenever the card's contents or selection change (switch, delete, download).
     generation: u64,
     /// A switch is reloading the SIM: reads are answered from this list without touching the card.
@@ -253,6 +256,7 @@ impl Inventory {
     fn record(&mut self, profiles: Vec<Value>, now: u64) {
         self.profiles = Some(profiles);
         self.observed_at = now;
+        self.observed_seq += 1;
         self.error = None;
     }
 
@@ -264,6 +268,7 @@ impl Inventory {
             "profiles": profiles,
             "enabled_iccid": enabled_iccid(&profiles),
             "observed_at": self.observed_at,
+            "observed_seq": self.observed_seq,
             "generation": self.generation,
             "agent_instance": instance,
             "updating": self.reloading || busy,
@@ -432,10 +437,7 @@ impl Esim {
                 control: DownloadControl::default(),
                 inventory: Mutex::new(Inventory::default()),
                 switch: Mutex::new(Switch::default()),
-                instance: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or_default(),
+                instance: crate::sim_identity::agent_instance(),
                 receipts: Mutex::new(Receipts::default()),
                 lock_path,
             }),
@@ -535,10 +537,13 @@ pub fn profiles(state: &AppState) -> (u16, Value) {
     if state.esim.reloading() {
         return (200, json!({"ok": true, "data": inner.inventory.lock().unwrap().view(inner.instance, false)}));
     }
+    let check = SwitchCheck::read(state);
     let Some(_guard) = state.esim.acquire() else {
         let inv = inner.inventory.lock().unwrap();
         return if inv.profiles.is_some() {
-            (200, json!({"ok": true, "data": inv.view(inner.instance, true)}))
+            let mut view = inv.view(inner.instance, true);
+            check.annotate(&mut view);
+            (200, json!({"ok": true, "data": view}))
         } else {
             busy()
         };
@@ -570,12 +575,143 @@ pub fn profiles(state: &AppState) -> (u16, Value) {
     let mut view = inv.view(inner.instance, false);
     drop(inv);
     view["pending_receipts"] = json!(inner.receipts.lock().unwrap().pending.as_ref().map(Vec::len));
+    check.annotate(&mut view);
     (200, json!({"ok": true, "data": view}))
+}
+
+/// What switching to a profile would run into, shown before the user confirms. Read-only: the
+/// agent never changes the APN or roaming setting itself.
+#[derive(Debug, Default)]
+struct SwitchCheck {
+    /// The enabled manual APN (name, APN) when the router is in manual APN mode.
+    manual_apn: Option<(String, String)>,
+    roaming_off: bool,
+    loaded_iccid: Option<String>,
+    sim_mcc: Option<String>,
+    net_mcc: Option<String>,
+}
+
+impl SwitchCheck {
+    /// One uncached APN-mode read (and the manual APN list only in manual mode); the SIM, WAN
+    /// and network values come from the shared cache.
+    fn read(state: &AppState) -> Self {
+        let manual = crate::ubus::call("zwrt_apn_object", "get_apn_mode", Some("{}"))
+            .ok()
+            .and_then(|v| int(&v["apn_mode"]))
+            == Some(1);
+        let manual_apn = manual
+            .then(|| crate::ubus::call("zwrt_apn_object", "get_manu_apn_list", Some("{}")).ok())
+            .flatten()
+            .and_then(|list| enabled_manual_apn(&list));
+        let roaming_off = crate::modem_ext::wwan(state).ok().and_then(|w| int(&w["roam_enable"])) == Some(0);
+        let sim = crate::sim::info(state).unwrap_or_default();
+        let text = |v: &Value| match v {
+            Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        };
+        SwitchCheck {
+            manual_apn,
+            roaming_off,
+            loaded_iccid: text(&sim["sim_iccid"]),
+            sim_mcc: text(&sim["mdm_mcc"]),
+            net_mcc: state.cache.netinfo(cache::NETINFO_TTL).ok().and_then(|n| text(&n["rmcc"])),
+        }
+    }
+
+    /// Codes for switching to `target`: `manual_apn` (any target; it will dial that APN too) and
+    /// `roaming_off` (the target looks like a profile from another country).
+    fn warnings(&self, target: &str) -> Vec<&'static str> {
+        let mut codes = Vec::new();
+        if self.manual_apn.is_some() {
+            codes.push("manual_apn");
+        }
+        let roams = target_roams(
+            target,
+            self.loaded_iccid.as_deref(),
+            self.sim_mcc.as_deref(),
+            self.net_mcc.as_deref(),
+        );
+        if self.roaming_off && roams == Some(true) {
+            codes.push("roaming_off");
+        }
+        codes
+    }
+
+    /// `switch_warnings` on each profile that can be switched to, and the top-level `manual_apn`.
+    fn annotate(&self, view: &mut Value) {
+        if let Some(profiles) = view["profiles"].as_array_mut() {
+            for p in profiles {
+                if p["state"] == "disabled" && p["class"] == "operational" {
+                    let codes = self.warnings(p["iccid"].as_str().unwrap_or(""));
+                    p["switch_warnings"] = json!(codes);
+                }
+            }
+        }
+        view["manual_apn"] = match &self.manual_apn {
+            Some((name, apn)) => json!({"name": name, "apn": apn}),
+            None => Value::Null,
+        };
+    }
+}
+
+/// A firmware number that may come as a number or a string.
+fn int(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str()?.trim().parse().ok())
+}
+
+/// The enabled entry of `get_manu_apn_list` as (name, APN); its user name and password are
+/// never copied.
+fn enabled_manual_apn(list: &Value) -> Option<(String, String)> {
+    list["apnListArray"].as_array()?.iter().find_map(|a| {
+        let enabled = a["isEnable"] == true || int(&a["isEnable"]) == Some(1);
+        let apn = a["wanapn"].as_str().map(str::trim).filter(|s| !s.is_empty())?;
+        enabled.then(|| {
+            let name = a["profilename"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(apn);
+            (name.to_string(), apn.to_string())
+        })
+    })
+}
+
+/// The ITU country code in an ICCID (`89` + E.164 code, ITU-T E.118). E.164 codes are
+/// prefix-free: 1 and 7 are one digit, the assigned two-digit ones are listed, the rest are three.
+fn iccid_country(iccid: &str) -> Option<&str> {
+    const TWO: [&str; 44] = [
+        "20", "27", "30", "31", "32", "33", "34", "36", "39", "40", "41", "43", "44", "45", "46", "47",
+        "48", "49", "51", "52", "53", "54", "55", "56", "57", "58", "60", "61", "62", "63", "64", "65",
+        "66", "81", "82", "84", "86", "90", "91", "92", "93", "94", "95", "98",
+    ];
+    let digits = iccid.trim().strip_prefix("89")?;
+    if digits.len() < 3 || !digits[..3].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(match &digits[..1] {
+        "1" | "7" => &digits[..1],
+        _ if TWO.contains(&&digits[..2]) => &digits[..2],
+        _ => &digits[..3],
+    })
+}
+
+/// Whether `target` would roam where the router is now, judged from ICCID countries: next to a
+/// home SIM, another country roams; next to a roaming SIM, only its own country is known to roam.
+/// `None` when it can't be told.
+fn target_roams(target: &str, loaded: Option<&str>, sim_mcc: Option<&str>, net_mcc: Option<&str>) -> Option<bool> {
+    let target = iccid_country(target)?;
+    let loaded = iccid_country(loaded?)?;
+    let home = sim_mcc? == net_mcc?;
+    match (home, target == loaded) {
+        (true, same) => Some(!same),
+        (false, true) => Some(true),
+        (false, false) => None,
+    }
 }
 
 /// GET /api/esim/switch — progress and verified outcome of the last profile switch.
 pub fn switch_status(state: &AppState) -> (u16, Value) {
-    let view = state.esim.inner.switch.lock().unwrap().view();
+    let mut view = state.esim.inner.switch.lock().unwrap().view();
+    if let Some(obj) = view.as_object_mut() {
+        state.sim_identity.stamp(obj);
+    }
     (200, json!({"ok": true, "data": view}))
 }
 
@@ -662,13 +798,16 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
     if let Err((status, message)) = check_enable_target(&list, &iccid) {
         return error(status, message);
     }
+    state.sim_identity.agent_switch_arm();
     let result = card(&["profile", "enable", &iccid, "1"], CARD_LIMIT);
     drop(guard);
     if let Err(CardError::NotStarted(m)) = &result {
+        state.sim_identity.agent_switch_disarm();
         return error(409, m); // the card was never asked: nothing to verify
     }
     if let Err(e) = &result {
         if card_busy(&e.message()) {
+            state.sim_identity.agent_switch_disarm();
             return retry_while_busy(state, iccid, previous, list, e.message());
         }
     }
@@ -693,6 +832,7 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
         ..Switch::default()
     };
     inner.switched_at.store(mono_secs(), Ordering::Relaxed);
+    state.sim_identity.agent_switch_started(generation, previous.as_deref());
     state
         .cache
         .invalidate_with_settle(cache::SIM_INFO, cache::SETTLE_WINDOW);
@@ -767,9 +907,10 @@ fn retry_while_busy(
     eprintln!("[esim] enable {} refused while busy ({message}); retrying", mask(&iccid));
     let worker = Arc::clone(inner);
     let cache = Arc::clone(&state.cache);
+    let identity = Arc::clone(&state.sim_identity);
     let target = iccid.clone();
     let spawned = crate::system::try_spawn_named("esim-switch", move || {
-        retry_enable(worker, target, cache, generation);
+        retry_enable(worker, target, cache, identity, generation);
     });
     if spawned.is_err() {
         let mut sw = inner.switch.lock().unwrap();
@@ -791,7 +932,13 @@ fn retry_while_busy(
 /// Retries a busy-refused enable every `CARD_BUSY_GAP` for `CARD_BUSY_LIMIT`, then verifies the
 /// switch like a first-time success; a failure other than "busy" may still have switched the
 /// card, so it is verified too.
-fn retry_enable(inner: Arc<Inner>, target: String, cache: Arc<crate::cache::UbusCache>, generation: u64) {
+fn retry_enable(
+    inner: Arc<Inner>,
+    target: String,
+    cache: Arc<crate::cache::UbusCache>,
+    identity: Arc<crate::sim_identity::SimIdentity>,
+    generation: u64,
+) {
     let started = Instant::now();
     let mut attempt = 1;
     let mut last = String::new();
@@ -800,18 +947,22 @@ fn retry_enable(inner: Arc<Inner>, target: String, cache: Arc<crate::cache::Ubus
         attempt += 1;
         let result = {
             let Some(_guard) = acquire_soon(&inner) else { continue };
+            identity.agent_switch_arm();
             card(&["profile", "enable", &target, "1"], CARD_LIMIT)
         };
         if !current(&inner, generation) {
+            identity.agent_switch_disarm();
             return; // another switch took over
         }
         let note = match result {
             Ok(_) => format!("the eSIM was busy; switched on attempt {attempt}"),
             Err(CardError::NotStarted(m)) => {
+                identity.agent_switch_disarm();
                 last = m;
                 continue;
             }
             Err(e) if card_busy(&e.message()) => {
+                identity.agent_switch_disarm();
                 last = e.message();
                 continue;
             }
@@ -819,6 +970,7 @@ fn retry_enable(inner: Arc<Inner>, target: String, cache: Arc<crate::cache::Ubus
         };
         inner.inventory.lock().unwrap().reloading = true;
         inner.switched_at.store(mono_secs(), Ordering::Relaxed);
+        identity.agent_switch_started(generation, None);
         cache.invalidate_with_settle(cache::SIM_INFO, cache::SETTLE_WINDOW);
         {
             let mut sw = inner.switch.lock().unwrap();
@@ -996,7 +1148,7 @@ fn wait_for_default_route(limit: Duration) {
 }
 
 /// `/proc/net/route` has a row with destination 00000000 that is up (flag 0x1).
-fn has_default_route(table: &str) -> bool {
+pub(crate) fn has_default_route(table: &str) -> bool {
     table.lines().skip(1).any(|l| {
         let f: Vec<&str> = l.split_whitespace().collect();
         f.len() > 3 && f[1] == "00000000" && u32::from_str_radix(f[3], 16).is_ok_and(|flags| flags & 1 == 1)
@@ -1017,6 +1169,11 @@ fn acquire_soon(inner: &Arc<Inner>) -> Option<BusyGuard> {
 /// `Some(true)` when the modem reports the SIM ready; `None` if the firmware did not answer.
 fn sim_ready() -> Option<bool> {
     let info = crate::ubus::call("zwrt_zte_mdm.api", "get_sim_info", Some("{}")).ok()?;
+    sim_states_ready(&info)
+}
+
+/// `get_sim_info` `sim_states` says the SIM is ready.
+pub(crate) fn sim_states_ready(info: &Value) -> Option<bool> {
     let s = info["sim_states"].as_str()?.to_ascii_lowercase();
     Some(s.contains("ready") && !s.contains("not"))
 }
@@ -1040,7 +1197,7 @@ fn data_connected() -> bool {
 
 /// Why data is down when the firmware says so: a profile from another country (SIM and network
 /// MCC differ, as with travel eSIMs) while data roaming is off, or mobile data switched off.
-fn data_blocker() -> Option<&'static str> {
+pub(crate) fn data_blocker() -> Option<&'static str> {
     let wwan = crate::ubus::call(
         "zwrt_data",
         "get_wwaniface",
@@ -1077,7 +1234,7 @@ fn radio_blocks_switch(operate_mode: Option<&str>, policy_state: Option<&str>) -
 }
 
 /// The firmware and the card may differ in a trailing filler `F`.
-fn same_iccid(a: &str, b: &str) -> bool {
+pub(crate) fn same_iccid(a: &str, b: &str) -> bool {
     let trim = |s: &str| s.trim().trim_end_matches(['F', 'f']).to_string();
     !a.trim().is_empty() && trim(a) == trim(b)
 }
@@ -2198,5 +2355,97 @@ mod tests {
     #[test]
     fn logs_show_only_the_last_four_digits() {
         assert_eq!(mask("8963000000000000001"), "…0001");
+    }
+
+    #[test]
+    fn inventory_seq_orders_reads_without_the_wall_clock() {
+        let mut inv = Inventory::default();
+        inv.record(list(), 1_000 + 28_800);
+        let first = inv.view(1, false);
+        inv.record(list(), 1_000);
+        let second = inv.view(1, false);
+        assert_eq!((first["observed_seq"].as_u64(), second["observed_seq"].as_u64()), (Some(1), Some(2)));
+        assert!(second["observed_at"].as_u64() < first["observed_at"].as_u64(), "the clock went back");
+        inv.error = Some(ReadError { kind: "read_failed", message: "x".into(), at: 2_000 });
+        assert_eq!(inv.view(1, false)["observed_seq"], 2, "a failed read doesn't count");
+    }
+
+    #[test]
+    fn iccid_country_codes_are_prefix_free() {
+        assert_eq!(iccid_country("8963000000000000001"), Some("63"));
+        assert_eq!(iccid_country("8965010000000000001"), Some("65"));
+        assert_eq!(iccid_country("8914800000000000001"), Some("1"));
+        assert_eq!(iccid_country("8970000000000000001"), Some("7"));
+        assert_eq!(iccid_country("8985212000000000001"), Some("852"));
+        assert_eq!(iccid_country("8988216000000000001"), Some("882"));
+        assert_eq!(iccid_country("8863000000000000001"), None);
+        assert_eq!(iccid_country("89"), None);
+        assert_eq!(iccid_country("89x1000000000000001"), None);
+    }
+
+    #[test]
+    fn target_roams_from_iccid_country() {
+        let (ph, sg) = ("8963000000000000001", "8965000000000000001");
+        assert_eq!(target_roams(sg, Some(ph), Some("515"), Some("515")), Some(true));
+        assert_eq!(target_roams(ph, Some(ph), Some("515"), Some("515")), Some(false));
+        // Next to a roaming SG SIM, a PH profile may well be home: unknown.
+        assert_eq!(target_roams(ph, Some(sg), Some("525"), Some("515")), None);
+        assert_eq!(target_roams(sg, Some(sg), Some("525"), Some("515")), Some(true));
+        assert_eq!(target_roams(sg, Some(ph), None, Some("515")), None);
+    }
+
+    #[test]
+    fn switch_warnings_codes() {
+        let (ph, sg) = ("8963000000000000001", "8965000000000000001");
+        let check = SwitchCheck {
+            manual_apn: Some(("GOMO".into(), "gomo.ph".into())),
+            roaming_off: true,
+            loaded_iccid: Some(ph.into()),
+            sim_mcc: Some("515".into()),
+            net_mcc: Some("515".into()),
+        };
+        assert_eq!(check.warnings(sg), ["manual_apn", "roaming_off"]);
+        assert_eq!(check.warnings(ph), ["manual_apn"]);
+        let roaming_on = SwitchCheck { roaming_off: false, ..check };
+        assert_eq!(roaming_on.warnings(sg), ["manual_apn"]);
+        let auto = SwitchCheck { manual_apn: None, ..roaming_on };
+        assert!(auto.warnings(ph).is_empty());
+    }
+
+    #[test]
+    fn enabled_manual_apn_keeps_credentials_out() {
+        let list = |enabled: Value| {
+            json!({"apnListArray": [
+                {"profilename": "Default", "wanapn": "", "isEnable": false},
+                {"profilename": "e-ideas", "wanapn": "e-ideas", "username": "user", "password": "secret", "isEnable": enabled},
+            ]})
+        };
+        for enabled in [json!(true), json!(1), json!("1")] {
+            let apn = enabled_manual_apn(&list(enabled)).unwrap();
+            assert_eq!(apn, ("e-ideas".to_string(), "e-ideas".to_string()));
+            assert!(!format!("{apn:?}").contains("secret"));
+        }
+        assert_eq!(enabled_manual_apn(&list(json!(false))), None);
+    }
+
+    #[test]
+    fn profiles_view_gets_switch_warnings() {
+        let mut inv = Inventory::default();
+        inv.record(list(), 1);
+        let mut view = inv.view(1, false);
+        let check = SwitchCheck {
+            manual_apn: Some(("GOMO".into(), "gomo.ph".into())),
+            ..SwitchCheck::default()
+        };
+        check.annotate(&mut view);
+        let p = view["profiles"].as_array().unwrap();
+        assert!(p[0].get("switch_warnings").is_none(), "the enabled profile");
+        assert_eq!(p[1]["switch_warnings"], json!(["manual_apn"]));
+        assert!(p[2].get("switch_warnings").is_none(), "a test profile can't be switched to");
+        assert_eq!(view["manual_apn"], json!({"name": "GOMO", "apn": "gomo.ph"}));
+        let mut view = inv.view(1, false);
+        SwitchCheck::default().annotate(&mut view);
+        assert_eq!(view["manual_apn"], Value::Null);
+        assert_eq!(view["profiles"][1]["switch_warnings"], json!([]));
     }
 }

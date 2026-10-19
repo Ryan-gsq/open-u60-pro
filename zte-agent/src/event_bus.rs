@@ -1,12 +1,15 @@
 use std::io::BufRead;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
 const RESTART_DELAY_SECS: u64 = 5;
 const IGNORED_EVENTS: &[&str] = &["zwrt_deviceui_event.touchstatus"];
+/// Events the agent publishes itself (`publish`, and `ubus send` for other processes). They are
+/// delivered in-process only: never asked of `ubus listen`, and skipped if it shows them anyway.
+pub const AGENT_EVENT_PREFIX: &str = "zte_agent.";
 
 struct Subscriber {
     event: String,
@@ -36,12 +39,18 @@ impl EventBus {
         rx
     }
 
-    /// Spawn the listener thread. Consumes self into an Arc-compatible form.
-    /// Call this after all subscriptions are registered: the set of event
-    /// names passed to `ubus listen` is fixed here and the kernel filters
-    /// everything else out before it reaches the agent.
-    pub fn start(self) {
-        std::thread::spawn(move || self.run_loop());
+    /// Spawn the listener thread. Call this after all firmware subscriptions
+    /// are registered: the set of event names passed to `ubus listen` is fixed
+    /// here and the kernel filters everything else out before it reaches the
+    /// agent. Agent events (`AGENT_EVENT_PREFIX`) can be subscribed at any time.
+    pub fn start(self: &Arc<Self>) {
+        let bus = Arc::clone(self);
+        std::thread::spawn(move || bus.run_loop());
+    }
+
+    /// Delivers an agent event to its in-process subscribers, as if `ubus listen` had read it.
+    pub fn publish(&self, event_name: &str, payload: &Value) {
+        self.dispatch(event_name, payload);
     }
 
     /// The `ubus listen` argument list derived from the current subscribers.
@@ -103,7 +112,9 @@ impl EventBus {
 
             // Extract single top-level key as event name
             for (event_name, payload) in obj {
-                if IGNORED_EVENTS.contains(&event_name.as_str()) {
+                if IGNORED_EVENTS.contains(&event_name.as_str())
+                    || event_name.starts_with(AGENT_EVENT_PREFIX)
+                {
                     continue;
                 }
 
@@ -134,7 +145,7 @@ impl EventBus {
 fn listen_patterns<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut patterns: Vec<String> = names
         .into_iter()
-        .filter(|name| !name.is_empty())
+        .filter(|name| !name.is_empty() && !name.starts_with(AGENT_EVENT_PREFIX))
         .map(str::to_string)
         .collect();
     patterns.sort();
@@ -280,5 +291,20 @@ mod tests {
         assert!(charger_rx.try_recv().is_err());
         assert!(sms_rx.try_recv().is_err());
         assert!(touch_rx.recv_timeout(Duration::from_millis(10)).is_err());
+    }
+
+    #[test]
+    fn agent_events_are_published_in_process_and_never_read_from_ubus() {
+        let bus = EventBus::new();
+        let _wan = bus.subscribe("router_event_wan_connect_status");
+        let identity = bus.subscribe("zte_agent.sim_identity");
+        assert_eq!(bus.listen_patterns(), ["router_event_wan_connect_status"]);
+
+        bus.read_events(Cursor::new("{ \"zte_agent.sim_identity\": {\"phase\": \"online\"} }\n"));
+        assert!(identity.try_recv().is_err(), "our own ubus send is not delivered twice");
+
+        let payload = serde_json::json!({"phase": "changed"});
+        bus.publish("zte_agent.sim_identity", &payload);
+        assert_eq!(identity.try_recv().unwrap(), payload);
     }
 }

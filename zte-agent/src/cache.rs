@@ -224,6 +224,20 @@ impl UbusCache {
         }
     }
 
+    /// A SIM identity phase (`sim_identity`): the WAN and SIM values may belong to the old
+    /// identity. After `changed` the SIM entry also settles, as the number and operator name
+    /// fill in a few seconds late. Called before the phase becomes visible to the apps.
+    pub fn on_sim_identity(&self, phase: &str) {
+        for key in [MODEM_DATA, WAN, WAN6] {
+            self.invalidate(key);
+        }
+        if phase == "changed" {
+            self.invalidate_with_settle(SIM_INFO, SETTLE_WINDOW);
+        } else {
+            self.invalidate(SIM_INFO);
+        }
+    }
+
     /// One parked thread per subscription; each wakes only when its event
     /// fires and calls [`on_event`](Self::on_event).
     pub fn start_event_invalidation(self: Arc<Self>, events: Vec<(Key, Receiver<Value>)>) {
@@ -605,6 +619,19 @@ mod tests {
         fill(&cache);
         cache.on_event("zwrt_wms_status_event", &json!({}));
         assert_eq!(dropped(&cache), Vec::<Key>::new());
+
+        for phase in ["leaving", "changed", "online", "stalled"] {
+            fill(&cache);
+            cache.on_sim_identity(phase);
+            assert_eq!(dropped(&cache), vec![WAN, WAN6, MODEM_DATA, SIM_INFO], "{phase}");
+        }
+        // After `changed` the SIM entry stays near-fresh while the number and SPN fill in.
+        fill(&cache);
+        let slot = cache.slot(SIM_INFO);
+        assert!(slot.state().settle_until.is_some());
+        cache.on_sim_identity("online");
+        let _: Result<Value, String> = cache.get_or_fetch(WAN, Duration::from_secs(30), || Ok(json!(1)));
+        assert_eq!(cache.peek(WAN), Some(json!(1)), "online doesn't settle the WAN entries");
     }
 
     #[test]

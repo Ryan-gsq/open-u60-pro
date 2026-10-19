@@ -5,14 +5,16 @@ use crate::handlers::AppState;
 use crate::ubus;
 
 pub fn modem_data_get(state: &AppState) -> (u16, Value) {
-    let fetch = || ubus::call("zwrt_data", "get_wwaniface", Some(r#"{"cid":1}"#));
-    match state
-        .cache
-        .get_or_fetch(cache::MODEM_DATA, cache::MODEM_DATA_TTL, fetch)
-    {
+    match wwan(state) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
+}
+
+/// `zwrt_data get_wwaniface` for the data call, through the shared cache.
+pub(crate) fn wwan(state: &AppState) -> Result<Value, String> {
+    let fetch = || ubus::call("zwrt_data", "get_wwaniface", Some(r#"{"cid":1}"#));
+    state.cache.get_or_fetch(cache::MODEM_DATA, cache::MODEM_DATA_TTL, fetch)
 }
 
 /// The data daemon applies mode changes asynchronously, so after a local

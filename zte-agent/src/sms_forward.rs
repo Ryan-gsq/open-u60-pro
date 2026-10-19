@@ -161,7 +161,7 @@ struct DecodedSms {
 
 // ── UCS-2 hex decoding ──────────────────────────────────────────────
 
-fn decode_ucs2_hex(hex: &str) -> String {
+pub(crate) fn decode_ucs2_hex(hex: &str) -> String {
     let hex = hex.trim();
     if hex.is_empty() {
         return String::new();
