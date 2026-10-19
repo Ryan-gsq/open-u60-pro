@@ -4,6 +4,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -31,6 +32,7 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import com.google.mlkit.vision.common.InputImage
+import com.openu60.core.model.RouterESimConnectionPhase
 import com.openu60.core.model.RouterESimActivationCode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -106,6 +108,11 @@ fun RouterESimAddScreen(viewModel: RouterESimViewModel, onClose: () -> Unit) {
                     Icon(Icons.Default.QrCodeScanner, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.primary)
                     Text("Add a profile to your router", style = MaterialTheme.typography.headlineSmall)
                     Text("Use the eSIM QR code from your operator. You’ll review the profile before installing it.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (state.connectionPhase == RouterESimConnectionPhase.DISCONNECTED || state.connectionPhase == RouterESimConnectionPhase.WAITING) {
+                        Surface(color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.35f), shape = RoundedCornerShape(12.dp)) {
+                            Text("Your router has no mobile data connection. Connect it before downloading; your phone’s own data can’t be used.", Modifier.padding(14.dp), style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             Button(onClick = scan, enabled = !reading, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.CameraAlt, null); Spacer(Modifier.width(8.dp)); Text("Scan QR code") }
@@ -136,7 +143,15 @@ fun RouterESimAddScreen(viewModel: RouterESimViewModel, onClose: () -> Unit) {
                         }
                     }
                     error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                    state.downloadNote?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                    state.downloadNote?.let { note ->
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("Can’t start this download", style = MaterialTheme.typography.titleSmall)
+                                Text(note, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                if (note.contains("agent password required", true)) Text("Set the router agent password in Agent Settings, then try again.", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
                     Text("Your router needs internet to download the profile. Keep its Wi-Fi connected. Downloads usually take 10–60 seconds.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text("Your activation code is private and single-use. It is sent only to your router and isn’t saved by OpenU60.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }

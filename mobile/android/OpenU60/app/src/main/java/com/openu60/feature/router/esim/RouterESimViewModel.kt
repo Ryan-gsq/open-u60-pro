@@ -28,6 +28,14 @@ data class RouterESimState(
     val isSwitching: Boolean = false,
     val pendingSwitch: RouterESimProfile? = null,
     val pendingDelete: RouterESimProfile? = null,
+    val pendingRename: RouterESimProfile? = null,
+    /** The list as last accepted from the agent, with its freshness markers. */
+    val inventory: RouterESimInventory = RouterESimInventory(),
+    /** A failed list read; cleared only by a newer clean read. */
+    val listError: String? = null,
+    /** Operator receipts waiting on the card (null = unknown or an older agent). */
+    val pendingReceipts: Int? = null,
+    val receiptsSending: Boolean = false,
     val download: RouterESimDownloadStatus = RouterESimDownloadStatus(),
     val operationInFlight: Boolean = false,
     val downloadNote: String? = null,
@@ -61,6 +69,9 @@ class RouterESimViewModel @Inject constructor(
     private var downloadInFlight = false
     private var downloadNoteIsPolling = false
     private var dismissedDownload: RouterESimDownloadStatus? = null
+    /** Following the agent's verified switch (GET /api/esim/switch); off for older agents. */
+    private var followSwitch = false
+    private var switchListRead = false
 
     fun refresh() {
         if (_state.value.isLoading || _state.value.isSwitching || _state.value.operationInFlight || downloadInFlight) return
@@ -85,6 +96,18 @@ class RouterESimViewModel @Inject constructor(
             } finally {
                 _state.value = _state.value.copy(isLoading = false, hasLoaded = true)
             }
+        }
+    }
+
+    /** Retry the list read without replaying a profile change or reading other card data. */
+    fun retryProfiles() {
+        if (_state.value.blocksSwitching || downloadInFlight) return
+        _state.value = _state.value.copy(isLoading = true)
+        viewModelScope.launch {
+            try { withReauth { loadProfiles() } }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { setError(errorText(e)) }
+            finally { _state.value = _state.value.copy(isLoading = false, hasLoaded = true) }
         }
     }
 
@@ -137,16 +160,16 @@ class RouterESimViewModel @Inject constructor(
                         it.copy(isEnabled = it.iccid == target.iccid)
                     })
                 }
-                reconnectTracker = RouterESimReconnectTracker(target.iccid)
-                switchedAt = SystemClock.elapsedRealtime()
-                _state.value = _state.value.copy(connectionPhase = RouterESimConnectionPhase.RELOADING)
-                delay(3000)
-                try { withReauth { loadProfiles() } }
-                catch (e: CancellationException) { throw e }
-                catch (e: Exception) { setError("Could not read eSIM profiles: ${errorText(e)}") }
+                beginFollowingSwitch(target)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                if (outcomeUnknown(e)) {
+                    // lpac failed or timed out, but the card may have switched: the agent checks.
+                    beginFollowingSwitch(target)
+                    _state.value = _state.value.copy(message = "The router is checking whether the switch happened.", messageIsError = false)
+                    return@launch
+                }
                 reconnectTracker = null
                 switchedAt = null
                 _state.value = _state.value.copy(connectionPhase = RouterESimConnectionPhase.UNAVAILABLE, switchingTo = null)
@@ -158,6 +181,60 @@ class RouterESimViewModel @Inject constructor(
         }
     }
 
+
+    private fun beginFollowingSwitch(target: RouterESimProfile) {
+        reconnectTracker = RouterESimReconnectTracker(target.iccid)
+        switchedAt = SystemClock.elapsedRealtime()
+        followSwitch = true
+        switchListRead = false
+        _state.value = _state.value.copy(connectionPhase = RouterESimConnectionPhase.RELOADING)
+    }
+
+    fun requestRename(profile: RouterESimProfile) {
+        if (_state.value.blocksSwitching) return
+        _state.value = _state.value.copy(pendingRename = profile)
+    }
+    fun dismissRename() { _state.value = _state.value.copy(pendingRename = null) }
+
+    /** An empty name clears the nickname, so the operator's name shows again. */
+    fun confirmRename(name: String) {
+        val target = _state.value.pendingRename ?: return
+        val nickname = name.trim()
+        _state.value = _state.value.copy(pendingRename = null)
+        if (nickname.toByteArray().size > 64) { setError("Nicknames can be up to 64 bytes."); return }
+        if (_state.value.blocksSwitching || nickname == target.nickname) return
+        _state.value = _state.value.copy(operationInFlight = true, message = null)
+        viewModelScope.launch {
+            try {
+                while (downloadInFlight) delay(50)
+                withReauth { agentClient.postJSON("/api/esim/nickname", mapOf("iccid" to target.iccid, "nickname" to nickname)) }
+                withReauth { loadProfiles() }
+                _state.value = _state.value.copy(message = if (nickname.isEmpty()) "Nickname cleared." else "Renamed to $nickname.", messageIsError = false)
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { setError(errorText(e)) }
+            finally { _state.value = _state.value.copy(operationInFlight = false) }
+        }
+    }
+
+    /** Sends the operator receipts waiting on the card now; the router keeps retrying the rest. */
+    fun sendReceipts() {
+        if (_state.value.blocksSwitching || _state.value.receiptsSending) return
+        _state.value = _state.value.copy(receiptsSending = true)
+        viewModelScope.launch {
+            try {
+                withReauth { agentClient.postJSON("/api/esim/notifications/process") }
+                delay(8000)
+                val left = withReauth { agentClient.get<RouterESimNotifications>("/api/esim/notifications") }.count
+                _state.value = _state.value.copy(
+                    pendingReceipts = left ?: _state.value.pendingReceipts,
+                    message = if (left == 0) "Operator receipts sent." else "Some receipts couldn't be sent yet. The router keeps retrying.",
+                    messageIsError = left != 0,
+                )
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { setError(errorText(e)) }
+            finally { _state.value = _state.value.copy(receiptsSending = false) }
+        }
+    }
 
     fun requestDelete(profile: RouterESimProfile) {
         if (profile.isEnabled || _state.value.blocksSwitching) return
@@ -267,6 +344,12 @@ class RouterESimViewModel @Inject constructor(
     private suspend fun refreshConnection() {
         if (statusInFlight || _state.value.isSwitching) return
         statusInFlight = true
+        if (followSwitch) {
+            val handled = try { followSwitchStatus() }
+            catch (e: CancellationException) { statusInFlight = false; throw e }
+            catch (e: Exception) { _state.value = _state.value.copy(connectionNote = errorText(e)); true }
+            if (handled) { statusInFlight = false; return }
+        }
         try {
             val sim = withReauth { agentClient.get<RouterESimSIMStatus>("/api/sim/info") }
             val data = withReauth { agentClient.getJSON("/api/modem/data") }
@@ -302,8 +385,73 @@ class RouterESimViewModel @Inject constructor(
         } finally { statusInFlight = false }
     }
 
+    /**
+     * One step of the agent's verified switch: card, then modem identity, then data. Returns
+     * false when the agent has no switch endpoint (older agent), so the tracker fallback runs.
+     */
+    private suspend fun followSwitchStatus(): Boolean {
+        val status = try {
+            withReauth { agentClient.get<RouterESimSwitchStatus>("/api/esim/switch") }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
+            if (errorText(e).contains("not found")) { followSwitch = false; return false }
+            _state.value = _state.value.copy(connectionNote = errorText(e))
+            return true
+        }
+        if (_state.value.isSwitching) return true
+        if (status.state == "idle") { followSwitch = false; return false }
+        _state.value = _state.value.copy(connectionPhase = status.phase, connectionNote = null)
+        if (status.cardConfirmed && !switchListRead) {
+            switchListRead = true
+            withReauth { loadProfiles() }
+        }
+        if (!status.isRunning) {
+            followSwitch = false
+            reconnectTracker = null
+            _state.value = _state.value.copy(connectionNote = status.outcomeNote)
+            withReauth { loadProfiles() }
+        }
+        if (_state.value.connectionPhase == RouterESimConnectionPhase.CONNECTED) {
+            runCatching {
+                val parsed = SignalParser.parseNetInfo(withReauth { agentClient.getJSON("/api/network/signal") })
+                _state.value = _state.value.copy(
+                    operatorName = parsed.operatorInfo.provider,
+                    networkType = if (parsed.operatorInfo.networkType.isEmpty()) "" else parsed.operatorInfo.displayNetworkType(parsed.nr.isConnected, parsed.lte),
+                    signalBars = parsed.operatorInfo.signalBar.coerceIn(0, 5),
+                )
+            }
+        }
+        return true
+    }
+
     private suspend fun loadProfiles() {
-        _state.value = _state.value.copy(profiles = RouterESimParser.parseProfiles(agentClient.get<RouterESimProfilesResponse>("/api/esim/profiles")))
+        try {
+            val fresh = RouterESimParser.parseInventory(agentClient.get<RouterESimProfilesResponse>("/api/esim/profiles"))
+            val shown = _state.value.inventory
+            // An older answer, or the pre-switch list served while the SIM reloads, must not replace
+            // the switch target on screen.
+            if (fresh.isOlderThan(shown) || (fresh.updating && followSwitch)) return
+            _state.value = _state.value.copy(
+                inventory = fresh,
+                profiles = fresh.profiles,
+                pendingReceipts = fresh.pendingReceipts,
+                listError = fresh.errorText?.let { "$it Showing the list read at ${clock(fresh.observedAt)}." },
+            )
+        } catch (e: CancellationException) { throw e }
+        catch (e: AgentError.Unauthorized) { throw e }
+        catch (e: Exception) {
+            _state.value = _state.value.copy(listError = "Couldn't read eSIM profiles: ${errorText(e)}")
+        }
+    }
+
+    private fun clock(unix: Long): String =
+        if (unix <= 0) "an earlier time"
+        else java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(unix * 1000))
+
+    /** The agent replies `outcome: "unknown"` when lpac failed or timed out mid-switch. */
+    private fun outcomeUnknown(error: Exception): Boolean {
+        val text = (error.message ?: return false).removePrefix("Server error: ")
+        return runCatching { Json.parseToJsonElement(text).jsonObject["outcome"]?.jsonPrimitive?.contentOrNull }.getOrNull() == "unknown"
     }
 
     private suspend fun loadChip() {

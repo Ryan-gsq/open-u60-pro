@@ -1,6 +1,8 @@
 package com.openu60.feature.router.esim
 
 import android.text.format.Formatter
+import java.text.DateFormat
+import java.util.Date
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -10,6 +12,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -44,6 +47,10 @@ fun RouterESimScreen(onBack: () -> Unit, viewModel: RouterESimViewModel = hiltVi
     var adding by remember { mutableStateOf(false) }
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(viewModel) { viewModel.refresh() }
+    LaunchedEffect(state.message, state.downloadNote, state.operationInFlight) {
+        if (!state.operationInFlight && (state.message?.contains("a different eSIM card", ignoreCase = true) == true ||
+                state.downloadNote?.contains("a different eSIM card", ignoreCase = true) == true)) viewModel.retryProfiles()
+    }
     DisposableEffect(lifecycleOwner, viewModel) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_START) viewModel.startMonitoring()
@@ -72,7 +79,8 @@ fun RouterESimScreen(onBack: () -> Unit, viewModel: RouterESimViewModel = hiltVi
             onRefresh = viewModel::refresh,
             modifier = Modifier.padding(padding).fillMaxSize(),
         ) {
-            RouterESimContent(state, viewModel::refresh, viewModel::requestSwitch, viewModel::requestDelete, { viewModel.resetDownloadResult(); adding = true }, { adding = true })
+            RouterESimContent(state, viewModel::refresh, viewModel::requestSwitch, viewModel::requestDelete, { viewModel.resetDownloadResult(); adding = true }, { adding = true },
+                rename = viewModel::requestRename, sendReceipts = viewModel::sendReceipts, retryList = viewModel::retryProfiles)
         }
     }
 
@@ -87,6 +95,9 @@ fun RouterESimScreen(onBack: () -> Unit, viewModel: RouterESimViewModel = hiltVi
             dismissButton = { TextButton(onClick = viewModel::dismissDelete) { Text("Cancel") } },
         )
     }
+    state.pendingRename?.let { target ->
+        RenameDialog(target, state.blocksSwitching, viewModel::dismissRename, viewModel::confirmRename)
+    }
     state.pendingSwitch?.let { target ->
         AlertDialog(
             onDismissRequest = viewModel::dismissSwitch,
@@ -95,18 +106,55 @@ fun RouterESimScreen(onBack: () -> Unit, viewModel: RouterESimViewModel = hiltVi
             text = {
                 Text("The router disconnects from ${state.enabledProfile?.displayName ?: "the current profile"} and connects with ${target.displayName}. Internet is down for about a minute. Wi-Fi stays on.")
             },
-            confirmButton = { TextButton(onClick = viewModel::confirmSwitch) { Text("Switch to ${target.displayName}") } },
+            confirmButton = { TextButton(onClick = viewModel::confirmSwitch, enabled = !state.blocksSwitching) { Text("Switch to ${target.displayName}") } },
             dismissButton = { TextButton(onClick = viewModel::dismissSwitch) { Text("Cancel") } },
         )
     }
 }
 
 @Composable
-private fun RouterESimContent(state: RouterESimState, refresh: () -> Unit, switch: (RouterESimProfile) -> Unit, delete: (RouterESimProfile) -> Unit = {}, add: () -> Unit = {}, resume: () -> Unit = {}) {
+private fun RenameDialog(profile: RouterESimProfile, blocked: Boolean, dismiss: () -> Unit, save: (String) -> Unit) {
+    var text by remember(profile.iccid) { mutableStateOf(profile.nickname) }
+    val trimmed = text.trim()
+    val bytes = trimmed.toByteArray(Charsets.UTF_8).size
+    val valid = bytes <= 64 && text.none { it == '\n' || it == '\r' || it == '\u0085' || it == '\u2028' || it == '\u2029' }
+    AlertDialog(
+        onDismissRequest = dismiss,
+        icon = { Icon(Icons.Default.Edit, null) },
+        title = { Text("Rename profile") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(profile.displayName, style = MaterialTheme.typography.titleSmall)
+                OutlinedTextField(text, { text = it }, singleLine = true, label = { Text("Nickname") },
+                    modifier = Modifier.fillMaxWidth(), placeholder = { Text(profile.name.ifEmpty { profile.provider }) },
+                    isError = !valid, supportingText = {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(if (valid) "One line" else "Use one line, up to 64 bytes.", Modifier.weight(1f))
+                            Text("$bytes / 64 bytes")
+                        }
+                    })
+                Text("Leave empty to use the operator’s name. Emoji and accented letters may use more than one byte per character.", style = MaterialTheme.typography.bodySmall)
+            }
+        },
+        confirmButton = { TextButton(onClick = { save(trimmed) }, enabled = valid && !blocked && trimmed != profile.nickname) { Text("Save") } },
+        dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun RouterESimContent(
+    state: RouterESimState, refresh: () -> Unit, switch: (RouterESimProfile) -> Unit, delete: (RouterESimProfile) -> Unit = {},
+    add: () -> Unit = {}, resume: () -> Unit = {}, rename: (RouterESimProfile) -> Unit = {}, sendReceipts: () -> Unit = {},
+    retryList: () -> Unit = refresh,
+) {
     val others = remember(state.profiles) { state.profiles.filter { !it.isEnabled } }
+    val scroll = rememberScrollState()
+    LaunchedEffect(state.message, state.operationInFlight, state.switchingTo) {
+        if (state.message != null || state.operationInFlight || state.switchingTo != null) scroll.animateScrollTo(0)
+    }
     Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(20.dp),
+        modifier = Modifier.fillMaxSize().verticalScroll(scroll).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         if (!state.hasLoaded && state.profiles.isEmpty()) {
             Card(Modifier.fillMaxWidth()) {
@@ -119,8 +167,14 @@ private fun RouterESimContent(state: RouterESimState, refresh: () -> Unit, switc
                 }
             }
         } else {
-            state.message?.let { message ->
-                MessageCard(message, state.messageIsError, !state.blocksSwitching, refresh)
+            state.message?.let { MessageCard(it, state.messageIsError, !state.blocksSwitching, retryList) }
+            if (state.operationInFlight) {
+                Card(Modifier.fillMaxWidth()) {
+                    Row(Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text("Updating eSIM…", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                    }
+                }
             }
             if (state.download.state != "idle") {
                 Card(onClick = resume, modifier = Modifier.fillMaxWidth()) {
@@ -134,8 +188,11 @@ private fun RouterESimContent(state: RouterESimState, refresh: () -> Unit, switc
                     }
                 }
             }
+            if (state.profiles.isNotEmpty() || state.switchingTo != null) ConnectionCard(state, refresh)
+            InventoryHeading(state)
+            state.listError?.let { ListErrorCard(it, !state.blocksSwitching, retryList) }
             if (state.profiles.isEmpty()) {
-                if (state.message == null && !state.download.isBusy) {
+                if (state.message == null && state.listError == null && !state.download.isBusy) {
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.fillMaxWidth().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
                             Icon(Icons.Default.SimCard, null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -146,38 +203,49 @@ private fun RouterESimContent(state: RouterESimState, refresh: () -> Unit, switc
                     }
                 }
             } else {
-                state.enabledProfile?.let { active ->
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        SectionHeading("Active profile")
-                        ProfileCard(active, false) {}
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    state.enabledProfile?.let { active ->
+                        ProfileCard(active, false, onRename = { rename(active) }, canEdit = !state.blocksSwitching) {}
                     }
-                }
-                ConnectionCard(state, refresh)
-                if (others.isNotEmpty()) {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            SectionHeading(if (state.enabledProfile == null) "Profiles on this card" else "Other profiles")
-                            Text(others.size.toString(), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
+                    if (others.isNotEmpty()) {
+                        if (state.enabledProfile != null) SectionHeading("Switch to another profile")
                         others.forEach { profile ->
-                            key(profile.iccid) { ProfileCard(profile, !state.blocksSwitching, onDelete = { delete(profile) }) { switch(profile) } }
+                            key(profile.iccid) {
+                                ProfileCard(profile, !state.blocksSwitching, onDelete = { delete(profile) }, onRename = { rename(profile) },
+                                    canEdit = !state.blocksSwitching) { switch(profile) }
+                            }
                         }
                     }
-                }
-                OutlinedButton(onClick = add, enabled = !state.blocksSwitching, modifier = Modifier.fillMaxWidth()) {
-                    Icon(Icons.Default.AddCircle, null); Spacer(Modifier.width(8.dp)); Text("Add eSIM")
-                }
-                Surface(color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.45f), shape = RoundedCornerShape(12.dp)) {
-                    Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Icon(Icons.Default.Schedule, null, tint = MaterialTheme.colorScheme.onTertiaryContainer)
-                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                            Text("Switching pauses internet", style = MaterialTheme.typography.titleSmall)
-                            Text("About a minute offline. Your router’s Wi-Fi stays on.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
+                    OutlinedButton(onClick = add, enabled = !state.blocksSwitching, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Default.AddCircle, null); Spacer(Modifier.width(8.dp)); Text("Add eSIM")
+                    }
+                    Row(Modifier.padding(horizontal = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(Icons.Default.Wifi, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Switching pauses internet for about a minute. Your router’s Wi-Fi stays on.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
+            state.pendingReceipts?.takeIf { it > 0 }?.let { ReceiptsCard(it, state.receiptsSending, !state.blocksSwitching, sendReceipts) }
             if (state.chip != RouterESimChip.empty) ChipCard(state.chip)
+        }
+    }
+}
+
+@Composable
+private fun InventoryHeading(state: RouterESimState) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            SectionHeading("On your eSIM")
+            if (state.inventory.updating || state.connectionPhase.blocksSwitching) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp)
+                    Text("Updating…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else Text(if (state.listError != null && state.profiles.isEmpty()) "Not read yet" else if (state.profiles.size == 1) "1 profile" else "${state.profiles.size} profiles", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (state.inventory.observedAt > 0) {
+            val time = remember(state.inventory.observedAt) { DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(state.inventory.observedAt * 1000)) }
+            Text("Last read $time", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -188,7 +256,10 @@ private fun SectionHeading(text: String) {
 }
 
 @Composable
-private fun ProfileCard(profile: RouterESimProfile, canSwitch: Boolean, onDelete: (() -> Unit)? = null, onSwitch: () -> Unit) {
+private fun ProfileCard(
+    profile: RouterESimProfile, canSwitch: Boolean, onDelete: (() -> Unit)? = null, onRename: (() -> Unit)? = null,
+    canEdit: Boolean = canSwitch, onSwitch: () -> Unit,
+) {
     var menu by remember { mutableStateOf(false) }
     val accent = if (profile.isEnabled) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary
     val subtitle = when {
@@ -201,36 +272,30 @@ private fun ProfileCard(profile: RouterESimProfile, canSwitch: Boolean, onDelete
     val colors = CardDefaults.cardColors(containerColor = if (profile.isEnabled) accent.copy(alpha = 0.08f) else MaterialTheme.colorScheme.surfaceContainerLow)
     val border = BorderStroke(1.dp, if (profile.isEnabled) accent.copy(alpha = 0.35f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
     val content: @Composable () -> Unit = {
-        Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Box(Modifier.size(46.dp, 50.dp).background(accent.copy(alpha = 0.1f), RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
+        Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 6.dp, top = 14.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(Modifier.size(44.dp, 50.dp).background(accent.copy(alpha = 0.1f), RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
                 Icon(Icons.Default.SimCard, null, tint = accent)
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                Text(profile.displayName.ifEmpty { "Unnamed profile" }, style = if (profile.isEnabled) MaterialTheme.typography.titleLarge else MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                if (profile.isEnabled) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Icon(Icons.Default.CheckCircle, null, Modifier.size(12.dp), tint = accent)
+                    Text("Active", style = MaterialTheme.typography.labelSmall, color = accent)
+                }
+                Text(profile.displayName.ifEmpty { "Unnamed profile" }, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("Profile · …${profile.iccid.takeLast(4)}", style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("…${profile.iccid.takeLast(4)}", style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            when {
-                profile.isEnabled -> {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Icon(Icons.Default.CheckCircle, null, Modifier.size(16.dp), tint = accent)
-                        Text("Active", style = MaterialTheme.typography.labelMedium, color = accent)
-                    }
-                }
-                profile.canEnable -> Box(Modifier.size(36.dp).background(accent.copy(alpha = if (canSwitch) 0.1f else 0.03f), CircleShape), contentAlignment = Alignment.Center) {
-                    Icon(Icons.Default.SwapHoriz, "Switch profile", tint = if (canSwitch) accent else MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
-                }
-                else -> Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Icon(Icons.Default.Lock, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
-                    Text("Unavailable", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-            if (!profile.isEnabled && onDelete != null) {
+            if (profile.canEnable) Icon(Icons.Default.SwapHoriz, null, tint = if (canSwitch) accent else MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+            else if (!profile.isEnabled) Icon(Icons.Default.Lock, "Unavailable", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            val canDelete = !profile.isEnabled && onDelete != null
+            if (canDelete || onRename != null) {
                 Box {
-                    IconButton(onClick = { menu = true }, enabled = canSwitch) { Icon(Icons.Default.MoreVert, "Profile options for ${profile.displayName}") }
+                    IconButton(onClick = { menu = true }, enabled = canEdit) { Icon(Icons.Default.MoreVert, "Profile options for ${profile.displayName}") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(text = { Text("Delete profile", color = MaterialTheme.colorScheme.error) },
-                            leadingIcon = { Icon(Icons.Default.DeleteOutline, null) }, onClick = { menu = false; onDelete() }, enabled = canSwitch)
+                        if (onRename != null) DropdownMenuItem(text = { Text("Rename") },
+                            leadingIcon = { Icon(Icons.Default.Edit, null) }, onClick = { menu = false; onRename() }, enabled = canEdit)
+                        if (canDelete) DropdownMenuItem(text = { Text("Delete profile", color = MaterialTheme.colorScheme.error) },
+                            leadingIcon = { Icon(Icons.Default.DeleteOutline, null) }, onClick = { menu = false; onDelete?.invoke() }, enabled = canEdit)
                     }
                 }
             }
@@ -247,69 +312,149 @@ private fun ProfileCard(profile: RouterESimProfile, canSwitch: Boolean, onDelete
 private fun ConnectionCard(state: RouterESimState, refresh: () -> Unit) {
     val phase = state.connectionPhase
     val progress = phase.blocksSwitching
+    val attention = phase == RouterESimConnectionPhase.WAITING || phase == RouterESimConnectionPhase.UNAVAILABLE
+    val accent = if (attention) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary
     val title = when (phase) {
         RouterESimConnectionPhase.CHECKING -> "Checking connection"
-        RouterESimConnectionPhase.SWITCHING -> "Switching to ${state.switchingTo ?: "profile"}"
+        RouterESimConnectionPhase.SWITCHING -> "Switching profile"
         RouterESimConnectionPhase.RELOADING -> "Reloading SIM"
         RouterESimConnectionPhase.REGISTERING -> "Registering on network"
-        RouterESimConnectionPhase.CONNECTED -> "Mobile internet connected"
-        RouterESimConnectionPhase.DISCONNECTED -> "Mobile internet offline"
-        RouterESimConnectionPhase.WAITING -> "Still waiting for internet"
-        RouterESimConnectionPhase.UNAVAILABLE -> "Connection status unavailable"
+        RouterESimConnectionPhase.CONNECTED -> "Mobile data connected"
+        RouterESimConnectionPhase.DISCONNECTED -> "Mobile data offline"
+        RouterESimConnectionPhase.WAITING -> "Connection needs attention"
+        RouterESimConnectionPhase.UNAVAILABLE -> if (state.switchingTo == null) "Connection status unavailable" else "Switch needs attention"
     }
     val detail = state.connectionNote ?: when (phase) {
-        RouterESimConnectionPhase.SWITCHING, RouterESimConnectionPhase.RELOADING, RouterESimConnectionPhase.REGISTERING -> "Internet usually returns in about a minute. Wi-Fi stays on."
-        RouterESimConnectionPhase.WAITING -> "The profile is active. First network registration can take longer."
-        RouterESimConnectionPhase.DISCONNECTED -> "Mobile data is not connected. Your router’s Wi-Fi stays on."
+        RouterESimConnectionPhase.SWITCHING -> "Selecting the new profile on your eSIM."
+        RouterESimConnectionPhase.RELOADING -> "The modem is loading the SIM. The card may be unreadable for 5–25 seconds."
+        RouterESimConnectionPhase.REGISTERING -> "The new profile is loaded. Waiting for a mobile data connection."
+        RouterESimConnectionPhase.WAITING -> "Mobile data hasn’t connected yet. Check the plan or coverage, or choose another profile below."
+        RouterESimConnectionPhase.DISCONNECTED -> "Your router’s Wi-Fi stays connected. You can still switch profiles."
         RouterESimConnectionPhase.CHECKING -> "Reading live status from your router."
-        RouterESimConnectionPhase.UNAVAILABLE -> "Refresh to check the router’s mobile data connection."
-        RouterESimConnectionPhase.CONNECTED -> listOf(state.operatorName, state.networkType).filter { it.isNotEmpty() }.joinToString(" · ")
+        RouterESimConnectionPhase.UNAVAILABLE -> "Check again to read the router’s connection status."
+        RouterESimConnectionPhase.CONNECTED -> "Mobile data is up. Traffic may take a few more seconds."
     }
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.Top) {
-                if (progress || phase == RouterESimConnectionPhase.CHECKING) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-                else Icon(if (phase == RouterESimConnectionPhase.CONNECTED) Icons.Default.CheckCircle else Icons.Default.SignalCellularConnectedNoInternet0Bar, null, tint = if (phase == RouterESimConnectionPhase.CONNECTED) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant)
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(title, style = MaterialTheme.typography.titleSmall, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
-                    if (detail.isNotEmpty()) Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    val current = when {
+        phase == RouterESimConnectionPhase.SWITCHING || phase == RouterESimConnectionPhase.UNAVAILABLE -> 0
+        phase == RouterESimConnectionPhase.RELOADING -> 1
+        else -> 2
+    }
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Top) {
+                Box(Modifier.size(44.dp).background(accent.copy(alpha = 0.1f), RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
+                    if (progress || phase == RouterESimConnectionPhase.CHECKING) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = accent)
+                    else Icon(if (phase == RouterESimConnectionPhase.CONNECTED) Icons.Default.CheckCircle else if (attention) Icons.Default.Info else Icons.Default.SignalCellularConnectedNoInternet0Bar, null, tint = accent)
+                }
+                Column(Modifier.weight(1f).semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    state.switchingTo?.let { Text("Switch to $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    Text(title, style = MaterialTheme.typography.titleMedium)
+                    // Outcome text participates in the live region even if the phase stays WAITING.
+                    if (attention) Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (phase == RouterESimConnectionPhase.CONNECTED) {
+                        Text(listOf(state.operatorName, state.networkType).filter { it.isNotEmpty() }.joinToString(" · "), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
                 if (phase == RouterESimConnectionPhase.CONNECTED) Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.Bottom) {
                     repeat(5) { index ->
                         Box(Modifier.width(3.dp).height((6 + index * 2).dp).background(
-                            if (index < state.signalBars) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f),
-                            RoundedCornerShape(1.dp),
-                        ))
+                            if (index < state.signalBars) accent else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f), RoundedCornerShape(1.dp)))
                     }
                 }
             }
-            if (state.switchingTo != null && (progress || phase == RouterESimConnectionPhase.CONNECTED || phase == RouterESimConnectionPhase.WAITING)) {
-                val current = when (phase) { RouterESimConnectionPhase.SWITCHING -> 0; RouterESimConnectionPhase.RELOADING -> 1; else -> 2 }
-                Column(Modifier.padding(start = 32.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                    listOf("Switch profile", "Reload SIM", "Connect to network").forEachIndexed { index, label ->
+            if (state.switchingTo != null && (progress || phase == RouterESimConnectionPhase.CONNECTED)) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    listOf("Switch profile" to Icons.Default.SimCard, "Reload SIM" to Icons.Default.Refresh, "Connect to network" to Icons.Default.CellTower).forEachIndexed { index, (label, icon) ->
                         val complete = phase == RouterESimConnectionPhase.CONNECTED || index < current
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(if (complete) Icons.Default.CheckCircle else if (index == current) Icons.Default.RadioButtonChecked else Icons.Default.RadioButtonUnchecked, null, Modifier.size(15.dp), tint = if (complete) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        val active = index == current && phase != RouterESimConnectionPhase.CONNECTED
+                        val color = if (complete || active) accent else MaterialTheme.colorScheme.onSurfaceVariant
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(28.dp).background(color.copy(alpha = if (active || complete) 0.12f else 0.05f), CircleShape), contentAlignment = Alignment.Center) {
+                                Icon(if (complete) Icons.Default.Check else if (active && attention) Icons.Default.PriorityHigh else icon, null, Modifier.size(16.dp), tint = color)
+                            }
+                            Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal, color = color)
+                            if (active && progress) Text("In progress", style = MaterialTheme.typography.labelSmall, color = color)
+                            if (complete) Text("Done", style = MaterialTheme.typography.labelSmall, color = color)
                         }
                     }
                 }
             }
-            if (phase == RouterESimConnectionPhase.WAITING || phase == RouterESimConnectionPhase.UNAVAILABLE) OutlinedButton(onClick = refresh) { Text("Check again") }
+            if (!attention && (phase != RouterESimConnectionPhase.CONNECTED || state.switchingTo != null)) Text(detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (progress) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Wifi, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Wi-Fi stays connected · Usually 15–45 seconds", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (attention) OutlinedButton(onClick = refresh, enabled = !state.isLoading && !state.operationInFlight) { Text("Check again") }
+        }
+    }
+}
+
+@Composable
+private fun ListErrorCard(text: String, canRetry: Boolean, retry: () -> Unit) {
+    Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.35f)) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Update, null, Modifier.size(20.dp))
+                Text("Couldn’t refresh profiles", style = MaterialTheme.typography.titleSmall)
+            }
+            Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedButton(onClick = retry, enabled = canRetry) { Text("Try again") }
+        }
+    }
+}
+
+@Composable
+private fun ReceiptsCard(count: Int, sending: Boolean, canSend: Boolean, send: () -> Unit) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(40.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), RoundedCornerShape(10.dp)), contentAlignment = Alignment.Center) {
+                    Icon(Icons.AutoMirrored.Filled.Send, null, tint = MaterialTheme.colorScheme.primary)
+                }
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text("Operator receipts", style = MaterialTheme.typography.titleSmall)
+                    Text(if (sending) "Sending…" else "$count waiting · Retried automatically", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                }
+                if (sending) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+            }
+            TextButton(onClick = { expanded = !expanded }, contentPadding = PaddingValues(0.dp)) {
+                Text("Why are these waiting?"); Spacer(Modifier.width(8.dp)); Icon(if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null, Modifier.size(16.dp))
+            }
+            if (expanded) Text("Your eSIM sends operators a receipt when a profile is added, switched or deleted. The router retries every 10 minutes while mobile data is connected. You don’t need to keep this screen open.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedButton(onClick = send, enabled = canSend && !sending) {
+                Icon(Icons.Default.Upload, null, Modifier.size(16.dp)); Spacer(Modifier.width(8.dp)); Text(if (sending) "Sending receipts…" else "Send now")
+            }
         }
     }
 }
 
 @Composable
 private fun MessageCard(message: String, isError: Boolean, canRetry: Boolean, retry: () -> Unit) {
+    val housekeeping = message.contains("receipts", true)
+    val guidance = when {
+        message.contains("agent password required", true) -> "Set the router agent password in Agent Settings, then try your action again."
+        message.contains("airplane", true) || message.contains("low-power", true) -> "Open Router Settings → Mobile Network to check the modem mode."
+        message.contains("different eSIM card", true) -> "Reloading the profiles on the card now in your router. Review the list before trying again."
+        message.contains("404") || message.contains("not found", true) -> "This action may need a newer router agent. Your saved profiles are unchanged."
+        else -> null
+    }
     Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(if (isError) Icons.Default.ErrorOutline else Icons.Default.CheckCircle, null, tint = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary)
-                Text(if (message.contains("busy", true)) "Card is busy" else if (isError) "Couldn’t complete the request" else "Profile updated", style = MaterialTheme.typography.titleSmall)
+        Row(Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Icon(if (housekeeping) Icons.AutoMirrored.Filled.Send else if (isError) Icons.Default.Info else Icons.Default.CheckCircle, null,
+                tint = if (isError && !housekeeping) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(if (housekeeping) "Operator receipts" else if (isError) "Can’t complete this right now" else "Profile updated", style = MaterialTheme.typography.titleSmall)
+                Text(message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                guidance?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                if (isError && !housekeeping) {
+                    OutlinedButton(onClick = retry, enabled = canRetry) { Text("Reload profiles") }
+                    Text("Reloading only reads the list. It doesn’t repeat your action.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
-            Text(message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (isError) OutlinedButton(onClick = retry, enabled = canRetry) { Text("Try again") }
         }
     }
 }

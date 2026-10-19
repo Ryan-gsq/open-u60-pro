@@ -6,6 +6,8 @@ final class AgentClient {
     var requests: [String] = []
     var bodies: [[String: Any]] = []
     var status: [String: Any] = ["state": "idle"]
+    var switchStatus: [String: Any] = ["state": "idle"]
+    var inventoryMeta: [String: Any] = [:]
     var postResult: [String: Any] = [:]
     var postError: Error?
     var holdStatus = false
@@ -17,12 +19,13 @@ final class AgentClient {
     func get<T: Decodable>(_ path: String) async throws -> T {
         requests.append("GET " + path)
         if holdStatus { await withCheckedContinuation { statusGate = $0 } }
-        return try JSONDecoder().decode(T.self, from: JSONSerialization.data(withJSONObject: status))
+        let source = path == "/api/esim/switch" ? switchStatus : status
+        return try JSONDecoder().decode(T.self, from: JSONSerialization.data(withJSONObject: source))
     }
     func getJSON(_ path: String) async throws -> [String: Any] {
         requests.append("GET " + path)
         switch path {
-        case "/api/esim/profiles": return ["profiles": entries]
+        case "/api/esim/profiles": return inventoryMeta.merging(["profiles": entries]) { _, new in new }
         case "/api/esim/chip": return ["eid": "89000000000000000000000000000001", "firmware": "4.2.0"]
         case "/api/modem/data": return ["connect_status": "connected"]
         default: return [:]
@@ -44,6 +47,10 @@ struct RouterESimFlowTests {
         let vm = RouterESimViewModel(client: client, authManager: AuthManager())
         await vm.refresh()
         precondition(Array(client.requests.prefix(3)) == ["GET /api/esim/download", "GET /api/esim/profiles", "GET /api/esim/chip"], "Discover background work before sequential card reads")
+        let beforeRetry = client.requests.count
+        await vm.retryProfiles()
+        precondition(Array(client.requests.dropFirst(beforeRetry)) == ["GET /api/esim/profiles"],
+                     "A list retry must only read profiles, never repeat a switch or access other card data")
         let active = vm.profiles[0], other = vm.profiles[1]
         vm.requestDelete(active)
         precondition(vm.pendingDelete == nil, "The active profile cannot be deleted")
@@ -54,6 +61,9 @@ struct RouterESimFlowTests {
         precondition(client.bodies.last?["activation_code"] as? String == "LPA:1$example.com$ABC$1.2.3$1")
         precondition(client.bodies.last?["preview"] as? Bool == true)
         precondition(vm.download.state == "confirm" && vm.blocksSwitching)
+        let beforeBlockedRetry = client.requests.count
+        await vm.retryProfiles()
+        precondition(client.requests.count == beforeBlockedRetry, "A list retry must respect the download's exclusive card access")
         vm.requestSwitch(to: other); vm.requestDelete(other)
         precondition(vm.pendingSwitch == nil && vm.pendingDelete == nil, "Download excludes switch/delete")
         let readsBeforeRefresh = client.requests.filter { $0 == "GET /api/esim/profiles" }.count
@@ -118,6 +128,47 @@ struct RouterESimFlowTests {
         await switchVM.confirmSwitch(to: target)
         precondition(switchClient.requests.contains("POST /api/esim/enable") && switchClient.bodies.last?["iccid"] as? String == target.iccid,
                      "A confirmed switch must reach the router after the dialog cleared its selection")
+        let beforeSwitchRetry = switchClient.requests.count
+        await switchVM.retryProfiles()
+        precondition(switchClient.requests.count == beforeSwitchRetry, "Do not read the card while a switch reloads the SIM")
+        let enableAt = switchClient.requests.lastIndex(of: "POST /api/esim/enable")!
+        precondition(!switchClient.requests[(enableAt + 1)...].contains("GET /api/esim/profiles"),
+                     "No fixed list read right after the switch")
+        // While the SIM reloads the agent serves the pre-switch list marked updating: keep the target.
+        switchClient.inventoryMeta = ["updating": true, "agent_instance": 5, "generation": 1, "observed_at": 100]
+        switchClient.switchStatus = ["state": "reloading", "target_iccid": target.iccid]
+        await switchVM.refresh()
+        precondition(switchVM.connectionPhase == .reloading)
+        precondition(switchVM.enabledProfile?.iccid == target.iccid, "The switch target stays active on screen during the reload")
+        switchClient.entries = switchClient.entries.map { e in var e = e; e["state"] = e["iccid"] as? String == target.iccid ? "enabled" : "disabled"; return e }
+        switchClient.inventoryMeta = ["updating": false, "agent_instance": 5, "generation": 1, "observed_at": 110]
+        switchClient.switchStatus = ["state": "modem_confirmed", "target_iccid": target.iccid]
+        await switchVM.refresh()
+        precondition(switchVM.connectionPhase == .registering, "card and modem confirmed: registering")
+        precondition(switchVM.inventory.observedAt == 110 && switchVM.enabledProfile?.iccid == target.iccid, "List re-read once the card is confirmed")
+        switchClient.switchStatus = ["state": "no_data", "target_iccid": target.iccid]
+        await switchVM.refresh()
+        precondition(switchVM.connectionPhase == .waiting && switchVM.connectionNote?.contains("hasn't connected") == true,
+                     "A switch without data reports why and does not switch back")
+        precondition(switchClient.requests.filter { $0 == "POST /api/esim/enable" }.count == 1, "Never switched again or back")
+        // Older answers are ignored; a failed read keeps the list; a newer clean read clears the error.
+        switchClient.inventoryMeta = ["agent_instance": 5, "generation": 0, "observed_at": 999]
+        await switchVM.refresh()
+        precondition(switchVM.inventory.observedAt == 110, "An answer from before the switch is ignored")
+        switchClient.inventoryMeta = ["agent_instance": 5, "generation": 1, "observed_at": 120, "stale": true,
+                                      "error": ["kind": "management_unavailable", "message": "euicc_init", "at": 120]]
+        await switchVM.refresh()
+        precondition(switchVM.listError?.contains("isn't responding") == true && !switchVM.profiles.isEmpty, "A failed read keeps the list and says why")
+        switchClient.inventoryMeta = ["agent_instance": 5, "generation": 1, "observed_at": 130, "pending_receipts": 2]
+        await switchVM.refresh()
+        precondition(switchVM.listError == nil && switchVM.pendingReceipts == 2, "A newer clean read clears the error")
+        // Rename passes the profile from the alert and an empty name clears the nickname.
+        switchVM.requestRename(target)
+        switchVM.pendingRename = nil
+        await switchVM.confirmRename(target, to: "  Travel  ")
+        precondition(switchClient.requests.last == "GET /api/esim/profiles" && switchClient.bodies.last?["nickname"] as? String == "Travel")
+        await switchVM.confirmRename(target, to: String(repeating: "x", count: 65))
+        precondition(switchVM.messageIsError && switchClient.bodies.last?["nickname"] as? String == "Travel", "Over-long names never reach the router")
         print("RouterESimFlowTests: request ordering, operation guards, installation safety, resume, deletion, and errors passed")
     }
 }

@@ -24,6 +24,9 @@ The router side is finished and live-tested. This brief covers the mobile UI.
 | Method | Path | Body → data |
 |---|---|---|
 | GET | `/api/esim/profiles` | → `{ enabled_iccid, profiles: [{ iccid, isdp_aid, state: "enabled"/"disabled", nickname, provider, name, class }] }` (~0.3–3 s) |
+| POST | `/api/esim/nickname` | `{ iccid, nickname }` → `{ iccid, nickname, generation }`. Up to 64 bytes; empty clears it |
+| GET | `/api/esim/notifications` | → `{ count, pending: [{ seq, operation, address, attempts, last_error, gave_up }], retrying, … }` — operator receipts waiting on the card |
+| POST | `/api/esim/notifications/process` | → 202. Sends waiting receipts now; the router also retries every 10 min |
 | GET | `/api/esim/switch` | → `{ state, target_iccid, previous_iccid, generation, started_at, card_confirmed_at, modem_confirmed_at, connected_at, finished_at, note }` — verified progress of the last switch |
 | GET | `/api/esim/chip` | → `{ eid, firmware, sgp22_version, profile_version, free_nvm_bytes, free_ram_bytes }` |
 | POST | `/api/esim/enable` | `{ iccid }` → `{ enabled_iccid, previous_iccid, reconnecting: true }` |
@@ -89,6 +92,11 @@ Only for **non-active** profiles (the router refuses to delete the active one: "
 - **Android:** CameraX + ML Kit barcode scanning (`com.google.mlkit:barcode-scanning`, QR only) — or the Google code scanner (`play-services-code-scanner`, no camera permission needed); gallery import via Photo Picker + ML Kit `InputImage.fromFilePath`. If using CameraX, request `android.permission.CAMERA` at runtime with a rationale.
 - Stop the camera as soon as a valid `LPA:` code is read; haptic on success; torch toggle; viewfinder framing.
 - Unit-test the activation-code parsing (valid, lowercase prefix, confirmation flag, garbage, whitespace).
+
+### Rename and receipts (implemented)
+- Rename: long-press (iOS) / ⋮ menu (Android) on any profile, including the active one → text field prefilled with the nickname; empty restores the operator's name.
+- When `pending_receipts` > 0 on the profile list: a card "N operator receipts waiting" with **Send now**. Receipts tell the operator a profile was added/removed; the router retries on its own.
+- Refusals to show as-is: 409 "the modem is in airplane / low-power mode…" (switch), 409 "the router has no mobile data connection…" (download), 409 "a different eSIM card is in the slot…" (then reload).
 
 ## States to design
 Loading · list (active highlighted) · empty ("No profiles yet — add one with a QR code") · switching/reconnecting · add: scanner, manual entry, confirmation-code prompt, progress, profile confirmation, success (+ switch now), failure, cancelling · delete confirmation · busy (409) · not available (503 / not installed) · password required (403) · offline/unauthorized.

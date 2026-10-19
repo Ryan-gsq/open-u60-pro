@@ -70,6 +70,11 @@ struct RouterESimAddView: View {
                 Text("Add a profile to your router").font(.title2.bold())
                 Text("Use the eSIM QR code from your operator. You’ll review the profile before installing it.").font(.subheadline).foregroundStyle(.secondary)
             }
+            if viewModel.connectionPhase == .disconnected || viewModel.connectionPhase == .waiting {
+                Label("Your router has no mobile data connection. Connect it before downloading; your phone’s own data can’t be used.", systemImage: "wifi.exclamationmark")
+                    .font(.subheadline).foregroundStyle(.secondary).padding(14)
+                    .background(.orange.opacity(0.08), in: .rect(cornerRadius: 12))
+            }
             CardView(padding: 16) {
                 VStack(spacing: 12) {
                     Button { scanner = true } label: { Label("Scan QR code", systemImage: "camera.fill").frame(maxWidth: .infinity, minHeight: 30) }
@@ -106,7 +111,17 @@ struct RouterESimAddView: View {
                 }
             }
             if let inputError { Label(inputError, systemImage: "exclamationmark.circle").font(.subheadline).foregroundStyle(.orange) }
-            if let note = viewModel.downloadNote { Text(note).font(.subheadline).foregroundStyle(.orange).textSelection(.enabled) }
+            if let note = viewModel.downloadNote {
+                CardView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Can’t start this download", systemImage: "exclamationmark.circle").font(.subheadline.weight(.semibold))
+                        Text(note).font(.subheadline).foregroundStyle(.secondary).textSelection(.enabled)
+                        if note.localizedCaseInsensitiveContains("agent password required") {
+                            Text("Set the router agent password in Agent Settings, then try again.").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
             Label("Your router needs internet to download the profile. Keep its Wi-Fi connected. Downloads usually take 10–60 seconds.", systemImage: "wifi").font(.caption).foregroundStyle(.secondary)
             Label("Your activation code is private and single-use. It is sent only to your router and isn’t saved by OpenU60.", systemImage: "lock").font(.caption).foregroundStyle(.secondary)
         }

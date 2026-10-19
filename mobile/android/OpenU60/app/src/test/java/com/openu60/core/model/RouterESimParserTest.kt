@@ -88,4 +88,38 @@ class RouterESimParserTest {
         org.junit.Assert.assertFalse(status.copy(state = "cancelling").canCancel)
         org.junit.Assert.assertEquals("GOMO added.", status.copy(state = "done").progressText)
     }
+
+    @Test
+    fun inventoryCarriesFreshnessAndIgnoresOlderAnswers() {
+        val inv = RouterESimParser.parseInventory(json.decodeFromString<RouterESimProfilesResponse>("""
+            {"agent_instance":1792300000000,"generation":3,"observed_at":1792300100,"updating":false,"stale":true,
+             "error":{"kind":"sim_reloading","message":"euicc_init","at":1792300110},"pending_receipts":1,
+             "profiles":[{"class":"operational","iccid":"8963000000000000001","state":"enabled","provider":"SMART","name":"Operational","nickname":null}]}
+        """))
+        assertEquals(1792300000000L, inv.agentInstance)
+        assertEquals(1, inv.pendingReceipts)
+        assertEquals("The eSIM is still settling after the switch.", inv.errorText)
+        assertTrue(inv.copy(generation = 2).isOlderThan(inv))
+        assertTrue(inv.copy(observedAt = inv.observedAt - 1).isOlderThan(inv))
+        assertFalse(inv.isOlderThan(inv.copy(generation = 2)))
+        assertFalse("a restarted agent is never older", inv.copy(agentInstance = 1, generation = 0).isOlderThan(inv))
+        val old = RouterESimParser.parseInventory(json.decodeFromString<RouterESimProfilesResponse>("""{"profiles":[],"error":null,"pending_receipts":null}"""))
+        assertFalse("older agents carry no counters", old.isOlderThan(inv))
+        assertEquals(null, old.errorText)
+    }
+
+    @Test
+    fun switchStatusMapsToScreenPhases() {
+        val sw = json.decodeFromString<RouterESimSwitchStatus>("""{"state":"card_confirmed","target_iccid":"89630000000000000027","generation":4,"started_at":1,"card_confirmed_at":7,"finished_at":0,"note":null}""")
+        assertEquals("89630000000000000027", sw.targetICCID)
+        assertTrue(sw.isRunning && sw.cardConfirmed)
+        assertEquals(RouterESimConnectionPhase.REGISTERING, sw.phase)
+        assertEquals(RouterESimConnectionPhase.RELOADING, RouterESimSwitchStatus("reloading").phase)
+        assertFalse(RouterESimSwitchStatus("reloading").cardConfirmed)
+        assertEquals(RouterESimConnectionPhase.CONNECTED, RouterESimSwitchStatus("connected").phase)
+        assertEquals(RouterESimConnectionPhase.WAITING, RouterESimSwitchStatus("no_data").phase)
+        assertTrue(RouterESimSwitchStatus("modem_unconfirmed").outcomeNote!!.contains("Restart the router"))
+        assertEquals(RouterESimConnectionPhase.UNAVAILABLE, RouterESimSwitchStatus("not_applied").phase)
+        assertFalse(RouterESimSwitchStatus("connected").isRunning)
+    }
 }
