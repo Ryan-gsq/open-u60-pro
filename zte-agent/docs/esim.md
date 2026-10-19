@@ -101,4 +101,5 @@ Agent `esim-8`, 2026-10-19:
 - **Shared lock.** While a manual `flock -n /tmp/lpac.lock` held the lock, `chip` answered busy and `profiles` served the saved list (`updating`, `stale`); after release, `chip` worked again.
 - **Download pre-check.** The start reply carried `free_nvm_bytes` (971752); a download to an unresolvable server failed safely; `DELETE /api/esim/download` cleared the result.
 - **Build info.** `chip` reported the bundle's BUILDINFO (lpac commit, patch, Alpine pins, CA file SHA-256, build time) and the lpac checksum.
+- **Receipts after switching** (agent `esim-11`, switches made in the app). Smart → GOMO: modem confirmed at 6 s, data at 21 s. At 26 s the Smart disable receipt was sent and the GOMO enable receipt failed at once (`SSL connect error`); the second try at 60 s sent it. On the earlier DITO → Smart switch, the first request also failed: it hung until the 45 s limit. In both cases the request right after it went through, so the first request after the attach is unreliable and the second try is needed.
 - **Not exercised live:** the airplane-mode refusal (the modem stayed ONLINE) and the card-swap check (one card).
