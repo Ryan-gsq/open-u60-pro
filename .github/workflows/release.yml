@@ -3,6 +3,15 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Pull requests that touch the agent build it too (no release), so a broken
+  # cross build shows up before a tag is pushed.
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'zte-agent/**'
+      - 'euicc/**'
 
 permissions:
   contents: write
@@ -26,6 +35,9 @@ jobs:
       - name: Build zte-agent
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          # ring (TLS for operator servers and Apple push) compiles C and assembly for the target.
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
         run: cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 
       # The binary links the LGPL-2.1 euicc crate: its notice and license travel with it.
@@ -38,6 +50,15 @@ jobs:
           cp LICENSE dist/LICENSE-MIT.txt
 
       - name: Upload binary to release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+
+      - name: Keep the build for review
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: zte-agent-aarch64-musl
+          path: dist/*
+          retention-days: 7
