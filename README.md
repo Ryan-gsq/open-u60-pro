@@ -16,6 +16,9 @@ config backup/decryption, network customization, and more.
 [![Qualcomm](https://img.shields.io/badge/chipset-Snapdragon%20X75-red.svg)]()
 [![OS](https://img.shields.io/badge/firmware-ZWRT%20(OpenWrt%2023.05)-green.svg)]()
 [![Website](https://img.shields.io/badge/website-open--u60--pro.vercel.app-blue.svg)](https://open-u60-pro.vercel.app)
+[![Release](https://img.shields.io/github/v/release/jesther-ai/open-u60-pro)](https://github.com/jesther-ai/open-u60-pro/releases/latest)
+
+**Download:** [latest release](https://github.com/jesther-ai/open-u60-pro/releases/latest) · **What's new:** [CHANGELOG.md](CHANGELOG.md)
 
 </div>
 
