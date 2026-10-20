@@ -19,3 +19,7 @@ swiftc -module-cache-path "$test_dir/cache" \
     mobile/ios/OpenU60/Core/Models/RouterSettingsModels.swift \
     mobile/ios/Tests/MobileNetworkTests.swift -o "$test_dir/mobile-network-tests"
 "$test_dir/mobile-network-tests"
+swiftc -module-cache-path "$test_dir/cache" \
+    mobile/ios/OpenU60/Core/Models/SimIdentity.swift \
+    mobile/ios/Tests/SimIdentityTests.swift -o "$test_dir/sim-identity-tests"
+"$test_dir/sim-identity-tests"

@@ -44,10 +44,10 @@ All routes use the agent's bearer authentication and `{ok,data}` / `{ok:false,er
 
 | Method | Path | Result |
 |---|---|---|
-| GET | `/api/esim/profiles` | `profiles`: `iccid`, `isdp_aid`, `state` (`enabled`/`disabled`), `nickname`, `provider`, `name`, `class`; plus `enabled_iccid`, `observed_at`, `generation`, `agent_instance`, `updating`, `stale`, `error` (see Reading during a switch) |
+| GET | `/api/esim/profiles` | `profiles`: `iccid`, `isdp_aid`, `state` (`enabled`/`disabled`), `nickname`, `provider`, `name`, `class`, and on profiles that can be switched to `switch_warnings` (see Before switching); plus `enabled_iccid`, `observed_at`, `observed_seq`, `generation`, `agent_instance`, `updating`, `stale`, `error` (see Reading during a switch), `manual_apn` |
 | GET | `/api/esim/chip` | `eid`, `firmware`, `sgp22_version`, `profile_version`, `free_nvm_bytes`, `free_ram_bytes`, `card_changed` |
 | POST | `/api/esim/enable` | Body `{"iccid": "..."}`. Returns `enabled_iccid`, `previous_iccid`, `reconnecting: true`, `generation`. If the card command fails or times out the reply carries `outcome: "unknown"`: the switch may still have happened, see `/api/esim/switch`. If the card refuses because it is busy, the reply is 202 with `retrying: true` and the agent keeps trying (state `card_busy`) |
-| GET | `/api/esim/switch` | Last switch: `state`, `target_iccid`, `previous_iccid`, `generation`, `started_at`, `card_confirmed_at`, `modem_confirmed_at`, `connected_at`, `finished_at`, `note`, `reason` (for `no_data`: `roaming_off` or `data_off`, else null) |
+| GET | `/api/esim/switch` | Last switch: `state`, `target_iccid`, `previous_iccid`, `generation`, `started_at`, `card_confirmed_at`, `modem_confirmed_at`, `connected_at`, `finished_at`, `note`, `reason` (for `no_data`: `roaming_off` or `data_off`, else null); `sim_epoch`, `sim_phase`, `agent_instance` (see SIM identity event) |
 | POST | `/api/esim/delete` | Body `{"iccid": "..."}`. Disabled profiles only. Returns `deleted_iccid`, `operator_notified` |
 | POST | `/api/esim/nickname` | Body `{"iccid": "...", "nickname": "..."}` (at most 64 bytes, no control characters; empty clears it). Returns `iccid`, `nickname`, `generation` |
 | GET | `/api/esim/notifications` | Operator receipts waiting on the card: `count`, `pending` (`seq`, `operation`, `address`, `iccid`, `attempts`, `last_error`, `gave_up`), `listed_at`, `last_attempt_at`, `last_sent_at`, `retrying`, `stale` |
@@ -102,6 +102,30 @@ Apart from that, the agent never retries a switch or switches back by itself. "C
 
 ICCIDs and the EID are digit strings longer than 64-bit integers can hold: clients must keep them as strings.
 
+### Before switching
+
+`GET /api/esim/profiles` warns about what a switch would run into, read-only (the agent never changes these settings). While a switch reloads the SIM (`updating: true`) the reply carries neither `switch_warnings` nor `manual_apn`.
+
+- `manual_apn: {name, apn}` when the router is in manual APN mode, and `manual_apn` in `switch_warnings` of each disabled operational profile: the new profile would dial that APN too (seen live: a travel profile's `e-ideas`, then `gomo.ph`, carried over to the next profile).
+- `roaming_off` in `switch_warnings` when data roaming is off and the profile looks like one from another country. This is a heuristic: it compares the country code in the ICCIDs (`89` + E.164 code; US issuers' `8901…` counts as 1 and Canadian `89302…` as 302) with the loaded profile, and whether that profile is at home (its MCC equals the network's). Without a registered network there is no `roaming_off`. Next to a roaming profile, only profiles from the same country are flagged.
+
+`observed_seq` counts good reads of the card. Clients order lists of the same `generation` by it rather than by `observed_at`, because the router's clock jumps by hours when the network sets the time after an attach.
+
+### SIM identity event
+
+The agent tracks the loaded SIM's identity by its ICCID, whether it changes through the agent's own switch, the card's menu or a physical swap. The same SIM reloading (a low-power cycle, a refresh that keeps the profile) is not a change. Each phase is published inside the agent and with `ubus send zte_agent.sim_identity '<payload>'` for other processes; no firmware daemon listens to it, and the agent sends no firmware events itself.
+
+| Phase | When |
+|---|---|
+| `leaving` | The firmware's `switch_slot_begin` or `sim hot remove`, or the agent's own switch; carries the outgoing identity |
+| `changed` | A ready SIM with a different ICCID; `epoch` goes up by one |
+| `online` | After the change, a default route, DNS, a WAN-up event if the ICCID changed, no WAN script running and 8 s without WAN events (`settled: true`), or a default route for 30 s (`settled: false`). `identity_changed: false` when the same SIM came back |
+| `stalled` | No `online` 150 s after `leaving`; `reason`: `sim_not_ready`, `no_wan`, `roaming_off` or `data_off`. A later `online` can still follow |
+
+Payload: `phase`, `epoch`, `source` (`agent`, `card`, `hotswap` or `unknown`), `generation` (the switch's, for agent switches), `plmn` (`515-02`), `operator`, `iccid_tail` (last 4 digits), `since_leaving_ms`, and `identity_changed`/`settled` or `reason`. It never carries the full ICCID, the IMSI, the phone number, an IP address or the APN.
+
+On each phase the agent drops its cached SIM and WAN values, then shows the phase on `GET /api/network/signal`, `/api/sim/info` and `/api/esim/switch` as `sim_epoch` (changes counted since the agent started), `sim_phase` (`idle` until the first phase) and `agent_instance`. The apps refresh their SIM and network screens when that triple changes. The Live Activity pauses on `leaving` and checks the connection again on `online`. Idle, the tracker uses no timers and runs no commands.
+
 ## Tested
 
 Card details, setup and limits for the tested card: [docs/9esim-b1.md](../../docs/9esim-b1.md). The tests below up to agent `esim-15` ran lpac; the in-process results are under [How it works](#how-it-works).
@@ -124,4 +148,5 @@ Agent `esim-8`, 2026-10-19:
 - **Real download** (agent `esim-12`, from the iOS app). The test used a Klook travel eSIM QR code. The preview showed provider "Travel - PHL" and name "Klook_app" 4 s after the start; the user confirmed 9 s later. `es10b_load_bound_profile_package` took 16 s, and the whole download took 31 s. The profile was installed disabled, using about 36 KB of card storage (free space 971752 → 934475 bytes). The install receipt reached the operator right after (`operator_notified: true`), and the other profiles and the active connection were untouched. Renaming from the app worked on all three existing profiles.
 - **Travel eSIM** (Klook, a Singapore-issued profile, MCC 525, that roams on Globe and Smart). The switch reached `modem_confirmed` at 5 s and ended `no_data` at 150 s. The router had data roaming off, and while roaming is blocked the firmware also turns mobile data off (`enable: 0`). The iOS app's Data Roaming save then re-sent that off value, so data stayed off even with roaming on; fixed in the app, which now turns mobile data on together with roaming. With roaming and mobile data on, the profile connected within 3 s using the provider's APN (`e-ideas`, entered in the app), and the retry loop delivered both receipts. The agent now reports `reason: roaming_off` for this case.
 - **Busy card** (2026-10-19, Klook travel profile enabled). Three switches to DITO within about two minutes ended `not_applied`: lpac reported `es10c_enable_profile: unknown`, so the card answered with a code other than 1–4. An enable about two minutes later was accepted (`BF31 03 80 01 00`, result 0). DITO's modem identity was confirmed at 12 s and data at 28 s. The refusal code wasn't captured. Confirmed on the next switch away from Klook (to GOMO, agent `esim-14`): the patched lpac reported `es10c_enable_profile: cat busy` (SGP.22 `catBusy`). The agent retried every 10 s, and attempt 13 was accepted 2 min 3 s after the first. GOMO's card and modem were confirmed 5 s later, and data followed. Both busy spells lasted about two minutes from the first attempt, so the retry window is 240 s. With agent `native-5` after the Klook reinstall: Smart → Klook connected at 63 s (the network showed limited service for about 55 s on the first roaming attach), and Klook → GOMO was refused with `catBusy` 13 times over 131 s, accepted on attempt 14, with data 22 s later and both receipts delivered.
+- **SIM identity event** (agent `bridge-1`, 2026-10-20, switches from the iOS app). GOMO → DITO: `leaving` (source `agent`) came with the firmware's `switch_slot_begin` and `switch_slot_end` (the latter seen live for the first time), `changed` 5.0 s later right after the second "sim ready", and `online` (`settled: true`) at 44 s, 9 s after `zte_wan6` and `zte_wan` came up (IPv6 first). One event per phase. `sim_epoch` on the endpoints moved within a second, SMS forwarding counted `ipv6_connected` as WAN up, and the firmware flushed the old connections itself. DITO → GOMO with a Live Activity running: `changed` at 4.7 s, `online` at 31.7 s; the activity paused, resumed with a new APNs connection and kept updating on the Lock Screen. In both switches the first receipt after the attach timed out and went out on the second try, and the network's clock change on attach invalidated an agent login token (the apps log in again by themselves). Idle, the tracker and SMS threads had no wakeups in 30 s.
 - **Not exercised live:** the airplane-mode refusal (the modem stayed ONLINE) and the card-swap check (one card).

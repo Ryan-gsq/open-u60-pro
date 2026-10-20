@@ -48,11 +48,16 @@ final class RouterESimViewModel {
     /// agents, which fall back to `reconnectTracker`.
     @ObservationIgnored private var followSwitch = false
     @ObservationIgnored private var switchListRead = false
+    /// The client's SIM identity revision this screen last re-read for.
+    @ObservationIgnored private var seenIdentityRevision = 0
 
     init(client: AgentClient, authManager: AuthManager) {
         self.client = client
         self.authManager = authManager
     }
+
+    /// Shown, not as an error, when a confirmed switch or delete finds the card still in use.
+    static let busyText = "The eSIM is busy; try again in a moment."
 
     var enabledProfile: RouterESimProfile? { profiles.first(where: \.isEnabled) }
     var blocksSwitching: Bool { isLoading || isSwitching || operationInFlight || download.isBusy || connectionPhase.blocksSwitching }
@@ -88,9 +93,24 @@ final class RouterESimViewModel {
         guard !statusPoller.isRunning else { return }
         nextStatusCheck = .distantPast
         nextDownloadCheck = .distantPast
+        seenIdentityRevision = client.identityRevision
         statusPoller.start(interval: .seconds(1)) { [weak self] in
             guard let self else { return .failure }
             guard !self.isLoading, !self.isSwitching, !self.operationInFlight else { return .success }
+            // The connection check's own reads carry the router's SIM identity. When it moved
+            // (a switch from the card's menu, a swapped card, or the WAN coming up), check now
+            // and re-read the list unless a switch or download owns the card.
+            if self.client.identityRevision != self.seenIdentityRevision {
+                self.seenIdentityRevision = self.client.identityRevision
+                self.nextStatusCheck = .distantPast
+                if !self.blocksSwitching {
+                    // Busy while the agent holds the card for the read, so a switch or delete
+                    // confirmed meanwhile waits for it instead of failing with "eSIM manager busy".
+                    self.isLoading = true
+                    defer { self.isLoading = false }
+                    await self.loadProfiles()
+                }
+            }
             if self.download.isBusy || Date() >= self.nextDownloadCheck {
                 await self.pollDownload()
                 self.nextDownloadCheck = Date().addingTimeInterval(30)
@@ -110,9 +130,13 @@ final class RouterESimViewModel {
     }
 
     /// Takes the profile from the dialog button: SwiftUI clears `pendingSwitch` when the dialog
-    /// closes, before this task runs.
+    /// closes, before this task runs. A list read the monitor started meanwhile (a new SIM
+    /// identity) holds the card briefly; the switch waits for it rather than being dropped.
     func confirmSwitch(to target: RouterESimProfile) async {
-        guard target.canEnable, !blocksSwitching else { return }
+        while isLoading && !Task.isCancelled { try? await Task.sleep(for: .milliseconds(100)) }
+        // Checked against the list as now read: the card's own menu may have enabled the target.
+        guard profiles.contains(where: { $0.iccid == target.iccid && $0.canEnable }) else { return }
+        guard !blocksSwitching else { showMessage(Self.busyText, isError: false); return }
         pendingSwitch = nil
         isSwitching = true
         message = nil
@@ -131,7 +155,7 @@ final class RouterESimViewModel {
                 profiles = profiles.map {
                     RouterESimProfile(iccid: $0.iccid, provider: $0.provider, name: $0.name,
                                       nickname: $0.nickname, isEnabled: $0.iccid == target.iccid,
-                                      profileClass: $0.profileClass)
+                                      profileClass: $0.profileClass, switchWarnings: $0.switchWarnings)
                 }
             }
             beginFollowingSwitch(to: target)
@@ -209,10 +233,12 @@ final class RouterESimViewModel {
         pendingDelete = profile
     }
 
-    /// Takes the profile from the dialog button (see `confirmSwitch(to:)`).
+    /// Takes the profile from the dialog button and waits out a background list read (see
+    /// `confirmSwitch(to:)`).
     func confirmDelete(_ target: RouterESimProfile) async {
-        guard !blocksSwitching,
-              profiles.contains(where: { $0.iccid == target.iccid && !$0.isEnabled }) else { return }
+        while isLoading && !Task.isCancelled { try? await Task.sleep(for: .milliseconds(100)) }
+        guard profiles.contains(where: { $0.iccid == target.iccid && !$0.isEnabled }) else { return }
+        guard !blocksSwitching else { showMessage(Self.busyText, isError: false); return }
         pendingDelete = nil
         operationInFlight = true
         message = nil

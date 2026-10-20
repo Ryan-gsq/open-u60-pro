@@ -42,6 +42,8 @@ struct ForwardLogEntry: Identifiable, Sendable {
     let destinationType: String
     let success: Bool
     let error: String?
+    /// Held while the router had no link; the agent retries it on its own.
+    let pending: Bool
 }
 
 // MARK: - Parsing & Serialization
@@ -152,7 +154,8 @@ enum SMSForwardParser {
             return nil
         }
         return ForwardLogEntry(
-            id: "\(timestamp)-\(smsId)",
+            // One SMS can have an entry per rule (a held one next to a failed one).
+            id: "\(timestamp)-\(smsId)-\(parseIntValue(data["rule_id"]) ?? 0)",
             timestamp: timestamp,
             smsId: smsId,
             sender: data["sender"] as? String ?? "",
@@ -160,7 +163,8 @@ enum SMSForwardParser {
             ruleName: data["rule_name"] as? String ?? "",
             destinationType: data["destination_type"] as? String ?? "",
             success: data["success"] as? Bool ?? false,
-            error: data["error"] as? String
+            error: data["error"] as? String,
+            pending: data["pending"] as? Bool ?? false
         )
     }
 

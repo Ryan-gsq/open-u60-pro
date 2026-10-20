@@ -1,5 +1,6 @@
 package com.openu60.core.model
 
+import com.openu60.core.network.AgentClient
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -109,6 +110,56 @@ class RouterESimParserTest {
     }
 
     @Test
+    fun observedSeqOrdersReadsAcrossClockJumps() {
+        // The read after a switch is often stamped about 8 h ahead, before the router's clock settles.
+        val ahead = RouterESimInventory(agentInstance = 1760860000000, generation = 2, observedAt = 28900, observedSeq = 4)
+        val later = ahead.copy(observedAt = 100, observedSeq = 5)
+        assertFalse(later.isOlderThan(ahead))
+        assertTrue(ahead.isOlderThan(later))
+        assertFalse(later.isOlderThan(later))
+        assertTrue("generation still decides first", later.copy(generation = 1).isOlderThan(ahead))
+        assertTrue("seq 0 falls back to observed_at", later.copy(observedSeq = 0).isOlderThan(ahead))
+        assertFalse("on either side", ahead.isOlderThan(later.copy(observedSeq = 0)))
+    }
+
+    @Test
+    fun switchWarningsAndManualApnDecode() {
+        val inv = RouterESimParser.parseInventory(AgentClient.json.decodeFromString<RouterESimProfilesResponse>("""
+            {"agent_instance":1760860000000,"generation":3,"observed_at":1760860100,"observed_seq":7,
+             "manual_apn":{"name":"Office","apn":"internet.example"},
+             "profiles":[
+              {"class":"operational","iccid":"8963000000000000001","state":"enabled","provider":"SMART","name":"Operational","nickname":null},
+              {"class":"operational","iccid":"8965000000000000002","state":"disabled","provider":"Klook","name":"Travel","nickname":"Trip",
+               "switch_warnings":["manual_apn","roaming_off","future_code"]},
+              {"class":"operational","iccid":"8963000000000000003","state":"disabled","provider":"GOMO","name":"GOMO","nickname":null,
+               "switch_warnings":["manual_apn"]}]}
+        """))
+        assertEquals(7L, inv.observedSeq)
+        assertEquals(RouterESimManualApn("Office", "internet.example"), inv.manualApn)
+        assertEquals(emptyList<String>(), inv.profiles[0].switchWarnings)
+        assertEquals(listOf("manual_apn", "roaming_off", "future_code"), inv.profiles[1].switchWarnings)
+        val trip = inv.switchWarnings(inv.profiles[1])
+        assertEquals("unknown codes are skipped", 2, trip.size)
+        assertEquals("The router is set to the manual APN “internet.example”. If Trip needs a different APN, change it in Mobile Network after switching, or it may have no data.", trip[0])
+        assertEquals("Trip looks like a travel (roaming) profile and Data Roaming is off, so it will have no data until you turn Data Roaming on.", trip[1])
+        assertEquals(1, inv.switchWarnings(inv.profiles[2]).size)
+        assertTrue(inv.switchWarnings(inv.profiles[2])[0].contains("If GOMO needs"))
+        assertEquals(emptyList<String>(), inv.switchWarnings(inv.profiles[0]))
+
+        val old = RouterESimParser.parseInventory(AgentClient.json.decodeFromString<RouterESimProfilesResponse>("""
+            {"agent_instance":1760860000000,"generation":3,"observed_at":1760860100,
+             "profiles":[{"class":"operational","iccid":"8965000000000000002","state":"disabled","provider":"Klook","name":"Travel","nickname":null}]}
+        """))
+        assertEquals(0L, old.observedSeq)
+        assertEquals(null, old.manualApn)
+        assertEquals("an older agent gives no warnings", emptyList<String>(), old.switchWarnings(old.profiles[0]))
+        val auto = RouterESimParser.parseInventory(AgentClient.json.decodeFromString<RouterESimProfilesResponse>(
+            """{"manual_apn":null,"profiles":[{"iccid":"8965000000000000002","state":"disabled","class":"operational","switch_warnings":["roaming_off"]}]}"""))
+        assertEquals(null, auto.manualApn)
+        assertEquals(1, auto.switchWarnings(auto.profiles[0]).size)
+    }
+
+    @Test
     fun switchStatusMapsToScreenPhases() {
         val sw = json.decodeFromString<RouterESimSwitchStatus>("""{"state":"card_confirmed","target_iccid":"89630000000000000027","generation":4,"started_at":1,"card_confirmed_at":7,"finished_at":0,"note":null}""")
         assertEquals("89630000000000000027", sw.targetICCID)
@@ -131,5 +182,19 @@ class RouterESimParserTest {
         assertTrue(RouterESimSwitchStatus("not_applied").outcomeNote!!.contains("didn't happen"))
         assertEquals(RouterESimConnectionPhase.UNAVAILABLE, RouterESimSwitchStatus("not_applied").phase)
         assertFalse(RouterESimSwitchStatus("connected").isRunning)
+    }
+
+    @Test
+    fun identityChangeDuringAReadWaitsForItInsteadOfBeingDropped() {
+        val read = RouterESimIdentityRead()
+        assertFalse("no change, no read", read.take(busy = false))
+        read.changed()
+        assertFalse("the `online` change lands while a list read runs", read.take(busy = true))
+        assertFalse("still running", read.take(busy = true))
+        assertTrue("read once the screen is free", read.take(busy = false))
+        assertFalse("one change, one read", read.take(busy = false))
+        read.changed(); read.changed()
+        assertTrue("changes that pile up during a read need one read", read.take(busy = false))
+        assertFalse(read.take(busy = false))
     }
 }

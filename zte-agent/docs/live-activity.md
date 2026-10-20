@@ -127,6 +127,15 @@ A failed signal read never becomes a new successful sample. Token/config/payload
 rejections stop that registration and expose a sanitized error; correct the issue
 and register again. Accurate device UTC is needed for TLS, JWT and sample age.
 
+The HTTP/2 connection to Apple is rebuilt after any network change the recovery
+logic sees (WAN down/up, SIM ready or removed, and the agent's `zte_agent.sim_identity`
+phases) and after a transport failure, so pushes never reuse a socket bound to the
+old WAN address. The SIM identity event pauses delivery on `leaving` (label
+`sim_leaving`) and checks the connection again on `online` (`sim_online`); see
+[esim.md](esim.md#sim-identity-event). Verified 2026-10-20 on an eSIM switch (DITO →
+GOMO): paused at the switch, resumed 26 s later with a new APNs connection, Apple
+kept accepting a push every 15 s, and the Lock Screen activity kept updating.
+
 `last_accepted_at` means Apple accepted a request, NOT that the iPhone displayed it.
 Without credentials and a matching iOS Live Activity, only local tests/builds can
 be verified. Actual Apple delivery, background timing and modem resource use need

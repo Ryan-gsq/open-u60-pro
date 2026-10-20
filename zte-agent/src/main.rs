@@ -23,6 +23,7 @@ mod router;
 mod scheduler;
 mod server;
 mod sim;
+mod sim_identity;
 mod sms;
 mod sms_forward;
 mod speedtest;
@@ -65,7 +66,7 @@ fn main() {
     }
 
     // Event bus: single `ubus listen` process dispatches to subscribers
-    let event_bus = EventBus::new();
+    let event_bus = Arc::new(EventBus::new());
     let sms_rx = event_bus.subscribe("zwrt_wms_status_event");
     let charger_rx = event_bus.subscribe("BSP_CHARGER_EVENT");
     let service_rx = event_bus.subscribe("zwrt_servicestatus");
@@ -75,6 +76,7 @@ fn main() {
         "zwrt_card_state_event",
         "router_event_wan_connect_status",
         "network.interface",
+        sim_identity::EVENT,
     ]
     .into_iter()
     .map(|name| (name, event_bus.subscribe(name)))
@@ -88,6 +90,10 @@ fn main() {
     // The firmware restarts Wi-Fi on every wake from sleep, which re-runs the
     // zte_post_wifi.sh script that can spin forever; check 150 s after each.
     let power_rx = event_bus.subscribe("zwrt_device_power_state_event");
+    let identity_events = sim_identity::FIRMWARE_EVENTS
+        .iter()
+        .map(|&name| (name, event_bus.subscribe(name)))
+        .collect();
     event_bus.start();
     system::spawn_named("wifi-power-watch", move || {
         for event in power_rx.iter() {
@@ -98,6 +104,7 @@ fn main() {
     });
 
     Arc::clone(&state.cache).start_event_invalidation(cache_events);
+    state.sim_identity.start(Arc::clone(&event_bus), Arc::clone(&state.cache), identity_events);
 
     state.live_activity.start(Arc::clone(&state), apns_events);
     state.doh.auto_start();

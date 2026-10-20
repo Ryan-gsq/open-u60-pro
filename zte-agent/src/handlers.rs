@@ -35,6 +35,8 @@ pub struct AppState {
     pub call_active: std::sync::atomic::AtomicBool,
     /// Unix seconds of the last USSD prompt that still needs a reply (0 = none).
     pub ussd_prompt_at: std::sync::atomic::AtomicU64,
+    /// Tracks the active SIM's identity across profile switches and swaps (see sim_identity.rs).
+    pub sim_identity: Arc<crate::sim_identity::SimIdentity>,
 }
 
 impl AppState {
@@ -59,6 +61,7 @@ impl AppState {
             conn_watchdog: Arc::new(crate::conn_watchdog::ConnWatchdog::new()),
             call_active: std::sync::atomic::AtomicBool::new(false),
             ussd_prompt_at: std::sync::atomic::AtomicU64::new(0),
+            sim_identity: Arc::new(crate::sim_identity::SimIdentity::new()),
         }
     }
 }
@@ -129,6 +132,7 @@ pub fn network_signal(state: &AppState) -> (u16, Value) {
         Ok(mut data) => {
             if let Some(obj) = data.as_object_mut() {
                 obj.insert("bearer".into(), crate::bearer::read());
+                state.sim_identity.stamp(obj);
             }
             (200, json!({"ok": true, "data": data}))
         }

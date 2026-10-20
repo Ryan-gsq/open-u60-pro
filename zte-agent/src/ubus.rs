@@ -29,6 +29,27 @@ pub fn call(object: &str, method: &str, params: Option<&str>) -> Result<Value, S
     serde_json::from_str(trimmed).map_err(|e| format!("ubus JSON parse: {e}"))
 }
 
+/// `ubus send <event> <payload>`: broadcasts an agent event to other processes on the router.
+pub fn send(event: &str, payload: &Value) -> Result<(), String> {
+    let output = send_command(event, payload)
+        .output()
+        .map_err(|e| format!("ubus exec: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "ubus send {event} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn send_command(event: &str, payload: &Value) -> Command {
+    let mut cmd = Command::new("ubus");
+    cmd.args(["-t", "3", "send", event, &payload.to_string()]);
+    cmd
+}
+
 /// Run `uci get <key>` and return the value.
 pub fn uci_get(key: &str) -> Result<String, String> {
     let output = Command::new("uci")
@@ -120,6 +141,14 @@ mod uci_show_tests {
         assert_eq!(m["wireless.x.ssid"], "Bob's Wi-Fi");
         assert_eq!(m["wireless.x.tricky"], "' '");
         assert_eq!(m["wireless.x.spaced"], "a b");
+    }
+
+    #[test]
+    fn send_command_passes_event_and_compact_json() {
+        let cmd = super::send_command("zte_agent.sim_identity", &serde_json::json!({"phase": "online", "epoch": 1}));
+        assert_eq!(cmd.get_program(), "ubus");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["-t", "3", "send", "zte_agent.sim_identity", r#"{"epoch":1,"phase":"online"}"#]);
     }
 }
 

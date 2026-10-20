@@ -5,6 +5,7 @@ import Foundation
 final class AgentClient {
     var requests: [String] = []
     var bodies: [[String: Any]] = []
+    var identityRevision = 0
     var status: [String: Any] = ["state": "idle"]
     var switchStatus: [String: Any] = ["state": "idle"]
     var inventoryMeta: [String: Any] = [:]
@@ -12,6 +13,8 @@ final class AgentClient {
     var postError: Error?
     var holdStatus = false
     var statusGate: CheckedContinuation<Void, Never>?
+    var holdProfiles = false
+    var profilesGate: CheckedContinuation<Void, Never>?
     var entries: [[String: Any]] = [
         ["iccid": "8963000000000000001", "provider": "Smart", "class": "operational", "state": "enabled"],
         ["iccid": "8963000000000000002", "provider": "GOMO", "class": "operational", "state": "disabled"]
@@ -24,6 +27,7 @@ final class AgentClient {
     }
     func getJSON(_ path: String) async throws -> [String: Any] {
         requests.append("GET " + path)
+        if path == "/api/esim/profiles" && holdProfiles { await withCheckedContinuation { profilesGate = $0 } }
         switch path {
         case "/api/esim/profiles": return inventoryMeta.merging(["profiles": entries]) { _, new in new }
         case "/api/esim/chip": return ["eid": "89000000000000000000000000000001", "firmware": "4.2.0"]
@@ -66,6 +70,14 @@ struct RouterESimFlowTests {
         precondition(client.requests.count == beforeBlockedRetry, "A list retry must respect the download's exclusive card access")
         vm.requestSwitch(to: other); vm.requestDelete(other)
         precondition(vm.pendingSwitch == nil && vm.pendingDelete == nil, "Download excludes switch/delete")
+        let postsWhileBusy = client.bodies.count
+        await vm.confirmSwitch(to: other)
+        precondition(client.bodies.count == postsWhileBusy && vm.message == RouterESimViewModel.busyText && !vm.messageIsError,
+                     "A switch confirmed while the card is in use says so instead of vanishing")
+        vm.message = nil
+        await vm.confirmDelete(other)
+        precondition(client.bodies.count == postsWhileBusy && vm.message == RouterESimViewModel.busyText && !vm.messageIsError,
+                     "A delete confirmed while the card is in use says so instead of vanishing")
         let readsBeforeRefresh = client.requests.filter { $0 == "GET /api/esim/profiles" }.count
         client.status = client.postResult
         await vm.refresh()
@@ -169,6 +181,47 @@ struct RouterESimFlowTests {
         precondition(switchClient.requests.last == "GET /api/esim/profiles" && switchClient.bodies.last?["nickname"] as? String == "Travel")
         await switchVM.confirmRename(target, to: String(repeating: "x", count: 65))
         precondition(switchVM.messageIsError && switchClient.bodies.last?["nickname"] as? String == "Travel", "Over-long names never reach the router")
-        print("RouterESimFlowTests: request ordering, operation guards, installation safety, resume, deletion, and errors passed")
+        // A moved SIM identity (a switch from the card's menu, a swapped card) re-reads the list and
+        // the connection on the next monitor tick, not at the 12 s connection check.
+        let watchClient = AgentClient()
+        let watchVM = RouterESimViewModel(client: watchClient, authManager: AuthManager())
+        await watchVM.refresh()
+        watchVM.startMonitoring()
+        func soon(_ condition: () -> Bool) async -> Bool {
+            for _ in 0..<250 where !condition() { try? await Task.sleep(for: .milliseconds(10)) }
+            return condition()
+        }
+        let checksBefore = watchClient.requests.filter { $0 == "GET /api/network/signal" }.count
+        let checked = await soon { watchClient.requests.filter { $0 == "GET /api/network/signal" }.count > checksBefore }
+        precondition(checked, "Monitoring starts with a connection check")
+        let idleMark = watchClient.requests.count
+        try? await Task.sleep(for: .milliseconds(1200))
+        precondition(!watchClient.requests[idleMark...].contains("GET /api/esim/profiles"), "An unchanged identity reads nothing")
+        precondition(!watchVM.blocksSwitching)
+        watchClient.holdProfiles = true
+        watchClient.identityRevision += 1
+        let reread = await soon { watchClient.profilesGate != nil }
+        precondition(reread && watchClient.requests[idleMark...].contains("GET /api/esim/profiles"), "A new SIM identity re-reads the list")
+        // The agent holds the card for that read: a switch confirmed now must wait, not hit a 409
+        // and not be dropped.
+        precondition(watchVM.blocksSwitching, "The identity-triggered list read marks the screen busy")
+        let otherProfile = watchVM.profiles.first(where: \.canEnable)!
+        let gatedSwitch = Task { await watchVM.confirmSwitch(to: otherProfile) }
+        try? await Task.sleep(for: .milliseconds(350))
+        precondition(!watchClient.requests.contains { $0.hasPrefix("POST ") }, "No POST while the identity re-read holds the card")
+        precondition(watchVM.message == nil, "A waiting switch is neither dropped nor reported busy")
+        watchClient.holdProfiles = false
+        watchClient.profilesGate?.resume()
+        watchClient.profilesGate = nil
+        await gatedSwitch.value
+        precondition(watchClient.requests.filter { $0.hasPrefix("POST ") } == ["POST /api/esim/enable"]
+                     && watchClient.bodies.last?["iccid"] as? String == otherProfile.iccid,
+                     "The switch confirmed during the re-read runs exactly once after it")
+        precondition(watchVM.message != RouterESimViewModel.busyText, "A switch that ran is not reported busy")
+        let rechecked = await soon { watchClient.requests[idleMark...].contains("GET /api/sim/info") }
+        precondition(rechecked, "A new SIM identity checks the connection now")
+        precondition(!watchVM.isLoading, "The screen is free again after the re-read")
+        watchVM.stopMonitoring()
+        print("RouterESimFlowTests: request ordering, operation guards, installation safety, resume, deletion, errors, and identity re-reads passed")
     }
 }

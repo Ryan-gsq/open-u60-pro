@@ -5,14 +5,21 @@ use crate::handlers::AppState;
 use crate::ubus;
 
 pub fn sim_info(state: &AppState) -> (u16, Value) {
-    let fetch = || ubus::call("zwrt_zte_mdm.api", "get_sim_info", Some("{}"));
-    match state
-        .cache
-        .get_or_fetch(cache::SIM_INFO, cache::SIM_INFO_TTL, fetch)
-    {
-        Ok(data) => (200, json!({"ok": true, "data": data})),
+    match info(state) {
+        Ok(mut data) => {
+            if let Some(obj) = data.as_object_mut() {
+                state.sim_identity.stamp(obj);
+            }
+            (200, json!({"ok": true, "data": data}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
+}
+
+/// `get_sim_info`, through the shared cache.
+pub(crate) fn info(state: &AppState) -> Result<Value, String> {
+    let fetch = || ubus::call("zwrt_zte_mdm.api", "get_sim_info", Some("{}"));
+    state.cache.get_or_fetch(cache::SIM_INFO, cache::SIM_INFO_TTL, fetch)
 }
 
 /// PIN/PUK/lock operations change `get_sim_info` (state, remaining tries)

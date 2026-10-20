@@ -17,6 +17,11 @@ final class AgentClient {
     @ObservationIgnored
     var onUnauthorized: (@MainActor () async -> Bool)?
 
+    /// Moves each time a response shows the router on another SIM identity or in another
+    /// switch phase (see `SimIdentityTracker`). Screens re-read SIM-bound state when it does.
+    private(set) var identityRevision = 0
+    @ObservationIgnored private var identity = SimIdentityTracker()
+
     private let session: URLSession
 
     init(baseURL: String = "http://192.168.0.1:9090") {
@@ -95,6 +100,18 @@ final class AgentClient {
         return payload as? [String: Any] ?? [:]
     }
 
+    // MARK: - SIM identity
+
+    /// Keeps `identityRevision` current on a screen that polls nothing stamped itself: the
+    /// dashboard's poller stops while another tab is shown. `/api/esim/switch` is answered from
+    /// the agent's memory, so this costs the router no ubus fork.
+    func watchSimIdentity() async {
+        while !Task.isCancelled {
+            _ = try? await getJSON("/api/esim/switch")
+            try? await Task.sleep(for: .seconds(2))
+        }
+    }
+
     // MARK: - Auth
 
     /// Login with plaintext password. Returns the token string.
@@ -141,14 +158,15 @@ final class AgentClient {
     // MARK: - Internal
 
     /// Runs a request whose response is the `{ ok, data, error }` envelope and hands back the raw
-    /// `data` field, leaving the shape cast to the caller.
+    /// `data` field, leaving the shape cast to the caller. Every raw read of a stamped endpoint,
+    /// from any screen, also feeds the SIM identity tracker.
     private func envelopeData(
         method: String,
         path: String,
         body: Data?,
         retryOnUnauthorized: Bool = true
     ) async throws -> Any? {
-        try await send(
+        let payload = try await send(
             method: method,
             path: path,
             body: body,
@@ -162,6 +180,8 @@ final class AgentClient {
             }
             return json["data"]
         }
+        if identity.observe(payload as? [String: Any]) { identityRevision += 1 }
+        return payload
     }
 
     /// Builds the request on the main actor, runs and parses it off the main actor, and gives the

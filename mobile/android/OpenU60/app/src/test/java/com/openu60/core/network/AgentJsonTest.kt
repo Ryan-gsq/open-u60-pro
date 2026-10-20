@@ -1,6 +1,7 @@
 package com.openu60.core.network
 
 import com.openu60.core.model.DeviceParser
+import com.openu60.feature.router.sim.SIMViewModel
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
@@ -51,5 +52,28 @@ class AgentJsonTest {
         assertEquals(null, DeviceParser.asInt("03:00"))
         assertTrue(DeviceParser.asBool("1") && DeviceParser.asBool("2") && DeviceParser.asBool("ON") && DeviceParser.asBool(1L))
         assertFalse(DeviceParser.asBool("0") || DeviceParser.asBool("off") || DeviceParser.asBool(""))
+    }
+
+    @Test
+    fun stampedRepliesMoveIdentityRevisionOncePerChange() {
+        val client = AgentClient()
+        fun unwrap(epoch: Int, phase: String) = client.unwrapResponse(
+            """{"ok":true,"data":{"sim_iccid":"89630000000000000027","agent_instance":1760860000000,"sim_epoch":$epoch,"sim_phase":"$phase"}}""")
+        unwrap(0, "idle")
+        assertEquals("the first stamp only seeds", 0L, client.identityRevision.value)
+        val data = unwrap(1, "changed")
+        assertEquals(1L, client.identityRevision.value)
+        unwrap(1, "changed")
+        assertEquals("an identical stamp is no change", 1L, client.identityRevision.value)
+        client.unwrapResponse("""{"ok":true,"data":{"sim_iccid":"89630000000000000027"}}""")
+        client.unwrapResponse("""{"ok":true,"data":[]}""")
+        assertEquals("unstamped replies leave it alone", 1L, client.identityRevision.value)
+        assertEquals("89630000000000000027", data["sim_iccid"])
+        assertEquals(1760860000000L, data["agent_instance"])
+    }
+
+    @Test
+    fun simScreenReadsTheRoutedLockTrials() {
+        assertEquals("/api/sim/lock-trials", SIMViewModel.LOCK_TRIALS_PATH)
     }
 }

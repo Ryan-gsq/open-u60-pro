@@ -86,6 +86,56 @@ struct RouterESimTests {
         precondition(!RouterESimParser.parseInventory(["profiles": []]).isOlder(than: inv), "Older agents carry no counters")
         precondition(RouterESimParser.parseInventory(data(#"{"profiles":[],"error":null,"pending_receipts":null}"#)).errorText == nil)
 
+        // The read counter orders reads of one generation; the router clock jumps hours on attach.
+        let jumped = RouterESimParser.parseInventory(data(#"{"agent_instance":5,"generation":2,"observed_at":28900,"observed_seq":4,"profiles":[]}"#))
+        let afterJump = RouterESimParser.parseInventory(data(#"{"agent_instance":5,"generation":2,"observed_at":100,"observed_seq":5,"profiles":[]}"#))
+        precondition(jumped.observedSeq == 4 && afterJump.observedSeq == 5)
+        precondition(!afterJump.isOlder(than: jumped) && jumped.isOlder(than: afterJump),
+                     "A later read stamped before the clock jump's time is still the newer one")
+        var noSeq = afterJump; noSeq.observedSeq = 0
+        precondition(noSeq.isOlder(than: jumped) && !jumped.isOlder(than: noSeq), "Without the counter on one side, read times decide")
+        var shownNoSeq = jumped; shownNoSeq.observedSeq = 0
+        precondition(afterJump.isOlder(than: shownNoSeq), "Without the counter on the shown side, read times decide")
+        var nextGeneration = jumped; nextGeneration.generation = 3; nextGeneration.observedSeq = 1
+        precondition(!nextGeneration.isOlder(than: afterJump), "The change counter still comes first")
+
+        // Pre-switch warnings: advisory sentences naming the APN and the target.
+        let warned = RouterESimParser.parseInventory(data(#"""
+        {"agent_instance":5,"generation":2,"observed_seq":6,"manual_apn":{"name":"Office","apn":"internet.example"},
+         "profiles":[
+          {"class":"operational","iccid":"8963000000000000001","state":"enabled","provider":"SMART","name":"Operational","nickname":null},
+          {"class":"operational","iccid":"8965000000000000002","state":"disabled","provider":"Travel","name":"","nickname":"Trip",
+           "switch_warnings":["manual_apn","roaming_off","future_code"]},
+          {"class":"operational","iccid":"8963000000000000003","state":"disabled","provider":"GOMO","name":"","nickname":null,
+           "switch_warnings":["manual_apn"]}]}
+        """#))
+        precondition(warned.manualAPN == RouterESimManualAPN(name: "Office", apn: "internet.example"))
+        precondition(warned.profiles[0].switchWarnings.isEmpty && warned.profiles[2].switchWarnings == ["manual_apn"])
+        precondition(warned.profiles[1].switchWarnings == ["manual_apn", "roaming_off", "future_code"])
+        let travel = warned.switchWarnings(for: warned.profiles[1])
+        precondition(travel == [
+            "The router is set to the manual APN “internet.example”. If Trip needs a different APN, change it in Mobile Network after switching, or it may have no data.",
+            "Trip looks like a travel (roaming) profile and Data Roaming is off, so it will have no data until you turn Data Roaming on."
+        ], "Both known codes name the APN and the target; the unknown one is skipped")
+        precondition(warned.switchWarnings(for: warned.profiles[2]).count == 1)
+        precondition(warned.switchWarnings(for: warned.profiles[0]).isEmpty)
+        var stillListed = warned.profiles[1]; stillListed.switchWarnings = []
+        precondition(warned.switchWarnings(for: stillListed).count == 2, "The dialog's profile takes the list's current codes")
+        let apnOff = RouterESimParser.parseInventory(data(#"""
+        {"manual_apn":null,"profiles":[{"class":"operational","iccid":"8965000000000000002","state":"disabled","provider":"Travel",
+          "switch_warnings":["roaming_off","manual_apn"]}]}
+        """#))
+        precondition(apnOff.manualAPN == nil)
+        precondition(apnOff.switchWarnings(for: apnOff.profiles[0]) == [
+            "Travel looks like a travel (roaming) profile and Data Roaming is off, so it will have no data until you turn Data Roaming on."
+        ], "manual_apn without the APN itself is skipped")
+        let olderAgent = RouterESimParser.parseInventory(data(#"""
+        {"agent_instance":5,"generation":2,"observed_at":100,
+         "profiles":[{"class":"operational","iccid":"8965000000000000002","state":"disabled","provider":"Travel"}]}
+        """#))
+        precondition(olderAgent.observedSeq == 0 && olderAgent.manualAPN == nil && olderAgent.profiles[0].switchWarnings.isEmpty)
+        precondition(olderAgent.switchWarnings(for: olderAgent.profiles[0]).isEmpty, "An older agent's list gives no warnings")
+
         let sw = try! JSONDecoder().decode(RouterESimSwitchStatus.self, from: Data(#"{"state":"card_confirmed","target_iccid":"8963000000000000002","generation":4,"started_at":1,"card_confirmed_at":7,"finished_at":0,"note":null}"#.utf8))
         precondition(sw.isRunning && sw.cardConfirmed && sw.phase == .registering && sw.targetICCID == "8963000000000000002")
         for (state, phase, running) in [("reloading", RouterESimConnectionPhase.reloading, true), ("connected", .connected, false),
@@ -106,6 +156,6 @@ struct RouterESimTests {
         precondition(RouterESimSwitchStatus(state: "not_applied").outcomeNote?.contains("didn't happen") == true)
         precondition(RouterESimSwitchStatus(state: "connected").progressNote == nil)
 
-        print("RouterESimTests: identifiers, reconnection, activation codes, and download stages passed")
+        print("RouterESimTests: identifiers, reconnection, activation codes, download stages, read ordering, and switch warnings passed")
     }
 }

@@ -1,6 +1,11 @@
 package com.openu60.core.network
 
+import com.openu60.core.model.SimIdentityTracker
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -34,6 +39,15 @@ class AgentClient @Inject constructor() {
 
     var baseURL: String = "http://192.168.0.1:9090"
     var token: String? = null
+
+    private val identity = SimIdentityTracker()
+    private val _identityRevision = MutableStateFlow(0L)
+
+    /**
+     * Moves when a stamped reply (signal, SIM info, eSIM switch) shows a new SIM identity. Any
+     * screen's poll feeds it; the dashboard keeps polling the signal while other screens are open.
+     */
+    val identityRevision: StateFlow<Long> = _identityRevision.asStateFlow()
 
     // MARK: - Typed REST methods
 
@@ -188,12 +202,13 @@ class AgentClient @Inject constructor() {
         }
     }
 
-    private fun unwrapResponse(data: String): Map<String, Any?> {
+    internal fun unwrapResponse(data: String): Map<String, Any?> {
         val element = Json.parseToJsonElement(data)
         val obj = element.jsonObject
         val ok = obj["ok"]?.jsonPrimitive?.booleanOrNull ?: false
         if (!ok) throw AgentError.ServerError(obj["error"]?.jsonPrimitive?.contentOrNull ?: "Unknown error")
         val dataElement = obj["data"]
+        if (dataElement is JsonObject && identity.observe(dataElement)) _identityRevision.update { it + 1 }
         return when (dataElement) {
             is JsonObject -> dataElement.toMap()
             else -> emptyMap()

@@ -179,8 +179,9 @@ final class SMSForwardViewModel {
     func clearLog() async {
         do {
             let _ = try await client.postJSON("/api/sms/forward/log/clear")
-            log = []
             showMessage("Log cleared", isError: false)
+            // Held forwards survive a clear: show the entries the agent kept.
+            await fetchLog()
         } catch {
             report(error, as: "Failed")
         }

@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -72,6 +73,22 @@ class RouterESimViewModel @Inject constructor(
     /** Following the agent's verified switch (GET /api/esim/switch); off for older agents. */
     private var followSwitch = false
     private var switchListRead = false
+    private val identityRead = RouterESimIdentityRead()
+
+    init {
+        // A switch from the card menu, a SIM swap or an agent restart: check the connection now
+        // and re-read the list once a running read or operation ends (skipped while a switch or
+        // download owns the card).
+        viewModelScope.launch {
+            agentClient.identityRevision.drop(1).collect { nextStatusCheck = 0L; identityRead.changed(); readForIdentity() }
+        }
+    }
+
+    /** Re-reads the list for a moved SIM identity; a change during a read or an operation waits for it. */
+    private fun readForIdentity() {
+        val s = _state.value
+        if (identityRead.take(busy = s.isLoading || s.isSwitching || s.operationInFlight || downloadInFlight)) retryProfiles()
+    }
 
     fun refresh() {
         if (_state.value.isLoading || _state.value.isSwitching || _state.value.operationInFlight || downloadInFlight) return
@@ -117,6 +134,7 @@ class RouterESimViewModel @Inject constructor(
         nextDownloadCheck = 0L
         monitor = viewModelScope.launch {
             while (currentCoroutineContext().isActive) {
+                readForIdentity() // an identity change that waited for a read or an operation
                 if (!_state.value.isLoading && !_state.value.isSwitching && !_state.value.operationInFlight) {
                     if (_state.value.download.isBusy || SystemClock.elapsedRealtime() >= nextDownloadCheck) {
                         pollDownload()
