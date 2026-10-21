@@ -1,7 +1,7 @@
 <div align="center">
 
 <p>
-<img src="mobile/ios/screenshots/screenshot1.PNG" alt="Dashboard" width="250">&nbsp;&nbsp;<img src="mobile/ios/screenshots/screenshot3.png" alt="Signal Monitor" width="250">&nbsp;&nbsp;<img src="mobile/ios/screenshots/screenshot2.PNG" alt="Router Settings" width="250">
+<img src="mobile/ios/screenshots/dashboard.png" alt="Dashboard" width="250">&nbsp;&nbsp;<img src="mobile/ios/screenshots/connection-signal.png" alt="Connection and signal" width="250">&nbsp;&nbsp;<img src="mobile/ios/screenshots/esim-profiles.png" alt="eSIM profiles" width="250">
 </p>
 
 # ZTE U60 Pro Toolkit
@@ -18,7 +18,7 @@ config backup/decryption, network customization, and more.
 [![Website](https://img.shields.io/badge/website-open--u60--pro.vercel.app-blue.svg)](https://open-u60-pro.vercel.app)
 [![Release](https://img.shields.io/github/v/release/jesther-ai/open-u60-pro)](https://github.com/jesther-ai/open-u60-pro/releases/latest)
 
-**Download:** [latest release](https://github.com/jesther-ai/open-u60-pro/releases/latest) · **What's new:** [CHANGELOG.md](CHANGELOG.md)
+**Download:** [latest release](https://github.com/jesther-ai/open-u60-pro/releases/latest) · **What's new:** [CHANGELOG.md](CHANGELOG.md) · **Screenshots:** [by feature](#screenshots)
 
 </div>
 
@@ -101,6 +101,38 @@ Native apps that connect directly over WiFi -- no computer needed.
 | **Features** | BandLock, Call, Clients, Config, Dashboard, DeviceInfo, Login, RouterSettings, Scheduler, Signal, SIM/STK/USSD, SMS, Tools, USBMode | BandLock, Clients, Config, Dashboard, DeviceInfo, Login, RouterSettings, Scheduler, Signal, SIM/STK, SMS, Tools, USBMode |
 | **Tabs** | Dashboard, SMS, Tools, Router, Settings | Dashboard, SMS, Tools, Router, Settings |
 | **Path** | `mobile/ios/OpenU60/` (109 Swift files) | `mobile/android/OpenU60/` (90 Kotlin files) |
+
+## Screenshots
+
+From the iOS app on iPhone. Personal identifiers (ICCID digits, cell IDs) are masked in these images.
+
+### Dashboard and signal
+
+The Dashboard shows the operator, network type, live traffic, battery, CPU temperature and connected devices. Tap **Connection & signal** for 5G NR and LTE readings (RSRP, RSRQ, SINR, RSSI), band, channel, bandwidth, the operator's speed cap, and a signal history chart.
+
+| Dashboard | Connection & signal |
+|:---:|:---:|
+| <img src="mobile/ios/screenshots/dashboard.png" alt="Dashboard with operator, 5G NSA, live traffic, battery, CPU temperature, and connected devices" width="220"> | <img src="mobile/ios/screenshots/connection-signal.png" alt="Connection and signal screen with 5G NR and LTE anchor readings, data session, and signal history chart" width="220"> |
+
+### eSIM profiles
+
+With an eSIM card such as the [9eSIM B1](docs/9esim-b1.md) in the SIM slot, **Router → eSIM Profiles** lists the operator profiles on the card. Swipe right on a profile to switch to it; the app shows each step until mobile data is back. Setup: [eSIM profiles](#esim-profiles-optional).
+
+| Profiles on the card | Switching profile |
+|:---:|:---:|
+| <img src="mobile/ios/screenshots/esim-profiles.png" alt="eSIM Profiles screen listing four operator profiles with the active one marked" width="220"> | <img src="mobile/ios/screenshots/esim-switching.png" alt="Profile switch in progress: switch profile and reload SIM done, connecting to network" width="220"> |
+
+### Battery and power
+
+Battery details, USB-C mode (charge your phone from the router's battery), and device controls: charge limit, power-save mode, fast boot and auto sleep.
+
+| Battery details | USB-C mode | Device controls |
+|:---:|:---:|:---:|
+| <img src="mobile/ios/screenshots/battery-details.png" alt="Battery details: capacity, charging status, voltage, current, power, temperature, time to full" width="220"> | <img src="mobile/ios/screenshots/usb-mode.png" alt="USB Mode sheet showing USB-C connected with a Fast Charging button" width="220"> | <img src="mobile/ios/screenshots/device-controls.png" alt="Device controls: charge limit at 85 percent, power-save mode, fast boot, auto sleep" width="220"> |
+
+### Lock Screen
+
+Live modem signal on the Lock Screen and in the Dynamic Island: see [iOS Live Activities](#ios-live-activities).
 
 ## Why Use This Instead of the Official ZTE App?
 
