@@ -8,11 +8,13 @@
 use maud::{html, Markup};
 
 use super::dashboard::{self, cpu_usage, fresh, percent, DASH};
+use super::signal::letters;
 use crate::boottime::BootInstant;
 use crate::events::Topic;
 use crate::web::fmt;
 use crate::web::kit::{self, Icon};
 use crate::web::render::{self, age_line, Fragment, Views};
+use crate::web::roll::roll;
 use crate::web::screen::PageData;
 
 // --- Live traffic ---
@@ -68,9 +70,9 @@ pub fn battery_rows(v: &Views) -> Markup {
             ul.list {
                 (kit::kv_row(Some(kit::battery_icon(capacity)), "Capacity", &dash_or(capacity.map(|c| format!("{c}%")))))
                 (kit::kv_row(Some(Icon::Bolt), "Status", fmt::charge_label(state, capacity).0))
-                @if let Some(mv) = mv { (kit::kv_row(Some(Icon::BoltCircle), "Voltage", &format!("{:.3} V", mv as f64 / 1000.0))) }
-                @if let Some(ma) = ma { (kit::kv_row(Some(Icon::Swap), "Current", &format!("{ma} mA"))) }
-                @if let Some(w) = b.and_then(fmt::watts) { (kit::kv_row(Some(Icon::Flame), "Power", &format!("{w:.1} W"))) }
+                @if let Some(mv) = mv { (kit::kv_row_m(Some(Icon::BoltCircle), "Voltage", roll(v, "bv", &format!("{:.3} V", mv as f64 / 1000.0)))) }
+                @if let Some(ma) = ma { (kit::kv_row_m(Some(Icon::Swap), "Current", roll(v, "bc", &format!("{ma} mA")))) }
+                @if let Some(w) = b.and_then(fmt::watts) { (kit::kv_row_m(Some(Icon::Flame), "Power", roll(v, "bw", &format!("{w:.1} W")))) }
                 // The app's temperature is in the primary colour (its other values are secondary).
                 li.it {
                     (kit::icon(Icon::Thermometer)) span { "Temperature" }
@@ -149,8 +151,8 @@ fn hl_cpu(v: &Views) -> Markup {
     html! {
         section #hl-cpu .card .ctr {
             (kit::icon(Icon::Cpu))
-            p.big { (percent(cpu_usage(v))) }
-            p.cap { (dash_or(cpu_temp(v).map(fmt::celsius))) }
+            p.big { (roll(v, "cpu", &percent(cpu_usage(v)))) }
+            p.cap.num { (roll(v, "ct", &dash_or(cpu_temp(v).map(fmt::celsius)))) }
             p.cap { "CPU" }
             (age_line(v, &[Topic::Health]))
         }
@@ -158,14 +160,14 @@ fn hl_cpu(v: &Views) -> Markup {
 }
 
 /// A temperature row: "—" once the reading is 10 s old, "Unavailable" when
-/// it is fresh but the sensor reports nothing valid.
-fn temp_row(i: Icon, label: &str, value: Option<f64>, fresh: bool) -> Markup {
+/// it is fresh but the sensor reports nothing valid; `key` rolls it.
+fn temp_row(v: &Views, key: &str, i: Icon, label: &str, value: Option<f64>, fresh: bool) -> Markup {
     html! {
         div {
             dt { (kit::icon(i)) " " (label) }
             @match (fresh, value) {
                 (true, None) => dd.muted { "Unavailable" },
-                (true, Some(t)) => dd { b { (fmt::celsius(t)) } },
+                (true, Some(t)) => dd { b { (roll(v, key, &fmt::celsius(t))) } },
                 (false, _) => dd { b { (DASH) } },
             }
         }
@@ -181,10 +183,10 @@ fn hl_temps(v: &Views) -> Markup {
     html! {
         div #hl-temps {
             dl.kv.tk {
-                (temp_row(Icon::Cpu, "CPU \u{b7} hottest sensor", cpu_temp(v), thermal_fresh))
-                (temp_row(Icon::Battery(100), "Battery", battery, fresh(v, Topic::Battery)))
-                @for (name, t) in sensors(v).into_iter().filter(|(n, _)| summary(n)) {
-                    (temp_row(Icon::Thermometer, &sensor_label(name), t, thermal_fresh))
+                (temp_row(v, "tc", Icon::Cpu, "CPU \u{b7} hottest sensor", cpu_temp(v), thermal_fresh))
+                (temp_row(v, "tb", Icon::Battery(100), "Battery", battery, fresh(v, Topic::Battery)))
+                @for (i, (name, t)) in sensors(v).into_iter().filter(|(n, _)| summary(n)).enumerate() {
+                    (temp_row(v, &format!("ts{}", letters(i)), Icon::Thermometer, &sensor_label(name), t, thermal_fresh))
                 }
             }
             p.cap {
@@ -202,11 +204,11 @@ fn hl_temps(v: &Views) -> Markup {
 fn hl_all(v: &Views) -> Markup {
     html! {
         dl #hl-all .kv .tk {
-            @for (name, t) in sensors(v) {
+            @for (i, (name, t)) in sensors(v).into_iter().enumerate() {
                 @let label = sensor_label(name);
                 div {
                     dt { (label) @if label != name { small.lbl { (name) } } }
-                    @match t { Some(t) => dd { (fmt::celsius(t)) }, None => dd.muted { "Unavailable" } }
+                    @match t { Some(t) => dd { (roll(v, &format!("ta{}", letters(i)), &fmt::celsius(t))) }, None => dd.muted { "Unavailable" } }
                 }
             }
         }
@@ -247,22 +249,22 @@ pub const CPU: [Fragment; 3] = [
     Fragment { id: "hc-temp", topics: &[Topic::Health], render: hc_temp },
 ];
 
-fn live_row(id: &str, i: Icon, label: &str, value: &str) -> Markup {
+fn live_row(id: &str, i: Icon, label: &str, value: Markup) -> Markup {
     html! { li.it id=(id) { (kit::icon(i)) span { (label) } span.v { (value) } } }
 }
 
 fn hc_use(v: &Views) -> Markup {
-    live_row("hc-use", Icon::Cpu, "CPU Usage", &percent(cpu_usage(v)))
+    live_row("hc-use", Icon::Cpu, "CPU Usage", roll(v, "cpu", &percent(cpu_usage(v))))
 }
 
 /// The cores the kernel reports (the app assumes 4).
 fn hc_cores(v: &Views) -> Markup {
     let n = v.value(Topic::Health).and_then(|h| h["cpu"]["cores"].as_array()).map(Vec::len).filter(|n| *n > 0);
-    live_row("hc-cores", Icon::Grid, "CPU Cores", &dash_or(n.map(|n| n.to_string())))
+    live_row("hc-cores", Icon::Grid, "CPU Cores", html! { (dash_or(n.map(|n| n.to_string()))) })
 }
 
 fn hc_temp(v: &Views) -> Markup {
-    live_row("hc-temp", Icon::Thermometer, "CPU \u{b7} hottest sensor", &dash_or(cpu_temp(v).map(fmt::celsius)))
+    live_row("hc-temp", Icon::Thermometer, "CPU \u{b7} hottest sensor", roll(v, "tc", &dash_or(cpu_temp(v).map(fmt::celsius))))
 }
 
 /// Uptime and memory from `/api/device/system` at page load (read 0), the
@@ -438,7 +440,7 @@ mod tests {
         // The fragment sits inside the disclosure, never around it.
         assert!(page.contains("<details><summary>All sensors</summary><dl class=\"kv tk\" id=\"hl-all\">"), "{page}");
         for want in [
-            "<section class=\"card ctr\" id=\"hl-cpu\">", "<p class=\"big\">12.3%</p>", "<p class=\"cap\">41.5 °C</p>",
+            "<section class=\"card ctr\" id=\"hl-cpu\">", "<p class=\"big\">12.3%</p>", "<p class=\"cap num\">41.5 °C</p>",
             "<a class=\"nl\" href=\"/ui/health/cpu\">CPU, memory &amp; processes</a>", "Temperatures",
             "CPU shows the hottest CPU zone. Board numbers follow the device’s sensor names.",
         ] {
@@ -448,7 +450,7 @@ mod tests {
         // (the app shows it only with sensors); live updates still find it.
         let none = health_body(&views(vec![(Topic::Health, json!({"cpu": {"overall": 5}, "thermal": {"sensors": []}}))])).into_string();
         assert!(none.contains("<details><summary>All sensors</summary><dl class=\"kv tk\" id=\"hl-all\"></dl></details>"), "{none}");
-        assert!(none.contains("<p class=\"cap\">—</p>"), "{none}");
+        assert!(none.contains("<p class=\"cap num\">—</p>"), "{none}");
         assert!(include_str!("../assets/app.css").contains("details:has(>#hl-all:empty) { display: none; }"));
     }
 
@@ -462,7 +464,7 @@ mod tests {
         app.auth.set_password("pw");
         let issued = app.auth.login("pw", Kind::Browser, PeerKey::UNKNOWN, &[]).unwrap();
         let p = app.auth.authenticate(Kind::Browser, issued.token.expose()).unwrap();
-        let pd = PageData { app: &app, p: &p, views: &v, reads: &reads, remote: false, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default() };
+        let pd = PageData { app: &app, p: &p, views: &v, reads: &reads, remote: false, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default(), secure: false };
         let s = cpu(&pd).into_string();
         for (label, value) in [
             ("CPU Usage", "12.3%"), ("CPU Cores", "6"), ("CPU · hottest sensor", "41.5 °C"), ("Uptime", "1d 2h 3m"),
@@ -482,7 +484,7 @@ mod tests {
         // A failed read: dashes, no "Memory Used".
         let reads = [Err("no /proc".to_owned()), Err("no /proc".to_owned())];
         let empty = views(vec![]);
-        let pd = PageData { app: &app, p: &p, views: &empty, reads: &reads, remote: false, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default() };
+        let pd = PageData { app: &app, p: &p, views: &empty, reads: &reads, remote: false, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default(), secure: false };
         let s = cpu(&pd).into_string();
         for label in ["CPU Usage", "CPU Cores", "Uptime", "Memory Total", "Memory Free"] {
             assert!(s.contains(&format!("<span>{label}</span><span class=\"v\">—</span>")), "{label} in {s}");

@@ -295,7 +295,7 @@ pub fn host_count(clients: &Value) -> Option<usize> {
 fn device_count(v: &Views) -> Markup {
     let n = v.value(Topic::Clients).and_then(host_count);
     html! {
-        b #wf-count .big { @match n { Some(n) => (n), None => (DASH) } }
+        b #wf-count .big { @match n { Some(n) => (crate::web::roll::roll(v, "dev", &n.to_string())), None => (DASH) } }
     }
 }
 
@@ -560,7 +560,7 @@ mod tests {
         let p = app.auth.authenticate(Kind::Browser, issued.token.expose()).unwrap();
         let v = Views::new(NOW, vec![]);
         let reads = [Ok(read)];
-        share(&PageData { app: &app, p: &p, views: &v, reads: &reads, remote: false, form: None, query, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default() }).into_string()
+        share(&PageData { app: &app, p: &p, views: &v, reads: &reads, remote: false, form: None, query, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default(), secure: false }).into_string()
     }
 
     /// The password's text is in the page only after "Show password"; the

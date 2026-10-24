@@ -34,6 +34,7 @@ mod stk;
 mod system;
 mod tailscale;
 mod telephony;
+mod tls;
 mod ubus;
 mod usb;
 mod web;
@@ -134,6 +135,12 @@ fn main() {
         busy_check(&state),
         connwd_wan_rx,
     );
+
+    // LAN HTTPS: load the certificates if it is on, write the local name
+    // for dnsmasq again (/tmp is tmpfs), issue again for a new address.
+    // Once, off the HTTP thread; the listener starts when it is on.
+    let tls = Arc::clone(&state.tls);
+    system::spawn_named("tls-start", move || tls.start());
 
     // Firmware bug guard: zte_post_wifi.sh can spin forever after any Wi-Fi
     // reconfiguration (see system::kill_stuck_post_wifi); sweep every 5 min.

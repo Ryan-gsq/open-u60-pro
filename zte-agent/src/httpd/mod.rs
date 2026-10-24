@@ -8,6 +8,7 @@ pub mod api;
 pub mod gate;
 pub mod guard;
 pub mod mobile;
+pub mod tls;
 
 use std::io::ErrorKind;
 use std::net::IpAddr;
@@ -99,7 +100,8 @@ impl Ctx {
         Ctx {
             gate: Arc::new(Gate::new(threads, SLOW_PERMITS, GATE_WAIT)),
             lan: Arc::new(Semaphore::new(LAN_STREAMS)),
-            hosts: Arc::new(HostPolicy::from_env()),
+            // The LAN HTTPS name answers only over HTTPS (`allows_via`).
+            hosts: Arc::new(HostPolicy::from_env_with(app.tls.name())),
             ts: Arc::new(TsNames::new(Arc::clone(&app.tailscale))),
             body_wait: BODY_WAIT,
             ops: Arc::default(),
@@ -128,21 +130,20 @@ fn clamp_threads(threads: usize) -> usize {
 /// Bind, then run the listener on this thread; never returns. `threads` is
 /// the number of general API calls that may block at once. Connections from
 /// the mobile-data side are refused (`mobile`; `ZTE_AGENT_ALLOW_MOBILE=1`
-/// serves them).
+/// serves them). The LAN HTTPS listener (`tls`) runs beside it on the same
+/// runtime, with the same router, caps and check, while HTTPS is on.
 pub fn serve(bind: &str, threads: usize, state: Arc<AppState>) {
     let threads = clamp_threads(threads);
     let side = mobile::Guard::from_env();
-    let listener = match std::net::TcpListener::bind(bind) {
+    let listener = match listen(bind) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[http] bind {bind}: {e}");
             std::process::exit(1);
         }
     };
-    set_tcp_keepalive(&listener);
-    if let Err(e) = listener.set_nonblocking(true) {
-        eprintln!("[http] set_nonblocking: {e}");
-        std::process::exit(1);
+    if let Ok(addr) = listener.local_addr() {
+        HTTP_PORT.store(addr.port(), std::sync::atomic::Ordering::Relaxed);
     }
     // Seed the CPU tracker with initial sample (speed tracker is demand-driven)
     state.cpu.sample();
@@ -154,36 +155,46 @@ pub fn serve(bind: &str, threads: usize, state: Arc<AppState>) {
             std::process::exit(1);
         }
     };
-    rt.block_on(accept_loop(listener, ctx, MAX_CONNS, side));
+    let caps = Caps::new(Limits::of(MAX_CONNS));
+    rt.block_on(async move {
+        let twin = side.twin();
+        tokio::spawn(tls::supervise(Arc::clone(&ctx.app.tls), ctx.clone(), caps.clone(), move || twin.twin()));
+        accept_loop_with(listener, ctx, caps, side, Wire::Plain).await
+    });
     std::process::exit(1);
 }
 
+/// The plain-http listener's port (`ZTE_AGENT_BIND`), set once it is bound.
+static HTTP_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(9090);
+
+/// The port the plain-http UI and API answer on (9090 unless
+/// `ZTE_AGENT_BIND` says otherwise), for texts that name it.
+pub fn http_port() -> u16 {
+    HTTP_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A bound, non-blocking listener with the keepalive settings.
+pub fn listen(bind: &str) -> std::io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(bind)?;
+    set_tcp_keepalive(&listener);
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
 /// Current-thread runtime; its blocking pool has room for every gate permit
-/// (so a permit holder never waits for a thread), the accept loop's
-/// interface lookup (`mobile`, one at a time) and one spare; its threads
-/// exit after 10 s idle.
+/// (so a permit holder never waits for a thread), each listener's
+/// interface lookup (`mobile`, one at a time per listener: :9090 and
+/// HTTPS), the HTTPS listener's certificate check (`tls::Tls::check`, at
+/// most one a minute, which may outlive its wait) and one spare; its
+/// threads exit after 10 s idle.
 fn runtime(threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
-        .max_blocking_threads(threads + SLOW_PERMITS + 2)
+        .max_blocking_threads(threads + SLOW_PERMITS + 4)
         .thread_name("http-blk")
         .thread_keep_alive(Duration::from_secs(10))
         .build()
-}
-
-/// Accept connections on a bound, non-blocking listener; returns only if the
-/// listener cannot be registered with the runtime it runs in. `side` says
-/// which peers are served (not the mobile-data side).
-pub async fn accept_loop(listener: std::net::TcpListener, ctx: Ctx, max_conns: usize, side: mobile::Guard) {
-    let limits = Limits {
-        conns: max_conns,
-        per_peer: MAX_CONNS_PER_PEER.min(max_conns),
-        idle: IDLE_TIMEOUT,
-        reserved: LOOPBACK_RESERVED.min(max_conns),
-        shared: IpAddr::is_loopback,
-    };
-    accept_loop_with(listener, ctx, limits, side).await
 }
 
 /// Which peers are served: asked first for each connection, on the runtime
@@ -209,7 +220,7 @@ impl<F: FnMut(std::net::SocketAddr, &tokio::net::TcpStream) -> bool> Admit for F
 
 /// Connection caps and the idle timeout (tests shrink them).
 #[derive(Copy, Clone)]
-struct Limits {
+pub struct Limits {
     conns: usize,
     /// Per address, except `shared` ones.
     per_peer: usize,
@@ -220,8 +231,71 @@ struct Limits {
     shared: fn(&IpAddr) -> bool,
 }
 
+impl Limits {
+    /// The router's: `conns` in all, `MAX_CONNS_PER_PEER` per LAN address,
+    /// the last `LOOPBACK_RESERVED` for loopback (Tailscale).
+    fn of(conns: usize) -> Limits {
+        Limits {
+            conns,
+            per_peer: MAX_CONNS_PER_PEER.min(conns),
+            idle: IDLE_TIMEOUT,
+            reserved: LOOPBACK_RESERVED.min(conns),
+            shared: IpAddr::is_loopback,
+        }
+    }
+}
+
+/// The open-connection counts both listeners (:9090 and HTTPS) share, so
+/// the caps hold for the two together.
+#[derive(Clone)]
+pub struct Caps {
+    conns: Arc<Semaphore>,
+    peers: Arc<PeerConns>,
+    limits: Limits,
+}
+
+impl Caps {
+    fn new(limits: Limits) -> Caps {
+        Caps { conns: Arc::new(Semaphore::new(limits.conns)), peers: Arc::default(), limits }
+    }
+}
+
+/// What a connection speaks: plain HTTP/1.1, or TLS first (`tls`).
+#[derive(Clone)]
+enum Wire {
+    Plain,
+    Tls(Arc<tls::Wire>),
+}
+
+/// hyper's HTTP/1.1 server on one connection, until `stop`: then a request
+/// in progress may finish within `STOP_WAIT` (a Reset's own reply), and
+/// keep-alive and live streams end.
+async fn serve_http1<I, S>(io: I, svc: S, idle: Duration, stop: impl std::future::Future<Output = ()>)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    S: hyper::service::HttpService<hyper::body::Incoming, ResBody = Body>,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    // `half_close` stays off: a client that closes its side is gone,
+    // which ends a request still queued for a lane.
+    let conn = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(idle)
+        .max_buf_size(MAX_BUF)
+        .serve_connection(io, svc);
+    let mut conn = std::pin::pin!(conn);
+    let stopped = matches!(futures_util::future::select(conn.as_mut(), std::pin::pin!(stop)).await, futures_util::future::Either::Right(_));
+    if stopped {
+        conn.as_mut().graceful_shutdown();
+        let _ = tokio::time::timeout(STOP_WAIT, conn).await;
+    }
+}
+
+/// How long a connection whose listener stopped may finish its request.
+const STOP_WAIT: Duration = Duration::from_secs(2);
+
 /// `admit`: whether to serve a connection from this peer (see `Admit`).
-async fn accept_loop_with(listener: std::net::TcpListener, ctx: Ctx, limits: Limits, mut admit: impl Admit) {
+async fn accept_loop_with(listener: std::net::TcpListener, ctx: Ctx, caps: Caps, mut admit: impl Admit, wire: Wire) {
     let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(l) => l,
         Err(e) => {
@@ -229,8 +303,7 @@ async fn accept_loop_with(listener: std::net::TcpListener, ctx: Ctx, limits: Lim
             return;
         }
     };
-    let conns = Arc::new(Semaphore::new(limits.conns));
-    let peers = Arc::new(PeerConns::default());
+    let Caps { conns, peers, limits } = caps;
     let router = app(ctx);
     let mut failing = false;
     loop {
@@ -276,23 +349,28 @@ async fn accept_loop_with(listener: std::net::TcpListener, ctx: Ctx, limits: Lim
         let _ = tcp.set_nodelay(true);
         set_tcp_user_timeout(&tcp);
         let router = router.clone();
-        let svc = hyper::service::service_fn(
-            move |mut req: axum::http::Request<hyper::body::Incoming>| {
-                req.extensions_mut().insert(Peer(addr));
-                tower::ServiceExt::oneshot(router.clone(), req.map(Body::new))
-            },
-        );
-        tokio::spawn(async move {
-            let _held = (permit, slot);
-            // `half_close` stays off: a client that closes its side is gone,
-            // which ends a request still queued for a lane.
-            let _ = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(limits.idle)
-                .max_buf_size(MAX_BUF)
-                .serve_connection(hyper_util::rt::TokioIo::new(tcp), svc)
-                .await;
-        });
+        let held = (permit, slot);
+        match &wire {
+            Wire::Plain => {
+                let svc = hyper::service::service_fn(
+                    move |mut req: axum::http::Request<hyper::body::Incoming>| {
+                        req.extensions_mut().insert(Peer(addr));
+                        tower::ServiceExt::oneshot(router.clone(), req.map(Body::new))
+                    },
+                );
+                tokio::spawn(async move {
+                    let _held = held;
+                    serve_http1(hyper_util::rt::TokioIo::new(tcp), svc, limits.idle, std::future::pending()).await;
+                });
+            }
+            Wire::Tls(w) => {
+                let w = Arc::clone(w);
+                tokio::spawn(async move {
+                    let _held = held;
+                    w.serve(tcp, addr, router, limits.idle).await;
+                });
+            }
+        }
     }
 }
 
@@ -543,7 +621,7 @@ mod wire_tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || runtime(2).unwrap().block_on(accept_loop_with(listener, ctx, limits, admit)));
+        std::thread::spawn(move || runtime(2).unwrap().block_on(accept_loop_with(listener, ctx, Caps::new(limits), admit, Wire::Plain)));
         addr
     }
 

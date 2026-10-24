@@ -21,7 +21,10 @@ enum Notice {
     Error(String),
 }
 
-/// `GET /ui/login[?next=…][&expired=1]`. A live session goes straight to `next`.
+/// `GET /ui/login[?next=…][&expired=1]`. A live session goes straight to
+/// `next`; the marker hop (`session::without_session`) applies here too, so
+/// a launch from outside the site that lands on the login page finds the
+/// session as well.
 pub async fn form(State(ctx): State<Ctx>, req: Request) -> Response {
     let nonce = CspNonce::of(&req);
     let query = req.uri().query();
@@ -32,12 +35,17 @@ pub async fn form(State(ctx): State<Ctx>, req: Request) -> Response {
     }
     let notice = (session::query_param(query, "expired").as_deref() == Some("1"))
         .then_some(Notice::Info("Your session expired. Nothing was changed."));
-    login_page(&ctx, req.headers(), &nonce, 200, &next, notice)
+    let (parts, _) = req.into_parts();
+    let hint = super::https::login_hint(&ctx, &parts);
+    session::without_session(&parts.headers, &parts.method, parts.uri.path(), parts.uri.query(), &nonce, |_| {
+        login_page(&ctx, &parts.headers, &nonce, 200, &next, notice, hint.as_deref())
+    })
 }
 
 /// The login form with a fresh `login_csrf`, re-setting the pre-login
 /// cookie (a well-formed one is reused, so a second tab keeps working).
-fn login_page(ctx: &Ctx, headers: &HeaderMap, nonce: &str, status: u16, next: &str, notice: Option<Notice>) -> Response {
+/// `hint`: the https address, shown over plain http while HTTPS is on.
+fn login_page(ctx: &Ctx, headers: &HeaderMap, nonce: &str, status: u16, next: &str, notice: Option<Notice>, hint: Option<&str>) -> Response {
     let auth = &ctx.app.auth;
     let pre = match session::pre_cookie(headers) {
         Some(p) => p.to_owned(),
@@ -49,12 +57,12 @@ fn login_page(ctx: &Ctx, headers: &HeaderMap, nonce: &str, status: u16, next: &s
     let Ok(token) = auth.login_form_token(&pre) else {
         return entropy_page(nonce);
     };
-    let mut resp = render::html(status, login_markup(nonce, &token, next, notice.as_ref()));
+    let mut resp = render::html(status, login_markup(nonce, &token, next, notice.as_ref(), hint));
     session::add_cookie(&mut resp, &session::set_pre(&pre));
     resp
 }
 
-fn login_markup(nonce: &str, token: &str, next: &str, notice: Option<&Notice>) -> Markup {
+fn login_markup(nonce: &str, token: &str, next: &str, notice: Option<&Notice>, hint: Option<&str>) -> Markup {
     let failed = matches!(notice, Some(Notice::Error(_)));
     let body = html! {
         div.narrow {
@@ -82,6 +90,9 @@ fn login_markup(nonce: &str, token: &str, next: &str, notice: Option<&Notice>) -
                 }
                 button.btn.btn-wide type="submit" { "Log in" }
             }
+            @if let Some(url) = hint {
+                p.note.ctr { "To install this web UI as an app, trust the router\u{2019}s certificate authority on this device (Settings \u{203a} HTTPS & Install as App \u{203a} Install on Your Devices), then open " a href=(url) rel="noreferrer" { (url) } "." }
+            }
         }
     };
     // The app's header is the page's heading: no brand over it.
@@ -108,7 +119,8 @@ pub async fn submit(State(ctx): State<Ctx>, req: Request) -> Response {
     };
     let next = session::safe_next(form.get("next")).to_owned();
     let auth = &ctx.app.auth;
-    let error = |status, msg: &str| login_page(&ctx, headers, &nonce, status, &next, Some(Notice::Error(msg.to_owned())));
+    let hint = super::https::login_hint(&ctx, &parts);
+    let error = |status, msg: &str| login_page(&ctx, headers, &nonce, status, &next, Some(Notice::Error(msg.to_owned())), hint.as_deref());
 
     let Some(pre) = session::pre_cookie(headers) else {
         // The pre-login cookie lives as long as the form token, so a form
@@ -135,6 +147,7 @@ pub async fn submit(State(ctx): State<Ctx>, req: Request) -> Response {
             }
             let mut resp = session::see_other(&next);
             session::add_cookie(&mut resp, &session::set_session(issued.token.expose(), issued.max_age.as_secs()));
+            session::add_cookie(&mut resp, &session::set_marker(issued.max_age.as_secs()));
             session::add_cookie(&mut resp, session::CLEAR_PRE);
             resp
         }
@@ -175,7 +188,7 @@ pub async fn logout_form(State(ctx): State<Ctx>, Session(p): Session, req: Reque
 }
 
 /// `POST /ui/logout`: ends the session (its live streams end too) and
-/// clears the cookie. Without a valid session there is no session to end: a
+/// clears the cookie and the marker. Without a valid session there is no session to end: a
 /// same-origin post still clears a stale cookie it sent; any other post is
 /// refused without touching cookies (a cross-site form must not be able to
 /// delete the session cookie, which `SameSite=Strict` keeps it from sending).
@@ -191,6 +204,9 @@ pub async fn logout(State(ctx): State<Ctx>, req: Request) -> Response {
         let mut resp = session::reply_unread(headers, body, session::see_other("/ui/login")).await;
         if !session::session_cookies(headers).is_empty() {
             session::add_cookie(&mut resp, session::CLEAR_SESSION);
+        }
+        if session::has_marker(headers) {
+            session::add_cookie(&mut resp, session::CLEAR_MARKER);
         }
         return resp;
     };
@@ -209,5 +225,6 @@ pub async fn logout(State(ctx): State<Ctx>, req: Request) -> Response {
     ctx.drafts.clear(p.id);
     let mut resp = session::see_other("/ui/login");
     session::add_cookie(&mut resp, session::CLEAR_SESSION);
+    session::add_cookie(&mut resp, session::CLEAR_MARKER);
     resp
 }

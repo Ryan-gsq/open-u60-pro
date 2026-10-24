@@ -44,6 +44,7 @@ pub async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
             bearer: header(headers, "authorization").and_then(|v| v.strip_prefix("Bearer ")),
             headers: req_headers(headers),
             loopback: addr.is_some_and(|a| a.ip().to_canonical().is_loopback()),
+            secure: parts.extensions.get::<super::tls::Secure>().is_some(),
         },
         &PreEnv {
             auth: &ctx.app.auth,

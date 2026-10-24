@@ -18,6 +18,7 @@ pub mod esim;
 pub mod esim_add;
 pub mod firewall;
 pub mod forward;
+pub mod https;
 pub mod lan;
 pub mod login;
 pub mod mobile;

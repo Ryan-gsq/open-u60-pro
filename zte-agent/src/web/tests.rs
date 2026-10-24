@@ -13,8 +13,8 @@ use axum::http::request::Builder;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use super::assets::{ASSETS, APP_CSS, ICON_180, MANIFEST_ETAG};
-use super::session::{CLEAR_PRE, CLEAR_SESSION};
+use super::assets::{ASSETS, APP_CSS, ICON_180, MANIFEST_ETAG, THEME_JS};
+use super::session::{CLEAR_MARKER, CLEAR_PRE, CLEAR_SESSION};
 use crate::auth::{AuthConfig, AuthState, FailRng, Kind, PeerKey, SeqRng};
 use crate::boottime::FakeClock;
 use crate::handlers::AppState;
@@ -76,9 +76,9 @@ impl Reply {
         })
     }
 
-    /// An HTML page with every security header and a fresh CSP nonce, which
-    /// only a live page (one with a script) carries in its markup, as
-    /// `data-nonce`.
+    /// An HTML page with every security header and a fresh CSP nonce. The
+    /// markup carries the nonce only on its script tags (the System theme's
+    /// `theme.js`, Datastar) and, on a live page (Datastar), as `data-nonce`.
     fn assert_secure_html(&self, status: u16) {
         assert_eq!(self.status, status, "{}", self.text());
         assert_eq!(self.header("content-type"), Some("text/html; charset=utf-8"));
@@ -89,11 +89,11 @@ impl Reply {
         assert_eq!(nonce.len(), 32);
         assert!(nonce.bytes().all(|b| b.is_ascii_hexdigit()));
         let html = self.text();
-        if html.contains("<script") {
-            assert!(html.contains(&format!("data-nonce=\"{nonce}\"")), "nonce not in the live page");
-        } else {
-            assert!(!html.contains("data-nonce") && !html.contains(nonce), "nonce in a page without scripts");
-        }
+        let scripts = html.matches("<script").count();
+        assert_eq!(html.matches(&format!(" nonce=\"{nonce}\"")).count(), scripts, "a script without this response's nonce");
+        let live = html.contains("/ui/a/datastar-");
+        assert_eq!(html.contains(&format!("data-nonce=\"{nonce}\"")), live, "data-nonce only on a live page");
+        assert_eq!(html.matches(nonce).count(), scripts + usize::from(live), "the nonce elsewhere in the markup");
         // Scripts by nonce only (no 'self').
         assert!(csp.starts_with("default-src 'none'; script-src 'nonce-"));
         assert_eq!(self.header("cross-origin-opener-policy"), Some("same-origin"));
@@ -191,6 +191,48 @@ fn app_css_at_most_48_kib() {
     // A snapshot (no JavaScript) hides the age badge, which would never
     // move, and shows its own age instead; live, the other way round.
     assert!(css.contains("body:has(#live-status.snap) #age, body:not(:has(#live-status.snap)) .sa { display: none; }"));
+}
+
+/// Rolling numbers are a `span.rl` (and a `span.sr`) inside their
+/// element: a rule that sets `display` on every span of a container beats
+/// `.rl { display: inline-block }` and drops the unit onto its own line
+/// (Connection & signal's metric grids did). Labels are named by class.
+/// A rolled number is an inline block, which gives the line a break point
+/// before its unit: on Connection & signal's grids a 3-digit value put
+/// "dBm" on its own line at phone widths (the panels grew from 48 to 71 px
+/// while live). And its visible copy is `aria-hidden` next to the `.sr`
+/// text: only the `.sr` text may be selected, so a copy gets it once.
+#[test]
+fn rolled_numbers_keep_their_unit_and_copy_once() {
+    let css = include_str!("assets/app.css");
+    assert!(css.contains("\n.metrics > div { white-space: nowrap; }\n"));
+    let rl = css.lines().find(|l| l.starts_with(".rl {")).unwrap();
+    assert!(rl.contains("-webkit-user-select: none;") && rl.contains(" user-select: none;"), "{rl}");
+}
+
+#[test]
+fn no_rule_sets_display_on_every_span() {
+    // Without comments.
+    let css: String = include_str!("assets/app.css").split("/*").enumerate().map(|(i, part)| if i == 0 { part } else { part.split_once("*/").map_or("", |(_, rest)| rest) }).collect();
+    let mut bad = Vec::new();
+    let mut from = 0;
+    while let Some(open) = css[from..].find('{').map(|i| from + i) {
+        let start = css[..open].rfind(['{', '}', ';']).map_or(0, |i| i + 1);
+        let close = css[open + 1..].find(['}', '{']).map_or(css.len(), |i| open + 1 + i);
+        let (selectors, decls) = (&css[start..open], &css[open + 1..close]);
+        if decls.contains("display:") {
+            for sel in selectors.split(',').map(str::trim) {
+                let last = sel.rsplit([' ', '>']).next().unwrap_or(sel);
+                // Containers without live numbers: AT chips, the snapshot
+                // ages, the live pill, cell signal squares, file buttons.
+                if last == "span" && ![".chips span", ".ages > span", ".on > span", ".sq > span", ".fbtn span"].contains(&sel) {
+                    bad.push(sel.to_owned());
+                }
+            }
+        }
+        from = open + 1;
+    }
+    assert!(bad.is_empty(), "{bad:?}");
 }
 
 #[tokio::test]
@@ -374,7 +416,12 @@ async fn login_post_checks_in_order() {
     assert_eq!(session.len(), 64);
     assert_eq!(
         r.cookies(),
-        [format!("zte_ui_session={session}; Path=/ui/; Max-Age=604800; HttpOnly; SameSite=Strict"), CLEAR_PRE.to_owned()]
+        [
+            format!("zte_ui_session={session}; Path=/ui/; Max-Age=604800; HttpOnly; SameSite=Strict"),
+            // The marker hop's cookie (owner decision 61): no secret, Lax.
+            "zte_ui_signed_in=1; Path=/ui/; Max-Age=604800; HttpOnly; SameSite=Lax".to_owned(),
+            CLEAR_PRE.to_owned()
+        ]
     );
     assert_eq!(CLEAR_PRE, "zte_ui_pre=; Path=/ui/; Max-Age=0; HttpOnly; SameSite=Strict");
     assert!(c.app.auth.authenticate(Kind::Browser, &session).is_some());
@@ -470,7 +517,7 @@ async fn logout() {
         .unwrap();
     let r = send(&c, r).await;
     r.assert_see_other("/ui/login");
-    assert_eq!(r.cookies(), [CLEAR_SESSION]);
+    assert_eq!(r.cookies(), [CLEAR_SESSION, CLEAR_MARKER]);
     assert!(CLEAR_SESSION.contains("; Path=/ui/;"));
     assert!(c.app.auth.authenticate(Kind::Browser, &session).is_none());
     get_with(&c, "/ui/", peer(8, 6), &cookie).await.assert_see_other("/ui/login?next=%2Fui%2F");
@@ -616,8 +663,10 @@ async fn every_page_links_the_hashed_assets() {
     assert!(html.contains(&format!("<link rel=\"stylesheet\" href=\"{APP_CSS}\">")));
     assert!(html.contains("<link rel=\"manifest\" href=\"/ui/manifest.webmanifest\">"));
     assert!(html.contains(&format!("<link rel=\"apple-touch-icon\" href=\"{ICON_180}\">")));
-    // No script on pages without live updates; no inline styles anywhere.
-    assert!(!html.contains("<script") && !html.contains("style="));
+    // Without live updates only the System theme's script (with the
+    // response's nonce); no inline styles anywhere.
+    assert_eq!(html.matches("<script").count(), 1, "{html}");
+    assert!(html.contains(&format!("<script src=\"{THEME_JS}\" nonce=")) && !html.contains("datastar") && !html.contains("style="));
     // Each response has its own nonce.
     let other = get(&c, "/ui/login", peer(14, 2)).await;
     assert_ne!(r.header("content-security-policy"), other.header("content-security-policy"));
@@ -631,6 +680,54 @@ async fn signed_in(test: u8) -> (Ctx, String, crate::auth::SessionId) {
     let session = login(&c, test, 1).await;
     let id = c.app.auth.authenticate(Kind::Browser, &session).unwrap().id;
     (c, format!("zte_ui_session={session}"), id)
+}
+
+/// Owner decision 61: Chrome for Android's installed web app (and links
+/// from other apps) open the UI without the `SameSite=Strict` session
+/// cookie. Login also sets a `Lax` marker; with it, a page without the
+/// session hops once to itself (a same-site navigation) and finds it.
+#[tokio::test]
+async fn an_outside_launch_hops_once_and_lands_signed_in() {
+    let c = ctx(Some(PW));
+    let session = login(&c, 41, 1).await;
+    let both = format!("zte_ui_session={session}; zte_ui_signed_in=1");
+    let launch = |uri: &str, cookie: &str, site: &'static str| {
+        req("GET", uri, peer(41, 2))
+            .header("cookie", cookie)
+            .header("sec-fetch-site", site)
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .body(Body::empty())
+            .unwrap()
+    };
+    // The screen route (`/ui/`), a `Session` extractor page and the login page.
+    for (uri, hop) in [("/ui/", "/ui/?hop=1"), ("/ui/logout", "/ui/logout?hop=1"), ("/ui/login?next=%2Fui%2Fsignal", "/ui/login?next=%2Fui%2Fsignal&amp;hop=1")] {
+        // From outside: only the marker came. A page that opens itself again.
+        let r = send(&c, launch(uri, "zte_ui_signed_in=1", "none")).await;
+        r.assert_secure_html(200);
+        assert!(r.text().contains(&format!("<meta http-equiv=\"refresh\" content=\"0; url={hop}\">")), "{}", r.text());
+        assert!(r.cookies().is_empty());
+    }
+    // The hop, same-site with both cookies: the page, without the flag.
+    send(&c, launch("/ui/?hop=1", &both, "same-origin")).await.assert_see_other("/ui/");
+    send(&c, launch("/ui/logout?hop=1", &both, "same-origin")).await.assert_see_other("/ui/logout");
+    send(&c, launch("/ui/login?next=%2Fui%2Fsignal&hop=1", &both, "same-origin")).await.assert_see_other("/ui/signal");
+    let r = send(&c, launch("/ui/", &both, "same-origin")).await;
+    r.assert_secure_html(200);
+    assert!(r.text().contains("Dashboard"));
+    // The session is gone (a hop without it, or a stale cookie): login once,
+    // and the marker is cleared, so the next launch does not hop.
+    let r = send(&c, launch("/ui/?hop=1", "zte_ui_signed_in=1", "same-origin")).await;
+    r.assert_see_other("/ui/login?next=%2Fui%2F");
+    assert_eq!(r.cookies(), [CLEAR_MARKER]);
+    let stale = format!("zte_ui_session={}; zte_ui_signed_in=1", "ab".repeat(32));
+    let r = send(&c, launch("/ui/", &stale, "none")).await;
+    r.assert_see_other("/ui/login?next=%2Fui%2F");
+    assert_eq!(r.cookies(), [CLEAR_MARKER]);
+    // Live streams and assets never hop.
+    let r = send(&c, launch("/ui/live/dashboard/0123456789abcdef", "zte_ui_signed_in=1", "none")).await;
+    assert_ne!(r.status, 200);
+    assert!(!r.text().contains("http-equiv=\"refresh\""));
 }
 
 /// Mobile Network (mobile data, airplane mode, roaming) and Device Controls
@@ -1011,7 +1108,7 @@ async fn mobile_network_page_and_confirmations() {
     for form in html.split("<form").skip(1) {
         assert!(form.split_once('>').unwrap().1.starts_with("<input type=\"hidden\" name=\"csrf\""), "{form}");
     }
-    assert!(!html.contains("<script") && !html.contains("style=") && !html.contains("<p class=\"actions\"><form"));
+    assert!(!html.contains("/ui/a/datastar-") && !html.contains("style=") && !html.contains("<p class=\"actions\"><form"));
     // The state is unknown here (no device): both directions, saying what they turn on or off.
     for label in ["Turn on Mobile Data", "Turn off Mobile Data", "Turn on Airplane Mode", "Turn off Airplane Mode"] {
         assert!(html.contains(&format!("aria-label=\"{label}\"")), "{label}");
@@ -1132,7 +1229,8 @@ async fn router_posts_check_session_csrf_confirm_and_values() {
     // What was typed and is no number is not shown.
     let r = p(charge.clone(), format!("csrf={csrf}&limit=%22%3E%3Cscript%3E&hysteresis=5")).await;
     r.assert_secure_html(400);
-    assert!(r.text().contains("Enter a whole number from 50 to 100.") && !r.text().contains("<scrip"));
+    let html = r.text();
+    assert!(html.contains("Enter a whole number from 50 to 100.") && !html.contains("\"><script>") && !html.contains("&lt;script&gt;"), "{html}");
     // A valid charge limit (kept in memory here: no device files on the
     // host): saved, and the page shows the new values.
     // Without the page's single-use token nothing is saved.
@@ -1233,7 +1331,7 @@ async fn a_timed_out_operation_stops_refreshing() {
     let html = r.text();
     assert!(html.contains("Couldn't read the modem state.") && html.contains("role=\"alert\""), "{html}");
     assert!(html.contains("<h1 id=\"op-title\">Change not confirmed</h1>"), "{html}");
-    assert!(!html.contains("http-equiv") && !html.contains("<script") && !html.contains("data-init"));
+    assert!(!html.contains("http-equiv") && !html.contains("/ui/a/datastar-") && !html.contains("data-init"));
     // Kept 10 minutes.
     clock.advance(Duration::from_secs(600));
     get_with(&c, "/ui/op/00000000000000cc", peer(24, 4), &cookie).await.assert_secure_html(404);
@@ -1466,7 +1564,7 @@ async fn wifi_pages_link_stream_clients_and_never_stream_the_password() {
         let r = get_with(&c, uri, peer(47, 4), &cookie).await;
         r.assert_secure_html(200);
         let html = r.text();
-        assert!(!html.contains("/ui/live/") && !html.contains("<script"), "{uri}");
+        assert!(!html.contains("/ui/live/") && !html.contains("/ui/a/datastar-"), "{uri}");
         assert!(html.contains("<a class=\"nl back\" href=\"/ui/wifi\">Wi-Fi &amp; devices</a></div><h1>WiFi Credentials</h1>"), "{html}");
         // The build machine has no Wi-Fi configuration: the read's error.
         assert!(html.contains("<p class=\"msg err\" role=\"alert\">Failed to load Wi-Fi credentials: "), "{html}");
@@ -1882,6 +1980,7 @@ mod esim;
 mod esim_add;
 mod firewall;
 mod forward;
+mod https;
 mod netcfg;
 mod router;
 mod sim;

@@ -98,13 +98,25 @@ fn compute_dhcp_end(base_ip: &str, netmask: &str, start: &str, limit: &str) -> S
     }
 }
 
-pub fn router_lan_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
+pub fn router_lan_set(state: &AppState, body: &[u8]) -> (u16, Value) {
+    lan_set_with(state, body, |params| ubus::call("zwrt_router.api", "router_set_lan_para", Some(params)))
+}
+
+/// `router_lan_set` with the firmware call as `apply` (tests swap it).
+fn lan_set_with(state: &AppState, body: &[u8], apply: impl FnOnce(&str) -> Result<Value, String>) -> (u16, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
-    match ubus::call("zwrt_router.api", "router_set_lan_para", Some(&parsed.to_string())) {
-        Ok(data) => (200, json!({"ok": true, "data": data})),
+    match apply(&parsed.to_string()) {
+        Ok(data) => {
+            // LAN HTTPS: a certificate (and local name) for the new address.
+            let ip = parsed["lan_ipaddr"].as_str().or(parsed["ipaddr"].as_str()).and_then(|s| s.parse().ok());
+            if let Some(ip) = ip {
+                state.tls.lan_changed(ip);
+            }
+            (200, json!({"ok": true, "data": data}))
+        }
         Err(e) => (503, json!({"ok": false, "error": e})),
     }
 }
@@ -346,6 +358,28 @@ pub fn router_apn_profiles_activate(_state: &AppState, body: &[u8]) -> (u16, Val
 
 #[cfg(test)]
 mod tests {
+    /// A LAN apply that the firmware took moves LAN HTTPS to the posted
+    /// address (the hosts line follows); a refused one changes nothing.
+    #[test]
+    fn a_lan_apply_moves_https() {
+        let w = crate::tls::tests::World::new("lan-apply");
+        let mut state = crate::handlers::AppState::new();
+        state.tls = std::sync::Arc::new(w.tls());
+        state.tls.turn_on().unwrap();
+        let body = br#"{"lan_ipaddr":"192.168.8.1","lan_netmask":"255.255.255.0"}"#;
+        let (status, _) = super::lan_set_with(&state, body, |_| Err("refused (fake)".into()));
+        assert_eq!((status, w.hosts_file().as_deref()), (503, Some("192.168.0.1 u60.home.arpa\n")));
+        let sent = std::cell::RefCell::new(String::new());
+        let (status, _) = super::lan_set_with(&state, body, |p| {
+            *sent.borrow_mut() = p.to_owned();
+            Ok(serde_json::json!({"result": "success"}))
+        });
+        assert_eq!(status, 200);
+        assert!(sent.borrow().contains("\"lan_ipaddr\":\"192.168.8.1\""));
+        assert_eq!(w.hosts_file().as_deref(), Some("192.168.8.1 u60.home.arpa\n"));
+        assert!(state.tls.status().error.unwrap().contains("now 192.168.8.1"));
+    }
+
     use super::compute_dhcp_end;
 
     /// The old answer: the last octet replaced.

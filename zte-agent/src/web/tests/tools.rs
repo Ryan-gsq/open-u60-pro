@@ -97,7 +97,7 @@ async fn placeholders_and_notes() {
         assert!(html.contains(&format!("<h1>{title}</h1>")) && html.contains(&format!("<strong>{title}</strong>")), "{uri}");
         assert!(html.contains(text), "{uri}: {text}");
         assert!(html.contains("<a class=\"nl back\" href=\"/ui/tools\">Tools</a>") && html.contains("<a href=\"/ui/tools\" aria-current=\"page\">"));
-        assert!(!html.contains("<form") && !html.contains("<script"), "{uri}");
+        assert!(!html.contains("<form") && !html.contains("/ui/a/datastar-"), "{uri}");
     }
     // New Automation reads nothing either; the screens that read wait for the router.
     assert_eq!(get_with(&c, "/ui/tools/automations/new", peer(101, 3), &cookie).await.status, 200);
@@ -178,7 +178,7 @@ async fn connected_devices_and_their_search() {
     let html = r.text();
     assert!(html.contains("<h2>1 Devices</h2>") && html.contains("<b class=\"dn\">tv</b>") && !html.contains("alice"), "{html}");
     assert!(html.contains("name=\"q\" value=\"TV\"") && html.contains("<a class=\"nl\" href=\"/ui/tools/devices\">Cancel</a>"));
-    assert!(!html.contains("/ui/live/") && !html.contains("<script"));
+    assert!(!html.contains("/ui/live/") && !html.contains("/ui/a/datastar-"));
     assert_eq!(c.app.hub.demand(Topic::Clients), 0);
     let html = post(&c, DEVICES, peer(103, 3), &cookie, &format!("csrf={csrf}&q=aa%3Abb")).await.text();
     assert!(html.contains("No Results for \u{201c}aa:bb\u{201d}"), "{html}");
@@ -226,7 +226,7 @@ async fn automations_empty_and_new_form() {
     ] {
         assert!(html.contains(want), "{want} in {html}");
     }
-    assert!(!html.contains("Custom:") && !html.contains("<script") && !html.contains("connected remotely"));
+    assert!(!html.contains("Custom:") && !html.contains("/ui/a/datastar-") && !html.contains("connected remotely"));
     // A remote browser is told what cuts its connection when it runs.
     let tailnet = Peer(std::net::SocketAddr::from(([127, 0, 0, 1], 40104)));
     let html = get_with(&c, "/ui/tools/automations/new", tailnet, &cookie).await.text();

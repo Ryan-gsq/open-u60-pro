@@ -254,6 +254,8 @@ pub struct PageData<'a> {
     pub token: std::cell::OnceCell<String>,
     /// This browser's preferences (Settings).
     pub prefs: Prefs,
+    /// The request came over HTTPS (`httpd::tls`).
+    pub secure: bool,
 }
 
 impl PageData<'_> {
@@ -310,6 +312,8 @@ pub struct Req {
     pub typed: Option<FormState>,
     /// This browser's preferences (Settings).
     pub prefs: Prefs,
+    /// Over HTTPS (`httpd::tls`).
+    pub secure: bool,
 }
 
 impl Req {
@@ -325,6 +329,7 @@ impl Req {
             esim_names: Arc::clone(&ctx.esim_names),
             typed: None,
             prefs: Prefs::of(req.headers()),
+            secure: super::pages::https::is_secure(req),
         }
     }
 }
@@ -424,6 +429,7 @@ fn build(
         notice: own,
         token: std::cell::OnceCell::new(),
         prefs: r.prefs,
+        secure: r.secure,
     };
     let (lead, trail) = match s.bar {
         Bar::Root => (html! {}, html! {}),
@@ -477,6 +483,7 @@ fn build(
         lead,
         trail,
         heading,
+        go: None,
     };
     render::html(status, render::page(&ctx, body))
 }

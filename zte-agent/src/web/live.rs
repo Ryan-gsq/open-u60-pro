@@ -173,6 +173,8 @@ impl PageEmitter {
         let mut views = Views::new(now, Vec::new());
         views.op = page.op;
         views.arg = page.arg;
+        // Numbers roll from the second time they are drawn (`roll`).
+        views.roll = Some(Default::default());
         let sent = vec![0; page.fragments.len()];
         PageEmitter { hub, page, views, sent, beat: false, done: false, usb: None }
     }
@@ -413,7 +415,7 @@ mod tests {
     use crate::web::pages::dashboard::tests::fixture as dash_fixture;
     use crate::web::pages::{dashboard, signal};
     use crate::web::pages::signal::tests::fixture as signal_fixture;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn dash_page() -> LivePage {
         LivePage::of(&crate::web::tabs::dashboard::DASHBOARD)
@@ -485,7 +487,10 @@ mod tests {
         // Battery (5 s cadence) is not 3 cadences old yet; traffic was
         // re-read; the signal reading is 4 s old now.
         assert_eq!(ids(&parts), ["age", "live-status"]);
-        assert!(parts[0].contains(">4s ago<") && parts[1].contains("class=\"live on ps hb-a\""));
+        // The badge's digit rolls up from 0 (`roll`); its label is what
+        // screen readers read.
+        assert!(parts[0].contains("aria-label=\"Updated 4 seconds ago\"><span class=\"rl\" aria-hidden=\"true\"><i id=\"age04\" data-u=\"0\">4</i>s ago</span>"), "{}", parts[0]);
+        assert!(parts[1].contains("class=\"live on ps hb-a\""));
         let much_later = v.now.saturating_add(Duration::from_secs(20));
         let parts = elements(&em.tick(much_later, &ages));
         // Traffic's caption ages from its last good sample and the
@@ -495,6 +500,93 @@ mod tests {
         assert!(parts[0].contains("Last traffic sample · 16s ago · waiting for device"));
         assert!(parts[1].contains("<dt>CPU</dt><dd>—</dd>") && !parts.iter().any(|p| p.contains("Updated 20 s ago")));
         assert!(parts.last().unwrap().contains("class=\"live on ps hb-b\""));
+    }
+
+    /// Every number of a topic value, moved (numbers and numeric strings).
+    fn bump(v: &Value) -> Value {
+        match v {
+            Value::Number(n) if n.is_i64() => json!(n.as_i64().unwrap() + 7),
+            Value::Number(n) => json!(n.as_f64().unwrap() + 1.37),
+            Value::String(s) if s.parse::<i64>().is_ok() => json!((s.parse::<i64>().unwrap() + 3).to_string()),
+            Value::Array(a) => Value::Array(a.iter().map(bump).collect()),
+            Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), bump(v))).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// Values for every topic the rolling numbers read.
+    fn every_topic() -> Vec<(Topic, SlotView)> {
+        let mut slots = dash_fixture().slots();
+        slots.retain(|(t, _)| *t != Topic::Health);
+        slots.extend(signal_fixture().slots().into_iter().filter(|(t, _)| *t == Topic::Signal).map(|(_, s)| (Topic::Signal, s)));
+        slots.retain(|(t, s)| *t != Topic::Signal || s.value.as_ref().is_some_and(|v| v["nr5g_pci"].is_string()));
+        let now = dash_fixture().now;
+        let slot = |v: Value| SlotView { version: 1, at: now, value_at: now, value: Some(Arc::new(v)), error: None };
+        slots.push((Topic::Health, slot(json!({"cpu": {"overall": 40.84, "cores": [1.0, 2.0]}, "thermal": {"cpuss_temp": 37.2, "sensors": [
+            {"id": "a", "name": "cpuss-0", "temperature_c": 41.5}, {"id": "b", "name": "usb", "temperature_c": 33.0},
+            {"id": "c", "name": "sys-therm-1", "temperature_c": 30.5}]}}))));
+        slots.push((Topic::Speedtest, slot(json!({"phase": "download", "progress": 42, "live_speed_mbps": 87.3, "server": "x"}))));
+        slots
+    }
+
+    #[test]
+    fn numbers_roll_only_on_later_frames_with_unique_digit_ids() {
+        let mut rolled = 0;
+        for s in crate::web::routes::SCREENS.iter().filter(|s| !s.live.is_empty()) {
+            let first = every_topic();
+            let now = dash_fixture().now;
+            let mut em = PageEmitter::new(hub(), LivePage::of(s), now);
+            // A first frame (and so a reconnect) draws every number plain.
+            let open = elements(&em.open(first.clone(), now)).join("");
+            assert!(!open.contains("class=\"rl\"") && !open.contains("<i id="), "{}: {open}", s.path);
+            let moved: Vec<(Topic, SlotView)> = first
+                .iter()
+                .map(|(t, sv)| (*t, SlotView { version: 2, value: sv.value.as_deref().map(|v| Arc::new(bump(v))), ..sv.clone() }))
+                .collect();
+            let parts = elements(&em.changes(moved.clone(), now));
+            let all = parts.join("");
+            let ids: Vec<&str> = all.split("<i id=\"").skip(1).map(|r| r.split('"').next().unwrap()).collect();
+            rolled += ids.len();
+            let mut unique = ids.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), ids.len(), "{}: duplicate digit ids {ids:?}", s.path);
+            for id in &ids {
+                // Key letters, the place, the digit; never a fragment's id.
+                let digits = id.trim_start_matches(|c: char| c.is_ascii_lowercase());
+                assert!(digits.len() >= 2 && digits.bytes().all(|b| b.is_ascii_digit()), "{id}");
+                assert!(s.live.iter().all(|f| f.id != *id), "{id}");
+            }
+            // Every rolled number is read once: its text in `.sr`, the
+            // digits hidden.
+            assert_eq!(all.matches("<span class=\"rl\" aria-hidden=\"true\">").count(), all.matches("class=\"rl\"").count());
+            // The same values again: nothing to send, so nothing restarts
+            // (a screen streamed only while something runs has ended).
+            let again: Vec<(Topic, SlotView)> = moved.into_iter().map(|(t, sv)| (t, SlotView { version: 3, ..sv })).collect();
+            let again = elements(&em.changes(again, now));
+            assert!(again.is_empty() || s.live_while.is_some(), "{}: {again:?}", s.path);
+        }
+        assert!(rolled > 40, "{rolled}");
+        // The dashboard: the changed digits of each card roll, by direction.
+        let first = every_topic();
+        let now = dash_fixture().now;
+        let mut em = PageEmitter::new(hub(), dash_page(), now);
+        em.open(first.clone(), now);
+        let sig = |rsrp: &str| {
+            let v = first.iter().find(|(t, _)| *t == Topic::Signal).unwrap().1.value.as_deref().unwrap().clone();
+            let mut v = v;
+            v["nr5g_rsrp"] = json!(rsrp);
+            SlotView { version: 9, at: now, value_at: now, value: Some(Arc::new(v)), error: None }
+        };
+        let parts = elements(&em.changes(vec![(Topic::Signal, sig("-78"))], now));
+        let conn = parts.iter().find(|p| p.contains("id=\"card-conn\"")).unwrap();
+        assert!(
+            conn.contains("<b class=\"num\"><span class=\"sr\">-78 dBm</span><span class=\"rl\" aria-hidden=\"true\">-7<i id=\"rsrp08\" data-d=\"7\">8</i> dBm</span></b>"),
+            "{conn}"
+        );
+        let parts = elements(&em.changes(vec![(Topic::Signal, sig("-69"))], now));
+        let conn = parts.iter().find(|p| p.contains("id=\"card-conn\"")).unwrap();
+        assert!(conn.contains("-<i id=\"rsrp16\" data-u=\"7\">6</i><i id=\"rsrp09\" data-u=\"8\">9</i> dBm"), "{conn}");
     }
 
     #[test]
@@ -612,12 +704,12 @@ mod tests {
             let v = hostile(dash_fixture(), error);
             let html = live_page("/ui/live/dashboard/0123456789abcdef", dashboard::body(&v, Some(true), &html! {}));
             assert!(html.contains("&lt;script&gt;x&lt;/script&gt;&quot;' data-on:x=1"), "{html}");
-            inert(&html, 1, 2);
+            inert(&html, 2, 2);
             inert(&PageEmitter::new(hub(), dash_page(), v.now).open(v.slots(), v.now).concat(), 0, 0);
             let mut v = hostile(signal_fixture(), error);
             let html = live_page("/ui/live/signal/0123456789abcdef", signal::body(&v));
             assert!(html.contains("&lt;script&gt;x&lt;/script&gt;&quot;' data-on:x=1"), "{html}");
-            inert(&html, 1, 2);
+            inert(&html, 2, 2);
             v.history = Vec::new();
             inert(&PageEmitter::new(hub(), signal_page(), v.now).open(v.slots(), v.now).concat(), 0, 0);
         }

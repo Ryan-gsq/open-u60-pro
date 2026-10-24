@@ -291,7 +291,7 @@ async fn band_lock_grids_questions_and_bodies() {
     ] {
         assert!(html.contains(want), "{want} in {html}");
     }
-    assert!(!html.contains("<script") && !html.contains("checked"));
+    assert!(!html.contains("/ui/a/datastar-") && !html.contains("checked"));
     let _dev = device::set(&c.app, device::Device::default());
     // NR: the question (no form without a band), then NSA and SA.
     let html = get_with(&c, "/ui/tools/band-lock/nr", peer(114, 3), &cookie).await.text();

@@ -77,18 +77,25 @@ fn parse_port(p: &str) -> Option<u16> {
 }
 
 /// Host names the agent answers to besides IP literals (and, for loopback
-/// peers, `localhost` and the Tailscale names).
+/// peers, `localhost` and the Tailscale names; over the HTTPS listener,
+/// the LAN HTTPS name).
 pub struct HostPolicy {
     extra: Vec<String>,
+    /// The LAN HTTPS name (`tls`, `u60.home.arpa`).
+    local: Option<String>,
 }
 
 impl HostPolicy {
-    /// `ZTE_AGENT_UI_HOSTS`: comma-separated exact names (e.g. a local DNS name).
-    pub fn from_env() -> Self {
-        let extra = std::env::var("ZTE_AGENT_UI_HOSTS")
+    /// `ZTE_AGENT_UI_HOSTS`: comma-separated exact names (e.g. a local DNS
+    /// name), and `local`: the LAN HTTPS name, answered only over HTTPS
+    /// (`allows_via`): another network's DNS can answer for a `home.arpa`
+    /// name too (a rebinding target over http), but it cannot present the
+    /// router's certificate for it.
+    pub fn from_env_with(local: &str) -> Self {
+        let extra: Vec<String> = std::env::var("ZTE_AGENT_UI_HOSTS")
             .map(|v| v.split(',').map(str::to_owned).collect())
             .unwrap_or_default();
-        Self::new(extra)
+        HostPolicy { local: Some(local.to_ascii_lowercase()), ..Self::new(extra) }
     }
 
     /// Each entry is parsed like a Host header, so it matches exactly what
@@ -103,7 +110,14 @@ impl HostPolicy {
                 None => eprintln!("[httpd] ZTE_AGENT_UI_HOSTS: ignoring {raw:?} (not a host name)"),
             }
         }
-        HostPolicy { extra: names }
+        HostPolicy { extra: names, local: None }
+    }
+
+    /// `allows`, and over the HTTPS listener (`secure`, which runs only
+    /// while HTTPS is on) also the LAN HTTPS name.
+    pub fn allows_via(&self, host_header: &str, loopback: bool, secure: bool, ts_names: &dyn Fn() -> Vec<String>) -> bool {
+        self.allows(host_header, loopback, ts_names)
+            || (secure && matches!(parse_authority(host_header), Some((Authority::Name(n), _)) if Some(&n) == self.local.as_ref()))
     }
 
     /// Any IP literal or a configured name; `localhost` and the Tailscale
@@ -299,6 +313,23 @@ mod tests {
         assert_eq!(parse_authority("[FE80::1]"), Some((Authority::V6("fe80::1".parse().unwrap()), None)));
         assert_eq!(parse_authority("10.0.0.1:80"), Some((Authority::V4(Ipv4Addr::new(10, 0, 0, 1)), Some(80))));
         assert_eq!(parse_authority("example.com.."), None);
+    }
+
+    /// The LAN HTTPS name answers only over the HTTPS listener (another
+    /// network's DNS can answer for it over http); names around it never
+    /// (DNS-rebinding protection otherwise).
+    #[test]
+    fn the_local_name_is_allowed_over_https_only() {
+        let p = HostPolicy::from_env_with("u60.home.arpa");
+        for host in ["u60.home.arpa", "U60.HOME.ARPA:9443", "u60.home.arpa.:9090"] {
+            assert!(p.allows_via(host, false, true, &Vec::new), "{host}");
+            assert!(!p.allows_via(host, false, false, &Vec::new) && !p.allows_via(host, true, false, &Vec::new), "{host} over http");
+            assert!(!p.allows(host, false, &Vec::new), "{host}");
+        }
+        for host in ["home.arpa", "x.u60.home.arpa", "u60.home.arpa.evil.example", "evil.example"] {
+            assert!(!p.allows_via(host, false, true, &Vec::new), "{host}");
+        }
+        assert!(p.allows_via("192.168.0.1:9443", false, true, &Vec::new));
     }
 
     #[test]

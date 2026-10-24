@@ -10,7 +10,7 @@ use maud::{html, Markup, DOCTYPE};
 
 use serde_json::Value;
 
-use super::assets::{APP_CSS, DATASTAR_JS, ICON_180, ICON_SVG, THEME_DARK_CSS, THEME_LIGHT_CSS};
+use super::assets::{APP_CSS, DATASTAR_JS, ICON_180, ICON_SVG, THEME_DARK_CSS, THEME_JS, THEME_LIGHT_CSS};
 use super::fmt;
 use super::kit::{self, Tab};
 use super::ops::Op;
@@ -40,11 +40,14 @@ pub struct Views {
     /// The eSIM profile names last read (`Ctx::esim_names`), for pages and
     /// streams with `esim_switch`.
     pub esim_names: Option<std::sync::Arc<crate::web::pages::esim::Names>>,
+    /// A live stream's numbers as last drawn (`roll::roll`); `None` on a
+    /// page load, which draws plain numbers.
+    pub roll: Option<std::cell::RefCell<super::roll::Rolls>>,
 }
 
 impl Views {
     pub fn new(now: BootInstant, slots: Vec<(Topic, SlotView)>) -> Self {
-        Views { now, slots, history: Vec::new(), op: None, usb_dismissed: false, arg: 0, esim_names: None }
+        Views { now, slots, history: Vec::new(), op: None, usb_dismissed: false, arg: 0, esim_names: None, roll: None }
     }
 
     pub fn slot(&self, t: Topic) -> Option<&SlotView> {
@@ -141,6 +144,9 @@ pub struct PageCtx<'a> {
     /// test), to `refresh_to` if given.
     pub refresh: bool,
     pub refresh_to: Option<&'a str>,
+    /// Open this page of the UI at once, with or without JavaScript (the
+    /// marker hop, `hop_page`; a `session::without_session` target only).
+    pub go: Option<&'a str>,
     /// The nav bar's leading and trailing items.
     pub lead: Markup,
     pub trail: Markup,
@@ -182,12 +188,15 @@ pub fn page(ctx: &PageCtx, body: Markup) -> Markup {
                 link rel="stylesheet" href=(APP_CSS);
                 // The system's scheme; a browser's theme replaces these
                 // tags (`prefs::themed`).
-                (scheme_tags(Theme::System))
+                (scheme_tags(Theme::System, ctx.nonce))
                 link rel="manifest" href="/ui/manifest.webmanifest";
                 link rel="icon" type="image/svg+xml" href=(ICON_SVG);
                 link rel="apple-touch-icon" href=(ICON_180);
                 @if ctx.refresh {
                     noscript { meta http-equiv="refresh" content=(ctx.refresh_to.map_or_else(|| "3".to_owned(), |u| format!("3; url={u}"))); }
+                }
+                @if let Some(url) = ctx.go {
+                    meta http-equiv="refresh" content=(format!("0; url={url}"));
                 }
                 @if live.is_some() {
                     script type="module" src=(DATASTAR_JS) nonce=(ctx.nonce) {}
@@ -221,9 +230,14 @@ pub fn page(ctx: &PageCtx, body: Markup) -> Markup {
 }
 
 /// The colour-scheme tags of the page shell: for the system's scheme both
-/// (and the nav bar colour of each), else the theme's, with its stylesheet
-/// after `app.css` (Settings › Appearance).
-fn scheme_tags(theme: Theme) -> Markup {
+/// (and the nav bar colour of each) and the small script that makes Safari
+/// take the bar colours again when the system's scheme changes with the
+/// page open (`assets/theme.js`, owner decision 60; it does nothing until
+/// then, and the page is the same without it), else the theme's, with its
+/// stylesheet after `app.css` (Settings › Appearance). What each browser
+/// colours from them (and from the page's background, which Safari 26
+/// samples): docs/web-ui.md, "Theme and the browser's own colours".
+fn scheme_tags(theme: Theme, nonce: &str) -> Markup {
     let one = |scheme: &str, color: &str, css: &str| {
         html! {
             meta name="color-scheme" content=(scheme);
@@ -236,15 +250,16 @@ fn scheme_tags(theme: Theme) -> Markup {
             meta name="color-scheme" content="light dark";
             meta name="theme-color" media="(prefers-color-scheme: light)" content="#f2f2f7";
             meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000000";
+            script src=(THEME_JS) nonce=(nonce) defer {}
         },
         Theme::Light => one("light", "#f2f2f7", THEME_LIGHT_CSS),
         Theme::Dark => one("dark", "#000000", THEME_DARK_CSS),
     }
 }
 
-/// `scheme_tags` as the page has them.
-pub fn scheme(theme: Theme) -> String {
-    scheme_tags(theme).into_string()
+/// `scheme_tags` as a page with this CSP nonce has them.
+pub fn scheme(theme: Theme, nonce: &str) -> String {
+    scheme_tags(theme, nonce).into_string()
 }
 
 /// The hidden CSRF field; always the first field of a POST form.
@@ -309,6 +324,21 @@ pub fn error_page(title: &str, msg: &str, nonce: &str, retry: Option<&str>) -> M
         }
     };
     page(&PageCtx { title, nonce, ..PageCtx::default() }, body)
+}
+
+/// The marker hop (`session::without_session`, owner decision 61): this
+/// page opens `target` (the request's own page, flagged) at once. It is a
+/// navigation the page starts itself, so the browser counts it as
+/// same-site and sends the `SameSite=Strict` session cookie that a launch
+/// from outside the site (an installed app, another app's link) left
+/// behind. A link for a browser that does not follow the refresh.
+pub fn hop_page(target: &str, nonce: &str) -> Response {
+    let body = html! {
+        div.narrow.vc {
+            p.actions.ctr { a.btn href=(target) { "Continue" } }
+        }
+    };
+    html(200, page(&PageCtx { title: "Opening", nonce, go: Some(target), ..PageCtx::default() }, body))
 }
 
 /// `text/html` with `status` (the header middleware adds the security headers).
@@ -391,10 +421,13 @@ mod tests {
         assert!(s.contains("</main><nav class=\"tabs\" aria-label=\"Tabs\">"));
         assert!(s.contains("<a href=\"/ui/router\" aria-current=\"page\">"));
         assert_eq!(s.matches("aria-current").count(), 1);
-        // Without live updates: no script, and the nonce is not in the markup.
+        // Without live updates: only the System theme's script, which carries
+        // the nonce; no Datastar, no `data-nonce`, no `data-init`.
         let ctx = PageCtx { live: None, ..ctx };
         let s = page(&ctx, html! {}).into_string();
-        assert!(!s.contains("<script") && !s.contains("data-init") && !s.contains("00ff"), "{s}");
+        assert_eq!(s.matches("<script").count(), 1, "{s}");
+        assert!(s.contains(&format!(r#"<script src="{THEME_JS}" nonce="00ff" defer></script>"#)), "{s}");
+        assert!(!s.contains("datastar") && !s.contains("data-init") && !s.contains("data-nonce") && s.matches("00ff").count() == 1, "{s}");
         assert!(s.starts_with("<!DOCTYPE html><html lang=\"en\">"));
     }
 

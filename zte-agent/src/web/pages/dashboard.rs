@@ -23,6 +23,7 @@ use crate::web::fmt;
 use crate::web::kit::{self, Icon};
 use crate::web::pages::usb;
 use crate::web::render::{self, Fragment, Views};
+use crate::web::roll::{roll, roll_up_labelled};
 use crate::web::screen::PageData;
 use crate::web::signal::display_type;
 
@@ -122,23 +123,25 @@ pub fn body(v: &Views, wifi: Option<bool>, csrf: &Markup) -> Markup {
 /// answered).
 pub fn age_badge(v: &Views) -> Markup {
     let s = v.slot(Topic::Signal).filter(|s| s.value.is_some());
-    badge(v.now, s.map(|s| s.value_at))
+    badge(v, s.map(|s| s.value_at))
 }
 
 /// The signal sheet's badge counts from the last read, failed or not (the
 /// app's sheet sets its time on an error too).
 pub fn read_badge(v: &Views) -> Markup {
     let s = v.slot(Topic::Signal).filter(|s| s.value.is_some() || s.error.is_some());
-    badge(v.now, s.map(|s| s.at))
+    badge(v, s.map(|s| s.at))
 }
 
-fn badge(now: BootInstant, at: Option<BootInstant>) -> Markup {
-    let (text, label) = match at.map(|at| now.saturating_duration_since(at).as_secs()) {
+/// The badge's text rolls up on a live page (the app's `LastUpdatedView`);
+/// its label is what screen readers read.
+fn badge(v: &Views, at: Option<BootInstant>) -> Markup {
+    let (text, label) = match at.map(|at| v.now.saturating_duration_since(at).as_secs()) {
         None => ("--".to_owned(), "Never updated".to_owned()),
         Some(s) if s < 60 => (format!("{s}s ago"), format!("Updated {s} seconds ago")),
         Some(s) => (format!("{}m {}s ago", s / 60, s % 60), format!("Updated {} minutes {} seconds ago", s / 60, s % 60)),
     };
-    html! { span #age .agebadge role="img" aria-label=(label) { (text) } }
+    html! { span #age .agebadge role="img" aria-label=(label) { (roll_up_labelled(v, "age", &text)) } }
 }
 
 fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -237,7 +240,7 @@ pub fn card_conn(v: &Views) -> Markup {
             span {
                 (label) " "
                 // The app's `Int(rsrp)`: cut off, not rounded.
-                @match rsrp { Some(r) => b.num { (r.trunc() as i64) " dBm" }, None => (DASH) }
+                @match rsrp { Some(r) => b.num { (roll(v, "rsrp", &format!("{} dBm", r.trunc() as i64))) }, None => (DASH) }
             }
             span {
                 @if roaming { span.roam { "Roaming" } " " }
@@ -285,13 +288,13 @@ fn traffic_card(v: &Views, href: Option<&str>) -> Markup {
     let total = |key| num(key).map(|b| fmt::bytes(b.max(0.0) as u64)).unwrap_or_else(|| DASH.into());
     kit::card(Some("card-traffic"), href, Icon::Arrows, "Live traffic", html! {
         div.split {
-            div { (kit::icon(Icon::ArrowDown)) b.big { (rate("real_rx_speed")) } span.lbl { "Download" } }
-            div { (kit::icon(Icon::ArrowUp)) b.big { (rate("real_tx_speed")) } span.lbl { "Upload" } }
+            div { (kit::icon(Icon::ArrowDown)) b.big { (roll(v, "rx", &rate("real_rx_speed"))) } span.lbl { "Download" } }
+            div { (kit::icon(Icon::ArrowUp)) b.big { (roll(v, "tx", &rate("real_tx_speed"))) } span.lbl { "Upload" } }
         }
         p.cap { (traffic_caption(v)) }
         dl.kv.tot {
-            div { dt { "Total DL" } dd { (total("real_rx_bytes")) } }
-            div { dt { "Total UL" } dd { (total("real_tx_bytes")) } }
+            div { dt { "Total DL" } dd { (roll(v, "dl", &total("real_rx_bytes"))) } }
+            div { dt { "Total UL" } dd { (roll(v, "ul", &total("real_tx_bytes"))) } }
         }
     })
 }
@@ -313,7 +316,7 @@ pub fn card_battery(v: &Views) -> Markup {
         p.big { (capacity.map(|c| format!("{c}%")).unwrap_or_else(|| DASH.into())) }
         p.st {
             span class=(class) { (status) }
-            @if let Some(p) = b.and_then(fmt::power) { span.muted { " \u{b7} " } span class=(power_class) { (p) } }
+            @if let Some(p) = b.and_then(fmt::power) { span.muted { " \u{b7} " } span class=(power_class) { (roll(v, "pw", &p)) } }
         }
         p.cap { "Power details" }
         (render::error_line(v, &[Topic::Battery, Topic::Charger, Topic::BatteryInfo]))
@@ -342,12 +345,12 @@ pub fn card_health(v: &Views) -> Markup {
     let cpu = cpu_usage(v);
     let cpu_temp = h.and_then(|h| fmt::cpu_temp(&h["thermal"])).filter(|_| fresh(v, Topic::Health));
     let bat_temp = v.value(Topic::Battery).and_then(fmt::battery_celsius).filter(|_| fresh(v, Topic::Battery));
-    let temp = |t: Option<f64>| t.map(fmt::celsius).unwrap_or_else(|| DASH.into());
+    let temp = |key, t: Option<f64>| roll(v, key, &t.map(fmt::celsius).unwrap_or_else(|| DASH.into()));
     kit::card(Some("card-health"), Some("/ui/health"), Icon::Cpu, "CPU & heat", html! {
-        p.big { (percent(cpu)) }
+        p.big { (roll(v, "cpu", &percent(cpu))) }
         dl.kv {
-            div { dt { "CPU" } dd { (temp(cpu_temp)) } }
-            div { dt { "Battery" } dd { (temp(bat_temp)) } }
+            div { dt { "CPU" } dd { (temp("tc", cpu_temp)) } }
+            div { dt { "Battery" } dd { (temp("tb", bat_temp)) } }
         }
         (render::error_line(v, &[Topic::Health, Topic::Battery]))
     })
@@ -359,7 +362,7 @@ pub fn card_devices(v: &Views) -> Markup {
     let count = v.value(Topic::Clients).and_then(super::wifi::host_count);
     html! {
         span #card-devices {
-            @match count { Some(n) => b.big { (n) }, None => b.big { (DASH) } }
+            @match count { Some(n) => b.big { (roll(v, "dev", &n.to_string())) }, None => b.big { (DASH) } }
             " " span.lbl { "devices" }
         }
     }

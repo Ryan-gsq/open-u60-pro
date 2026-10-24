@@ -17,6 +17,7 @@ use crate::events::hub::{SIGNAL_CADENCE, SIGNAL_HINT_MAX};
 use crate::events::Topic;
 use crate::web::kit::{self, Icon};
 use crate::web::render::{self, Fragment, Views};
+use crate::web::roll::roll;
 use crate::web::screen::PageData;
 use crate::web::signal::{self as model, Metrics, Radio};
 use crate::web::{bands, fmt};
@@ -130,12 +131,13 @@ fn int(v: f64) -> i64 {
     v.trunc() as i64
 }
 
-/// The four-value grid (RSRP, RSRQ, SINR, RSSI).
-fn metrics(m: &Metrics) -> Markup {
-    const NAMES: [(&str, &str); 4] = [("RSRP", "dBm"), ("RSRQ", "dB"), ("SINR", "dB"), ("RSSI", "dBm")];
+/// The four-value grid (RSRP, RSRQ, SINR, RSSI); `key`: the radio's
+/// letters for its rolling numbers (`roll`).
+fn metrics(v: &Views, key: &str, m: &Metrics) -> Markup {
+    const NAMES: [(&str, &str, &str); 4] = [("RSRP", "dBm", "p"), ("RSRQ", "dB", "q"), ("SINR", "dB", "s"), ("RSSI", "dBm", "i")];
     html! {
         div.metrics {
-            @for (i, (name, unit)) in NAMES.iter().enumerate() {
+            @for (i, (name, unit, k)) in NAMES.iter().enumerate() {
                 @let class = m[i].map(|x| match i {
                     0 => fmt::quality_class(x),
                     1 => model::rsrq_class(x),
@@ -145,7 +147,7 @@ fn metrics(m: &Metrics) -> Markup {
                 div {
                     span.lbl { (name) }
                     @match m[i] {
-                        Some(x) => b class=[class.filter(|c| !c.is_empty())] { (int(x)) },
+                        Some(x) => b class=[class.filter(|c| !c.is_empty())] { (roll(v, &format!("{key}{k}"), &int(x).to_string())) },
                         None => b.muted { "--" },
                     }
                     small { (unit) }
@@ -162,6 +164,9 @@ fn radio(id: &str, v: &Views, nr: bool) -> Markup {
     };
     let r = if nr { &m.nr } else { &m.lte };
     let ca = r.ca_active();
+    // Rolling-number keys: "n…" for 5G NR, "l…" for LTE, a second letter
+    // for each secondary carrier.
+    let k = if nr { "n" } else { "l" };
     html! {
         section.card id=(id) {
             div.ph {
@@ -174,12 +179,12 @@ fn radio(id: &str, v: &Views, nr: bool) -> Markup {
                 }
             }
             @if r.connected() {
-                (metrics(&r.sig))
+                (metrics(v, k, &r.sig))
                 dl.kv.meta {
                     div { dt { "Band" } dd { (bands::band(&r.band, nr, ca)) } }
-                    div { dt { "PCI" } dd { (dash(&r.pci)) } }
-                    div { dt { "Cell ID" } dd { (dash(&r.cell)) } }
-                    div { dt { (if nr { "Channel" } else { "EARFCN" }) } dd { (dash(&r.channel)) } }
+                    div { dt { "PCI" } dd { (int_roll(v, &format!("{k}pci"), &r.pci)) } }
+                    div { dt { "Cell ID" } dd { (int_roll(v, &format!("{k}cid"), &r.cell)) } }
+                    div { dt { (if nr { "Channel" } else { "EARFCN" }) } dd { (int_roll(v, &format!("{k}ch"), &r.channel)) } }
                     div { dt { "Bandwidth" } dd { (bands::bandwidth(&r.bw, &r.band, nr)) } }
                     div { dt { "CA" } dd { @if ca { "Active (" (r.cc_count()) " CC)" } @else { "Inactive" } } }
                     @if let Some(total) = r.total_bw().filter(|_| nr && ca) {
@@ -190,12 +195,35 @@ fn radio(id: &str, v: &Views, nr: bool) -> Markup {
                     div.scc {
                         p.lbl { (if nr { "5G SCC" } else { "SCC" }) (i) }
                         p.cap { (bands::carrier_band(&c.band, nr)) "\u{2003}PCI " (dash(&c.pci)) "\u{2003}BW " (dash(&c.bw)) }
-                        (metrics(&c.sig))
+                        (metrics(v, &format!("{k}{}", letters(i)), &c.sig))
                     }
                 }
             }
         }
     }
+}
+
+/// A row value that rolls when it is a whole number (the app's
+/// `SignalRow`: `Int(value)` round-trips), else as it is.
+fn int_roll(v: &Views, key: &str, s: &str) -> Markup {
+    match s.parse::<i64>() {
+        Ok(n) if n.to_string() == s => roll(v, key, s),
+        _ => html! { (dash(s)) },
+    }
+}
+
+/// "a", "b", … "z", "ba", …: lowercase letters for an index (roll keys).
+pub fn letters(mut i: usize) -> String {
+    let mut out = Vec::new();
+    loop {
+        out.push(b'a' + (i % 26) as u8);
+        i /= 26;
+        if i == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// The app's placeholder for an empty value on this page.
@@ -229,12 +257,12 @@ fn sig_wcdma(v: &Views) -> Markup {
             div.metrics.two {
                 div {
                     span.lbl { "RSCP" }
-                    @match rscp { Some(x) => b class=(model::rscp_class(x)) { (int(x)) }, None => b.muted { "--" } }
+                    @match rscp { Some(x) => b class=(model::rscp_class(x)) { (roll(v, "wr", &int(x).to_string())) }, None => b.muted { "--" } }
                     small { "dBm" }
                 }
                 div {
                     span.lbl { "Ec/Io" }
-                    @match ecio { Some(x) => b class=(model::ecio_class(x)) { (int(x)) }, None => b.muted { "--" } }
+                    @match ecio { Some(x) => b class=(model::ecio_class(x)) { (roll(v, "we", &int(x).to_string())) }, None => b.muted { "--" } }
                     small { "dB" }
                 }
             }

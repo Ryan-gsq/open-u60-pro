@@ -9,8 +9,9 @@
 use maud::{html, Markup};
 
 use crate::web::kit::{self, Tab};
+use crate::web::pages::https;
 use crate::web::prefs::{self, Theme};
-use crate::web::screen::{Block, PageData, Screen};
+use crate::web::screen::{Bar, Block, PageData, Screen};
 
 pub static SETTINGS: Screen = Screen {
     path: "/ui/settings",
@@ -21,6 +22,8 @@ pub static SETTINGS: Screen = Screen {
         Block::Custom(session),
         Block::Custom(polling),
         Block::Custom(appearance),
+        // LAN HTTPS (a web addition: `pages::https`).
+        Block::Custom(https::section),
         Block::Rows(
             "About",
             &[
@@ -31,6 +34,17 @@ pub static SETTINGS: Screen = Screen {
         ),
         Block::Custom(legal),
     ],
+    ..Screen::BLANK
+};
+
+/// Settings › HTTPS › "Install on Your Devices" (`pages::https`).
+pub static INSTALL: Screen = Screen {
+    path: https::PAGE,
+    id: "install",
+    title: "Install on Your Devices",
+    tab: Tab::Settings,
+    bar: Bar::Back("/ui/settings", "Settings"),
+    blocks: &[Block::Custom(https::install)],
     ..Screen::BLANK
 };
 

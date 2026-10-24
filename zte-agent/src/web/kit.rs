@@ -319,6 +319,11 @@ pub fn link_row(href: &str, i: Option<Icon>, label: &str) -> Markup {
 
 /// A label (with its icon) and a value.
 pub fn kv_row(i: Option<Icon>, label: &str, value: &str) -> Markup {
+    kv_row_m(i, label, html! { (value) })
+}
+
+/// `kv_row` with markup as its value (a rolling number, `roll`).
+pub fn kv_row_m(i: Option<Icon>, label: &str, value: Markup) -> Markup {
     html! { li.it { @if let Some(i) = i { (icon(i)) } span { (label) } span.v { (value) } } }
 }
 

@@ -188,6 +188,11 @@ impl LiveActivity {
             }),
         }
     }
+    /// UTC checked over TLS against a time server within the last 6 hours
+    /// (unix seconds), if any: the LAN HTTPS certificates' dates (`tls`).
+    pub fn verified_utc(&self) -> Option<u64> {
+        self.trusted_now()
+    }
     pub fn status(&self) -> (u16, Value) {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         (

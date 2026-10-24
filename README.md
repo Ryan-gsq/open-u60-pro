@@ -208,6 +208,7 @@ lpac is still the better tool elsewhere. It supports many card readers and modem
 ```
 /data/                              (writable /data partition)
 ├── zte-agent                       <- on-device REST agent
+├── zte-agent-tls/                  <- LAN HTTPS certificates (only once turned on; 0700)
 └── local/tmp/
     ├── start_zte_agent.sh          <- agent boot script
     ├── dropbear                    <- SSH binary (if installed)
@@ -325,14 +326,30 @@ It looks and works like the iOS app, with the same five tabs, screens and words.
   - **Security and quality:** Firewall (on/off and level, NAT, UPnP, DMZ, port forwarding), Telemetry Blocker, VPN Passthrough, QoS.
   - **Device Controls:** charge limit (50–100 %), Power-save Mode, Fast Boot, Auto Sleep with its idle timeout, and **Reboot Router** and **Factory Reset**, which ask for the agent password (wrong passwords count like failed logins).
   - Changes that can cut the connection or are destructive ask for confirmation first (mobile data off, roaming on, airplane mode on, a network mode, a band or cell lock, WiFi, APN, LAN, DNS and firewall changes, deletes); over Tailscale the question also says how it affects your remote connection. Mobile data, airplane mode, network mode and eSIM changes show their progress until they have settled. Passwords are never shown (leave the field empty to keep the current one), and after a change that restarts WiFi or moves the router's address the page tells you where to reconnect.
-- **Settings:** Session (**Log out**), Polling (how often live pages update the signal, 1–10 s), Appearance (System, Light or Dark), About and Legal. The refresh interval and the theme are saved in the browser.
+- **Settings:** Session (**Log out**), Polling (how often live pages update the signal, 1–10 s), Appearance (System, Light or Dark), **HTTPS & Install as App** (see [below](#install-it-as-an-app)), About and Legal. The refresh interval and the theme are saved in the browser.
 
 You stay logged in for 12 hours without use, and at most 7 days. Restarting the agent logs every browser out.
 
-### Add it to your home screen
+### Install it as an app
 
-- **iPhone/iPad (Safari):** Share → **Add to Home Screen**. It opens full screen with the U60 Pro icon; use the tab bar to move between tabs. A home-screen web app has its own cookies, so log in once inside it.
-- **Android (Chrome):** menu (⋮) → **Add to Home screen**. The page is plain HTTP, so Chrome may open the shortcut as a normal tab.
+Browsers install web apps only from HTTPS pages, so the agent can serve the web UI over HTTPS on your LAN with a certificate from the router's own certificate authority. No internet, account or domain is needed; each phone or computer trusts that authority once.
+
+1. **Turn it on:** Settings › **HTTPS & Install as App** › **Turn On HTTPS** (it shows the router's date, which the certificates are dated from). The web UI is then also at **https://192.168.0.1:9443/** and **https://u60.home.arpa:9443/**; plain http on port 9090 keeps working.
+2. **Trust the router's certificate authority on each device** (Settings › **Install on Your Devices** has the downloads, the fingerprint to compare and these steps):
+   - **iPhone/iPad:** in Safari tap **Profile for iPhone and iPad** › **Allow**; Settings › **Profile Downloaded** › **Install**; then Settings › General › About › **Certificate Trust Settings** › turn on full trust for "U60 Pro local CA …".
+   - **Android:** tap **Certificate (.crt)** to download it; Settings › Security & privacy › More security & privacy › Encryption & credentials › **Install a certificate** › **CA certificate** › Install anyway, confirm with your screen lock, pick the file (names differ by maker: search Settings for "CA certificate").
+   - **Mac:** open the downloaded `.crt` (Keychain Access adds it), double-click "U60 Pro local CA …" › Trust › **Always Trust**.
+   - **Windows:** open the `.crt` › **Install Certificate** › Current User › Place all certificates in the following store › **Trusted Root Certification Authorities**.
+   - **Firefox:** version 120 and later uses the certificates you add to Windows, macOS or Android. On Linux (or with that setting off): Settings › Privacy & Security › Certificates › View Certificates… › Authorities › Import…, and trust it for websites.
+   - **Check the fingerprint** each device shows (iPhone: Profile Downloaded › More Details, before Install; Mac: Keychain Access; Android: Trusted credentials › User; Windows: Details › Thumbprint, SHA-1) against one that did not come over plain http: the Install page opened over HTTPS on a device that already trusts the CA, or `sha256sum /data/zte-agent-tls/ca.crt` over SSH. Someone on your Wi-Fi could otherwise swap the http page and the file for their own.
+3. **Install:** open `https://192.168.0.1:9443/` (or `https://u60.home.arpa:9443/`) and log in, then **Chrome:** menu › **Install** (Android: Add to Home screen › Install); **Safari on iPhone:** ••• › Share › View More › **Add to Home Screen**; **Safari on Mac:** File › **Add to Dock**.
+
+- The certificate authority can only vouch for this router: its LAN address when you turned HTTPS on and `u60.home.arpa` (and names under it), never for other websites or devices. Its root key is destroyed after setup; the key the router keeps is limited the same way. If you change the router's LAN address later, `https://u60.home.arpa:9443/` keeps working; for the new address, reset HTTPS and trust the new authority. See [SECURITY.md](SECURITY.md).
+- The certificate lasts 397 days. It renews itself only when the agent has a verified clock (a configured Live Activity provider); otherwise Settings shows **Renew Certificate** in its last 30 days, about every 13 months. Devices keep trusting the same authority.
+- `u60.home.arpa` comes from the router's DNS and works only over HTTPS. A device that uses its own DNS (Android's Private DNS set to a provider, DNS over HTTPS in the browser, a VPN) may not find it; the address always works.
+- The http and https addresses keep separate logins (and a home-screen app has its own), so log in once on the one you use.
+- **Reset HTTPS** (Settings) deletes the certificate authority and stops HTTPS (open https pages stop working too). Remove the old one from your devices; turning HTTPS on again needs each device to trust the new one.
+- Without HTTPS you can still add the page to the home screen: Safari's ••• › Share › View More › **Add to Home Screen** works over http (log in once inside it); Chrome for Android only makes a shortcut that opens as a normal tab.
 
 ### With and without JavaScript
 
@@ -340,7 +357,7 @@ Everything works with JavaScript off: logging in and out, every page and every s
 
 - The dashboard and its detail pages show a snapshot with its age ("over 1 min old" after a minute) and a **Refresh** link.
 - A change that shows its progress (mobile data, airplane mode, network mode, a scan, an eSIM switch or download, a speed test, a signal detection) reloads its page every 3 s until it is done.
-- The theme (Settings › Appearance) works without JavaScript too.
+- The theme (Settings › Appearance) works without JavaScript too. With it, under System, iPhone's status bar also follows a light/dark switch made while a page is open.
 
 With JavaScript, the dashboard, its detail pages, the progress pages and the pages that follow the router (SMS, SIM Card, eSIM Profiles, SIM Services, Signal Detection) update live. This uses Datastar, which the agent serves itself, so no internet is needed.
 
@@ -350,7 +367,7 @@ With JavaScript, the dashboard, its detail pages, the progress pages and the pag
 
 ### Security
 
-The web UI is plain HTTP on your LAN, like the apps' connection to the agent. Your password and session cookie are not encrypted in transit: anyone who can watch traffic on the router's network can read them.
+On port 9090 the web UI is plain HTTP on your LAN, like the apps' connection to the agent: your password and session cookie are not encrypted in transit, and anyone who can watch traffic on the router's network can read them. Turn on HTTPS ([above](#install-it-as-an-app)) and use the https address to encrypt the browser's traffic.
 
 - Use a strong Wi-Fi password and never forward port 9090 to the internet.
 - The agent refuses connections that arrive over mobile data, even with the router's firewall off or at Low; Wi-Fi, USB and Tailscale keep working. `ZTE_AGENT_ALLOW_MOBILE=1` in the start script turns this off.

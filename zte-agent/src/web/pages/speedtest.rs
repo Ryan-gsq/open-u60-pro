@@ -31,6 +31,7 @@ use crate::web::action::Valid;
 use crate::web::fmt;
 use crate::web::kit::{self, Icon};
 use crate::web::render::{self, Fragment, Views};
+use crate::web::roll::roll;
 use crate::web::screen::PageData;
 use crate::web::session::query_param;
 
@@ -149,12 +150,12 @@ fn controls(v: &Views) -> Markup {
     let mbps = p["live_speed_mbps"].as_f64().unwrap_or(0.0);
     html! {
         li #st-run .it .fld .run {
-            span.row { span { (label) } span.muted.num { (pct) "%" } }
+            span.row { span { (label) } span.muted.num { (roll(v, "pct", &format!("{pct}%"))) } }
             progress max="100" value=(pct) aria-label=(label) {}
             p.stn {
                 @if phase == "download" { (kit::icon(Icon::ArrowDown)) }
                 @if phase == "upload" { span.c-orange { (kit::icon(Icon::ArrowUp)) } }
-                b.num { (format!("{mbps:.1}")) } " " span.muted { "Mbps" }
+                b.num { (roll(v, "mbps", &format!("{mbps:.1}"))) } " " span.muted { "Mbps" }
             }
         }
     }

@@ -2015,6 +2015,7 @@ dependencies = [
  "png",
  "qrcodegen",
  "reqwest",
+ "ring",
  "rqrr",
  "rustls",
  "serde",
@@ -2022,6 +2023,7 @@ dependencies = [
  "sha2",
  "subtle",
  "tokio",
+ "tokio-rustls",
  "tower",
  "ureq",
 ]

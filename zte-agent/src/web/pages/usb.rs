@@ -252,7 +252,7 @@ mod tests {
         app.auth.set_password("pw");
         let issued = app.auth.login("pw", Kind::Browser, PeerKey::UNKNOWN, &[]).unwrap();
         let p = app.auth.authenticate(Kind::Browser, issued.token.expose()).unwrap();
-        mode_page(&PageData { app: &app, p: &p, views: v, reads: &[], remote: false, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default() }).into_string()
+        mode_page(&PageData { app: &app, p: &p, views: v, reads: &[], remote: false, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default(), secure: false }).into_string()
     }
 
     /// The app's USB Mode: the status rows, and the switch (the only way to

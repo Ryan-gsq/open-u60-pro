@@ -7,7 +7,8 @@
 //!   system's scheme; the `guard` middleware swaps its colour-scheme tags
 //!   for the theme's (`themed`), which adds a small stylesheet with that
 //!   scheme's colours (`theme-light.css` / `theme-dark.css`, made from
-//!   `app.css` by `build.rs`). No JavaScript.
+//!   `app.css` by `build.rs`). No JavaScript: the one small script of the
+//!   System theme (`assets/theme.js`, owner decision 60) is left out.
 //! - **Refresh interval** (`zte_ui_refresh=<ms>`, 1.0–10.0 s by 0.5 s; the
 //!   2.0 s default clears it): the signal cadence a live page of this
 //!   browser asks the hub for (`signal_hint`; the fastest open stream
@@ -183,10 +184,11 @@ pub async fn post(ctx: Ctx, req: Request, k: Post) -> Response {
 }
 
 /// A page in this browser's theme: the shell's colour-scheme tags (drawn
-/// for the system's scheme) swapped for the theme's, which link its
-/// stylesheet after `app.css`. Anything but a whole HTML page, and every
-/// page under the System theme, is left as it is.
-pub async fn themed(resp: Response, theme: Theme) -> Response {
+/// for the system's scheme, with the System script carrying this
+/// response's CSP `nonce`) swapped for the theme's, which link its
+/// stylesheet after `app.css` and load no script. Anything but a whole
+/// HTML page, and every page under the System theme, is left as it is.
+pub async fn themed(resp: Response, theme: Theme, nonce: &str) -> Response {
     let html = session::content_type(&resp).is_some_and(|ct| ct.starts_with("text/html"));
     if theme == Theme::System || !html {
         return resp;
@@ -197,7 +199,7 @@ pub async fn themed(resp: Response, theme: Theme) -> Response {
         return render::internal("");
     };
     let page = match std::str::from_utf8(&bytes) {
-        Ok(s) => s.replacen(&render::scheme(Theme::System), &render::scheme(theme), 1),
+        Ok(s) => s.replacen(&render::scheme(Theme::System, nonce), &render::scheme(theme, nonce), 1),
         Err(_) => return Response::from_parts(parts, Body::from(bytes)),
     };
     parts.headers.remove(CONTENT_LENGTH);

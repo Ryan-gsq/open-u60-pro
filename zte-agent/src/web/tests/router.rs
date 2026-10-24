@@ -79,7 +79,7 @@ async fn mobile_network_page_follows_the_app() {
     }
     let tokens: Vec<&str> = html.split("name=\"once\" value=\"").skip(1).map(|t| t.split('"').next().unwrap()).collect();
     assert!(tokens.len() == 2 && tokens[0] == tokens[1] && tokens[0].len() == 16, "{tokens:?}");
-    assert!(!html.contains("<script") && !html.contains("style=") && !html.contains("Failed"));
+    assert!(!html.contains("/ui/a/datastar-") && !html.contains("style=") && !html.contains("Failed"));
     // Over Tailscale the scan asks first (no `confirm`).
     let remote = get_with(&c, MN, tailnet(40140), &cookie).await.text();
     assert!(remote.contains("<form id=\"mn-scan\"") && !remote.contains("name=\"confirm\""), "{remote}");

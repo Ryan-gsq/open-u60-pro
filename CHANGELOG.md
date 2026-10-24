@@ -9,6 +9,7 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 - **Web UI in the agent.** Open `http://192.168.0.1:9090/` on the router's Wi-Fi and log in with the agent password. It is a copy of the iOS app with its five tabs: Dashboard, SMS, Tools, Router and Settings (what stays in the apps is listed in the README). It works without JavaScript; with JavaScript the pages update live. It can be added to the home screen on iPhone and Android.
 - **Live updates for apps and integrations:** `GET /api/events`, a Server-Sent Events stream. The router samples values only while a stream is open.
 - **Safer logins:** random tokens, a login rate limit, and sessions that no longer end when the network changes the router's clock.
+- **Install the web UI as an app, over HTTPS on your LAN:** Settings › HTTPS & Install as App turns on `https://192.168.0.1:9443/` (and `https://u60.home.arpa:9443/`) with the router's own certificate authority. Each phone or computer trusts it once (an iPhone profile or a `.crt`, with the steps per platform); it can only vouch for the router's LAN address and `u60.home.arpa`. Offline, no accounts; plain http on port 9090 stays.
 
 ### zte-agent
 
@@ -19,7 +20,9 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
   - a confirmation page before changes that can cut the connection or are destructive (mobile data off, roaming on, airplane mode on, a network mode, band and cell locks, WiFi, APN, LAN, DNS and firewall changes, deletes); Reboot Router and Factory Reset ask for the agent password;
   - passwords (Wi-Fi, guest Wi-Fi, APN) and SMS forwarding secrets are never put into a page: leave the field empty to keep the current one;
   - a web app manifest and icons for the home screen;
-  - live updates with Datastar 1.0.4, served by the agent itself.
+  - live updates with Datastar 1.0.4, served by the agent itself; a number that changes rolls its changed digits up or down like the app's (not with reduced motion, never on a page load);
+  - Settings › Appearance also colours the browser's bars and the home-screen app's status bar wherever the browser takes them from the page (Safari, and Chrome in the system's light mode; Chrome for Android keeps its own dark bars in dark mode). Under System, a light/dark switch with a page open also recolours iPhone's status bar, in Safari and in the home-screen app: a small script (`theme.js`, System only, no timer) makes iOS take the colours again; pages work the same without it;
+  - Chrome for Android's installed app (and links from other apps) open signed in: login also sets a `SameSite=Lax` marker cookie with no secret (`zte_ui_signed_in=1`), and a page that arrives with the marker but without the `SameSite=Strict` session cookie opens itself once more (a same-site navigation, so the session cookie comes along), never twice and only for its own page;
 
   See `zte-agent/docs/web-ui.md`.
 - **`GET /api/events`** (bearer token; needs an agent password): JSON SSE with 22 topics, a snapshot on connect and then only changes.
@@ -27,6 +30,15 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
   - Contract: `zte-agent/docs/events.md`.
 - **`ZTE_AGENT_UI_HOSTS`:** extra host names the agent answers to (comma-separated), besides IP addresses and, for Tailscale clients, `localhost` and the router's Tailscale names.
 - Lockouts are logged: when the global login limit runs dry, and when one address is blocked for a minute or more (with the address, never the password).
+- **LAN HTTPS with the router's own certificate authority** (`zte-agent/docs/web-ui.md`, "LAN HTTPS"). Nothing exists until the owner turns it on in Settings (a question with the router's date, single-use token):
+  - a root CA and one issuing CA (ECDSA P-256, 10 years; built in DER by the agent and signed with ring and p256, no new crate), both with critical name constraints: the LAN address at Turn On (`/32`, if private) and `u60.home.arpa` permitted, every IPv6 address excluded (and every IPv4 address when none is permitted); pathLen 1 and 0; serverAuth only. The root's key is dropped (and wiped) once it has signed the issuing CA (Android ignores a user-installed root's name constraints but not an intermediate's), so the key the router keeps can vouch for nothing else on any device;
+  - a server certificate for the LAN address (`br-lan`) and `u60.home.arpa`, 397 days from two days back (never past the CA), issued again without a restart when the address it should name changes (same dates; at agent start, after a LAN apply, at a TLS connection to a new address; after a LAN address change the name alone, until Reset makes a CA for the new address) or, by the TLS-verified clock only (which needs a Live Activity provider), when fewer than 30 days are left; "Renew Certificate" in Settings otherwise (about every 13 months without one). No timers;
+  - files in `/data/zte-agent-tls/` (directory 0700, keys 0600; the root key is never stored); a server pair lost to a power cut or a full disk is issued again from the same CA at start (or at Turn On), so devices keep trusting it; "Reset HTTPS" deletes them, closes the port, ends open HTTPS connections and removes the local name;
+  - the listener on `0.0.0.0:9443` (**`ZTE_AGENT_TLS_BIND`**), rustls with ring, TLS 1.2 and 1.3, ALPN `http/1.1`, the same router, mobile-side check and connection caps as :9090 (shared with it); no HSTS;
+  - `u60.home.arpa` (**`ZTE_AGENT_TLS_NAME`**, a name under `.home.arpa`) in dnsmasq through `/tmp/hosts/zte-agent` (SIGHUP to the LAN dnsmasq), written again at every start (the temporary file created new, never through a link); answered only over HTTPS;
+  - over HTTPS the web UI's cookies are `__Host-zte_ui_*; Path=/; Secure`: the http and https origins of one host never read or overwrite each other's session;
+  - downloads `/ui/https/u60-pro-ca.crt` (DER) and `/ui/https/u60-pro-ca.mobileconfig` (iPhone profile), public while HTTPS is on, never cached; Settings shows the CA's SHA-256 (and Windows' SHA-1) fingerprint, where each device shows it and how to check it against a source that does not come over plain http, and the steps for iPhone, Android, Mac, Windows and Firefox; the http login page and Settings point to the https address; a bind that fails is shown with Try Again;
+  - **`GET /api/https`** (bearer token): whether it is on and listening, the addresses, the certificate's end, the CA's name, fingerprint and what it can vouch for.
 - **The agent refuses connections from the mobile-data side itself**, whatever the router's firewall says (the web UI can turn the firewall off or set it to Low):
   - it serves a connection only from loopback (every Tailscale client), the router's own addresses, or an address in the subnet of a local interface (the Wi-Fi bridge, the USB network: any interface not named `rmnet*`) unless a cellular subnet holds it as specifically or more; any other is closed without a reply. The client's address is what counts, so a port forward or DMZ to the router's address is refused too;
   - refusals are logged: the first, then at most one line a minute with the count (the address and interface, never what was sent);
@@ -99,6 +111,7 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 - A few app features stay in the apps (the iOS Live Activity, live-camera QR scanning, calls, LAN Speed Test, Config Decrypt/Encrypt); see the README's "Not in the browser" list.
 - Not yet verified on the router: the field names some Router settings send (LAN / DHCP, firewall, port forwarding, DMZ, domain filter; the web sends the app's and the firmware's), and the power-save and auto-sleep bodies.
 - Not yet verified on the router: a home-screen web app staying logged in after relaunch, and idle power and memory with the new listener.
+- Not yet checked on a real phone: the status bar after a light/dark switch (checked in the iOS 26.5 simulator) and the Android installed app's launch (checked in Chrome with a link from another site).
 
 ## [2.2.0] - 2026-10-20
 

@@ -35,6 +35,7 @@ pub mod prefs;
 pub mod qr;
 pub mod qr_decode;
 pub mod render;
+pub mod roll;
 pub mod routes;
 pub mod screen;
 pub mod session;
@@ -97,6 +98,8 @@ async fn to_ui() -> Response {
 fn is_static(path: &str) -> bool {
     path.strip_prefix("/ui/a/").is_some_and(|file| !file.is_empty() && !file.contains('/'))
         || path == "/ui/manifest.webmanifest"
+        || path == crate::tls::DOWNLOAD_CRT
+        || path == crate::tls::DOWNLOAD_PROFILE
 }
 
 /// Paths that may render HTML: everything under `/ui` but static files.
@@ -119,9 +122,10 @@ async fn guard(State(ctx): State<Ctx>, mut req: Request, next: Next) -> Response
     // This browser's theme (Settings › Appearance) for its pages.
     let theme = if page { prefs::Prefs::of(req.headers()).theme } else { prefs::Theme::System };
     let loopback = req.extensions().get::<Peer>().is_some_and(|p| p.0.ip().to_canonical().is_loopback());
+    let over_tls = req.extensions().get::<crate::httpd::tls::Secure>().is_some();
     match api::header(req.headers(), "host") {
         None => return early(req, text(StatusCode::BAD_REQUEST, "Missing Host"), None).await,
-        Some(h) if !ctx.hosts.allows(h, loopback, &|| ctx.ts.get()) => {
+        Some(h) if !ctx.hosts.allows_via(h, loopback, over_tls, &|| ctx.ts.get()) => {
             return early(req, text(StatusCode::FORBIDDEN, "Host not allowed"), None).await
         }
         Some(_) => {}
@@ -136,7 +140,7 @@ async fn guard(State(ctx): State<Ctx>, mut req: Request, next: Next) -> Response
     };
     let resp = match &nonce {
         Some(n) if !ctx.app.auth.has_password() => {
-            let resp = prefs::themed(render::no_password(n), theme).await;
+            let resp = prefs::themed(render::no_password(n), theme, n).await;
             return early(req, resp, Some(n)).await;
         }
         Some(n) => {
@@ -145,7 +149,7 @@ async fn guard(State(ctx): State<Ctx>, mut req: Request, next: Next) -> Response
         }
         None => next.run(req).await,
     };
-    secure(prefs::themed(resp, theme).await, nonce.as_deref())
+    secure(prefs::themed(resp, theme, nonce.as_deref().unwrap_or("")).await, nonce.as_deref())
 }
 
 /// A reply that leaves the request body unread (drained if small, else the
@@ -179,9 +183,9 @@ fn secure(mut resp: Response, nonce: Option<&str>) -> Response {
     resp
 }
 
-/// Scripts by nonce only: the Datastar tag and the scripts Datastar itself
-/// adds for `data-*` expressions carry it; no other script, same-origin or
-/// not, runs.
+/// Scripts by nonce only: the Datastar tag, the System theme's script tag
+/// (`assets/theme.js`) and the scripts Datastar itself adds for `data-*`
+/// expressions carry it; no other script, same-origin or not, runs.
 fn csp(nonce: &str) -> String {
     format!(
         "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'self'; img-src 'self'; \

@@ -76,14 +76,15 @@ const READ_WAIT: Duration = Duration::from_millis(500);
 
 /// Set once at startup by `Guard::from_env`.
 static ALLOW_MOBILE: AtomicBool = AtomicBool::new(false);
-/// The router's guard serves everything because its lookup fails.
-static UNGUARDED: AtomicBool = AtomicBool::new(false);
+/// Per router listener (:9090, then HTTPS): its guard serves everything
+/// because its lookup fails. Each listener writes only its own flag.
+static UNGUARDED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
 
 /// Whether the agent serves the mobile side now: `ZTE_AGENT_ALLOW_MOBILE=1`,
-/// or the interface lookup fails with no recent table (the firewall
-/// questions then say this web UI may become reachable).
+/// or a listener's interface lookup fails with no recent table (the
+/// firewall questions then say this web UI may become reachable).
 pub fn mobile_served() -> bool {
-    ALLOW_MOBILE.load(Ordering::Relaxed) || UNGUARDED.load(Ordering::Relaxed)
+    ALLOW_MOBILE.load(Ordering::Relaxed) || UNGUARDED.iter().any(|f| f.load(Ordering::Relaxed))
 }
 
 /// The opt-out from the variable: exactly `1` (spaces around it ignored)
@@ -111,6 +112,11 @@ pub struct IfAddr {
 /// The table's source: `getifaddrs` on the router, a fixed table in tests.
 /// It runs on the blocking pool.
 pub type Lookup = Arc<dyn Fn() -> std::io::Result<Vec<IfAddr>> + Send + Sync>;
+
+/// Every address of every interface that is up (`getifaddrs`; blocking).
+pub fn interfaces() -> std::io::Result<Vec<IfAddr>> {
+    sys::interfaces()
+}
 
 /// An interface on the mobile-data side.
 pub fn mobile_side(name: &str) -> bool {
@@ -179,8 +185,10 @@ pub struct Guard {
     off: bool,
     lookup: Lookup,
     clock: Arc<dyn Clock>,
-    /// The router's guard: says in `mobile_served` when it serves everything.
-    global: bool,
+    /// A router listener's guard: its flag in `mobile_served` (the set and
+    /// this listener's place in it), true while it serves everything
+    /// (cleared when the guard goes, at a stop).
+    flag: Option<(&'static [AtomicBool; 2], usize)>,
     /// The last table read; kept through failed reads for `KEEP`. `None`
     /// before the first and after that (every connection is then served).
     table: Option<Vec<IfAddr>>,
@@ -199,6 +207,15 @@ pub struct Guard {
     pending: Option<tokio::task::JoinHandle<std::io::Result<Vec<IfAddr>>>>,
 }
 
+/// A listener that stops (HTTPS reset) no longer serves anything.
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if let Some((f, i)) = self.flag {
+            f[i].store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Guard {
     /// The router's: `getifaddrs`, the boot clock, and the opt-out from
     /// `ZTE_AGENT_ALLOW_MOBILE` (logged when set, also when ignored).
@@ -208,7 +225,17 @@ impl Guard {
         if let Some(line) = line {
             eprintln!("{line}");
         }
-        Guard { global: true, ..Guard::new(off, Arc::new(sys::interfaces), Arc::new(BootClock)) }
+        let mut g = Guard::new(off, Arc::new(sys::interfaces), Arc::new(BootClock));
+        g.flag = Some((&UNGUARDED, 0));
+        g
+    }
+
+    /// Another listener's check with the same settings (its own table and,
+    /// for the router's, its own flag in `mobile_served`).
+    pub fn twin(&self) -> Guard {
+        let mut g = Guard::new(self.off, Arc::clone(&self.lookup), Arc::clone(&self.clock));
+        g.flag = self.flag.map(|(f, _)| (f, 1));
+        g
     }
 
     pub fn new(off: bool, lookup: Lookup, clock: Arc<dyn Clock>) -> Guard {
@@ -216,7 +243,7 @@ impl Guard {
             off,
             lookup,
             clock,
-            global: false,
+            flag: None,
             table: None,
             good_at: None,
             read_at: None,
@@ -260,7 +287,7 @@ impl Guard {
 
     /// `admit` on this thread, with its log lines returned.
     #[cfg(test)]
-    fn check(&mut self, peer: SocketAddr, local: impl FnOnce() -> Option<SocketAddr>) -> (bool, Vec<String>) {
+    pub(crate) fn check(&mut self, peer: SocketAddr, local: impl FnOnce() -> Option<SocketAddr>) -> (bool, Vec<String>) {
         if self.off {
             return (true, Vec::new());
         }
@@ -334,8 +361,8 @@ impl Guard {
                 self.failing = true;
             }
         }
-        if self.global {
-            UNGUARDED.store(self.open(), Ordering::Relaxed);
+        if let Some((f, i)) = self.flag {
+            f[i].store(self.open(), Ordering::Relaxed);
         }
     }
 
@@ -730,6 +757,34 @@ mod tests {
         let (ok, lines) = g.check(v4("203.0.113.7"), lan_ip);
         assert!(!ok && !g.open());
         assert_eq!(lines, ["[http] interface lookup works again: connections from the mobile side are refused"]);
+    }
+
+    /// Each listener (:9090 and its HTTPS twin) has its own fail-open
+    /// flag: one failing open is said while the other reads fine (no last
+    /// writer wins), and a stopped listener's flag goes with it.
+    #[test]
+    fn each_listener_says_when_it_fails_open() {
+        let flags: &'static [AtomicBool; 2] = Box::leak(Box::new([AtomicBool::new(false), AtomicBool::new(false)]));
+        let any = || flags.iter().any(|f| f.load(Ordering::Relaxed));
+        let (mut plain, f) = fake(false);
+        plain.flag = Some((flags, 0));
+        let mut https = plain.twin();
+        assert_eq!(https.flag.map(|(_, i)| i), Some(1));
+        f.set(Err(std::io::Error::other("netlink busy (fake)")));
+        assert!(plain.check(v4("203.0.113.7"), lan_ip).0 && any());
+        f.set(Ok(router()));
+        assert!(!https.check(v4("203.0.113.7"), lan_ip).0);
+        assert!(any(), "the HTTPS guard's good read hid :9090 serving everything");
+        // Ten minutes on, HTTPS's lookup fails with no recent table.
+        f.set(Err(std::io::Error::other("netlink busy (fake)")));
+        f.clock.advance(Duration::from_secs(601));
+        assert!(https.check(v4("203.0.113.7"), lan_ip).0);
+        f.set(Ok(router()));
+        assert!(!plain.check(v4("203.0.113.7"), lan_ip).0);
+        assert!(any(), ":9090's good read hid HTTPS serving everything");
+        drop(https);
+        assert!(!any());
+        assert!(!mobile_served(), "test flags are not the router's");
     }
 
     #[test]

@@ -39,12 +39,16 @@ pub struct AppState {
     pub sim_identity: Arc<crate::sim_identity::SimIdentity>,
     /// Live updates for `GET /api/events` (see events/); no threads until `events::start`.
     pub hub: Arc<crate::events::Hub>,
+    /// LAN HTTPS with the router's own CA (see tls/); nothing until `start` or Turn On.
+    pub tls: Arc<crate::tls::Tls>,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
         Self {
-            live_activity: Arc::new(crate::live_activity::LiveActivity::new()),
+            tls: Arc::new(crate::tls::Tls::router(Arc::clone(&live_activity))),
+            live_activity,
             auth: Arc::new(AuthState::new()),
             cpu: CpuTracker::new(),
             speed: SpeedTracker::new(),

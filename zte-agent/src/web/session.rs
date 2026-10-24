@@ -3,6 +3,21 @@
 //!
 //! Cookies are read only under `/ui/` and bearer headers are ignored there;
 //! the JSON API never reads cookies.
+//!
+//! **The marker hop** (owner decision 61). The session cookie is
+//! `SameSite=Strict`, so a page opened from outside the site (Chrome for
+//! Android's installed web app and home-screen shortcuts, a link in another
+//! app: navigations Chrome counts as cross-site) arrives without it. Login
+//! also sets a marker cookie (`zte_ui_signed_in=1`: no secret, the same
+//! lifetime, `SameSite=Lax`, so it does come along). A GET page that
+//! arrives with the marker but without the session cookie (`without_session`)
+//! answers with a small page that opens the same URL once more, flagged
+//! `hop=1` (`hop_page`, a meta refresh: a navigation the page itself starts,
+//! so it is same-site and the browser sends the `Strict` cookie). There the
+//! session either works (`303` to the URL without the flag) or is gone (the
+//! login, and the marker is cleared). Never twice in a row (the flag, and a
+//! same-site request or one that brought the session cookie never hops),
+//! only to the request's own path, never for posts, live streams or the API.
 
 use axum::body::Body;
 use axum::extract::FromRequestParts;
@@ -33,10 +48,28 @@ const NEXT_MAX: usize = 200;
 
 pub const CLEAR_SESSION: &str = "zte_ui_session=; Path=/ui/; Max-Age=0; HttpOnly; SameSite=Strict";
 pub const CLEAR_PRE: &str = "zte_ui_pre=; Path=/ui/; Max-Age=0; HttpOnly; SameSite=Strict";
+/// "This browser has a session" (the marker hop, above): a fixed value, no
+/// secret.
+pub const MARKER_COOKIE: &str = "zte_ui_signed_in";
+pub const CLEAR_MARKER: &str = "zte_ui_signed_in=; Path=/ui/; Max-Age=0; HttpOnly; SameSite=Lax";
+/// The query flag of the hop's request.
+const HOP: &str = "hop=1";
+/// Longest URL a hop goes to.
+const HOP_MAX: usize = 400;
 
 /// `Set-Cookie` for a new session; `Max-Age` is the session's absolute lifetime.
 pub fn set_session(token: &str, max_age_secs: u64) -> String {
     format!("{SESSION_COOKIE}={token}; Path=/ui/; Max-Age={max_age_secs}; HttpOnly; SameSite=Strict")
+}
+
+/// `Set-Cookie` for the marker, with the session cookie's lifetime.
+pub fn set_marker(max_age_secs: u64) -> String {
+    format!("{MARKER_COOKIE}=1; Path=/ui/; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax")
+}
+
+/// The request carries the marker.
+pub fn has_marker(headers: &HeaderMap) -> bool {
+    cookies(headers, MARKER_COOKIE).any(|v| v == "1")
 }
 
 /// `Set-Cookie` for the pre-login cookie the login form token is bound to.
@@ -172,6 +205,80 @@ fn form_page(path: &str) -> &str {
     }
 }
 
+/// The query without the hop's flag (and without `hop` at all).
+fn without_hop(query: Option<&str>) -> Option<String> {
+    let kept: Vec<&str> = query.unwrap_or("").split('&').filter(|p| !p.is_empty() && *p != "hop" && !p.starts_with("hop=")).collect();
+    (!kept.is_empty()).then(|| kept.join("&"))
+}
+
+fn hopped(query: Option<&str>) -> bool {
+    query.unwrap_or("").split('&').any(|p| p == HOP)
+}
+
+/// Where a hop goes: the request's own page with the flag (and without a
+/// search, which can be a phone number, as `login_redirect`), if it is a
+/// plain `/ui/` path (the `next` rule's character set, no dot segment, not
+/// a live stream or an asset).
+fn hop_target(path: &str, query: Option<&str>) -> Option<String> {
+    let query: Vec<&str> = query.unwrap_or("").split('&').filter(|p| !p.is_empty() && *p != "q" && !p.starts_with("q=")).collect();
+    let target = match query.is_empty() {
+        true => format!("{path}?{HOP}"),
+        false => format!("{path}?{}&{HOP}", query.join("&")),
+    };
+    let ok = target.starts_with("/ui/")
+        && target.len() <= HOP_MAX
+        && target.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-.?=&%".contains(&b))
+        && !has_dot_segment(&target)
+        && !target.starts_with("/ui/live/")
+        && !target.starts_with("/ui/a/");
+    ok.then_some(target)
+}
+
+/// `Sec-Fetch-*` say this is not a page navigation (a fetch, an iframe);
+/// browsers without them navigate.
+fn not_a_navigation(headers: &HeaderMap) -> bool {
+    api::header(headers, "sec-fetch-mode").is_some_and(|m| m != "navigate")
+        || api::header(headers, "sec-fetch-dest").is_some_and(|d| d != "document")
+}
+
+/// A GET page that found no session: the hop (the module doc) when it can
+/// help, else `to` (the login) with the query without the hop's flag. The
+/// session is known to be gone when the request is the hop itself, brought
+/// a session cookie, or came from this site (`Sec-Fetch-Site`: the browser
+/// would have sent the `Strict` cookie); then the marker is cleared too.
+pub fn without_session(
+    headers: &HeaderMap,
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+    nonce: &str,
+    to: impl FnOnce(Option<&str>) -> Response,
+) -> Response {
+    let marker = has_marker(headers);
+    let site = api::header(headers, "sec-fetch-site");
+    let gone = hopped(query) || !session_cookies(headers).is_empty() || matches!(site, Some("same-origin" | "same-site"));
+    let query = without_hop(query);
+    if marker && !gone && method == Method::GET && !not_a_navigation(headers) {
+        if let Some(target) = hop_target(path, query.as_deref()) {
+            return render::hop_page(&target, nonce);
+        }
+    }
+    let mut resp = to(query.as_deref());
+    if marker && gone {
+        add_cookie(&mut resp, CLEAR_MARKER);
+    }
+    resp
+}
+
+/// A page with a session reached by the hop: `303` to it without the
+/// flag (same-site, so the cookie goes along again).
+pub fn after_hop(path: &str, query: Option<&str>) -> Option<Response> {
+    hopped(query).then(|| match without_hop(query) {
+        Some(q) => see_other(&format!("{path}?{q}")),
+        None => see_other(path),
+    })
+}
+
 /// Connected remotely: Tailscale's userspace networking makes every tailnet
 /// request come from the loopback address.
 pub fn is_remote(peer: Option<&Peer>) -> bool {
@@ -182,7 +289,8 @@ pub fn is_remote(peer: Option<&Peer>) -> bool {
 }
 
 /// An authenticated browser session (request extractor) for GET pages.
-/// Without one the request is answered with `login_redirect`.
+/// Without one the request is answered with `without_session` (the hop or
+/// `login_redirect`).
 ///
 /// Not for POST handlers: an extractor cannot reach the body, and a reply
 /// that leaves a posted body unread may reach the client as a reset. A POST
@@ -199,9 +307,16 @@ impl FromRequestParts<Ctx> for Session {
             "Session extractor on a {} route; see its doc",
             parts.method
         );
+        let (path, query) = (parts.uri.path(), parts.uri.query());
         match find_session(&ctx.app.auth, &parts.headers) {
-            Some(p) => Ok(Session(p)),
-            None => Err(login_redirect(&parts.method, parts.uri.path(), parts.uri.query())),
+            Some(p) => match after_hop(path, query) {
+                Some(clean) => Err(clean),
+                None => Ok(Session(p)),
+            },
+            None => {
+                let nonce = parts.extensions.get::<super::CspNonce>().map(|n| n.0.as_str()).unwrap_or_default();
+                Err(without_session(&parts.headers, &parts.method, path, query, nonce, |q| login_redirect(&parts.method, path, q)))
+            }
         }
     }
 }
@@ -364,6 +479,95 @@ mod tests {
         let peer = |ip: &str| Peer(std::net::SocketAddr::new(ip.parse().unwrap(), 1));
         assert!(is_remote(Some(&peer("127.0.0.1"))) && is_remote(Some(&peer("::1"))) && is_remote(Some(&peer("::ffff:127.0.0.1"))));
         assert!(!is_remote(Some(&peer("192.168.0.20"))) && !is_remote(None));
+    }
+
+    /// The marker hop (owner decision 61).
+    #[test]
+    fn hop_targets_are_the_requests_own_page() {
+        assert_eq!(hop_target("/ui/", None).as_deref(), Some("/ui/?hop=1"));
+        assert_eq!(hop_target("/ui/router/wifi", Some("t=00ff")).as_deref(), Some("/ui/router/wifi?t=00ff&hop=1"));
+        // A search (it can be a phone number) is left out, as for `next`.
+        assert_eq!(hop_target("/ui/sms", Some("q=5555550100&store=sim")).as_deref(), Some("/ui/sms?store=sim&hop=1"));
+        let long = format!("/ui/{}", "a".repeat(400));
+        for (path, query) in [
+            ("/ui/live/dashboard/00ff", None),
+            ("/ui/a/app.0123456789.css", None),
+            ("/ui/x/../api/device", None),
+            ("/ui/%2e%2e/api", None),
+            ("/ui/x", Some("a=\"><b")),
+            ("/ui/x", Some("a=1;url=//evil")),
+            ("/api/device", None),
+            (long.as_str(), None),
+        ] {
+            assert_eq!(hop_target(path, query), None, "{path} {query:?}");
+        }
+        assert_eq!(without_hop(Some("a=1&hop=1&b=2&hop")).as_deref(), Some("a=1&b=2"));
+        assert_eq!(without_hop(Some("hop=1")), None);
+    }
+
+    fn hop_headers(cookies: &str, site: Option<&'static str>, mode: &'static str, dest: &'static str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if !cookies.is_empty() {
+            h.append("cookie", HeaderValue::from_str(cookies).unwrap());
+        }
+        if let Some(site) = site {
+            h.append("sec-fetch-site", HeaderValue::from_static(site));
+        }
+        h.append("sec-fetch-mode", HeaderValue::from_static(mode));
+        h.append("sec-fetch-dest", HeaderValue::from_static(dest));
+        h
+    }
+
+    fn set_cookies(r: &Response) -> Vec<&str> {
+        r.headers().get_all(axum::http::header::SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_launch_from_outside_hops_once_to_find_the_strict_cookie() {
+        let login = |q: Option<&str>| login_redirect(&Method::GET, "/ui/sms", q);
+        let go = |h: &HeaderMap, method: &Method, query: Option<&str>| without_session(h, method, "/ui/sms", query, "00ff", login);
+        let marker = "zte_ui_signed_in=1";
+        // Launched from outside the site (an installed app, a link in
+        // another app): the marker came, the Strict session cookie did not.
+        for site in [Some("none"), Some("cross-site"), None] {
+            let r = go(&hop_headers(marker, site, "navigate", "document"), &Method::GET, Some("store=sim"));
+            assert_eq!(r.status(), StatusCode::OK, "{site:?}");
+            assert!(set_cookies(&r).is_empty());
+            let body = String::from_utf8(axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap().to_vec()).unwrap();
+            assert!(body.contains(r#"<meta http-equiv="refresh" content="0; url=/ui/sms?store=sim&amp;hop=1">"#), "{body}");
+            assert!(body.contains(r#"<a class="btn" href="/ui/sms?store=sim&amp;hop=1">Continue</a>"#), "{body}");
+        }
+        // The hop itself, a request from this site, or one that brought a
+        // (stale) session cookie: the session is gone; login, marker cleared.
+        let gone = [
+            (hop_headers(marker, Some("same-origin"), "navigate", "document"), Some("store=sim&hop=1")),
+            (hop_headers(marker, Some("same-origin"), "navigate", "document"), Some("store=sim")),
+            (hop_headers(marker, Some("same-site"), "navigate", "document"), Some("store=sim")),
+            (hop_headers(&format!("{marker}; zte_ui_session={}", "a".repeat(64)), Some("none"), "navigate", "document"), Some("store=sim")),
+        ];
+        for (h, query) in &gone {
+            let r = go(h, &Method::GET, *query);
+            assert_eq!(r.headers()[LOCATION], "/ui/login?next=%2Fui%2Fsms%3Fstore%3Dsim", "{query:?}");
+            assert_eq!(set_cookies(&r), [CLEAR_MARKER]);
+        }
+        // Never for a post, a fetch, a frame, or without the marker.
+        let no_hop = [
+            (hop_headers(marker, Some("cross-site"), "navigate", "document"), Method::POST),
+            (hop_headers(marker, Some("none"), "cors", "empty"), Method::GET),
+            (hop_headers(marker, Some("none"), "navigate", "iframe"), Method::GET),
+            (hop_headers("", Some("none"), "navigate", "document"), Method::GET),
+            (hop_headers("zte_ui_signed_in=0", Some("none"), "navigate", "document"), Method::GET),
+        ];
+        for (h, method) in &no_hop {
+            let r = go(h, method, Some("store=sim"));
+            assert_eq!(r.status(), StatusCode::SEE_OTHER, "{method} {h:?}");
+        }
+        // With the session found on the hop: the page without the flag.
+        assert_eq!(after_hop("/ui/sms", Some("store=sim&hop=1")).map(|r| r.headers()[LOCATION].clone()).unwrap(), "/ui/sms?store=sim");
+        assert_eq!(after_hop("/ui/", Some("hop=1")).map(|r| r.headers()[LOCATION].clone()).unwrap(), "/ui/");
+        assert!(after_hop("/ui/", Some("store=sim")).is_none() && after_hop("/ui/", None).is_none());
+        assert_eq!(set_marker(604_800), "zte_ui_signed_in=1; Path=/ui/; Max-Age=604800; HttpOnly; SameSite=Lax");
+        assert_eq!(CLEAR_MARKER, "zte_ui_signed_in=; Path=/ui/; Max-Age=0; HttpOnly; SameSite=Lax");
     }
 
     #[test]

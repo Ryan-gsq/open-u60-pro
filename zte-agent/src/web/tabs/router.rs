@@ -581,7 +581,7 @@ mod tests {
                 Ok(json!({"operate_mode": mode})),
                 Ok(Value::Null),
             ];
-            mobile::page(&PageData { app: &app, p: &p, views: &views, reads: &reads, remote: false, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default() }).into_string()
+            mobile::page(&PageData { app: &app, p: &p, views: &views, reads: &reads, remote: false, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default(), secure: false }).into_string()
         };
         let s = page("ONLINE");
         let order = [

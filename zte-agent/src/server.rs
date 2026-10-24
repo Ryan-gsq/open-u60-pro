@@ -67,6 +67,8 @@ pub struct ReqInfo<'a> {
     pub headers: ReqHeaders<'a>,
     /// The peer is this device: Tailscale clients (userspace networking).
     pub loopback: bool,
+    /// Over the LAN HTTPS listener (`httpd::tls`).
+    pub secure: bool,
 }
 
 pub struct PreEnv<'a> {
@@ -111,7 +113,7 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
         let Some(host) = req.headers.host else {
             return refuse(400, "missing host");
         };
-        if !env.hosts.allows(host, req.loopback, env.ts_names) {
+        if !env.hosts.allows_via(host, req.loopback, req.secure, env.ts_names) {
             return refuse(403, "host not allowed");
         }
     }
@@ -423,6 +425,8 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         (&Method::Post, "/api/doh/cache/clear") => doh_cache_clear(state),
         // Tailscale remote management
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
+        // LAN HTTPS (docs/web-ui.md, "LAN HTTPS"): read-only for the apps.
+        (&Method::Get, "/api/https") => state.tls.status_json(),
         (&Method::Post, "/api/tailscale/setup") => tailscale::setup(state, body),
         (&Method::Post, "/api/tailscale/login-url") => tailscale::login_url(state),
         (&Method::Post, "/api/tailscale/enable") => tailscale::enable(state),
@@ -527,7 +531,7 @@ mod tests {
 
     /// A request from a Tailscale client (loopback); `lan` for one from the LAN.
     fn info<'a>(method: Method, path: &'a str, query: Option<&'a str>, bearer: Option<&'a str>, headers: ReqHeaders<'a>) -> ReqInfo<'a> {
-        ReqInfo { method, path, query, bearer, headers, loopback: true }
+        ReqInfo { method, path, query, bearer, headers, loopback: true, secure: false }
     }
 
     fn lan(req: ReqInfo<'_>) -> ReqInfo<'_> {

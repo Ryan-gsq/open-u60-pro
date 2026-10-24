@@ -152,9 +152,9 @@ mod tests {
     }
 
     #[test]
-    fn eight_assets_with_hashed_paths() {
+    fn nine_assets_with_hashed_paths() {
         use sha2::{Digest, Sha256};
-        assert_eq!(ASSETS.len(), 8);
+        assert_eq!(ASSETS.len(), 9);
         for a in &ASSETS {
             assert!(a.path.starts_with("/ui/a/"), "{}", a.path);
             let hash = a.etag.trim_matches('"');
@@ -278,5 +278,13 @@ mod tests {
             assert!(ASSETS.iter().any(|a| a.path == src), "{src}");
         }
         assert_eq!(icons[2]["purpose"], "maskable");
+        // The installed app's fallback colour is the light pages' own
+        // (Chrome for Android takes the manifest's when a page's
+        // theme-color is too bright, as #f2f2f7 is, and then shows its own
+        // light bar instead of a dark one over a light page); the splash
+        // stays the icon's tile.
+        assert_eq!((m["theme_color"].as_str(), m["background_color"].as_str()), (Some("#f2f2f7"), Some("#0f172a")));
+        let light = crate::web::render::scheme(crate::web::prefs::Theme::Light, "00ff");
+        assert!(light.contains("<meta name=\"theme-color\" content=\"#f2f2f7\">"), "{light}");
     }
 }

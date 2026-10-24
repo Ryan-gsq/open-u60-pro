@@ -382,7 +382,8 @@ async fn ussd_sends_once_and_keeps_the_answer_for_the_session() {
     let r = post(&c, &format!("{SVC}/ussd/send"), peer(154, 7), &cookie, &format!("csrf={csrf}&once={token}&confirm=1&code=**04*1234*5678*5678%23")).await;
     r.assert_secure_html(400);
     let html = r.text();
-    assert!(html.contains("Use Router \u{203a} SIM Card to change the PIN or enter the PUK.") && !html.contains("1234") && !html.contains("5678"), "{html}");
+    // (With their delimiters: the page's random hex tokens may hold the digits.)
+    assert!(html.contains("Use Router \u{203a} SIM Card to change the PIN or enter the PUK.") && !html.contains("*1234") && !html.contains("5678*") && !html.contains("*5678"), "{html}");
     assert_eq!(calls(&c).len(), 2);
     // A send that fails keeps the answer shown (the app's); answers are
     // shown as they are (a voucher number whole).

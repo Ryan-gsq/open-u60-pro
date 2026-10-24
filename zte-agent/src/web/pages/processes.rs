@@ -563,7 +563,7 @@ mod tests {
         let p = app.auth.authenticate(Kind::Browser, issued.token.expose()).unwrap();
         let v = Views::new(NOW, vec![]);
         let reads = [read];
-        f(&PageData { app: &app, p: &p, views: &v, reads: &reads, remote, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default() }).into_string()
+        f(&PageData { app: &app, p: &p, views: &v, reads: &reads, remote, form: None, query: None, once: None, at: None, ussd: None, notice: None, token: Default::default(), prefs: Default::default(), secure: false }).into_string()
     }
 
     #[test]

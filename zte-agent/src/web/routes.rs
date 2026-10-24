@@ -8,13 +8,13 @@ use axum::http::Method;
 use axum::response::Response;
 
 use super::action::{self, Action};
-use super::pages::{at, automations, confirm, devctl, esim, esim_add, forward as forward_page, netcfg, op, services, sim, sms as sms_page};
+use super::pages::{at, automations, confirm, devctl, esim, esim_add, forward as forward_page, https, netcfg, op, services, sim, sms as sms_page};
 use super::screen::{self, Screen, Search};
 use super::tabs::{dashboard, router, settings, sms, tools};
 use super::{live, prefs, render, session, CspNonce};
 use crate::httpd::{Ctx, Peer};
 
-pub static SCREENS: [&Screen; 74] = [
+pub static SCREENS: [&Screen; 75] = [
     &dashboard::DASHBOARD,
     &dashboard::SIGNAL,
     &dashboard::TRAFFIC,
@@ -89,6 +89,7 @@ pub static SCREENS: [&Screen; 74] = [
     &router::DEVICE_REBOOT,
     &router::DEVICE_RESET,
     &settings::SETTINGS,
+    &settings::INSTALL,
 ];
 
 pub static ACTIONS: [&Action; 25] = [
@@ -149,6 +150,7 @@ pub fn form_page(path: &str) -> Option<&'static str> {
         .or_else(|| (path == at::SEND).then_some(at::PATH))
         .or_else(|| devctl::Power::of(path).map(devctl::Power::path))
         .or_else(|| prefs::Post::of(path).map(prefs::Post::form))
+        .or_else(|| https::Post::of(path).map(|_| settings::SETTINGS.path))
         .or_else(|| sim::Sheet::of(path).map(sim::Sheet::path))
         .or_else(|| services::Post::of(path).map(|_| services::PATH))
         .or_else(|| esim::Post::of(path).map(|_| esim::PATH))
@@ -174,6 +176,8 @@ enum Get {
     /// (WiFi's "Reconnect to …", LAN's new address).
     Net(netcfg::Kind),
     NetDone(netcfg::Kind),
+    /// Turn On, Renew or Reset HTTPS: the question.
+    Https(https::Post),
 }
 
 /// `/ui/` and `/ui/{*rest}`.
@@ -231,6 +235,10 @@ pub async fn dispatch(State(ctx): State<Ctx>, req: Request) -> Response {
         if let Some(k) = prefs::Post::of(path) {
             return prefs::post(ctx, req, k).await;
         }
+        // Settings: Turn On, Renew, Reset HTTPS (single-use token).
+        if let Some(k) = https::Post::of(path) {
+            return https::post(ctx, req, k).await;
+        }
         // SMS open, send (single-use token) and delete: keyed (`pages::sms`).
         if let Some(post) = sms_page::Post::of(path) {
             return sms_page::post(ctx, req, post).await;
@@ -248,6 +256,11 @@ pub async fn dispatch(State(ctx): State<Ctx>, req: Request) -> Response {
             return resp;
         }
     }
+    // The CA downloads: public (no session), while HTTPS is on.
+    if let Some(resp) = https::download(&ctx, req.method(), path) {
+        let (parts, body) = req.into_parts();
+        return session::reply_unread(&parts.headers, body, resp).await;
+    }
     let target = if let Some(s) = screen(path) {
         Some(Get::Screen(s))
     } else if let Some(page) = sms_page::Page::of(path) {
@@ -262,6 +275,8 @@ pub async fn dispatch(State(ctx): State<Ctx>, req: Request) -> Response {
         Some(Get::Net(kind))
     } else if let Some(kind) = netcfg::result_kind(path) {
         Some(Get::NetDone(kind))
+    } else if let Some(k) = https::Post::of(path) {
+        Some(Get::Https(k))
     } else if let Some(a) = path.strip_suffix("/confirm").and_then(action).filter(|a| !a.confirm.is_empty()) {
         Some(Get::Confirm(a))
     } else {
@@ -273,10 +288,17 @@ pub async fn dispatch(State(ctx): State<Ctx>, req: Request) -> Response {
         let (parts, body) = req.into_parts();
         return session::reply_unread(&parts.headers, body, render::not_found(&nonce)).await;
     };
-    // GET pages: as the `Session` extractor.
+    // GET pages: as the `Session` extractor (with the marker hop).
+    let (path, query) = (req.uri().path(), req.uri().query());
     let Some(p) = session::find_session(&ctx.app.auth, req.headers()) else {
-        return session::login_redirect(req.method(), req.uri().path(), req.uri().query());
+        let nonce = CspNonce::of(&req);
+        return session::without_session(req.headers(), req.method(), path, query, &nonce, |q| {
+            session::login_redirect(req.method(), path, q)
+        });
     };
+    if let Some(clean) = session::after_hop(path, query) {
+        return clean;
+    }
     match target {
         Get::Screen(s) => {
             // A Router settings form with `?t=`: as typed (its draft).
@@ -298,5 +320,6 @@ pub async fn dispatch(State(ctx): State<Ctx>, req: Request) -> Response {
         Get::Ask(kind) => confirm::get(&ctx, p, req, kind).await,
         Get::Net(kind) => netcfg::get(&ctx, p, req, kind).await,
         Get::NetDone(kind) => netcfg::result(&ctx, &p, &req, kind),
+        Get::Https(k) => https::get(&ctx, &p, &req, k),
     }
 }

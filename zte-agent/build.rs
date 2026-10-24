@@ -18,6 +18,8 @@ use sha2::{Digest, Sha256};
 
 const CSS: &str = "src/web/assets/app.css";
 const DATASTAR: &str = "src/web/assets/datastar-1.0.4.js";
+/// The System theme's script (owner decision 60; `web::render::scheme_tags`).
+const THEME_JS: &str = "src/web/assets/theme.js";
 /// The official v1.0.4 release bundle (`bundles/datastar.js` at tag v1.0.4).
 const DATASTAR_SHA256: &str = "727844adfc825ee651fb93c544a2a739986f9a21820a94524b35f0cac470cf91";
 
@@ -47,7 +49,7 @@ struct Built {
 fn main() {
     let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
-    for f in ["build.rs", CSS, DATASTAR] {
+    for f in ["build.rs", CSS, DATASTAR, THEME_JS] {
         println!("cargo:rerun-if-changed={f}");
     }
 
@@ -75,6 +77,7 @@ fn main() {
     add("THEME_LIGHT_CSS", "theme-light", "css", "text/css; charset=utf-8", light.into_bytes(), true);
     add("THEME_DARK_CSS", "theme-dark", "css", "text/css; charset=utf-8", dark.into_bytes(), true);
     add("DATASTAR_JS", "datastar-1.0.4", "js", "text/javascript; charset=utf-8", datastar, true);
+    add("THEME_JS", "theme", "js", "text/javascript; charset=utf-8", read(&dir.join(THEME_JS)), true);
     add("ICON_SVG", "icon", "svg", "image/svg+xml", icon_svg().into_bytes(), true);
     for (konst, n) in ["ICON_180", "ICON_192", "ICON_512"].into_iter().zip(PNG_SIZES) {
         add(konst, &format!("icon-{n}"), "png", "image/png", icon_png(n), false);
@@ -167,7 +170,7 @@ fn manifest(built: &[Built]) -> String {
     format!(
         concat!(
             r##"{{"name":"U60 Pro","short_name":"U60 Pro","id":"/ui/","start_url":"/ui/","scope":"/ui/","##,
-            r##""display":"standalone","background_color":"#0f172a","theme_color":"#0f172a","icons":["##,
+            r##""display":"standalone","background_color":"#0f172a","theme_color":"#f2f2f7","icons":["##,
             r##"{{"src":"{i192}","sizes":"192x192","type":"image/png"}},"##,
             r##"{{"src":"{i512}","sizes":"512x512","type":"image/png"}},"##,
             r##"{{"src":"{i512}","sizes":"512x512","type":"image/png","purpose":"maskable"}},"##,
