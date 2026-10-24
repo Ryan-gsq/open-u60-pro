@@ -2,6 +2,7 @@ mod at_cmd;
 mod at_terminal;
 mod auth;
 mod bearer;
+mod boottime;
 mod cache;
 mod cell;
 mod charge_policy;
@@ -12,7 +13,9 @@ mod esim;
 mod esim_download;
 mod esim_native;
 mod event_bus;
+mod events;
 mod handlers;
+mod httpd;
 mod lan_test;
 mod live_activity;
 mod modem_ext;
@@ -33,6 +36,7 @@ mod tailscale;
 mod telephony;
 mod ubus;
 mod usb;
+mod web;
 mod wifi;
 
 use std::sync::Arc;
@@ -41,8 +45,8 @@ use event_bus::EventBus;
 use handlers::AppState;
 
 const DEFAULT_BIND: &str = "0.0.0.0:9090";
-// 4 workers: tailscale setup/logout are legitimately slow (up to ~1-2 min
-// against the control plane) and must not starve the rest of the API.
+// General-lane permits: API calls that may block at once (slow calls such as
+// Tailscale setup have their own 2-permit lane, `httpd::SLOW_PERMITS`).
 const DEFAULT_THREADS: usize = 4;
 
 fn main() {
@@ -50,6 +54,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("esim-native") {
         std::process::exit(esim_native::cli(&args[2..]));
+    }
+    // `zte-agent qr-decode photo.jpg` times one QR decode of the web UI's eSIM upload.
+    if args.get(1).map(String::as_str) == Some("qr-decode") {
+        std::process::exit(web::qr_decode::cli(&args[2..]));
     }
 
     let bind = std::env::var("ZTE_AGENT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
@@ -94,6 +102,7 @@ fn main() {
         .iter()
         .map(|&name| (name, event_bus.subscribe(name)))
         .collect();
+    events::start(&state, &event_bus);
     event_bus.start();
     system::spawn_named("wifi-power-watch", move || {
         for event in power_rx.iter() {

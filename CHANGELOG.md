@@ -2,6 +2,104 @@
 
 Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, Android and web apps). Each version has a [GitHub release](https://github.com/jesther-ai/open-u60-pro/releases) with the `zte-agent` binary for the router (aarch64, musl), `THIRD_PARTY_NOTICES.md` and the license texts. `./setup.sh` downloads the binary from the latest release.
 
+## [Unreleased]
+
+### Highlights
+
+- **Web UI in the agent.** Open `http://192.168.0.1:9090/` on the router's Wi-Fi and log in with the agent password. It is a copy of the iOS app with its five tabs: Dashboard, SMS, Tools, Router and Settings (what stays in the apps is listed in the README). It works without JavaScript; with JavaScript the pages update live. It can be added to the home screen on iPhone and Android.
+- **Live updates for apps and integrations:** `GET /api/events`, a Server-Sent Events stream. The router samples values only while a stream is open.
+- **Safer logins:** random tokens, a login rate limit, and sessions that no longer end when the network changes the router's clock.
+
+### zte-agent
+
+#### Added
+
+- **Web UI** under `/ui/` (`/` redirects there):
+  - server-rendered pages, cookie sessions, and a CSRF token in every form;
+  - a confirmation page before changes that can cut the connection or are destructive (mobile data off, roaming on, airplane mode on, a network mode, band and cell locks, WiFi, APN, LAN, DNS and firewall changes, deletes); Reboot Router and Factory Reset ask for the agent password;
+  - passwords (Wi-Fi, guest Wi-Fi, APN) and SMS forwarding secrets are never put into a page: leave the field empty to keep the current one;
+  - a web app manifest and icons for the home screen;
+  - live updates with Datastar 1.0.4, served by the agent itself.
+
+  See `zte-agent/docs/web-ui.md`.
+- **`GET /api/events`** (bearer token; needs an agent password): JSON SSE with 22 topics, a snapshot on connect and then only changes.
+  - At most 8 streams in all, shared with open web UI pages, and 3 per token; a stream ends with `bye lifetime` after 30 minutes.
+  - Contract: `zte-agent/docs/events.md`.
+- **`ZTE_AGENT_UI_HOSTS`:** extra host names the agent answers to (comma-separated), besides IP addresses and, for Tailscale clients, `localhost` and the router's Tailscale names.
+- Lockouts are logged: when the global login limit runs dry, and when one address is blocked for a minute or more (with the address, never the password).
+- **The agent refuses connections from the mobile-data side itself**, whatever the router's firewall says (the web UI can turn the firewall off or set it to Low):
+  - it serves a connection only from loopback (every Tailscale client), the router's own addresses, or an address in the subnet of a local interface (the Wi-Fi bridge, the USB network: any interface not named `rmnet*`) unless a cellular subnet holds it as specifically or more; any other is closed without a reply. The client's address is what counts, so a port forward or DMZ to the router's address is refused too;
+  - refusals are logged: the first, then at most one line a minute with the count (the address and interface, never what was sent);
+  - the interface table (`getifaddrs`, read on the blocking pool; a new connection waits at most 0.5 s for it, then the last table decides until the read finishes) is re-read at a connection that needs it when 5 s old, or when a connection would be refused (at most once a second for those); no timer. A failed read keeps the last table for 10 minutes; with none that recent every connection is served and this is logged once (the firewall is then the only guard, and the firewall questions say so);
+  - **`ZTE_AGENT_ALLOW_MOBILE=1`** turns it off (logged at startup; another value is ignored and logged).
+
+#### Changed
+
+- **Login tokens** are 32 random bytes from the OS (64 hex characters), no longer derived from the password and the login time.
+  - They expire after 1 hour without use (each request extends this) and at most 24 hours after login, measured on the boot clock.
+  - At most 32 tokens are kept; the least recently used one is dropped.
+- **Login rate limit:** after 5 wrong passwords from one address, its logins get `429` with `Retry-After` (1 s, doubling up to 5 min).
+  - All Tailscale clients arrive as one address (127.0.0.1); its blocks stop at 10 s, so one phone with an old password cannot lock out every remote user.
+  - After 30 wrong passwords from all addresses together, new logins are refused until the limit recovers (one more attempt every 10 s).
+  - Tokens and sessions already issued keep working.
+- **HTTP server:** tiny_http and its 9 idle threads are replaced by axum/hyper running on the main thread.
+  - Device work runs on a small pool that starts threads only when needed.
+  - Two new event-hub threads sleep until a live stream is open; the event-bus reader thread is now named `event-bus`.
+- **`ZTE_AGENT_THREADS`** now sets how many API calls may work on the device at once (default 4, limited to 1–32). Slow calls (eSIM, Tailscale setup, AT/USSD/STK, scans, speed test) have 2 slots of their own.
+- An empty `ZTE_AGENT_PASSWORD` now means no password (logged at startup); before, an empty password was accepted at login.
+
+#### Behaviour differences apps and scripts may notice
+
+- `GET /` and `HEAD /` answer `303` to `/ui/` (before: `401` or `404` JSON). Other methods on `/` are unchanged.
+- A call that waits more than 7 s for a free slot gets `503 {"ok":false,"error":"agent busy, retry"}` with `Retry-After: 1`.
+- Request bodies are capped at 64 KiB (login 1 KiB, Live Activity 4 KiB) → `413 {"ok":false,"error":"body too large"}`.
+- A body that is cut off or does not arrive within 15 s gets `400 {"ok":false,"error":"incomplete body"}`, and the action is not run.
+- At most 64 connections, 16 per LAN address. Tailscale clients (all 127.0.0.1) have no per-address cap, and the last 8 connections are kept for them.
+  - A connection over the limit is closed without a reply.
+  - Idle keep-alive connections close after 120 s.
+- LAN speed test: 2 streams at once; a third gets `503`.
+- A browser request from another site that changes something gets `403 {"ok":false,"error":"cross-origin request refused"}`. Browser requests (with `Origin` or `Sec-Fetch-Site`) for a host name the agent does not answer to get `403 host not allowed`, also with a password. The apps send neither header and are not affected.
+- Without an agent password, the API only answers requests addressed to an IP address, a `ZTE_AGENT_UI_HOSTS` name, or (from Tailscale clients) `localhost` or a Tailscale name:
+  - other names get `403 host not allowed`;
+  - a missing `Host` gets `400 missing host`.
+- A crash inside a request handler returns `500 {"ok":false,"error":"internal error"}` instead of an empty reply.
+- Header names are lowercase, there is no `Server` header, JSON replies carry `X-Content-Type-Options: nosniff`, and replies use `Content-Length` (streams stay chunked).
+- Connections from the mobile-data side (an `rmnet*` network, or the internet through a port forward or DMZ to the router) are closed without a reply, also with the router's firewall off. Set `ZTE_AGENT_ALLOW_MOBILE=1` to serve them as before. With `ZTE_AGENT_BIND=[::]:9090`, a LAN client's global IPv6 address outside every local interface's prefix is refused too (IPv4 and link-local work).
+- `GET /api/router/lan`: `dhcp_end` is computed from the LAN address and netmask. For a /24 whose range fits the subnet it is unchanged; a range past the subnet ends at its last host (before: an address such as `192.168.0.299`).
+
+#### Fixed
+
+- Logins no longer end when the network sets the router's clock on attach (the 2.2.0 known issue).
+- A request declaring a huge `Content-Length` could crash the agent, even without a token.
+- `GET /api/router/lan` read `dhcp_end` wrong on networks larger than /24 (it replaced only the last octet: `10.0.0.299` for 10.0.0.1/16 with start 200 and limit 100; now `10.0.1.43`).
+
+#### Removed
+
+- `tiny_http` (and `ascii`, `chunked_transfer`).
+
+#### Licensing
+
+- The binary embeds Datastar 1.0.4 (MIT); its license is in `THIRD_PARTY_NOTICES.md`.
+- New crates: axum, axum-core, matchit, mime, tokio-macros, maud, maud_macros, proc-macro2-diagnostics. `THIRD_PARTY_NOTICES.md` now also reproduces the BSD-3-Clause notices of matchit and subtle.
+
+### Mobile apps
+
+- No changes in this release; the apps keep working. See "Behaviour differences" above.
+- **For app developers** (follow-ups, not in this release):
+  - Handle `429` + `Retry-After` on login as "Too many login attempts, try again in N s", with no automatic retry before then.
+  - Android: one shared re-login with a cooldown, instead of one per screen on every `401`, so a phone with an old password cannot use up the global login limit.
+  - After a login `401 invalid password`, stop logging in silently until the user enters the password again.
+  - Ping `GET /api/lan/ping` instead of `HEAD /` (which now redirects to the web UI). Without a token it answers `401` when a password is set; that still proves the agent is reachable.
+  - Treat `503 agent busy, retry` as a transient "Router busy" and retry a GET after `Retry-After`.
+  - Adopt `GET /api/events` to replace polling, per events.md "Client guidance".
+  - Suggested: an "Open web UI" link in the apps' Settings.
+
+### Known issues
+
+- A few app features stay in the apps (the iOS Live Activity, live-camera QR scanning, calls, LAN Speed Test, Config Decrypt/Encrypt); see the README's "Not in the browser" list.
+- Not yet verified on the router: the field names some Router settings send (LAN / DHCP, firewall, port forwarding, DMZ, domain filter; the web sends the app's and the firmware's), and the power-save and auto-sleep bodies.
+- Not yet verified on the router: a home-screen web app staying logged in after relaunch, and idle power and memory with the new listener.
+
 ## [2.2.0] - 2026-10-20
 
 ### Highlights
@@ -104,6 +202,7 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 - On-device HTTP agent.
 
+[Unreleased]: https://github.com/jesther-ai/open-u60-pro/compare/v2.2.0...HEAD
 [2.2.0]: https://github.com/jesther-ai/open-u60-pro/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/jesther-ai/open-u60-pro/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/jesther-ai/open-u60-pro/compare/v2.0.0...v2.0.1
