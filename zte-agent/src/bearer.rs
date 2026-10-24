@@ -14,8 +14,6 @@
 //! a line still being written is left for the next read, and a line longer
 //! than the scan window cannot stall the scan.
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Mutex;
@@ -23,11 +21,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::key_log::{self, Scan, KEY_LOG, KEY_LOG_ROTATED};
 use crate::ubus;
 
 const SECTION: &str = "zwrt_data_tmp.wwaniface1";
-const KEY_LOG: &str = "/logfs/key.log";
-const KEY_LOG_ROTATED: &str = "/logfs/key.log.0";
 const CHUNK: u64 = 256 * 1024;
 /// The bearer only changes on session setup, and each refresh forks `uci`.
 const TTL: Duration = Duration::from_secs(10);
@@ -149,76 +146,8 @@ impl LogCursor {
     }
 }
 
-struct Scan {
-    newest: Option<Ambr>,
-    /// Offset just past the last complete line in the scanned range.
-    consumed: u64,
-}
-
-fn scan(path: &Path, floor: u64, end: u64) -> Scan {
-    scan_chunked(path, floor, end, CHUNK)
-}
-
-/// Finds the newest data-session AMBR line in `floor..end`, reading backwards
-/// `chunk` bytes at a time. `floor` must be a line start.
-fn scan_chunked(path: &Path, floor: u64, end: u64, chunk: u64) -> Scan {
-    let mut out = Scan {
-        newest: None,
-        consumed: floor,
-    };
-    let Ok(mut file) = File::open(path) else {
-        return out;
-    };
-    let mut hi = end;
-    let mut newest_window = true;
-    while hi > floor {
-        let lo = hi.saturating_sub(chunk).max(floor);
-        let Some(buf) = read_range(&mut file, lo, hi) else {
-            break;
-        };
-        // Bytes after the last newline are a line still being written.
-        let stop = if newest_window {
-            newest_window = false;
-            let stop = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-            if stop > 0 {
-                out.consumed = lo + stop as u64;
-            }
-            stop
-        } else {
-            buf.len()
-        };
-        // Bytes before the first newline may finish a line that began before `lo`.
-        let start = if lo == floor {
-            0
-        } else {
-            buf.iter()
-                .position(|&b| b == b'\n')
-                .map_or(buf.len(), |i| i + 1)
-        };
-        if start < stop {
-            if let Some(a) = newest(&String::from_utf8_lossy(&buf[start..stop])) {
-                out.newest = Some(a);
-                return out;
-            }
-        }
-        // Re-read the cut line whole in the next window, unless it fills this
-        // one: such a line is not an AMBR line, and re-reading would not progress.
-        hi = if start == 0 || start >= buf.len() {
-            lo
-        } else {
-            lo + start as u64
-        };
-    }
-    out
-}
-
-fn read_range(file: &mut File, start: u64, end: u64) -> Option<Vec<u8>> {
-    file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
-    file.take(end.saturating_sub(start))
-        .read_to_end(&mut buf)
-        .ok()?;
-    Some(buf)
+fn scan(path: &Path, floor: u64, end: u64) -> Scan<Ambr> {
+    key_log::scan_back(path, floor, end, CHUNK, newest)
 }
 
 /// The newest AMBR line in `text` for a session that carries user data.
@@ -427,7 +356,7 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
         let complete = (text.len() - partial.len()) as u64;
         for chunk in [250, 300, 512, 4096, CHUNK] {
-            let scan = scan_chunked(&path, 0, text.len() as u64, chunk);
+            let scan = key_log::scan_back(&path, 0, text.len() as u64, chunk, newest);
             assert_eq!(scan.newest, parse_line(NR), "chunk {chunk}");
             assert_eq!(scan.consumed, complete, "chunk {chunk}");
         }
@@ -439,7 +368,7 @@ mod tests {
         let path = temp_path("long");
         let text = format!("{NR}\n{}\n", "x".repeat(1000));
         std::fs::write(&path, &text).unwrap();
-        let scan = scan_chunked(&path, 0, text.len() as u64, 64);
+        let scan = key_log::scan_back(&path, 0, text.len() as u64, 64, newest);
         assert_eq!(scan.newest, None);
         assert_eq!(scan.consumed, text.len() as u64);
         std::fs::remove_file(&path).unwrap();

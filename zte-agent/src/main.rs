@@ -16,6 +16,7 @@ mod event_bus;
 mod events;
 mod handlers;
 mod httpd;
+mod key_log;
 mod lan_test;
 mod live_activity;
 mod modem_ext;
@@ -30,6 +31,7 @@ mod sim_identity;
 mod sms;
 mod sms_forward;
 mod speedtest;
+mod standby_guard;
 mod stk;
 mod system;
 mod tailscale;
@@ -39,6 +41,7 @@ mod ubus;
 mod usb;
 mod web;
 mod wifi;
+mod wifi_watchdog;
 
 use std::sync::Arc;
 
@@ -96,22 +99,14 @@ fn main() {
         .collect();
     let oos_service_rx = event_bus.subscribe("zwrt_servicestatus");
     let connwd_wan_rx = event_bus.subscribe("router_event_wan_connect_status");
-    // The firmware restarts Wi-Fi on every wake from sleep, which re-runs the
-    // zte_post_wifi.sh script that can spin forever; check 150 s after each.
-    let power_rx = event_bus.subscribe("zwrt_device_power_state_event");
     let identity_events = sim_identity::FIRMWARE_EVENTS
         .iter()
         .map(|&name| (name, event_bus.subscribe(name)))
         .collect();
+    // Power-state events for the standby Wi-Fi guard (unless opted out).
+    let standby_rx = standby_guard::subscribe(&event_bus);
     events::start(&state, &event_bus);
     event_bus.start();
-    system::spawn_named("wifi-power-watch", move || {
-        for event in power_rx.iter() {
-            if event["action"].as_str() == Some("mode_power_on") {
-                system::arm_post_wifi_watchdog(std::time::Duration::from_secs(150));
-            }
-        }
-    });
 
     Arc::clone(&state.cache).start_event_invalidation(cache_events);
     state.sim_identity.start(Arc::clone(&event_bus), Arc::clone(&state.cache), identity_events);
@@ -142,9 +137,10 @@ fn main() {
     let tls = Arc::clone(&state.tls);
     system::spawn_named("tls-start", move || tls.start());
 
-    // Firmware bug guard: zte_post_wifi.sh can spin forever after any Wi-Fi
-    // reconfiguration (see system::kill_stuck_post_wifi); sweep every 5 min.
-    system::start_post_wifi_watchdog();
+    // Firmware bug guards: zte_post_wifi.sh can spin forever after any Wi-Fi
+    // start (watched through the script's open, no timer between launches),
+    // and the firmware can switch Wi-Fi on during standby.
+    wifi_watchdog::start(standby_rx);
 
     server::start(&bind, threads, state);
 }

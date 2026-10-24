@@ -44,6 +44,12 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
   - refusals are logged: the first, then at most one line a minute with the count (the address and interface, never what was sent);
   - the interface table (`getifaddrs`, read on the blocking pool; a new connection waits at most 0.5 s for it, then the last table decides until the read finishes) is re-read at a connection that needs it when 5 s old, or when a connection would be refused (at most once a second for those); no timer. A failed read keeps the last table for 10 minutes; with none that recent every connection is served and this is logged once (the firewall is then the only guard, and the firewall questions say so);
   - **`ZTE_AGENT_ALLOW_MOBILE=1`** turns it off (logged at startup; another value is ignored and logged).
+- **Standby Wi-Fi guard** (on by default). In fast-boot standby the firmware can switch Wi-Fi back on by itself (seen once while charging from a computer: Wi-Fi on, no internet, until the cable was unplugged). When Wi-Fi comes on while the router is in standby, the agent turns it off again the way the firmware's own power-off does (`wireless.zte_mbb.wifi_onoff=0`, then a Wi-Fi reload). The user's Wi-Fi switch (`wifi_onoff_by_user`) is never changed, and a real power-on brings Wi-Fi back as usual.
+  - It acts only when the last power event was standby and the newest power mode in `/logfs/key.log` agrees, and not while the firmware is still entering standby (its own power-off turns Wi-Fi off then). An agent started in the first 10 minutes after boot takes the router as on until a standby event. An agent restarted later, with no power event seen yet, goes by key.log, and only if the firmware reported Wi-Fi off before it came on. If key.log shows a power-on whose event was missed, the router is taken as on.
+  - At most 3 turn-offs per standby, then it only logs. If the firmware does not report Wi-Fi off within 30 s, it tries once more (counted). Wi-Fi switched on through the app during standby is turned off too.
+  - If a turn-off overlaps a real power-on and the firmware has not reported Wi-Fi on 90 s after the power-on, the agent switches Wi-Fi on (`wireless.zte_mbb.wifi_onoff=1`, then a reload) once, if the user's Wi-Fi switch is on.
+  - Event-driven: it uses the firmware's power-state events and the Wi-Fi status file the stuck-script guard already watches. It sets a timer only for the 30 s after acting and the 90 s after such a power-on.
+  - Each decision is one log line with the time since boot. Turn it off with `export ZTE_AGENT_STANDBY_WIFI_GUARD=0` in the agent's startup script. It is also off, and says so in the log, when inotify is unavailable.
 
 #### Changed
 
@@ -59,6 +65,10 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
   - Two new event-hub threads sleep until a live stream is open; the event-bus reader thread is now named `event-bus`.
 - **`ZTE_AGENT_THREADS`** now sets how many API calls may work on the device at once (default 4, limited to 1–32). Slow calls (eSIM, Tailscale setup, AT/USSD/STK, scans, speed test) have 2 slots of their own.
 - An empty `ZTE_AGENT_PASSWORD` now means no password (logged at startup); before, an empty password was accepted at login.
+- **Stuck Wi-Fi script guard is event-driven.** The agent now notices `/sbin/zte_post_wifi.sh` being started (by any firmware path, including the Wi-Fi restart on wake from sleep), checks again when a copy it saw turns 120 s, and stops it if it is still running then, as before. Between Wi-Fi starts it sets no timer. If inotify is unavailable it falls back to the 5-minute check and says so in the log.
+  - The launch form of firmware B31 (`zte_post_wifi.sh` with a numeric argument) is recognised.
+  - The script's own subshells are no longer counted as separate copies.
+  - **A copy that can never finish is stopped after about 6 s instead of 120 s.** That is when `/etc/config/wireless` has a radio off while one of its SSIDs is on (for example 2.4 GHz off), or Wi-Fi switched off altogether (`zte_mbb.wifi_onoff=0`: standby, the app's Wi-Fi switch, the standby guard's turn-off), so the script waits for more access points than can ever start. The agent reads the config again before stopping it, and first lets the script start the monitor for each access point that can run.
 
 #### Behaviour differences apps and scripts may notice
 
