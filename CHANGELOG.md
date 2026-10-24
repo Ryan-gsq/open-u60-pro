@@ -2,6 +2,26 @@
 
 Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, Android and web apps). Each version has a [GitHub release](https://github.com/jesther-ai/open-u60-pro/releases) with the `zte-agent` binary for the router (aarch64, musl), `THIRD_PARTY_NOTICES.md` and the license texts. `./setup.sh` downloads the binary from the latest release.
 
+## [Unreleased]
+
+### zte-agent
+
+#### Added
+
+- **Standby Wi-Fi guard** (on by default). In fast-boot standby the firmware can switch Wi-Fi back on by itself (seen once while charging from a computer: Wi-Fi on, no internet, until the cable was unplugged). When Wi-Fi comes on while the router is in standby, the agent turns it off again the way the firmware's own power-off does (`wireless.zte_mbb.wifi_onoff=0`, then a Wi-Fi reload). The user's Wi-Fi switch (`wifi_onoff_by_user`) is never changed, and a real power-on brings Wi-Fi back as usual.
+  - It acts only when the last power event was standby and the newest power mode in `/logfs/key.log` agrees, and not while the firmware is still entering standby (its own power-off turns Wi-Fi off then). An agent started in the first 10 minutes after boot takes the router as on until a standby event. An agent restarted later, with no power event seen yet, goes by key.log, and only if the firmware reported Wi-Fi off before it came on. If key.log shows a power-on whose event was missed, the router is taken as on.
+  - At most 3 turn-offs per standby, then it only logs. If the firmware does not report Wi-Fi off within 30 s, it tries once more (counted). Wi-Fi switched on through the app during standby is turned off too.
+  - If a turn-off overlaps a real power-on and the firmware has not reported Wi-Fi on 90 s after the power-on, the agent switches Wi-Fi on (`wireless.zte_mbb.wifi_onoff=1`, then a reload) once, if the user's Wi-Fi switch is on.
+  - Event-driven: it uses the firmware's power-state events and the Wi-Fi status file the stuck-script guard already watches. It sets a timer only for the 30 s after acting and the 90 s after such a power-on.
+  - Each decision is one log line with the time since boot. Turn it off with `export ZTE_AGENT_STANDBY_WIFI_GUARD=0` in the agent's startup script. It is also off, and says so in the log, when inotify is unavailable.
+
+#### Changed
+
+- **Stuck Wi-Fi script guard is event-driven.** The agent now notices `/sbin/zte_post_wifi.sh` being started (by any firmware path, including the Wi-Fi restart on wake from sleep), checks again when a copy it saw turns 120 s, and stops it if it is still running then, as before. Between Wi-Fi starts it sets no timer. If inotify is unavailable it falls back to the 5-minute check and says so in the log.
+  - The launch form of firmware B31 (`zte_post_wifi.sh` with a numeric argument) is recognised.
+  - The script's own subshells are no longer counted as separate copies.
+  - **A copy that can never finish is stopped after about 6 s instead of 120 s.** That is when `/etc/config/wireless` has a radio off while one of its SSIDs is on (for example 2.4 GHz off), or Wi-Fi switched off altogether (`zte_mbb.wifi_onoff=0`: standby, the app's Wi-Fi switch, the standby guard's turn-off), so the script waits for more access points than can ever start. The agent reads the config again before stopping it, and first lets the script start the monitor for each access point that can run.
+
 ## [2.2.0] - 2026-10-20
 
 ### Highlights
@@ -104,6 +124,7 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 - On-device HTTP agent.
 
+[Unreleased]: https://github.com/jesther-ai/open-u60-pro/compare/v2.2.0...HEAD
 [2.2.0]: https://github.com/jesther-ai/open-u60-pro/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/jesther-ai/open-u60-pro/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/jesther-ai/open-u60-pro/compare/v2.0.0...v2.0.1

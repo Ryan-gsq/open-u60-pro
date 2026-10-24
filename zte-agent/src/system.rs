@@ -444,82 +444,9 @@ impl SpeedTracker {
     }
 }
 
-// -- Firmware watchdog: stuck /sbin/zte_post_wifi.sh ------------------------
-
-/// Firmware bug: `zte_post_wifi.sh` (run on every Wi-Fi reconfiguration) loops
-/// without sleeping until it sees one `hostapd_cli` per enabled SSID. With a
-/// radio disabled but its SSID still enabled that never happens, and each stuck
-/// copy forks ~130 processes per second forever. Killing it is safe: the steps
-/// after the loop (MAC filter, tx power) are re-run by the next reload anyway.
-const POST_WIFI_SCRIPT: &str = "/sbin/zte_post_wifi.sh";
-
-/// Kills copies of `zte_post_wifi.sh` older than `max_age_secs`. Returns how many.
-pub fn kill_stuck_post_wifi(max_age_secs: u64) -> usize {
-    let uptime = fs::read_to_string("/proc/uptime")
-        .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
-    let Some(uptime) = uptime else { return 0 };
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let hz = if hz > 0 { hz as f64 } else { 100.0 };
-    let mut killed = 0;
-    let Ok(entries) = fs::read_dir("/proc") else { return 0 };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
-        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { continue };
-        if !is_post_wifi_cmdline(&cmdline) {
-            continue;
-        }
-        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
-        let Some(age) = process_age_secs(&stat, uptime, hz) else { continue };
-        if age < max_age_secs as f64 {
-            continue;
-        }
-        if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
-            eprintln!("[wifi] killed stuck zte_post_wifi.sh pid {pid} (running {age:.0} s)");
-            killed += 1;
-        }
-    }
-    killed
-}
-
-/// `sh /sbin/zte_post_wifi.sh` exactly: never a shell that merely mentions the script.
-fn is_post_wifi_cmdline(cmdline: &[u8]) -> bool {
-    let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
-    matches!(args.as_slice(), [shell, script]
-        if matches!(*shell, b"sh" | b"/bin/sh" | b"ash" | b"/bin/ash") && *script == POST_WIFI_SCRIPT.as_bytes())
-}
-
-/// Age of a process from its `/proc/<pid>/stat` line (field 22, start time in clock ticks).
-fn process_age_secs(stat: &str, uptime_secs: f64, hz: f64) -> Option<f64> {
-    let rest = &stat[stat.rfind(')')? + 2..];
-    let starttime: f64 = rest.split_whitespace().nth(19)?.parse().ok()?;
-    Some(uptime_secs - starttime / hz)
-}
-
 #[cfg(test)]
-mod post_wifi_tests {
+mod speed_tests {
     use super::*;
-
-    #[test]
-    fn matches_only_the_firmware_script_invocation() {
-        assert!(is_post_wifi_cmdline(b"sh\0/sbin/zte_post_wifi.sh\0"));
-        assert!(is_post_wifi_cmdline(b"/bin/sh\0/sbin/zte_post_wifi.sh\0"));
-        // a shell that merely mentions the script (ssh session, grep) must not match
-        assert!(!is_post_wifi_cmdline(b"ash\0-c\0ps | grep zte_post_wifi.sh\0"));
-        assert!(!is_post_wifi_cmdline(b"sh\0/sbin/zte_post_wifi.sh\0extra\0"));
-        assert!(!is_post_wifi_cmdline(b"sh\0/sbin/zte_wlan_func.sh\0"));
-        assert!(!is_post_wifi_cmdline(b""));
-    }
-
-    #[test]
-    fn process_age_uses_field_22_after_the_comm() {
-        // comm with spaces and parentheses, as /proc renders it
-        let stat = "123 (sh (x) y) S 1 123 123 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 4500 1500000 100 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 1 0 0 0 0 0";
-        let age = process_age_secs(stat, 1000.0, 100.0).unwrap();
-        assert!((age - 955.0).abs() < 1e-9);
-        assert!(process_age_secs("garbage", 1000.0, 100.0).is_none());
-    }
 
     #[test]
     fn speed_tracker_parks_until_requested() {
@@ -527,47 +454,6 @@ mod post_wifi_tests {
         assert!(SpeedInner::is_idle(&None));
         assert!(!SpeedInner::is_idle(&Some(Instant::now())));
         assert!(SpeedInner::is_idle(&Some(Instant::now() - SPEED_LINGER - Duration::from_secs(1))));
-    }
-}
-
-/// Runs `kill_stuck_post_wifi(120)` once, `delay` from now, on its own thread.
-/// Armed 150 s after every Wi-Fi reload the agent triggers, so an app toggle
-/// is cleaned up quickly; the periodic sweep below covers everything else.
-pub fn arm_post_wifi_watchdog(delay: Duration) {
-    // Called from request handlers: a refused thread must not unwind the
-    // HTTP worker. The periodic sweep below still covers a missed one-shot.
-    let spawned = try_spawn_named("wifi-watchdog", move || {
-        std::thread::sleep(delay);
-        let n = kill_stuck_post_wifi(120);
-        if n > 0 {
-            eprintln!("[wifi] watchdog killed {n} stuck zte_post_wifi.sh process(es)");
-        }
-    });
-    if let Err(e) = spawned {
-        eprintln!("[wifi] cannot spawn wifi-watchdog: {e}");
-    }
-}
-
-/// How often the periodic sweep looks for a stuck `zte_post_wifi.sh`.
-/// The firmware re-runs the script on its own triggers too (WAN reconnects,
-/// sleep/wake, the stock UI), so a sweep is needed; one wakeup per 5 min is
-/// nothing next to the ~265 forks/s a stuck copy costs. First pass at 150 s
-/// covers the boot-time invocation.
-const POST_WIFI_SWEEP: Duration = Duration::from_secs(300);
-
-pub fn start_post_wifi_watchdog() {
-    let spawned = try_spawn_named("wifi-sweep", move || {
-        std::thread::sleep(Duration::from_secs(150));
-        loop {
-            let n = kill_stuck_post_wifi(120);
-            if n > 0 {
-                eprintln!("[wifi] sweep killed {n} stuck zte_post_wifi.sh process(es)");
-            }
-            std::thread::sleep(POST_WIFI_SWEEP);
-        }
-    });
-    if let Err(e) = spawned {
-        eprintln!("[wifi] cannot spawn wifi-sweep: {e}");
     }
 }
 
