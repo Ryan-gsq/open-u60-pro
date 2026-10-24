@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::handlers::AppState;
-use crate::system::{arm_post_wifi_watchdog, try_spawn_named};
+use crate::system::try_spawn_named;
 use crate::ubus;
 
 // ---------------------------------------------------------------------------
@@ -43,10 +42,10 @@ impl Wireless {
     }
 }
 
-/// Fire the firmware's Wi-Fi reload without blocking the request, reap the
-/// child when it finishes (the old `sh -c '... &'` form left zombies), and arm
-/// the stuck-script watchdog: the reload re-runs `zte_post_wifi.sh`, which
-/// spins forever when a radio is disabled but its SSID is not.
+/// Fire the firmware's Wi-Fi reload without blocking the request and reap the
+/// child when it finishes (the old `sh -c '... &'` form left zombies). The
+/// reload re-runs `zte_post_wifi.sh`, which spins forever when a radio is
+/// disabled but its SSID is not; `wifi_watchdog` sees the script's open.
 fn reload_wifi_async() {
     match Command::new("ubus")
         .args(["call", "zwrt_wlan", "reload"])
@@ -68,7 +67,6 @@ fn reload_wifi_async() {
         }
         Err(e) => eprintln!("[wifi] reload spawn failed: {e}"),
     }
-    arm_post_wifi_watchdog(Duration::from_secs(150));
 }
 
 fn iw_info(iface: &str) -> (String, String) {
