@@ -491,7 +491,7 @@ mod tests {
         c.gate = Arc::new(Gate::new(0, 0, Duration::from_secs(30)));
         // `/` itself redirects to the web UI (no permit either).
         let r = send(&c, req("HEAD", "/", peer(2, 3)).body(Body::empty()).unwrap()).await;
-        assert_eq!((r.status, r.header("location")), (303, Some("/ui/")));
+        assert_eq!((r.status, r.header("location")), (303, Some("/console/")));
         for (method, uri) in [("HEAD", "/api/device"), ("OPTIONS", "/api/device")] {
             let r = req(method, uri, peer(2, 1)).body(Body::empty()).unwrap();
             let r = tokio::time::timeout(Duration::from_secs(5), send(&c, r)).await.unwrap();
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!((r.status, r.header("content-length")), (404, Some("32")));
         // `/` is the web UI's: a redirect, with or without a token.
         let r = send(&c, req("HEAD", "/", peer(3, 8)).body(Body::empty()).unwrap()).await;
-        assert_eq!((r.status, r.header("location")), (303, Some("/ui/")));
+        assert_eq!((r.status, r.header("location")), (303, Some("/console/")));
     }
 
     fn login(test: u8, n: u8, body: &str) -> axum::http::Request<Body> {

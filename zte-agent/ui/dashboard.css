@@ -2626,3 +2626,8 @@ dialog[data-motion="closing"]::backdrop { animation: dialog-scrim-out .12s ease-
 @media (max-width:480px) { .battery-metrics { gap: 24px 12px; }.battery-metrics > div { padding-left: 12px; }.battery-times dd { font-size: 23px; } }
 
 .battery-metrics .number-display { white-space: normal; overflow-wrap: anywhere; }
+
+.setup-screen { display:block; padding:clamp(24px,8vw,100px); }
+.setup-panel { max-width:640px; margin:0 auto; }
+.https-fingerprint { overflow-wrap:anywhere; user-select:all; }
+#https-install .settings-facts dd { font-family:inherit; line-height:1.7; }

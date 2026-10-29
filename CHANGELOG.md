@@ -4,6 +4,10 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 ## [Unreleased]
 
+### Changed
+
+- Make the responsive console the only served Web UI. Root and old page bookmarks redirect to the new screens; legacy actions/assets/live streams are retired. Move HTTPS enable/renew/reset, certificate trust instructions and installation into the console while preserving shared security and TLS services. Installed shortcuts launch the new UI.
+
 ### Added
 
 - eSIM handover checks the selected profile’s source-bound HTTPS data path before reporting success. A stalled handover may refresh the ZTE data session once when mobile data was already enabled in automatic mode; newer user modem commands cancel recovery. Disabled data, manual mode, APN and roaming preferences are preserved.

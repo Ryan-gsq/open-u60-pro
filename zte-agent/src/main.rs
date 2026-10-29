@@ -45,7 +45,13 @@ mod telephony;
 mod tls;
 mod ubus;
 mod usb;
+// Retired renderer fixtures; production serves only the responsive console.
+#[cfg(test)]
 mod web;
+mod calendar;
+#[cfg(not(test))]
+#[path = "web/qr_decode.rs"]
+mod qr_decode;
 mod wifi;
 mod wifi_watchdog;
 
@@ -67,7 +73,10 @@ fn main() {
     }
     // `zte-agent qr-decode photo.jpg` times one QR decode of the web UI's eSIM upload.
     if args.get(1).map(String::as_str) == Some("qr-decode") {
+        #[cfg(test)]
         std::process::exit(web::qr_decode::cli(&args[2..]));
+        #[cfg(not(test))]
+        std::process::exit(qr_decode::cli(&args[2..]));
     }
 
     let bind = std::env::var("ZTE_AGENT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());

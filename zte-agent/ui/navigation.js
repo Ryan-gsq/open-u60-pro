@@ -43,6 +43,7 @@
     ]},
     {id:'settings',label:'Settings',pages:[
       {id:'device',label:'Device & Power',title:'Device & power',description:'Charging, power settings and device maintenance.'},
+      {id:'https',label:'HTTPS & Install',title:'HTTPS & install',description:'Secure local access and install this console on your devices.'},
       {id:'appearance',label:'Appearance',title:'Appearance',description:'A comfortable view, in any light.'},
       {id:'connection',label:'Console connection',title:'Console connection',description:'Connection status and access to this local console.'},
       {id:'about',label:'About',title:'About OpenU60',description:'A local console for your ZTE U60 Pro.'}

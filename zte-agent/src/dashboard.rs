@@ -57,6 +57,7 @@ const TOPICS: &[&str] = &[
     "clients",
     "esim",
     "power",
+    "https",
 ];
 const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("operators", 2, 0),
@@ -74,6 +75,7 @@ const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("client_details", 2, 7),
     ("esim_status", 2, 8),
     ("battery_details", 5, 9),
+    ("https_status", 5, 10),
 ];
 
 #[derive(Clone, Copy, Default)]
