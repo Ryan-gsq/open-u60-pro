@@ -4,10 +4,13 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-10-29
+
 ### Highlights
 
-- **Web UI in the agent.** Open `http://192.168.0.1:9090/` on the router's Wi-Fi and log in with the agent password. It is a copy of the iOS app with its five tabs: Dashboard, SMS, Tools, Router and Settings (what stays in the apps is listed in the README). It works without JavaScript; with JavaScript the pages update live. It can be added to the home screen on iPhone and Android.
-- **Live updates for apps and integrations:** `GET /api/events`, a Server-Sent Events stream. The router samples values only while a stream is open.
+- **Two Web UIs in the agent, with nothing extra to install.** The default `http://192.168.0.1:9090/` opens the server-rendered UI at `/ui/`: Dashboard, SMS, Tools, Router and Settings. Pages work without JavaScript and update live when JavaScript is available. The new responsive console is at `http://192.168.0.1:9090/console/`, on the same HTTP and optional LAN HTTPS listeners. Both use the agent password.
+- **Responsive console for phones, tablets and desktops.** Light/Dark/System themes, animated live numbers and fluid page/dialog transitions; fixed five-tab bottom navigation on phones, including keyboard and landscape changes, and expandable navigation on larger screens. LTE and 5G carrier aggregation, SA/NSA, both WAN IP versions and retained statistics when the connection drops. Wi-Fi/mobile configuration, eSIM, SMS and forwarding, diagnostics and router controls are included.
+- **Live updates for apps and integrations:** `GET /api/events` and the responsive console's `GET /api/dashboard/events` use Server-Sent Events. Changes arrive without refreshing; collectors sleep when no streams need their readings.
 - **Safer logins:** random tokens, a login rate limit, and sessions that no longer end when the network changes the router's clock.
 - **Install the web UI as an app, over HTTPS on your LAN:** Settings › HTTPS & Install as App turns on `https://192.168.0.1:9443/` (and `https://u60.home.arpa:9443/`) with the router's own certificate authority. Each phone or computer trusts it once (an iPhone profile or a `.crt`, with the steps per platform); it can only vouch for the router's LAN address and `u60.home.arpa`. Offline, no accounts; plain http on port 9090 stays.
 
@@ -15,6 +18,18 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 #### Added
 
+- **Responsive console** under `/console/` (see `zte-agent/docs/responsive-console.md`):
+  - Dashboard, Network, SMS, Tools and Settings, with mobile bottom navigation and tablet/desktop sidebar groups;
+  - LTE and NR primary/aggregated carriers, 5G SA/NSA, WAN IPv4 and IPv6, signal measurements, traffic, battery and retained offline statistics;
+  - Wi-Fi and guest Wi-Fi, mobile data, roaming, APN, network modes, band/cell locks and operator scanning;
+  - SMS reading, sending, deleting and marking read, forwarding rules and the forwarding log;
+  - eSIM profiles, card info, switching, renaming, deleting disabled profiles, operator-preview downloads with confirmation/cancel, and receipts; rendered ICCIDs are masked;
+  - LAN/DHCP, DNS, firewall, port forwarding, UPnP, DMZ, QoS, advanced diagnostics and device controls;
+  - sign-in retained within the browser tab across navigation and reload; locking or session expiry clears the token, readings and drafts; passwords are never persisted;
+  - drafts preserved across route and stream changes, stale eSIM action/response guards, and reduced-motion support for animated numbers, pages and popups;
+  - six public screenshots generated from fictional fixtures, alongside the existing iOS screenshot gallery; no live device captures or credentials.
+- **Connected-device details in the responsive console:** names, MAC and reported IP addresses, connection/radio information, transferred bytes, measured upload/download rates and observed peaks. Rates come from Wi-Fi association counters and monotonic elapsed time; AP RX means device upload and AP TX means device download. Radio link rates, measured traffic and configured speed caps are separate fields. Peaks reset after counter resets, reassociation, interface changes or monitoring gaps.
+- **`GET /api/dashboard/events`** (bearer token): bounded JSON SSE snapshots and changes for the responsive console, with page-specific subscriptions for clients, routing, eSIM, operators, forwarding and diagnostics. At most eight console streams; no polling or sampling by its collectors without viewers. The existing `/api/events` and `/ui/` streams remain available.
 - **Web UI** under `/ui/` (`/` redirects there):
   - server-rendered pages, cookie sessions, and a CSRF token in every form;
   - a confirmation page before changes that can cut the connection or are destructive (mobile data off, roaming on, airplane mode on, a network mode, band and cell locks, WiFi, APN, LAN, DNS and firewall changes, deletes); Reboot Router and Factory Reset ask for the agent password;
@@ -118,7 +133,8 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 ### Known issues
 
-- A few app features stay in the apps (the iOS Live Activity, live-camera QR scanning, calls, LAN Speed Test, Config Decrypt/Encrypt); see the README's "Not in the browser" list.
+- Browser coverage differs between `/ui/` and `/console/`; use the console's About link to open the server-rendered UI and its additional screens, including HTTPS setup. Some features remain in the native apps; see the README's "Not in the browser" list.
+- Some U60 Pro firmware does not report per-device upload/download caps. The console shows these as "Not reported" instead of substituting observed peaks or radio link speeds. Device traffic measurements require supported Wi-Fi association counters and describe traffic over that Wi-Fi link, not cellular-only usage.
 - Not yet verified on the router: the field names some Router settings send (LAN / DHCP, firewall, port forwarding, DMZ, domain filter; the web sends the app's and the firmware's), and the power-save and auto-sleep bodies.
 - Not yet verified on the router: a home-screen web app staying logged in after relaunch, and idle power and memory with the new listener.
 - Not yet checked on a real phone: the status bar after a light/dark switch (checked in the iOS 26.5 simulator) and the Android installed app's launch (checked in Chrome with a link from another site).
@@ -225,7 +241,8 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 - On-device HTTP agent.
 
-[Unreleased]: https://github.com/jesther-ai/open-u60-pro/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/jesther-ai/open-u60-pro/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/jesther-ai/open-u60-pro/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/jesther-ai/open-u60-pro/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/jesther-ai/open-u60-pro/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/jesther-ai/open-u60-pro/compare/v2.0.0...v2.0.1
