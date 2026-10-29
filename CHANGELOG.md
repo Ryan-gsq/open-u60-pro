@@ -4,6 +4,12 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 ## [Unreleased]
 
+### Added
+
+- eSIM handover checks the selected profile’s source-bound HTTPS data path before reporting success. A stalled handover may refresh the ZTE data session once when mobile data was already enabled in automatic mode; newer user modem commands cancel recovery. Disabled data, manual mode, APN and roaming preferences are preserved.
+
+- Tools → Battery & Power in the responsive console: streamed charging/discharging state, temperature, voltage/current, battery and USB power, device time-to-full/runtime estimates, health, cycles, capacity, input limits and charge-policy details. Battery power uses voltage × current to avoid an inconsistent driver power reading. Missing measurements remain unreported.
+
 ## [2.3.0] - 2026-10-29
 
 ### Highlights

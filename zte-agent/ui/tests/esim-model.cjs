@@ -15,4 +15,7 @@ const wan={up:true,'ipv4-address':[{address:'10.0.0.2'},{address:'10.0.0.2'},{ad
 assert.deepEqual(A.collect(wan,wan6),{ipv4:['10.0.0.2'],ipv6:['2001:db8::1','2001:db8::2']});
 assert.deepEqual(A.collect(null,{'ipv6-prefix':[{address:'2001:db8::'}]}),{ipv4:[],ipv6:[]},'delegated prefixes are not interface addresses');
 assert.deepEqual(A.collect(null,wan6).ipv4,[]);assert.deepEqual(A.collect(null,null),{ipv4:[],ipv6:[]});
+assert.match(E.switchMessage({state:'modem_confirmed',network_check:'recovering'}),/Restoring the ZTE/);
+assert.match(E.switchMessage({state:'no_data',reason:'network_unavailable'}),/could not be confirmed/);
+assert.equal(E.warnings({switch_warnings:['data_off']},{}).length,1);
 console.log('Passed: eSIM identifiers, validation, clock-independent ordering, switch warnings, dual-stack WAN address collection, deduplication and delegated-prefix separation.');

@@ -34,6 +34,7 @@
     ]},
     {id:'tools',label:'Tools',pages:[
       {id:'device',label:'Device Info',title:'Device information',description:'System details reported by the on-device agent.'},
+      {id:'battery',label:'Battery & Power',title:'Battery & power',description:'Battery condition, charging, runtime estimates and measured power.'},
       {id:'diagnostics',label:'System diagnostics',title:'System diagnostics',description:'Live resource use, temperatures, processes and interface details.'},
       {id:'radio',label:'Radio diagnostics',title:'Radio diagnostics',description:'Inspect neighboring cells and run a signal quality sweep.'},
       {id:'speedtest',label:'Internet speed test',title:'Internet speed test',description:'Measure the router’s internet connection, with live progress.'},
