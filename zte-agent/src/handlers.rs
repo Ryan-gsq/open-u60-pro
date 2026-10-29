@@ -26,6 +26,10 @@ pub struct AppState {
     pub charge_limit: Arc<ChargeLimitEnforcer>,
     pub sms_forward: Arc<SmsForwarder>,
     pub tailscale: Arc<crate::tailscale::TailscaleManager>,
+    pub network_lock: crate::net_tools::NetworkLock,
+    pub cellular_control: crate::modem_ext::CellularControl,
+    pub mihomo: Arc<crate::mihomo::Mihomo>,
+    pub wifi_relay: Arc<crate::wifi_relay::WifiRelay>,
     /// Single-flight TTL cache in front of the `ubus` CLI (see cache.rs).
     pub cache: Arc<UbusCache>,
     pub oos_policy: Arc<crate::oos_policy::OosPolicy>,
@@ -46,7 +50,13 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
+        let network_lock = Arc::new(std::sync::Mutex::new(()));
+        let mihomo = Arc::new(crate::mihomo::Mihomo::new(Arc::clone(&network_lock)));
         Self {
+            wifi_relay: Arc::new(crate::wifi_relay::WifiRelay::with_core(Arc::clone(&network_lock), Arc::clone(&mihomo))),
+            mihomo,
+            network_lock,
+            cellular_control: crate::modem_ext::CellularControl::default(),
             tls: Arc::new(crate::tls::Tls::router(Arc::clone(&live_activity))),
             live_activity,
             auth: Arc::new(AuthState::new()),

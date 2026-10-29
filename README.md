@@ -264,6 +264,30 @@ Visit [open-u60-pro.vercel.app](https://open-u60-pro.vercel.app), enter your rou
 
 Enables ADB, builds and pushes the agent, creates boot scripts, and optionally sets up SSH for wireless deploys.
 
+For an already ADB-authorized B31, build this checkout as an ARM64 musl **release**
+and use the official admin password without entering or storing it:
+
+```bash
+./setup.sh --build --adb --factory-password --no-ssh
+# Add --serial SERIAL when more than one ADB device is connected.
+```
+
+This installs `/data/zte-agent` and the private launcher
+`/data/local/tmp/start_zte_agent.sh`, verifies the login page and API authentication
+requirement, and adds one boot entry before `exit 0` in `/etc/rc.local`. Other boot
+commands are preserved, repeated launcher calls do not create duplicate agents,
+and the script keeps an installation-specific rollback directory under `/data`.
+It does not reboot the router, set up SSH with `--no-ssh` or enable mobile data.
+Updates may leave Mihomo/Relay on: the new agent first recovers owned network
+changes, then attempts to resume the saved owner choices. Mihomo needs its enabled
+marker; Relay needs the last successfully connected remembered/open network.
+Switching Clash off or disconnecting Relay clears the respective resume choice.
+An older installation without these markers cannot supply missing intent; saved
+profiles or Wi-Fi credentials alone do not enable either extension. See
+[restart policy](zte-agent/docs/network-extensions.md#after-a-restart).
+In factory-password mode, successful login with the actual password is a manual
+check; setup verifies that the factory verifier loaded without reading plaintext.
+
 ### Deploy Agent (subsequent updates)
 
 ```bash
@@ -304,14 +328,16 @@ The agent also serves a web app, so any phone or computer on the router's Wi-Fi 
 
 1. Connect to the router's Wi-Fi.
 2. Open **http://192.168.0.1:9090/** in a browser.
-3. Log in with the **agent password**: the one you gave `setup.sh`, the browser installer or `deploy.sh` (`ZTE_AGENT_PASSWORD` in the agent's start script). Without an agent password the web UI only explains how to set one.
+3. By default, log in with the **official router admin password** (B31). An explicitly set `ZTE_AGENT_PASSWORD` overrides this: existing installations made by `setup.sh`, the browser installer or `deploy.sh` keep their configured agent password. To use the official password instead, remove that export and add `unset ZTE_AGENT_PASSWORD` to the agent's start script, then restart the agent.
 
-It looks and works like the iOS app, with the same five tabs, screens and words. What stays in the apps is listed [below](#not-in-the-browser-use-the-apps).
+The default reads the official admin's SHA-256 verifier once at startup, without copying its plaintext password or changing the official panel. After changing the official admin password, restart the agent for it to take effect here too; a restart also expires all agent sessions. An empty explicit password, an unreadable factory configuration or an unsupported verifier stops startup instead of exposing an unauthenticated API. On other firmware, use a nonempty `ZTE_AGENT_PASSWORD` override. Session tokens and Mihomo's internal API secret remain independently generated.
+
+It keeps the iOS app's original five tabs, screens and words, with an additional experimental web-only Relay tab and Mihomo controls in Router. What stays in the apps is listed [below](#not-in-the-browser-use-the-apps).
 
 - **Dashboard:** operator and network type, signal, live traffic, battery, CPU and battery temperature, Wi-Fi and the number of connected devices. Each card opens its details, as in the app:
   - **Connection & signal:** 5G NR, LTE and WCDMA readings (RSRP, RSRQ, SINR, RSSI, band, channel, bandwidth, carrier aggregation), the data session, a 2-minute signal chart, the WAN addresses and **Network mode**.
   - **Live traffic**, **Battery Details** (capacity, status, voltage, current, power, temperature, time to full or empty) and **CPU & temperatures** (every temperature sensor; **CPU, memory & processes** shows cores, uptime and memory, and the live process list, where you can kill bloat daemons after a confirmation; **Kill All Bloat** leaves the SMS daemon and the boot-critical daemons running).
-  - **Wi-Fi & devices:** the Wi-Fi networks and the live list of connected devices (name, IPv4 address and the last 2 octets of the MAC address), and **Share Wi-Fi** with the password (hidden until you ask) and a QR code to join.
+  - **Wi-Fi & devices:** the Wi-Fi networks and the live list of connected devices (hostname, IPv4 address and full MAC address; other device lists remain masked), and **Share Wi-Fi** with the password (hidden until you ask) and a QR code to join.
   - **USB-C:** while a cable is attached, a card offers **Fast Charging** (charge your phone from the router's battery) or **Dismiss** (until the cable is unplugged).
 - **SMS:** your conversations (search, storage filter, unread counts), reading and replying, **New Message** and deleting a conversation (after a confirmation). **SMS Forwarding** (gear icon, also under Tools): turn forwarding on or off, add, edit, test, switch and delete rules (Telegram, webhook, SMS, ntfy, Discord, Slack; saved tokens and webhook URLs are never shown, leave a field empty to keep it), and the **Forward Log** with **Retry** and **Clear**.
 - **Tools:**
@@ -321,12 +347,15 @@ It looks and works like the iOS app, with the same five tabs, screens and words.
   - **Device Info** (the IMEI shows only its last 4 digits) and **Connected Devices** (with search).
   - The app's placeholders for TTL Settings, Enable SSH and Device Explorer.
 - **Router:**
+  - **Mihomo / Clash (experimental, web-only):** start/stop switch, private profile library (HTTPS subscription/manual or scheduled refresh, file/paste import), global Merge/JavaScript and a local **Zashboard** link shown only while the proxy runs. Setup shows the saved automatic-start choice independently of the running state and offers **Stop automatic start & keep off** when only that choice remains. The optional official core/dashboard downloads are version- and SHA-256-pinned; the controller is loopback-only behind the authenticated web session. See [network extensions](zte-agent/docs/network-extensions.md) before enabling transparent routing.
+  - **Remembered relay Wi-Fi and fixed client IPs:** optional saved upstream credentials with Forget, and downstream MAC-to-IPv4 DHCP reservations shared by relay/cellular modes. Remember defaults on in the connection form. Only the last successfully connected remembered/open network is eligible to resume after restart; Disconnect clears that choice. Mobile interfaces are unchanged.
   - **Cellular:** Mobile Network (mobile data, airplane mode, connection mode, data roaming, network selection with a scan and manual registration), Network Mode (Auto, 5G NSA, 5G SA only, 4G only, 4G + 3G, 3G only), Cell Lock (with the neighbour scan), Smart Tower Connect, Signal Detection, SIM Card (PIN, PUK and unlock code; the ICCID, IMSI and number are masked), eSIM Profiles (switch, rename, delete, operator receipts, and **Add eSIM** from a photo of the QR code or the code) and SIM Services (USSD and the SIM Toolkit).
   - **Connectivity:** WiFi, Guest WiFi, APN, LAN / DHCP, DNS (with DNS over HTTPS and its cache).
   - **Security and quality:** Firewall (on/off and level, NAT, UPnP, DMZ, port forwarding), Telemetry Blocker, VPN Passthrough, QoS.
   - **Device Controls:** charge limit (50–100 %), Power-save Mode, Fast Boot, Auto Sleep with its idle timeout, and **Reboot Router** and **Factory Reset**, which ask for the agent password (wrong passwords count like failed logins).
   - Changes that can cut the connection or are destructive ask for confirmation first (mobile data off, roaming on, airplane mode on, a network mode, a band or cell lock, WiFi, APN, LAN, DNS and firewall changes, deletes); over Tailscale the question also says how it affects your remote connection. Mobile data, airplane mode, network mode and eSIM changes show their progress until they have settled. Passwords are never shown (leave the field empty to keep the current one), and after a change that restarts WiFi or moves the router's address the page tells you where to reconnect.
 - **Settings:** Session (**Log out**), Polling (how often live pages update the signal, 1–10 s), Appearance (System, Light or Dark), **HTTPS & Install as App** (see [below](#install-it-as-an-app)), About and Legal. The refresh interval and the theme are saved in the browser.
+- **Relay (experimental, web-only):** a separate Wi-Fi upstream tab for scanning, connecting/disconnecting and connection status. IPv4 NAT plus optional capability-gated Wi-Fi IPv6/Mihomo egress and LAN SLAAC/NAT66; absent usable upstream IPv6, relay stays IPv4-only and blocks cellular IPv6 bypass. Wi-Fi loss can fall back to already-enabled cellular but does not trigger automatic reconnection while the agent runs. After reboot/agent restart, the agent attempts to resume the saved relay choice; Stop reconnecting cancels it. No iOS/Android screens are changed. See [network extensions](zte-agent/docs/network-extensions.md) for limitations and device acceptance tests.
 
 You stay logged in for 12 hours without use, and at most 7 days. Restarting the agent logs every browser out.
 
@@ -375,7 +404,7 @@ On port 9090 the web UI is plain HTTP on your LAN, like the apps' connection to 
 - Sessions use an `HttpOnly`, `SameSite=Strict` cookie, and every form carries a CSRF token.
 - Requests for unknown host names are refused (DNS-rebinding defence). To use another local DNS name, list it in `ZTE_AGENT_UI_HOSTS` (comma-separated) in the start script.
 - Repeated wrong passwords are rate limited.
-- Lost a phone, or think the password leaked? Set a new agent password (`./deploy.sh <new-password>`): the agent restarts and every app and browser is logged out.
+- Lost a phone, or think the password leaked? In default mode, change the official admin password and restart the agent. For an explicit override, set a new agent password (`./deploy.sh <new-password>`). The restart logs every app and browser out.
 
 See [SECURITY.md](SECURITY.md) and [zte-agent/docs/web-ui.md](zte-agent/docs/web-ui.md).
 

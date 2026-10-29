@@ -4,6 +4,24 @@ use crate::cache;
 use crate::handlers::AppState;
 use crate::ubus;
 
+/// Serialize agent-originated modem writes. A user request invalidates an
+/// automatic two-phase recovery when it changes data/airplane intent, even
+/// while the between-phase wait is unlocked. Other writes only serialize.
+#[derive(Default)]
+pub struct CellularControl(std::sync::Mutex<u64>);
+
+impl CellularControl {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn user_change(&self) -> std::sync::MutexGuard<'_, u64> {
+        let mut generation = self.lock();
+        *generation = generation.wrapping_add(1);
+        generation
+    }
+}
+
 pub fn modem_data_get(state: &AppState) -> (u16, Value) {
     match wwan(state) {
         Ok(data) => (200, json!({"ok": true, "data": data})),
@@ -38,6 +56,7 @@ pub(crate) fn note_user_modem_change(state: &AppState) {
 /// bookkeeping (the policies' own effects send AT+CFUN=1 directly and never
 /// come through here).
 pub fn modem_online_user(state: &AppState) -> (u16, Value) {
+    let _user = state.cellular_control.lock();
     note_user_modem_change(state);
     state.oos_policy.user_mode(true);
     crate::handlers::modem_online(state)
@@ -47,6 +66,11 @@ pub fn modem_data_set(state: &AppState, body: &[u8]) -> (u16, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
+    };
+    let _user = if parsed.get("enable").is_some() {
+        state.cellular_control.user_change()
+    } else {
+        state.cellular_control.lock()
     };
     note_user_modem_change(state);
     let result = ubus::call("zwrt_data", "set_wwaniface", Some(&parsed.to_string()));
@@ -62,12 +86,13 @@ pub fn modem_airplane(state: &AppState, body: &[u8]) -> (u16, Value) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
-    note_user_modem_change(state);
     // Use AT+CFUN=1 for ONLINE (ubus nwinfo_set_mode ONLINE is broken for LPM→ONLINE recovery)
     if parsed["operate_mode"].as_str() == Some("ONLINE") {
         // modem_online settles the modem/data entry itself.
         return modem_online_user(state);
     }
+    let _user = state.cellular_control.user_change();
+    note_user_modem_change(state);
     let result = ubus::call(
         "zte_nwinfo_api",
         "nwinfo_set_mode",
@@ -90,6 +115,7 @@ pub fn modem_network_mode_set(state: &AppState, body: &[u8]) -> (u16, Value) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
     };
+    let _user = state.cellular_control.lock();
     note_user_modem_change(state);
     let result = ubus::call(
         "zte_nwinfo_api",

@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+cd "$(cd "$(dirname "$0")" && pwd)"
 
 # ── Colors ───────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -8,8 +9,45 @@ ok()    { echo -e "${GREEN}[+]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 fail()  { echo -e "${RED}[-]${NC} $1" >&2; exit 1; }
 
+# Existing interactive/positional use remains supported. The local B31 mode
+# needs no plaintext password when USB ADB is already authorized.
+BUILD_CHOICE=""
+FACTORY_PASSWORD=false
+FORCE_ADB=false
+SKIP_SSH=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --build) BUILD_CHOICE=2; shift ;;
+        --download) BUILD_CHOICE=1; shift ;;
+        --factory-password) FACTORY_PASSWORD=true; shift ;;
+        --adb) FORCE_ADB=true; shift ;;
+        --no-ssh) SKIP_SSH=true; shift ;;
+        --serial)
+            [ $# -ge 2 ] && [ -n "$2" ] || fail "--serial needs an ADB serial."
+            export ANDROID_SERIAL="$2"
+            FORCE_ADB=true
+            shift 2 ;;
+        --help|-h)
+            echo "Usage: ./setup.sh [--build|--download] [--adb] [--serial SERIAL] [--no-ssh]"
+            echo "                  [--factory-password | router-password agent-password]"
+            echo "Local B31: ./setup.sh --build --adb --factory-password --no-ssh"
+            echo "Factory-password mode requires a locally built agent and authorized ADB or SSH."
+            exit 0 ;;
+        --*) fail "Unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+
 # ── Password input ──────────────────────────────────────────────────
+if [ "$FACTORY_PASSWORD" = true ]; then
+    [ $# -eq 0 ] || fail "Do not pass passwords with --factory-password."
+    [ "$BUILD_CHOICE" != 1 ] || fail "Factory-password mode requires --build, not an older release download."
+    BUILD_CHOICE=2
+    ROUTER_PASSWORD=""
+    AGENT_PASSWORD=""
+else
 if [ $# -ge 2 ]; then
+    [ $# -eq 2 ] || fail "Expected exactly two passwords."
     ROUTER_PASSWORD="$1"
     AGENT_PASSWORD="$2"
 elif [ $# -eq 0 ]; then
@@ -24,6 +62,8 @@ else
     echo "       ./setup.sh    (interactive — prompts for passwords)"
     exit 1
 fi
+[ -n "$AGENT_PASSWORD" ] || fail "Agent password cannot be empty; use --factory-password instead."
+fi
 
 GATEWAY=192.168.0.1
 AGENT_PORT=9090
@@ -32,10 +72,19 @@ TARGET=aarch64-unknown-linux-musl
 BINARY=target/$TARGET/release/zte-agent
 REMOTE_BIN=/data/zte-agent
 STARTUP_SCRIPT=/data/local/tmp/start_zte_agent.sh
-BINARY_CHANGED=false
 DOWNLOAD_URL="https://github.com/jesther-ai/open-u60-pro/releases/latest/download/zte-agent"
+WORKDIR=$(mktemp -d)
+chmod 700 "$WORKDIR"
+umask 077
+FORWARD_PORT=""
+cleanup() {
+    [ -z "$FORWARD_PORT" ] || adb forward --remove "tcp:$FORWARD_PORT" >/dev/null 2>&1 || true
+    rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
 
 # ── Binary source menu ──────────────────────────────────────────────
+if [ -z "$BUILD_CHOICE" ]; then
 echo ""
 echo -e "${CYAN}How would you like to get the zte-agent binary?${NC}"
 echo "  1) Download pre-built from GitHub (recommended — no dev tools needed)"
@@ -44,6 +93,7 @@ echo ""
 echo -n "Choice [1]: "
 read -r BUILD_CHOICE
 BUILD_CHOICE="${BUILD_CHOICE:-1}"
+fi
 
 if [ "$BUILD_CHOICE" != "1" ] && [ "$BUILD_CHOICE" != "2" ]; then
     fail "Invalid choice. Enter 1 or 2."
@@ -205,13 +255,11 @@ ok "All prerequisites found."
 
 # ── Helper: SHA-256 ──────────────────────────────────────────────────
 sha256() {
-    echo -n "$1" | shasum -a 256 2>/dev/null | awk '{print $1}' \
-        || echo -n "$1" | sha256sum | awk '{print $1}'
+    printf '%s' "$1" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
 }
 
 sha256_file() {
-    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}' \
-        || sha256sum "$1" | awk '{print $1}'
+    python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
 }
 
 upper() {
@@ -253,19 +301,20 @@ wait_with_timeout() {
 }
 
 # ── Transport detection ──────────────────────────────────────────────
-SSH_CMD="ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=3 root@$GATEWAY"
+SSH_CMD="ssh -p $SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 root@$GATEWAY"
 USE_SSH=false
 
-if $SSH_CMD "echo ok" >/dev/null 2>&1; then
+if [ "$FORCE_ADB" != true ] && $SSH_CMD "echo ok" >/dev/null 2>&1; then
     USE_SSH=true
     ok "SSH reachable — using wireless deploy."
 else
-    warn "SSH not reachable — falling back to ADB."
+    info "Using authorized USB ADB (SSH unavailable or --adb selected)."
 
     # ── Steps 1-2: Enable ADB + connect ──────────────────────────────────
-    if adb devices 2>/dev/null | grep -qw device; then
+    if adb get-state 2>/dev/null | grep -qx device; then
         ok "ADB already connected, skipping web auth."
     else
+        [ "$FACTORY_PASSWORD" != true ] || fail "Authorize USB ADB first, or connect SSH before using --factory-password."
         info "Authenticating with router web interface..."
 
         ANON_SESSION="00000000000000000000000000000000"
@@ -302,7 +351,7 @@ except Exception:
         if [ -z "$SESSION" ] || [ "$SESSION" = "null" ]; then
             fail "Login failed. Check your router password."
         fi
-        ok "Logged in to router (session: ${SESSION:0:8}...)."
+        ok "Logged in to router."
 
         # Set USB mode to debug
         info "Enabling ADB (USB debug mode)..."
@@ -318,6 +367,10 @@ except Exception:
         fi
         ok "ADB device connected."
     fi
+    # Pin this device for every command, including forward cleanup.
+    ANDROID_SERIAL=$(adb get-serialno)
+    [ -n "$ANDROID_SERIAL" ] && [ "$ANDROID_SERIAL" != unknown ] || fail "Cannot identify one ADB device. Use --serial."
+    export ANDROID_SERIAL
 fi
 
 # ── Helper: remote command / push ────────────────────────────────────
@@ -325,16 +378,27 @@ rcmd() {
     if [ "$USE_SSH" = true ]; then
         $SSH_CMD "$@"
     else
-        adb shell "$@"
+        # B31's old adbd reports host exit 0 even when its shell command fails.
+        # Carry the real status separately; keep raw command output private.
+        local output status marker="__U60_RC_$$_${RANDOM}__"
+        output=$(adb shell "(
+$*
+)
+status=\$?
+printf '\\n${marker}%s\\n' \"\$status\"" | tr -d '\r') || return 1
+        status="${output##*$'\n'$marker}"
+        case "$status" in ''|*[!0-9]*) echo "Missing remote command status" >&2; return 1 ;; esac
+        printf '%s' "${output%$'\n'$marker*}"
+        return "$status"
     fi
 }
 
 rpush() {
     local src="$1" dst="$2"
     if [ "$USE_SSH" = true ]; then
-        cat "$src" | $SSH_CMD "cat > $dst && chmod +x $dst"
+        cat "$src" | $SSH_CMD "umask 077; cat > '$dst' && chmod 700 '$dst'"
     else
-        adb push "$src" "$dst" && adb shell "chmod +x $dst"
+        adb push "$src" "$dst" && rcmd "chmod 700 '$dst'"
     fi
 }
 
@@ -359,95 +423,96 @@ else
     ok "Build complete."
 fi
 
-# ── Step 4: Push binary ─────────────────────────────────────────────
-info "Checking zte-agent binary..."
+# Stage and verify before stopping the current panel.
+info "Checking device state and staging the local installation..."
+rcmd 'test -d /data && command -v flock >/dev/null && command -v sha256sum >/dev/null'
+rcmd 'test ! -e /etc/init.d/zte-agent' || fail "An init-managed agent exists; use its service manager instead."
+# Relay and Mihomo may stay on: the new agent rolls back what the old one
+# left and reconnects them (relay networks connected with Remember on).
+if ! rcmd 'test ! -e /sys/class/net/u60sta0 && test ! -e /sys/class/net/u60mh0'; then
+    info "Relay or Mihomo is on; the new agent turns them back on after a short interruption."
+fi
+STAGE="/data/zte-agent-install-$(date +%Y%m%d-%H%M%S)-$$"
+rcmd "umask 077; mkdir '$STAGE'; mkdir -p /data/local/tmp"
+ok "Installation backup directory: $STAGE"
+
 LOCAL_SHA=$(sha256_file "$BINARY")
-REMOTE_SHA=$(rcmd "sha256sum $REMOTE_BIN 2>/dev/null" | awk '{print $1}')
-if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
-    ok "Binary unchanged, skipping push."
+rpush "$BINARY" "$STAGE/agent.new"
+REMOTE_SHA=$(rcmd "sha256sum '$STAGE/agent.new'" | awk '{print $1}')
+[ "$LOCAL_SHA" = "$REMOTE_SHA" ] || fail "Staged binary checksum mismatch; current agent is untouched."
+
+if [ "$FACTORY_PASSWORD" = true ]; then
+    python3 scripts/install-agent.py launcher "$WORKDIR/start.sh"
 else
-    info "Stopping running agent before push..."
-    rcmd "killall zte-agent 2>/dev/null; sleep 1"
-    info "Pushing zte-agent to device..."
-    rpush "$BINARY" "$REMOTE_BIN"
-    BINARY_CHANGED=true
-    ok "Binary deployed to $REMOTE_BIN."
+    printf '%s' "$AGENT_PASSWORD" | python3 scripts/install-agent.py launcher "$WORKDIR/start.sh" override
 fi
-
-# ── Step 5: Create startup script ───────────────────────────────────
-# Escape single quotes for safe embedding in sh single-quoted string
-SAFE_PASSWORD=$(printf '%s' "$AGENT_PASSWORD" | sed "s/'/'\\\\''/g")
-
-if rcmd "grep -qF '${SAFE_PASSWORD}' $STARTUP_SCRIPT 2>/dev/null"; then
-    ok "Startup script already up to date."
-else
-    info "Creating startup script..."
-    cat > /tmp/start_zte_agent.sh <<BOOT
-#!/bin/sh
-export ZTE_AGENT_PASSWORD='${SAFE_PASSWORD}'
-nohup /data/zte-agent >/tmp/zte-agent.log 2>&1 &
-BOOT
-    rpush /tmp/start_zte_agent.sh "$STARTUP_SCRIPT"
-    rm /tmp/start_zte_agent.sh
-    ok "Startup script created at $STARTUP_SCRIPT."
-fi
-
-# ── Step 6: Update rc.local for boot persistence ────────────────────
-info "Configuring auto-start on boot..."
-RC_LINE="sh $STARTUP_SCRIPT"
-if rcmd "grep -qF '$RC_LINE' /etc/rc.local 2>/dev/null"; then
-    ok "rc.local already configured."
-else
-    rcmd "grep -q '^exit 0' /etc/rc.local \
-        && sed -i '/^exit 0/i $RC_LINE' /etc/rc.local \
-        || echo '$RC_LINE' >> /etc/rc.local"
-    ok "Added zte-agent to /etc/rc.local."
-fi
-
-# ── Step 7: Start agent ─────────────────────────────────────────────
-info "Checking agent status..."
-AGENT_RUNNING=false
-curl -sf "http://$GATEWAY:$AGENT_PORT/api/auth/login" \
-    -H 'Content-Type: application/json' \
-    -d "{\"password\":\"$AGENT_PASSWORD\"}" >/dev/null 2>&1 && AGENT_RUNNING=true
-
-if [ "$BINARY_CHANGED" = true ] || [ "$AGENT_RUNNING" = false ]; then
-    info "Starting zte-agent..."
-    rcmd "killall zte-agent 2>/dev/null; true"
-    sleep 1
-    rcmd "sh $STARTUP_SCRIPT"
-    ok "Agent (re)started."
-else
-    ok "Agent already running with current binary, skipping restart."
-fi
-
-# ── Step 8: Verify ──────────────────────────────────────────────────
-info "Verifying agent is running..."
-sleep 2
+rpush "$WORKDIR/start.sh" "$STAGE/start.sh"
+rcmd "set -e; sh -n '$STAGE/start.sh'; cp -p /etc/rc.local '$STAGE/rc.local.before'; chmod 600 '$STAGE/rc.local.before'"
+# rcmd intentionally adds no newline; preserve the boot file byte for byte.
+rcmd "cat '$STAGE/rc.local.before'" >"$WORKDIR/rc.local.before"
+RC_SHA=$(sha256_file "$WORKDIR/rc.local.before")
+[ "$RC_SHA" = "$(rcmd "sha256sum '$STAGE/rc.local.before'" | awk '{print $1}')" ] \
+    || fail "Could not preserve rc.local exactly; current agent is untouched."
+python3 scripts/install-agent.py boot "$WORKDIR/rc.local.new" "$WORKDIR/rc.local.before"
+rpush "$WORKDIR/rc.local.new" "$STAGE/rc.local.new"
+rcmd "sh -n '$STAGE/rc.local.new'; [ \"\$(sha256sum /etc/rc.local | awk '{print \$1}')\" = '$RC_SHA' ]" \
+    || fail "rc.local changed during staging; retry without overwriting it."
+# The install and boot launcher share exact process-identity checks and the
+# same lock. Stop only verified mains, never relay callbacks/CLI helpers.
+python3 scripts/install-agent.py install "$WORKDIR/install.sh"
+rpush "$WORKDIR/install.sh" "$STAGE/install.sh"
+rcmd "sh '$STAGE/install.sh' '$STAGE' '$RC_SHA'"
+ok "Installed $REMOTE_BIN; verifying before enabling the boot hook."
 
 if [ "$USE_SSH" = true ]; then
-    VERIFY_URL="http://$GATEWAY:$AGENT_PORT/api/auth/login"
+    VERIFY_URL="http://$GATEWAY:$AGENT_PORT"
 else
-    adb forward tcp:19090 tcp:$AGENT_PORT
-    VERIFY_URL="http://127.0.0.1:19090/api/auth/login"
+    FORWARD_PORT=$(adb forward tcp:0 tcp:$AGENT_PORT | tr -d '\r\n')
+    case "$FORWARD_PORT" in ''|*[!0-9]*) fail "Cannot allocate verification port." ;; esac
+    VERIFY_URL="http://127.0.0.1:$FORWARD_PORT"
+fi
+READY=false
+for attempt in $(seq 1 30); do
+    if curl --noproxy '*' -fsS --max-time 2 "$VERIFY_URL/ui/login" >"$WORKDIR/login.html" 2>/dev/null \
+        && grep -q 'name="password"' "$WORKDIR/login.html"; then
+        READY=true
+        break
+    fi
+    sleep 1
+done
+[ "$READY" = true ] || fail "Panel not ready; boot hook is unchanged. Backup: $STAGE"
+[ "$(curl --noproxy '*' -sS --max-time 5 -o /dev/null -w '%{http_code}' "$VERIFY_URL/api/device")" = 401 ] \
+    || fail "Unauthenticated API was not rejected; boot hook is unchanged."
+rcmd 'p=$(cat /tmp/zte-agent-run/pid); [ "$(readlink /proc/$p/exe)" = /data/zte-agent ]' \
+    || fail "The responding panel is not the installed process."
+if [ "$FACTORY_PASSWORD" = true ]; then
+    rcmd "grep -q '^\[auth\] using factory admin password' /tmp/zte-agent.log" \
+        || fail "The installed agent did not load the factory admin verifier."
+    ok "Panel ready; factory admin verifier loaded and unauthenticated API rejected."
+else
+    printf '%s' "$AGENT_PASSWORD" | python3 -c 'import json,sys; json.dump({"password":sys.stdin.read()},sys.stdout)' >"$WORKDIR/login.json"
+    chmod 600 "$WORKDIR/login.json"
+    curl --noproxy '*' -fsS --max-time 10 "$VERIFY_URL/api/auth/login" -H 'Content-Type: application/json' \
+        --data-binary "@$WORKDIR/login.json" >"$WORKDIR/login-response.json"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("ok") and d.get("data",{}).get("token")' "$WORKDIR/login-response.json"
+    ok "Agent authenticated with the explicit password."
 fi
 
-TOKEN=$(curl -sf "$VERIFY_URL" \
-    -H 'Content-Type: application/json' \
-    -d "{\"password\":\"$AGENT_PASSWORD\"}" \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["token"])')
-
-if [ "$USE_SSH" != true ]; then
-    adb forward --remove tcp:19090 2>/dev/null || true
-fi
-
-if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-    fail "Agent started but login verification failed."
-fi
-ok "Agent is running and authenticated."
+rcmd "set -e
+[ \"\$(sha256sum /etc/rc.local | awk '{print \$1}')\" = '$RC_SHA' ]
+cp -p /etc/rc.local /etc/rc.local.zte-agent-new
+cat '$STAGE/rc.local.new' >/etc/rc.local.zte-agent-new
+sh -n /etc/rc.local.zte-agent-new
+mv /etc/rc.local.zte-agent-new /etc/rc.local
+sync"
+ok "Boot hook enabled in rc.local; unrelated boot commands are preserved."
+# Keep only rollback inputs, not upload payloads or install helpers.
+rcmd "rm -f '$STAGE/agent.new' '$STAGE/start.sh' '$STAGE/rc.local.new' '$STAGE/install.sh' '$STAGE/backups.ready'"
 
 # ── Step 9: Optional SSH setup ──────────────────────────────────────
-if [ "$USE_SSH" = true ]; then
+if [ "$SKIP_SSH" = true ]; then
+    ok "SSH setup skipped."
+elif [ "$USE_SSH" = true ]; then
     ok "SSH already configured, skipping SSH setup."
 else
 echo ""
@@ -549,8 +614,14 @@ echo ""
 echo -e "${GREEN}Setup complete!${NC}"
 echo ""
 echo "  Agent API:  http://$GATEWAY:$AGENT_PORT"
-echo "  Web UI:     http://$GATEWAY:$AGENT_PORT/  (log in with the agent password)"
-echo "  Password:   $AGENT_PASSWORD"
-echo "  Deploy:     ./deploy.sh $AGENT_PASSWORD"
+echo "  Web UI:     http://$GATEWAY:$AGENT_PORT/ui/"
+if [ "$FACTORY_PASSWORD" = true ]; then
+    echo "  Login:      official router admin password (restart agent after changing it)"
+    echo "  Update:     ./setup.sh --build --adb --factory-password --no-ssh"
+else
+    echo "  Login:      your explicit agent password (not displayed)"
+fi
+echo "  Auto-start: rc.local -> $STARTUP_SCRIPT"
+echo "  Backup:     $STAGE"
 echo ""
 echo "  Point the iOS/Android companion app at http://$GATEWAY:$AGENT_PORT"
