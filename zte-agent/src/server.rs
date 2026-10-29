@@ -202,7 +202,7 @@ pub fn lane(method: Method, path: &str) -> Lane {
         | (Post, "/api/esim/download/confirm" | "/api/esim/download/cancel")
         | (Get, "/api/tailscale/status")
         | (Get, "/api/stk/menu" | "/api/stk/session") => false,
-        (_, p) if p.starts_with("/api/esim/") || p.starts_with("/api/tailscale/") => true,
+        (_, p) if p.starts_with("/api/esim/") || p.starts_with("/api/tailscale/") || p.starts_with("/api/https/") => true,
         (_, p) if p.starts_with("/api/ussd/") || p.starts_with("/api/stk/") => true,
         (Post, p) if p.starts_with("/api/sim/") || p.starts_with("/api/cell/") => true,
         (
@@ -433,6 +433,7 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
         // LAN HTTPS (docs/web-ui.md, "LAN HTTPS"): read-only for the apps.
         (&Method::Get, "/api/https") => state.tls.status_json(),
+        (&Method::Post, path @ ("/api/https/on" | "/api/https/renew" | "/api/https/reset")) => https_change(state, path, body),
         (&Method::Post, "/api/tailscale/setup") => tailscale::setup(state, body),
         (&Method::Post, "/api/tailscale/login-url") => tailscale::login_url(state),
         (&Method::Post, "/api/tailscale/enable") => tailscale::enable(state),
@@ -520,6 +521,32 @@ pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16
         state.dashboard.request_refresh();
     }
     reply
+}
+
+/// HTTPS changes use the existing authenticated API, never legacy browser cookies.
+fn https_change(state: &AppState, path: &str, body: &[u8]) -> (u16, Value) {
+    if !state.auth.has_password() {
+        return (403, json!({"ok":false,"error":"agent password required"}));
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return (400, json!({"ok":false,"error":"invalid JSON"}));
+    };
+    if value["confirm"] != true {
+        return (
+            400,
+            json!({"ok":false,"error":"explicit confirmation required"}),
+        );
+    }
+    let result = match path {
+        "/api/https/on" => state.tls.turn_on(),
+        "/api/https/renew" => state.tls.renew(),
+        "/api/https/reset" => state.tls.reset(),
+        _ => return (404, json!({"ok":false,"error":"not found"})),
+    };
+    match result {
+        Ok(()) => state.tls.status_json(),
+        Err(error) => (503, json!({"ok":false,"error":error})),
+    }
 }
 
 #[cfg(test)]

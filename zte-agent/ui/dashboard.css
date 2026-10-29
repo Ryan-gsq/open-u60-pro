@@ -2607,3 +2607,27 @@ dialog[data-motion="closing"]::backdrop { animation: dialog-scrim-out .12s ease-
   #primary-navigation .nav-group > summary, #primary-navigation .nav-children a, .section-tabs a, .button { transition: none; }
   dialog[data-motion]::backdrop { animation: none; }
 }
+
+/* Battery detail values keep stable nodes so SSE updates animate without moving rows. */
+.battery-state { color: var(--accent); font-size: 19px; font-weight: 600; margin: 22px 0 0; }
+.battery-metrics { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 24px; margin: 28px 0 20px; }
+.battery-metrics > div { min-width: 0; border-left: 2px solid var(--line); padding-left: 18px; }
+.battery-metrics dt { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+.battery-metrics dd { margin: 0 0 8px; font-size: clamp(22px,2.6vw,34px); letter-spacing: -1px; overflow-wrap: anywhere; }
+.battery-progress { display: block; width: 100%; height: 8px; accent-color: var(--accent); margin: 18px 0; }
+.battery-times { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.battery-facts { margin: 24px 0; }
+.battery-facts > div { min-width: 0; }
+.battery-facts dd { overflow-wrap: anywhere; }
+.battery-facts small { grid-column: 1/-1; }
+.battery-raw { margin-top: 28px; }
+.battery-raw pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 480px; overflow: auto; font-size: 12px; }
+@media (max-width:1100px) { .battery-metrics { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media (max-width:480px) { .battery-metrics { gap: 24px 12px; }.battery-metrics > div { padding-left: 12px; }.battery-times dd { font-size: 23px; } }
+
+.battery-metrics .number-display { white-space: normal; overflow-wrap: anywhere; }
+
+.setup-screen { display:block; padding:clamp(24px,8vw,100px); }
+.setup-panel { max-width:640px; margin:0 auto; }
+.https-fingerprint { overflow-wrap:anywhere; user-select:all; }
+#https-install .settings-facts dd { font-family:inherit; line-height:1.7; }

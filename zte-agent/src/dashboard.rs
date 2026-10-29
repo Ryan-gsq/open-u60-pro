@@ -56,6 +56,8 @@ const TOPICS: &[&str] = &[
     "routing",
     "clients",
     "esim",
+    "power",
+    "https",
 ];
 const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("operators", 2, 0),
@@ -72,6 +74,8 @@ const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("qos_config", 10, 6),
     ("client_details", 2, 7),
     ("esim_status", 2, 8),
+    ("battery_details", 5, 9),
+    ("https_status", 5, 10),
 ];
 
 #[derive(Clone, Copy, Default)]
@@ -815,4 +819,17 @@ mod tests {
         drop(inbox);
         assert!(!feed.state.lock().unwrap().readings.contains_key("sms"));
     }
+    #[test]
+    fn battery_details_are_collected_only_for_power_viewers_and_discarded_after_leaving() {
+        let feed = Arc::new(Dashboard::default());
+        let _ordinary = feed.subscribe(false).unwrap();
+        let power = Interests::from_url("/api/dashboard/events?topics=power");
+        let viewer = feed.subscribe(power).unwrap();
+        feed.publish(BTreeMap::from([("battery_details".into(), json!({"ok":true,"data":{}}))]));
+        assert!(feed.next(0, power).1.contains_key("battery_details"));
+        assert!(!feed.next(0, false).1.contains_key("battery_details"));
+        drop(viewer);
+        assert!(!feed.state.lock().unwrap().readings.contains_key("battery_details"));
+    }
+
 }

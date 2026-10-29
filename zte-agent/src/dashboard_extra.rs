@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 pub(crate) fn read(state: &AppState, name: &str) -> Value {
     match name {
         "client_details" => state.client_details.snapshot(),
+        "https_status" => state.tls.status_json().1,
+        "battery_details" => crate::battery_details::snapshot(state),
         "esim_status" => esim::dashboard_status(state),
         "operators" => json!({"ok":true,"data":{
             "status":modem_ext::modem_scan_status(state).1,

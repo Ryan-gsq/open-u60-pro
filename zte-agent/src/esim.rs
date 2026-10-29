@@ -92,6 +92,8 @@ struct Inner {
     busy: AtomicBool,
     /// `mono_secs()` of the last successful profile switch (0 = none).
     switched_at: AtomicU64,
+    user_modem_revision: AtomicU64,
+    modem_commands: Mutex<()>,
     download: Watched<Download>,
     /// The running download's decisions (preview answer, cancel).
     control: DownloadControl,
@@ -298,6 +300,9 @@ struct Switch {
     /// Why the switch didn't complete, when known: `roaming_off` or `data_off` (no data), or
     /// `card_busy` (not applied: the eSIM kept refusing).
     reason: Option<&'static str>,
+    network_policy: crate::esim_network::Policy,
+    network_check: &'static str,
+    data_recovery_attempted: bool,
 }
 
 impl Switch {
@@ -319,6 +324,8 @@ impl Switch {
             "finished_at": self.finished_at,
             "note": self.note,
             "reason": self.reason,
+            "network_check": self.network_check,
+            "data_recovery_attempted": self.data_recovery_attempted,
         })
     }
 }
@@ -435,6 +442,8 @@ impl Esim {
             inner: Arc::new(Inner {
                 busy: AtomicBool::new(false),
                 switched_at: AtomicU64::new(0),
+                user_modem_revision: AtomicU64::new(0),
+                modem_commands: Mutex::new(()),
                 download: Watched::new(Download::default(), Topic::EsimDownload),
                 control: DownloadControl::default(),
                 inventory: Mutex::new(Inventory::default()),
@@ -444,6 +453,13 @@ impl Esim {
                 lock_path,
             }),
         }
+    }
+
+    /// A newer explicit modem command takes priority over handover recovery.
+    pub(crate) fn note_user_modem_change(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner.user_modem_revision.fetch_add(1, Ordering::AcqRel);
+        let guard = self.inner.modem_commands.lock().unwrap_or_else(|e| e.into_inner());
+        guard
     }
 
     fn acquire(&self) -> Option<BusyGuard> {
@@ -588,6 +604,7 @@ struct SwitchCheck {
     /// The enabled manual APN (name, APN) when the router is in manual APN mode.
     manual_apn: Option<(String, String)>,
     roaming_off: bool,
+    data_off: bool,
     loaded_iccid: Option<String>,
     sim_mcc: Option<String>,
     net_mcc: Option<String>,
@@ -605,7 +622,9 @@ impl SwitchCheck {
             .then(|| crate::ubus::call("zwrt_apn_object", "get_manu_apn_list", Some("{}")).ok())
             .flatten()
             .and_then(|list| enabled_manual_apn(&list));
-        let roaming_off = crate::modem_ext::wwan(state).ok().and_then(|w| int(&w["roam_enable"])) == Some(0);
+        let wwan = crate::modem_ext::wwan(state).ok();
+        let roaming_off = wwan.as_ref().and_then(|w| int(&w["roam_enable"])) == Some(0);
+        let data_off = wwan.as_ref().and_then(|w| int(&w["enable"])) == Some(0);
         let sim = crate::sim::info(state).unwrap_or_default();
         let text = |v: &Value| match v {
             Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
@@ -615,6 +634,7 @@ impl SwitchCheck {
         SwitchCheck {
             manual_apn,
             roaming_off,
+            data_off,
             loaded_iccid: text(&sim["sim_iccid"]),
             sim_mcc: text(&sim["mdm_mcc"]),
             // Unregistered, the firmware reports MCC 0: no network country to compare with.
@@ -643,6 +663,7 @@ impl SwitchCheck {
         if self.roaming_off && roams == Some(true) {
             codes.push("roaming_off");
         }
+        if self.data_off { codes.push("data_off"); }
         codes
     }
 
@@ -838,6 +859,9 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
     if let Err((status, message)) = check_enable_target(&list, &iccid) {
         return error(status, message);
     }
+    let revision = state.esim.inner.user_modem_revision.load(Ordering::Acquire);
+    let before_data = crate::modem_ext::wwan(state).unwrap_or(Value::Null);
+    let network_policy = crate::esim_network::Policy::capture(&before_data, revision);
     state.sim_identity.agent_switch_arm();
     let result = card(&["profile", "enable", &iccid, "1"], CARD_LIMIT);
     drop(guard);
@@ -848,7 +872,7 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
     if let Err(e) = &result {
         if card_busy(&e.message()) {
             state.sim_identity.agent_switch_disarm();
-            return retry_while_busy(state, iccid, previous, list, e.message());
+            return retry_while_busy(state, iccid, previous, list, e.message(), network_policy);
         }
     }
     let inner = &state.esim.inner;
@@ -869,6 +893,8 @@ pub fn enable(state: &AppState, body: &[u8]) -> (u16, Value) {
         generation,
         started_at: now,
         note: result.as_ref().err().map(|e| format!("enable error: {}", e.message())),
+        network_policy,
+        network_check: "waiting",
         ..Switch::default()
     };
     inner.switched_at.store(mono_secs(), Ordering::Relaxed);
@@ -926,6 +952,7 @@ fn retry_while_busy(
     previous: Option<String>,
     list: Vec<Value>,
     message: String,
+    network_policy: crate::esim_network::Policy,
 ) -> (u16, Value) {
     let inner = &state.esim.inner;
     let now = unix_now();
@@ -942,6 +969,8 @@ fn retry_while_busy(
         generation,
         started_at: now,
         note: Some(format!("the eSIM refused while busy ({message}); retrying")),
+        network_policy,
+        network_check: "waiting",
         ..Switch::default()
     };
     eprintln!("[esim] enable {} refused while busy ({message}); retrying", mask(&iccid));
@@ -1111,10 +1140,32 @@ fn verify_switch(inner: Arc<Inner>, target: String, generation: u64) {
             eprintln!("[esim] switch check: card unreadable, but the modem loaded {}", mask(&target));
         }
     }
+    let policy = inner.switch.lock().unwrap().network_policy;
+    let mut handover = crate::esim_network::Handover::default();
+    let recovery_enabled = std::env::var("ZTE_AGENT_ESIM_RECOVERY").as_deref() != Ok("0");
     let connected = loop {
-        // Ask the firmware first, then publish under the lock.
+        use crate::esim_network::{Decision, Reachability};
+        if !current(&inner, generation) { return; }
         let modem_ok = modem_has_target();
-        let data_ok = data_connected();
+        let data = read_data_connection().unwrap_or(Value::Null);
+        let data_ok = crate::esim_network::bearer_connected(&data);
+        let configured = crate::sim_identity::observe_gate().ready_for_probe();
+        let health = if modem_ok && data_ok && configured && started.elapsed() < SWITCH_VERIFY_LIMIT {
+            if recovery_enabled { crate::esim_network::probe(&data) } else { Reachability::Unsupported }
+        } else { handover.reset(); Reachability::Down };
+        let allowed = recovery_enabled && policy.allows(inner.user_modem_revision.load(Ordering::Acquire), &data)
+            && SWITCH_VERIFY_LIMIT.saturating_sub(started.elapsed()) >= Duration::from_secs(45);
+        let decision = if modem_ok && data_ok && configured {
+            handover.observe(health, allowed, Instant::now())
+        } else { Decision::Wait };
+        if decision == Decision::Recover && try_data_recovery(&inner, generation, policy, &target) {
+            handover.recovery_started();
+            continue;
+        }
+
+        let ready_now = decision == Decision::Ready && modem_has_target()
+            && read_data_connection().is_some_and(|v| crate::esim_network::bearer_connected(&v))
+            && crate::sim_identity::observe_gate().ready_for_probe();
         let out_of_time = started.elapsed() >= SWITCH_VERIFY_LIMIT;
         let blocker = if out_of_time { data_blocker() } else { None };
         let now = unix_now();
@@ -1126,16 +1177,22 @@ fn verify_switch(inner: Arc<Inner>, target: String, generation: u64) {
             sw.modem_confirmed_at = now;
             sw.state = "modem_confirmed";
         }
-        if sw.modem_confirmed_at != 0 && data_ok {
+        sw.network_check = match health {
+            Reachability::Ready => if decision == Decision::Ready { "ready" } else { "settling" },
+            Reachability::Unsupported => "unverified",
+            Reachability::Down => "checking",
+        };
+        if ready_now {
             sw.connected_at = now;
             sw.finish("connected", now);
             eprintln!("[esim] switch to {} verified: card, modem, data", mask(&target));
             break true;
         }
         if out_of_time {
-            let outcome = if sw.modem_confirmed_at != 0 { "no_data" } else { "modem_unconfirmed" };
+            let outcome = if modem_ok { "no_data" } else { "modem_unconfirmed" };
             if outcome == "no_data" {
-                sw.reason = blocker;
+                sw.reason = blocker.or(Some("network_unavailable"));
+                sw.network_check = "failed";
             }
             sw.finish(outcome, now);
             eprintln!("[esim] switch to {} ended as {outcome}", mask(&target));
@@ -1226,15 +1283,53 @@ fn modem_iccid() -> Option<String> {
     info["sim_iccid"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
 }
 
+fn read_data_connection() -> Option<Value> {
+    crate::ubus::call_bounded("zwrt_data", "get_wwaniface", Some(r#"{"source_module":"zte_topsw_data","cid":1}"#), 2).ok()
+}
+
 fn data_connected() -> bool {
-    crate::ubus::call(
-        "zwrt_data",
-        "get_wwaniface",
-        Some(r#"{"source_module":"zte_topsw_data","cid":1}"#),
-    )
-    .ok()
-    .and_then(|v| v["connect_status"].as_str().map(str::to_string))
-    .is_some_and(|s| s.contains("connected") && !s.contains("disconnected"))
+    read_data_connection().is_some_and(|data| crate::esim_network::bearer_connected(&data))
+}
+
+fn recovery_current(inner: &Arc<Inner>, generation: u64, revision: u64, target: &str) -> bool {
+    current(inner, generation)
+        && inner.user_modem_revision.load(Ordering::Acquire) == revision
+        && recovery_identity_matches(target)
+        && crate::ubus::uci_get("zte_nwinfo.sys_info.operate_mode")
+            .is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("ONLINE"))
+}
+
+fn recovery_identity_matches(target: &str) -> bool {
+    crate::ubus::call_bounded("zwrt_zte_mdm.api", "get_sim_info", Some("{}"), 1)
+        .ok().and_then(|v| v["sim_iccid"].as_str().map(str::to_owned))
+        .is_some_and(|id| same_iccid(&id, target))
+}
+
+fn recovery_restore_allowed(inner: &Arc<Inner>, generation: u64, target: &str) -> bool {
+    current(inner, generation) && recovery_identity_matches(target)
+        && crate::ubus::uci_get("zte_nwinfo.sys_info.operate_mode")
+            .is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("ONLINE"))
+}
+
+fn try_data_recovery(inner: &Arc<Inner>, generation: u64, policy: crate::esim_network::Policy, target: &str) -> bool {
+    let Some(_card_guard) = acquire(inner) else { return false };
+    let Ok(_command_guard) = inner.modem_commands.try_lock() else { return false };
+    if !recovery_current(inner, generation, policy.revision, target) { return false; }
+    {
+        let mut sw = inner.switch.lock().unwrap();
+        if sw.generation != generation { return false; }
+        sw.network_check = "recovering";
+        sw.data_recovery_attempted = true;
+    }
+    let result = crate::esim_network::reconnect(
+        || recovery_current(inner, generation, policy.revision, target),
+        || recovery_restore_allowed(inner, generation, target),
+        read_data_connection,
+        |body| crate::ubus::call_bounded("zwrt_data", "set_wwaniface", Some(&body.to_string()), 3).is_ok(),
+        || std::thread::sleep(Duration::from_secs(1)),
+    );
+    eprintln!("[esim] handover data refresh: {result:?}");
+    true
 }
 
 /// Why data is down when the firmware says so: a profile from another country (SIM and network
@@ -2512,6 +2607,7 @@ mod tests {
         let check = SwitchCheck {
             manual_apn: Some(("GOMO".into(), "gomo.ph".into())),
             roaming_off: true,
+            data_off: false,
             loaded_iccid: Some(ph.into()),
             sim_mcc: Some("515".into()),
             net_mcc: Some("515".into()),
@@ -2560,4 +2656,26 @@ mod tests {
         assert_eq!(view["manual_apn"], Value::Null);
         assert_eq!(view["profiles"][1]["switch_warnings"], json!([]));
     }
+    #[test]
+    fn a_manual_data_command_queued_during_recovery_wins_after_the_refresh() {
+        use std::sync::mpsc;
+        let esim = Arc::new(Esim::with_lock_path(PathBuf::from("/unused-esim-network-test")));
+        let value = Arc::new(AtomicU64::new(1));
+        let recovery = esim.inner.modem_commands.lock().unwrap();
+        value.store(0, Ordering::Release);
+        let (tx,rx) = mpsc::channel();
+        let user = Arc::clone(&esim); let user_value = Arc::clone(&value);
+        let worker = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            let _command = user.note_user_modem_change();
+            user_value.store(0, Ordering::Release);
+        });
+        rx.recv().unwrap();
+        value.store(1, Ordering::Release);
+        drop(recovery);
+        worker.join().unwrap();
+        assert_eq!(value.load(Ordering::Acquire), 0);
+        assert_eq!(esim.inner.user_modem_revision.load(Ordering::Acquire), 1);
+    }
+
 }
