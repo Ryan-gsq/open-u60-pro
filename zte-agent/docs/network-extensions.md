@@ -587,6 +587,21 @@ controlled B31 tests; hotel authorization, both radio bands and long-run behavio
 remain separate acceptance gates. The earlier design/benefit assessment is in
 [relay-ipv6-nat-assessment.md](relay-ipv6-nat-assessment.md).
 
+### Hardware forwarding (IPA)
+
+Relayed IPv4 NAT is carried by the Qualcomm IPA once the owner installs the
+`u60sta0` IPACM entry and restarts the router (Relay page, `offload`). While
+connected the relay then adds a `main` default (metric 60631, with
+unreachable guards for the ranges its table throws) and keeps IPACM in
+hardware mode unless an owner speed limit, power saver or `ipa_disable`
+needs the CPU path; ZTE's Smart QoS (`Ai_mode`) switches it to software at
+boot and is overridden only while relaying. RPS and a 5000 backlog help the
+traffic that stays on the CPU. With Mihomo on, the optional China IP direct
+setting lets China IPv4 destinations bypass the core in the kernel, so they
+can be offloaded too. Offloaded connections skip iptables, tc and parental
+control. Design, measurements and open items:
+[relay-hw-offload.md](relay-hw-offload.md).
+
 ## Recovery
 
 Modules serialize their network changes and journal undo commands before each
@@ -692,11 +707,13 @@ never URLs. Zashboard's bridge uses the pass cookie instead of a bearer token.
 | POST | `/api/mihomo/install` | Install the pinned core and dashboard |
 | PUT | `/api/mihomo/config` | Validate and save `{"yaml":"..."}` |
 | POST | `/api/mihomo/switch` | Start/stop with `{"enabled":true/false}` |
+| POST | `/api/mihomo/cn-direct` | `{"enabled":true/false}`: China IPv4 bypasses the core in the kernel; restarts a running core and resets LAN IPv4 connections |
 | GET | `/api/wifi-relay/status` | Relay state and last scan, no BSSID/password |
 | POST | `/api/wifi-relay/scan` | Explicit scan, no background scanning |
 | POST | `/api/wifi-relay/connect` | `{"network":"opaque scan id","password":"...","confirmed":true,"ipv6":true}`; omitted IPv6 defaults on |
 | POST | `/api/wifi-relay/disconnect` | Restore runtime hotspot/routes |
 | POST | `/api/wifi-relay/clock` | Explicit fresh HTTPS time check; requires an active relay, never reconnects it |
+| POST | `/api/wifi-relay/offload` | `{"install":true/false}`: add/remove the IPACM `u60sta0` entry (loaded after a restart); status `offload.config` |
 | GET | `/api/mihomo/profiles` | Profile library status, no URLs or YAML |
 | GET | `/api/mihomo/profiles/{id}` | Explicit private editor read (metadata and URL, never saved YAML) for one profile |
 | POST | `/api/mihomo/profiles` | Add, edit, select, refresh and delete profiles; set Merge and Script |

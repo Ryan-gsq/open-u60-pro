@@ -2308,7 +2308,7 @@ mod tests {
             false,
             &[],
         );
-        net::write_private(Path::new(&path),&serde_json::to_vec_pretty(&json!({"setup":setup_plan(),"network":network,"network_ula_dns":network_ula_dns,"ipv4":ipv4,"mihomo":crate::mihomo::proxy_plan(&["192.168.0.1".parse().unwrap(), "2001:db8:2::1".parse().unwrap()])})).unwrap()).unwrap();
+        net::write_private(Path::new(&path),&serde_json::to_vec_pretty(&json!({"setup":setup_plan(),"network":network,"network_ula_dns":network_ula_dns,"ipv4":ipv4,"mihomo":crate::mihomo::proxy_plan(&["192.168.0.1".parse().unwrap(), "2001:db8:2::1".parse().unwrap()], false)})).unwrap()).unwrap();
     }
 
     #[cfg(target_os = "linux")]

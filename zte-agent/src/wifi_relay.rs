@@ -8,8 +8,10 @@ pub(crate) mod portal;
 mod dfs_switch;
 pub(crate) mod hotspot;
 mod llstats;
+pub(crate) mod offload;
 mod resume;
 mod scan;
+pub(crate) mod steering;
 mod width;
 mod width_watch;
 use width_watch::{reset_width, LinkWidth, tune_width};
@@ -71,6 +73,7 @@ struct Session {
     width: Option<LinkWidth>,
     tuning: saved::Tuning,
     association: Association,
+    offload: offload::Runtime,
     /// IPv4 addresses whose exact DNS exemptions this session maintains.
     local: Vec<std::net::IpAddr>,
     rules_checked: Option<Instant>,
@@ -196,6 +199,12 @@ impl WifiRelay {
         value["recovery_required"] = json!(recovery_pending(Path::new(JOURNAL)) && value["connected"] != true);
         // Reconnected after an agent restart or a reboot (`restore`).
         value["autostart"] = json!(resume::load(Path::new(JOURNAL)).is_some());
+        let mut offload = value["offload"].take();
+        if !offload.is_object() {
+            offload = json!({});
+        }
+        offload["config"] = json!(offload::config());
+        value["offload"] = offload;
         saved::annotate(&mut value);
         value
     }
@@ -234,6 +243,7 @@ impl WifiRelay {
             "association_state": s.map(|s| s.association.state),
             "association_recovering": s.is_some_and(|s| s.association.since.is_some()),
             "association_recovery_ms": s.map(|s| s.association.elapsed(BootClock.now()).as_millis() as u64),
+            "offload": s.map(|s| s.offload.status()),
             "restoring": i.restoring, "experimental": true, "error": i.error.as_ref().or_else(|| s.and_then(|s| s.dns_error.as_ref()))})
     }
 
@@ -354,6 +364,7 @@ impl WifiRelay {
                     let gateway = lease.gateway;
                     let dns = dns::reconcile(&resolvers);
                     let exemptions = s.follow_local();
+                    s.offload.audit(&mut s.network);
                     s.dns_error = dns
                         .and(exemptions)
                         .and(portal::reconcile_web())
@@ -569,6 +580,7 @@ impl WifiRelay {
             width: None,
             tuning: saved::Tuning::Off,
             association: Association::default(),
+            offload: offload::Runtime::off(),
             local: Vec::new(),
             rules_checked: None,
             renewed: None,
@@ -769,6 +781,18 @@ impl WifiRelay {
             if !route.contains(&format!("dev {IFACE}")) {
                 return Err("Firmware policy routing did not select the Wi-Fi upstream".into());
             }
+            // CPU-path help and hardware forwarding are optional: the relay
+            // works without them. Hardware mode first, then IPACM's WAN route.
+            if let Err(e) = session.network.apply_network(steering::plan()) {
+                eprintln!("[relay] receive steering not applied: {e}");
+            }
+            session.offload = offload::Runtime::start(&mut session.network, offload::config());
+            if session.offload.route {
+                let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(lease.ip) & u32::from(lease.subnet)));
+                if let Err(e) = session.network.apply_network(offload::route_plan(&lease.gateway.to_string(), &subnet)) {
+                    session.offload.no_route(e);
+                }
+            }
             let dns = lease.dns.first().copied().unwrap_or(lease.gateway).to_string();
             session.dns.apply(Step::new(
                 Cmd::new("@u60-relay-dns", &[&dns]),
@@ -877,6 +901,14 @@ impl WifiRelay {
         i.error = result.as_ref().err().cloned();
         self.publish(&i);
         result
+    }
+
+    /// Owner action: install or remove the IPACM entry (`offload`).
+    fn set_offload(&self, install: bool) -> Result<(), String> {
+        let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = if install { offload::install()? } else { offload::remove()? };
+        eprintln!("[relay] hardware forwarding config={config:?}");
+        Ok(())
     }
 }
 
@@ -1548,6 +1580,11 @@ pub fn change(state: &crate::handlers::AppState, action: &str, body: &[u8]) -> (
         "scan" => state.wifi_relay.scan(),
         "disconnect" => state.wifi_relay.disconnect(),
         "clock" => state.wifi_relay.recheck_clock_with(crate::network_clock::recheck_wifi),
+        "offload" => serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|v| v["install"].as_bool())
+            .ok_or_else(|| "install must be a boolean".to_owned())
+            .and_then(|install| state.wifi_relay.set_offload(install)),
         "tuning" => serde_json::from_slice::<Value>(body).map_err(|_| "Invalid request".to_owned()).and_then(|v| {
             let mode = saved::Tuning::parse(v["width_mode"].as_str().unwrap_or(""))?;
             state.wifi_relay.set_tuning(v["id"].as_str().unwrap_or(""), mode, v["confirmed"].as_bool() == Some(true))

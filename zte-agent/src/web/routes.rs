@@ -95,11 +95,13 @@ pub static SCREENS: [&Screen; 78] = [
     &settings::INSTALL,
 ];
 
-pub static ACTIONS: [&Action; 29] = [
+pub static ACTIONS: [&Action; 31] = [
     &router::MIHOMO_SWITCH,
     &router::MIHOMO_INSTALL,
+    &router::MIHOMO_CHINA_DIRECT,
     &relay::SCAN,
     &relay::DISCONNECT,
+    &relay::OFFLOAD,
     &dashboard::POWERBANK,
     &dashboard::USB_DISMISS,
     &router::MOBILE_DATA,

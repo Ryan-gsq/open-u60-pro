@@ -4,6 +4,15 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 ## [Unreleased]
 
+### Added
+
+- Wi-Fi relay hardware forwarding: an owner-installed IPACM entry (loaded after a restart) lets the Qualcomm IPA carry relayed IPv4 NAT, with a `main` default route and IPACM hardware mode kept while relaying unless an owner speed limit, power saver or IPA disable needs the CPU path. Receive steering (RPS) and a deeper backlog help the traffic that stays on the CPU.
+- Mihomo China IP direct: China IPv4 destinations can bypass the core in the kernel, so relayed connections to them can be offloaded; LAN connections are reset when the interception changes.
+
+### Fixed
+
+- Relay hotspot channel changes that keep the primary channel and change only the width (for example 36/40 to 36/20) now go through another non-DFS channel instead of failing cleanup with "Hotspot refused the channel switch".
+
 ## [2.4.0] - 2026-11-04
 
 ### Highlights

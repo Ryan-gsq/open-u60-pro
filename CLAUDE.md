@@ -85,6 +85,19 @@ cargo test --locked -p zte-agent wifi_relay:: -- --nocapture
 
 Replace `wifi_relay::` with the module or test name being investigated.
 
+## Test Scripts and Backups
+
+Keep every ad-hoc file in one fixed folder per kind, so cleanup is deleting a folder:
+
+| Kind | Router | Development Mac |
+| --- | --- | --- |
+| Test scripts, samplers, logs, captures | `/data/local/tmp/zte-agent-test/` | `/tmp/u60-test/` |
+| Copies of router files before a manual change, and their restore scripts | `/data/zte-agent-backup/<topic>/` | `../backups/<topic>/` (next to the repository) |
+
+- Delete both test folders when the test ends; repeatable checks belong in `scripts/` instead.
+- Name a backup after the original plus `.orig`, keep it until the owner asks to remove it, and record it in the topic's doc. Kept now: `ipacm/` (stock and installed `IPACM_cfg.xml`, `restore-stock.sh`; `zte-agent/docs/relay-hw-offload.md`).
+- The agent's own runtime state and backups stay in its directories (`/data/zte-agent-relay/`, `/data/zte-agent-mihomo/`); `setup.sh` keeps no installation backup.
+
 ---
 
 ## CRITICAL: ZTE Daemon Sync Barrier
@@ -165,6 +178,7 @@ ubus call zwrt_data get_wwaniface '{"source_module":"zte_topsw_data","cid":1}'
 - **eSIM**: No built-in eUICC. The user-tested 9eSIM B1 in the SIM slot is managed by the agent in-process (`euicc/` crate, a Rust translation of lpac's libeuicc, over QMI-over-QRTR, node 3, slot 1): list, switch, download, delete — see `zte-agent/docs/esim.md`. lpac itself is no longer used (removed 2026-10-19; the old `/data/lpac` bundle is archived on the router as `/data/lpac.removed`). The old phone-Bluetooth B1 code was removed. Do not reverse-engineer the qcril/RIL internals to forward SIM Toolkit screens.
 - **IMEI**: Hardware-locked (QFPROM fused), not modifiable.
 - **5 GHz DFS window**: after each 160 MHz 5 GHz start, `/sbin/zte_wifi_dfs_hdlr.sh` sets `iwpriv wlan2 disableDfsCS 1` for 599 s. Any 160 MHz AP here spans DFS, and a STA connect in that window wedges the AP in `Channel switch in progress` until a hotspot restart. The relay turns the switch back on before each join (owner decision 62, `wifi_relay/dfs_switch.rs`; `zte-agent/docs/network-extensions.md`).
+- **IPA hardware forwarding of the relay**: IPACM reads `/etc/data/ipa/IPACM_cfg.xml` once at boot; never restart `ipacm` at runtime (the new process misses the driver's earlier Wi-Fi events). It offloads relay NAT only with a `u60sta0` entry loaded at boot, a `main` default through `u60sta0` (policy tables are ignored) and HW mode (`/sbin/ipacm_switch.sh on`). ZTE's Smart QoS (`zwrt_smart_mng.smart_qos.mode=Ai_mode`) switches it to SW about 38 s after boot via `smart_set_qos_policy.sh` → `accelate_modem_proc off` (owner decision 63, `wifi_relay/offload.rs`; `zte-agent/docs/relay-hw-offload.md`).
 - **`iwpriv u60sta0 chwidth` is not a held setting**: a narrower width lapses silently after about 100-260 s (5 GHz downlink either goes back to wide or collapses, e.g. 80 MHz fell from about 310 to 45 Mbit/s at 190 s; 2.4 GHz 20 MHz collapses to about 3 Mbit/s) while `iw` still reads the narrow width. Re-sending the same value does nothing; set another width, then the target. The setting also survives relay reconnects, interface re-creation and band changes, so a fresh connection can inherit it (`zte-agent/docs/network-extensions.md`, stage B).
 - **A width readback does not prove the data path**: after an `iwpriv u60sta0 chwidth` change, `iw` can read the new width while the upstream gateway stops answering ping (seen after narrowing 40→20 at connect and after a rollback; it lasted about 60 s, until the next refresh). `arping` still gets replies in that state, so check with ICMP. Setting the wider width for 1 s and then the target recovers it; the width tuner checks after each narrowing, refresh and rollback (`zte-agent/docs/network-extensions.md`, health probes).
 - **The STA width cannot be capped at association**: the vendor `wpa_supplicant` has no HT/VHT overrides, and an upstream 2.11 build that has them was tested: it sent `disable_ht40=1` (HT40 bit cleared in the connect request) and qcacld still associated at 40 MHz. Upstream hostap also lacks the vendor `DRIVER` private commands (`SETROAMMODE`) the relay uses, so do not swap the system supplicant. Debugfs `ll_stats` per-rate counters are TX-only (RX is all zero), so the AP's real downlink width cannot be read either (`zte-agent/docs/network-extensions.md`, driver limits).

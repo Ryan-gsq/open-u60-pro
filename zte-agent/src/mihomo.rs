@@ -18,6 +18,7 @@ use crate::net_tools::{self as net, Cmd, NetworkLock, Step, Transaction};
 
 pub mod control;
 pub mod dashboard;
+pub(crate) mod cn_set;
 mod dns;
 mod download;
 mod geodata;
@@ -62,6 +63,9 @@ struct Running {
     uplink: Uplink,
     /// A stranding egress the watchdog saw, and since when it has held.
     stranding: Option<(Uplink, Instant)>,
+    /// What the mangle chain sends to the core: `all`, or China IP direct
+    /// with its set's digest (`cn_set::prepare`).
+    interception: String,
 }
 
 impl Running {
@@ -276,6 +280,9 @@ pub struct Mihomo {
     /// Fingerprint (secret masked) of the last configuration that passed
     /// `mihomo -t` and then started; an identical restart skips the check.
     validated_config: Mutex<Option<String>>,
+    /// Interception that LAN connections were last reset for. Offloaded and
+    /// established flows keep their old path until conntrack forgets them.
+    reset_for: Mutex<Option<String>>,
     digests: geodata::Digests,
     subscription_dns: Mutex<Vec<std::net::Ipv4Addr>>,
     passes: dashboard::Passes,
@@ -299,6 +306,7 @@ impl Mihomo {
             library_revision: AtomicU64::new(0),
             status_cache: Mutex::new(None),
             validated_config: Mutex::new(None),
+            reset_for: Mutex::new(None),
             digests: geodata::Digests::default(),
             subscription_dns: Mutex::new(Vec::new()),
             passes: dashboard::Passes::default(),
@@ -325,6 +333,7 @@ impl Mihomo {
             rules_checked: None,
             uplink: Uplink::default(),
             stranding: None,
+            interception: "all".into(),
         });
         this
     }
@@ -349,6 +358,8 @@ impl Mihomo {
             "running": i.run.is_some(), "version": VERSION, "dashboard_version": DASHBOARD_VERSION,
             "dashboard": if i.run.is_some() { Some(DASHBOARD) } else { None },
             "scope": "lan_tcp_udp_dual_stack_tun", "experimental": true, "error": i.error,
+            "cn_direct": self.root.join(cn_set::FLAG).is_file(),
+            "cn_direct_active": i.run.as_ref().is_some_and(|r| r.interception != "all"),
             "autostart": self.wants_restore(), "recovery_required": i.run.is_none() && journal})
     }
 
@@ -903,7 +914,16 @@ impl Mihomo {
         {
             return Err("Mihomo's reserved TUN address is already in use".into());
         }
-        let plan = proxy_plan(&local_addresses);
+        // China IP direct is optional: an unusable list starts without it.
+        let (china, china_error) = if self.root.join(cn_set::FLAG).is_file() {
+            match cn_set::prepare(&self.root) {
+                Ok(digest) => (Some(digest), None),
+                Err(e) => (None, Some(e)),
+            }
+        } else {
+            (None, None)
+        };
+        let plan = proxy_plan(&local_addresses, china.is_some());
         let mut running = Running {
             child: None,
             network: Transaction::new(self.journal()),
@@ -914,6 +934,7 @@ impl Mihomo {
             rules_checked: None,
             uplink: Uplink::observe(),
             stranding: None,
+            interception: china.unwrap_or_else(|| "all".into()),
         };
         let (guards, interception): (Vec<_>, Vec<_>) = plan
             .into_iter()
@@ -983,19 +1004,67 @@ impl Mihomo {
             return Err(rollback.err().unwrap_or(e));
         }
         let current = self.validation_fingerprint(&config, &running.secret);
+        let interception = running.interception.clone();
         let mut i = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         i.run = Some(running);
-        i.error = None;
+        i.error = china_error.map(|e| format!("Mihomo is on; China IP direct is off for this start: {e}"));
         *self
             .validated_config
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             validated.filter(|key| current.as_ref() == Some(key));
         self.wake.notify_all();
+        drop(i);
+        self.reset_connections(Some(interception));
         Ok(())
+    }
+
+    /// Resets LAN IPv4 connections when what the core intercepts changed
+    /// (on/off, China IP direct, its list). Established and IPA-offloaded
+    /// flows would otherwise keep their old path; IPACM drops a hardware
+    /// entry on the conntrack DESTROY event. A restart for an uplink change
+    /// keeps the interception and resets nothing.
+    fn reset_connections(&self, interception: Option<String>) {
+        let mut last = self.reset_for.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *last == interception {
+            return;
+        }
+        *last = interception;
+        drop(last);
+        if let Err(e) = reset_lan_connections() {
+            eprintln!("[mihomo] connection reset failed: {e}");
+            self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).error.get_or_insert_with(|| {
+                "Existing LAN connections were not reset; they keep their previous path until they end".into()
+            });
+        }
+    }
+
+    /// Owner choice: China IP ranges bypass the core in the kernel. Restarts a
+    /// running core so its rules follow.
+    pub fn set_china_direct(&self, enabled: bool) -> Result<(), String> {
+        let _lock = self
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _operation = self
+            .operation
+            .try_lock()
+            .map_err(|_| "A Mihomo operation is in progress")?;
+        let flag = self.root.join(cn_set::FLAG);
+        if enabled {
+            net::write_private(&flag, b"1")?;
+        } else {
+            match fs::remove_file(&flag) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err("Cannot clear the China IP direct setting".into())
+                }
+                _ => {}
+            }
+        }
+        self.restart_locked()
     }
 
     /// Caller owns the shared network lock. A fresh core also drops persistent
@@ -1083,7 +1152,9 @@ impl Mihomo {
             .map_err(|_| "A Mihomo operation is in progress")?;
         // Off until the owner turns it on, restarts included.
         let forgotten = self.forget_wanted();
-        self.disable_locked().and(forgotten)
+        let result = self.disable_locked().and(forgotten);
+        self.reset_connections(None);
+        result
     }
 
     fn disable_locked(&self) -> Result<(), String> {
@@ -1118,6 +1189,17 @@ fn local_addresses() -> Result<Vec<std::net::IpAddr>, String> {
     addresses.sort_unstable();
     addresses.dedup();
     Ok(addresses)
+}
+
+/// Deletes the conntrack entries of connections from the LAN subnet (IPv4:
+/// the only family IPA offloads). `conntrack -D` exits 1 when none matched.
+fn reset_lan_connections() -> Result<(), String> {
+    let ip: std::net::Ipv4Addr = crate::ubus::uci_get("network.lan.ipaddr")?.parse().map_err(|_| "Invalid LAN address")?;
+    let mask: std::net::Ipv4Addr = crate::ubus::uci_get("network.lan.netmask")?.parse().map_err(|_| "Invalid LAN mask")?;
+    let subnet = format!("{}/{}", std::net::Ipv4Addr::from(u32::from(ip) & u32::from(mask)), u32::from(mask).count_ones());
+    Cmd::new("sh", &["-c", "conntrack -D -f ipv4 -s \"$1\" >/dev/null 2>&1; [ $? -le 1 ]", "sh", &subnet])
+        .run()
+        .map(|_| ())
 }
 
 /// The mangle exemption that keeps traffic to one of the router's own
@@ -1485,7 +1567,7 @@ fn clear_egress_overrides(value: &mut Yaml) {
     }
 }
 
-pub fn proxy_plan(local: &[std::net::IpAddr]) -> Vec<Step> {
+pub fn proxy_plan(local: &[std::net::IpAddr], china_direct: bool) -> Vec<Step> {
     let mut plan = Vec::new();
     for (family, tool, destination) in [("-4", "iptables", TUN4), ("-6", "ip6tables", TUN6)] {
         plan.extend(net::chain(tool, "filter", "U60_MH_IN"));
@@ -1566,6 +1648,14 @@ pub fn proxy_plan(local: &[std::net::IpAddr]) -> Vec<Step> {
             &["-j", "U60_MH_FWD"],
             true,
         ));
+        let china_direct = china_direct && family == "-4";
+        if china_direct {
+            // Before the rule that uses it; destroyed after that rule's undo.
+            plan.push(Step::new(
+                Cmd::new("@u60-mihomo-cn4", &["load"]),
+                Cmd::new("@u60-mihomo-cn4", &["destroy"]),
+            ));
+        }
         plan.extend(net::chain(tool, "mangle", "U60_MH"));
         for proto in ["tcp", "udp"] {
             plan.push(net::rule(
@@ -1602,6 +1692,15 @@ pub fn proxy_plan(local: &[std::net::IpAddr]) -> Vec<Step> {
                 "mangle",
                 "U60_MH",
                 &["-d", dest, "-j", "RETURN"],
+                false,
+            ));
+        }
+        if china_direct {
+            plan.push(net::rule(
+                tool,
+                "mangle",
+                "U60_MH",
+                &["-m", "set", "--match-set", cn_set::SET, "dst", "-j", "RETURN"],
                 false,
             ));
         }
@@ -1690,6 +1789,13 @@ pub fn change(state: &crate::handlers::AppState, action: &str, body: &[u8]) -> (
             Some(true) => state.mihomo.enable(state.tls.name()),
             Some(false) => state.mihomo.disable(),
             _ => Err("enabled must be a boolean".into()),
+        },
+        "cn-direct" => match serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|v| v["enabled"].as_bool())
+        {
+            Some(enabled) => state.mihomo.set_china_direct(enabled),
+            None => Err("enabled must be a boolean".into()),
         },
         _ => Err("Unknown Mihomo action".into()),
     };
@@ -2089,7 +2195,7 @@ mod tests {
     #[test]
     fn exemptions_are_the_same_rules_the_proxy_plan_installs() {
         let address: std::net::IpAddr = "192.168.0.1".parse().unwrap();
-        let planned = proxy_plan(&[address]);
+        let planned = proxy_plan(&[address], false);
         assert!(
             net::foreign_identity(&planned).is_empty(),
             "prejournaled undos never match another writer's rule"
@@ -2113,7 +2219,7 @@ mod tests {
             "192.0.2.1".parse().unwrap(),
             "2001:db8:2::1".parse().unwrap(),
         ];
-        let plan = proxy_plan(&local);
+        let plan = proxy_plan(&local, false);
         assert!(!plan
             .iter()
             .any(|s| s.apply.args.iter().any(|a| a == "addrtype")));
@@ -2161,6 +2267,21 @@ mod tests {
         assert!(plan
             .iter()
             .all(|s| !s.apply.args.iter().any(|a| a == "-F" || a == "flush")));
+    }
+
+    #[test]
+    fn china_direct_returns_before_the_mark_and_its_set_outlives_the_rule() {
+        let plan = proxy_plan(&["192.0.2.1".parse().unwrap()], true);
+        let position = |f: &dyn Fn(&Step) -> bool| plan.iter().position(f).unwrap();
+        let load = position(&|s| s.apply.program == "@u60-mihomo-cn4");
+        let rule = position(&|s| s.apply.args.iter().any(|a| a == cn_set::SET));
+        let mark = position(&|s| s.apply.program == "iptables" && s.apply.args.iter().any(|a| a == "--set-xmark"));
+        assert!(load < rule && rule < mark, "the set loads first and is consulted before marking");
+        assert_eq!(plan[load].undo.args, ["destroy"], "undo runs in reverse: rule deleted, then the set");
+        assert_eq!(plan.iter().filter(|s| s.apply.args.iter().any(|a| a == cn_set::SET)).count(), 1);
+        assert!(plan.iter().all(|s| s.apply.program != "ip6tables" || !s.apply.args.iter().any(|a| a == "set")));
+        assert!(plan.iter().all(|s| !s.apply.args.iter().any(|a| a == "-F" || a == "flush")));
+        assert!(!proxy_plan(&[], false).iter().any(|s| s.apply.program.starts_with('@')));
     }
 
     #[test]

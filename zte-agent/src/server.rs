@@ -511,6 +511,7 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Post, "/api/mihomo/install") => crate::mihomo::change(state, "install", body),
         (&Method::Put, "/api/mihomo/config") => crate::mihomo::change(state, "config", body),
         (&Method::Post, "/api/mihomo/switch") => crate::mihomo::change(state, "switch", body),
+        (&Method::Post, "/api/mihomo/cn-direct") => crate::mihomo::change(state, "cn-direct", body),
         (&Method::Get, "/api/wifi-relay/status") => crate::wifi_relay::status(state),
         (&Method::Post, "/api/wifi-relay/scan") => crate::wifi_relay::change(state, "scan", body),
         (&Method::Post, "/api/wifi-relay/connect") => crate::wifi_relay::change(state, "connect", body),
@@ -518,6 +519,7 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Post, "/api/wifi-relay/clock") => crate::wifi_relay::change(state, "clock", body),
         (&Method::Post, "/api/wifi-relay/tuning") => crate::wifi_relay::change(state, "tuning", body),
         (&Method::Post, "/api/wifi-relay/forget") => crate::wifi_relay::change(state, "forget", body),
+        (&Method::Post, "/api/wifi-relay/offload") => crate::wifi_relay::change(state, "offload", body),
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
         // LAN HTTPS (docs/web-ui.md, "LAN HTTPS"): read-only for the apps.
         (&Method::Get, "/api/https") => state.tls.status_json(),

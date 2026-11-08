@@ -51,6 +51,11 @@ impl Channels {
         self.0.iter().find(|&&(f, dfs)| f >= 5000 && !dfs).map(|&(f, _)| f)
     }
 
+    /// A non-DFS 5 GHz channel other than `avoid`'s primary.
+    pub(super) fn staging_5ghz_avoiding(&self, avoid: u32) -> Option<u32> {
+        self.0.iter().find(|&&(f, dfs)| f >= 5000 && !dfs && f != avoid).map(|&(f, _)| f)
+    }
+
     /// Group 2.4 GHz, then scan each 5 GHz frequency separately for B31.
     pub(super) fn plan(&self) -> Vec<Vec<u32>> {
         let low: Vec<_> = self.0.iter().filter(|&&(f, _)| f < 3000).map(|&(f, _)| f).collect();

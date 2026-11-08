@@ -21,8 +21,11 @@ pub(super) fn prepare(
     let before = Cmd::new("iw", &["dev", "wlan2", "info"]).run()?;
     let (frequency, bandwidth, center) =
         width::parse_channel(&before).ok_or("Cannot snapshot hotspot channel")?;
+    // A switch that keeps the primary channel is refused (`switch_with`).
     let staging = channels
         .staging_5ghz()
+        .filter(|staging| *staging != frequency || bandwidth == 20)
+        .or_else(|| channels.staging_5ghz_avoiding(frequency))
         .ok_or("No enabled non-DFS hotspot staging channel")?;
     tx.apply(Step::new(
         command(staging, 20, staging),
@@ -174,7 +177,36 @@ pub(crate) fn switch(args: &[String]) -> Result<(), String> {
         },
         || started.elapsed(),
         || std::thread::sleep(Duration::from_secs(1)),
+        |avoid| {
+            let phy = super::radio_phy().ok()?;
+            let channels = Cmd::new("iw", &["phy", &phy, "channels"]).run().ok()?;
+            Channels::parse(&channels).staging_5ghz_avoiding(avoid)
+        },
     )
+}
+
+fn chan_switch(frequency: u32, bandwidth: u32, center: u32) -> Cmd {
+    let low = center + 10 - bandwidth / 2;
+    let mut args = vec![
+        "-p".into(),
+        HOSTAPD.into(),
+        "-i".into(),
+        "wlan2".into(),
+        "chan_switch".into(),
+        "5".into(),
+        frequency.to_string(),
+    ];
+    if bandwidth > 20 {
+        let offset = if ((frequency - low) / 20).is_multiple_of(2) { 1 } else { -1 };
+        args.push(format!("sec_channel_offset={offset}"));
+        args.push(format!("center_freq1={center}"));
+    }
+    args.push(format!("bandwidth={bandwidth}"));
+    args.push("ht".into());
+    if bandwidth >= 80 {
+        args.push("vht".into());
+    }
+    Cmd { program: "hostapd_cli".into(), args }
 }
 
 fn switch_with(
@@ -182,6 +214,7 @@ fn switch_with(
     mut run: impl FnMut(&Cmd) -> Result<String, String>,
     mut elapsed: impl FnMut() -> Duration,
     mut wait: impl FnMut(),
+    intermediate: impl FnOnce(u32) -> Option<u32>,
 ) -> Result<(), String> {
     let values: Vec<u32> = args.iter().filter_map(|s| s.parse().ok()).collect();
     let [frequency, bandwidth, center] = values.as_slice() else {
@@ -200,41 +233,33 @@ fn switch_with(
     }
     let info = Cmd::new("iw", &["dev", "wlan2", "info"]);
     let status = Cmd::new("hostapd_cli", &["-p", HOSTAPD, "-i", "wlan2", "status"]);
-    let matches =
-        |text: &str| width::parse_channel(text) == Some((*frequency, *bandwidth, *center));
+    let target = (*frequency, *bandwidth, *center);
     let current = run(&info)?;
-    if !matches(&current) {
+    let now = width::parse_channel(&current);
+    if now != Some(target) {
         if crate::net_tools::key(&run(&status)?, "state") != Some("ENABLED") {
             return Err("Wait for the hotspot radar check before connecting relay".into());
         }
-        let mut args = vec![
-            "-p".into(),
-            HOSTAPD.into(),
-            "-i".into(),
-            "wlan2".into(),
-            "chan_switch".into(),
-            "5".into(),
-            frequency.to_string(),
-        ];
-        if *bandwidth > 20 {
-            let offset = if ((frequency - low) / 20).is_multiple_of(2) {
-                1
-            } else {
-                -1
-            };
-            args.push(format!("sec_channel_offset={offset}"));
-            args.push(format!("center_freq1={center}"));
+        // B31 rejects a CSA that keeps the primary channel and changes only
+        // the width (CSA failed, -22): go through another non-DFS channel.
+        if now.is_some_and(|(primary, _, _)| primary == *frequency) {
+            let via = intermediate(*frequency).ok_or("No other non-DFS channel to change the hotspot width through")?;
+            if run(&chan_switch(via, 20, via))?.lines().last() != Some("OK") {
+                return Err("Hotspot refused the channel switch".into());
+            }
+            loop {
+                if crate::net_tools::key(&run(&status)?, "state") == Some("ENABLED")
+                    && width::parse_channel(&run(&info)?) == Some((via, 20, via))
+                {
+                    break;
+                }
+                if elapsed() >= Duration::from_secs(80) {
+                    return Err("Hotspot channel switch or radar check did not finish; recovery retained".into());
+                }
+                wait();
+            }
         }
-        args.push(format!("bandwidth={bandwidth}"));
-        args.push("ht".into());
-        if *bandwidth >= 80 {
-            args.push("vht".into());
-        }
-        let cmd = Cmd {
-            program: "hostapd_cli".into(),
-            args,
-        };
-        if run(&cmd)?.lines().last() != Some("OK") {
+        if run(&chan_switch(*frequency, *bandwidth, *center))?.lines().last() != Some("OK") {
             return Err("Hotspot refused the channel switch".into());
         }
     }
@@ -242,7 +267,7 @@ fn switch_with(
     // completion before removing the journal; never skip radar checks.
     while elapsed() < Duration::from_secs(80) {
         if crate::net_tools::key(&run(&status)?, "state") == Some("ENABLED")
-            && matches(&run(&info)?)
+            && width::parse_channel(&run(&info)?) == Some(target)
         {
             return Ok(());
         }
@@ -297,6 +322,7 @@ mod tests {
             },
             || elapsed.get(),
             || elapsed.set(elapsed.get() + Duration::from_secs(1)),
+            |_| None,
         );
         assert!(result.unwrap_err().contains("recovery retained"));
         assert!(elapsed.get() <= Duration::from_secs(83));
@@ -343,6 +369,7 @@ mod tests {
             },
             || Duration::from_secs(waits.get()),
             || waits.set(waits.get() + 1),
+            |_| None,
         )
         .unwrap();
         assert_eq!(waits.get(), 2);
@@ -359,8 +386,43 @@ mod tests {
                 .into())
             },
             || Duration::ZERO,
-            || panic!("refused CSA must fail immediately")
+            || panic!("refused CSA must fail immediately"),
+            |_| None
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_width_change_on_the_same_primary_goes_through_another_channel() {
+        // 36/40 -> 36/20 is refused by the driver as one CSA (ret -22).
+        let mut at = (5180, 40, 5190);
+        let mut switches = Vec::new();
+        switch_with(
+            &["5180".into(), "20".into(), "5180".into()],
+            |cmd| {
+                if cmd.program == "iw" {
+                    return Ok(format!("channel x ({} MHz), width: {} MHz, center1: {} MHz", at.0, at.1, at.2));
+                }
+                if cmd.args.iter().any(|s| s == "chan_switch") {
+                    let frequency: u32 = cmd.args[6].parse().unwrap();
+                    let width: u32 = cmd.args.iter().find_map(|a| a.strip_prefix("bandwidth=")).unwrap().parse().unwrap();
+                    if frequency == at.0 {
+                        return Ok("FAIL".into());
+                    }
+                    switches.push((frequency, width));
+                    at = (frequency, width, frequency);
+                    return Ok("OK".into());
+                }
+                Ok("state=ENABLED".into())
+            },
+            || Duration::ZERO,
+            || {},
+            |avoid| (avoid != 5200).then_some(5200),
+        )
+        .unwrap();
+        assert_eq!(switches, [(5200, 20), (5180, 20)]);
+        let channels = Channels::parse("* 5180 MHz [36]\n* 5200 MHz [40]\n* 5260 MHz [52]\n  Radar detection\n");
+        assert_eq!(channels.staging_5ghz_avoiding(5180), Some(5200));
+        assert_eq!(channels.staging_5ghz_avoiding(5260), Some(5180));
     }
 }

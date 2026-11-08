@@ -83,7 +83,7 @@ fn lists_table(routes: &str, table: &str) -> bool {
 /// Route type and destination of an `ip <family> route <action> ...` command.
 pub fn route_target(args: &[String]) -> (&str, &str) {
     let kind = args[3].as_str();
-    if matches!(kind, "throw" | "local") {
+    if matches!(kind, "throw" | "local" | "unreachable") {
         (kind, args[4].as_str())
     } else {
         ("unicast", kind)
@@ -187,6 +187,15 @@ impl Cmd {
         }
         if self.program == "@u60-relay-portal" {
             return crate::wifi_relay::portal::command(&self.args).map(|_| String::new());
+        }
+        if self.program == "@u60-relay-ipa" {
+            return crate::wifi_relay::offload::command(&self.args).map(|_| String::new());
+        }
+        if self.program == "@u60-relay-steer" {
+            return crate::wifi_relay::steering::command(&self.args).map(|_| String::new());
+        }
+        if self.program == "@u60-mihomo-cn4" {
+            return crate::mihomo::cn_set::command(&self.args).map(|_| String::new());
         }
         if self.program == "@u60-relay-roam" {
             return match self.args.as_slice() {
@@ -308,23 +317,18 @@ impl Cmd {
                 "route" => {
                     if let Some(table) = value("table") {
                         let (kind, destination) = route_target(&self.args);
-                        if Cmd::new(
-                            "ip",
-                            &[
-                                family,
-                                "route",
-                                "show",
-                                "table",
-                                table,
-                                "type",
-                                kind,
-                                "exact",
-                                destination,
-                            ],
-                        )
-                        .run()
-                        .is_ok_and(|s| s.is_empty())
-                        {
+                        // The kernel removes a vanished interface's routes.
+                        let device = value("dev");
+                        if device.is_some_and(|d| !Path::new(&format!("/sys/class/net/{d}")).exists()) {
+                            return Ok(());
+                        }
+                        let mut show = vec![family, "route", "show", "table", table, "type", kind, "exact", destination];
+                        // A shared table (main) may hold another writer's route
+                        // to the same destination through another interface.
+                        if let Some(device) = device {
+                            show.extend(["dev", device]);
+                        }
+                        if Cmd::new("ip", &show).run().is_ok_and(|s| s.is_empty()) {
                             return Ok(());
                         }
                         if !route_table_listed(family, table)? {
@@ -572,7 +576,7 @@ struct Journal {
     undo: Vec<Cmd>,
 }
 
-fn boot_id() -> String {
+pub(crate) fn boot_id() -> String {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .unwrap_or_default()
         .trim()

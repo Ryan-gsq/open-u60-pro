@@ -111,6 +111,18 @@ pub static MIHOMO_INSTALL: Action = Action {
     after: After::Flash(|_,_| (Some(true), "Mihomo and Zashboard installed. Save your configuration next; proxy remains off.".into())), again: None, once: true,
 };
 
+pub static MIHOMO_CHINA_DIRECT: Action = Action {
+    path: network::CHINA_DIRECT, screen: &MIHOMO,
+    fields: &[Field { name: "enable", kind: Kind::Choice(&["0", "1"]) }],
+    confirm: &[], confirm_at: None, unchanged: None, reads: &[],
+    call: (Method::Post, "/api/mihomo/cn-direct"), body: |v,_| Some(json!({"enabled":v.get("enable") == "1"})),
+    after: After::Flash(|v,_| (Some(true), if v.get("enable") == "1" {
+        "China IP direct on. China IPv4 addresses now bypass Mihomo; LAN connections were reset."
+    } else {
+        "China IP direct off. All LAN traffic goes through Mihomo again; LAN connections were reset."
+    }.into())), again: None, once: true,
+};
+
 /// Read at page load (the app reads once): the data call, the modem's
 /// mode, the selection mode (`signal`) and, coming back from a scan, the
 /// networks found.

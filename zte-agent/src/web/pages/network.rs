@@ -25,6 +25,7 @@ pub const SWITCH: &str = "/ui/router/mihomo/switch";
 pub const INSTALL: &str = "/ui/router/mihomo/install";
 pub const CONFIG: &str = "/ui/router/mihomo/config";
 pub const OPEN: &str = "/ui/router/mihomo/open";
+pub const CHINA_DIRECT: &str = "/ui/router/mihomo/china-direct";
 pub const RELAY: &str = "/ui/relay";
 pub const SCAN: &str = "/ui/relay/scan";
 pub const CONNECT: &str = "/ui/relay/connect";
@@ -32,6 +33,7 @@ pub const DISCONNECT: &str = "/ui/relay/disconnect";
 pub const CLOCK: &str = "/ui/relay/clock";
 pub const FORGET: &str = "/ui/relay/forget";
 pub const TUNING: &str = "/ui/relay/tuning";
+pub const OFFLOAD: &str = "/ui/relay/offload";
 
 pub fn mihomo_card(pd: &PageData) -> Markup {
     let Some(status) = pd.read(0) else {
@@ -110,6 +112,20 @@ pub fn mihomo_page(pd: &PageData) -> Markup {
             }
         }
         @if installed && !recovery { (super::mihomo_profiles::panel(pd)) }
+        @if installed && !recovery {
+            @let china = s["cn_direct"].as_bool() == Some(true);
+            form method="post" action=(CHINA_DIRECT) {
+                (pd.csrf()) (once_field(&pd.once()))
+                input type="hidden" name="enable" value=(if china { "0" } else { "1" });
+                (kit::section(Some("China IP direct"), Some(html! {
+                    p.foot { "China IPv4 addresses (the core's GeoIP.dat) bypass Mihomo in the kernel, so on the Wi-Fi relay they can use hardware forwarding. A domain rule that picks a proxy no longer applies when its address is in China. Changing this restarts a running core and resets LAN connections." }
+                }), html! {
+                    (kit::kv_row(None, "Setting", if china { "On" } else { "Off" }))
+                    @if on { (kit::kv_row(None, "Running core", if s["cn_direct_active"].as_bool() == Some(true) { "China IPs bypass the proxy" } else { "All traffic through the proxy" })) }
+                    li { button.it.cv.snd type="submit" { (if china { "Turn off China IP direct" } else { "Turn on China IP direct" }) } }
+                }))
+            }
+        }
         p.actions { a.btn href="/ui/router" { "Back to Router & proxy switch" } }
     }
 }
@@ -303,6 +319,44 @@ pub fn relay_page(pd: &PageData) -> Markup {
                 p { "Optional upstream IPv6 with LAN SLAAC/NAT66. Without a usable upstream IPv6 address and default route, relay stays IPv4-only. Cellular IPv6 bypass stays blocked. Internet access and hotel authorization are not verified automatically." }
                 p { "IPv6 needs the existing LAN odhcpd service and kernel NAT support. Its temporary settings are restored on disconnect; do not change the vendor LAN/DHCP settings while relaying. Restart resumes only the saved connection choice, not every remembered network. Upgrading an older agent cannot infer that choice from saved credentials." }
                 p { "Refresh this page to read the current state. No background scanning or polling runs while relay is off and no startup restoration is pending." }
+            }
+            (offload_panel(pd, s, connected))
+        }
+    }
+}
+
+fn offload_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Markup {
+    let offload = &s["offload"];
+    let config = offload["config"].as_str().unwrap_or("unavailable");
+    let installed = matches!(config, "loaded" | "reboot_required");
+    html! {
+        section.relay-panel aria-labelledby="offload-heading" {
+            h2 #offload-heading { "Hardware forwarding" }
+            p.relay-copy { "Qualcomm IPA carries relayed IPv4 NAT traffic without the CPU. Offloaded connections skip the router's firewall rules, speed limits, Smart QoS and parental control. IPv6/NAT66 and Mihomo traffic stay on the CPU. While relaying, the router's Smart QoS choice of CPU forwarding is overridden and restored when the relay ends; an owner speed limit or power saver mode keeps the CPU path." }
+            div.relay-address {
+                span { "CONFIGURATION" }
+                span { (match config {
+                    "loaded" => "Installed and loaded",
+                    "reboot_required" => "Installed; restart the router to load it",
+                    "not_installed" => "Not installed",
+                    "overwritten" => "Removed by a router reset; install again",
+                    _ => "Unavailable on this firmware",
+                }) }
+            }
+            @if connected {
+                div.relay-address {
+                    span { "RELAY PATH" }
+                    span { (if offload["hardware"].as_bool() == Some(true) { "Hardware (IPA)" } else { "CPU" }) }
+                }
+                @if let Some(reason) = offload["reason"].as_str() { p.relay-copy { (reason) } }
+            }
+            @if config != "unavailable" {
+                form method="post" action=(OFFLOAD) {
+                    (pd.csrf()) (once_field(&pd.once()))
+                    input type="hidden" name="install" value=(if installed { "0" } else { "1" });
+                    p.relay-copy { (if installed { "Removing affects new relay connections at once and is complete after a restart." } else { "Adds the relay interface to the IPA configuration (a backup is kept). Takes effect after a router restart." }) }
+                    p.actions { button.relay-btn.relay-secondary type="submit" { (if installed { "Remove hardware forwarding" } else { "Install hardware forwarding" }) } }
+                }
             }
         }
     }

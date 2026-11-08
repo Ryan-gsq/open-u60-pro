@@ -1087,3 +1087,32 @@ fn conflicting_device_setters_refuse_during_network_transactions() {
         assert_eq!(status, 409, "{path}");
     }
 }
+
+#[tokio::test]
+async fn hardware_forwarding_and_china_direct_post_their_own_handlers() {
+    let c = ctx(Some(PW));
+    let cookie = format!("zte_ui_session={}", login(&c, 226, 1).await);
+    for (config, connected, hardware, install) in [("not_installed", false, false, true), ("overwritten", false, false, true), ("loaded", true, true, false), ("reboot_required", true, false, false)] {
+        let _d = device::set(&c.app, device::Device {
+            gets: vec![("/api/wifi-relay/status", Ok(json!({"connected":connected,"offload":{"config":config,"hardware":hardware,"reason":(!hardware).then_some("Hardware forwarding is installed; restart the router to load it")}})))],
+            ..Default::default()
+        });
+        let relay = get_with(&c, network::RELAY, peer(226, 2), &cookie).await;
+        relay.assert_secure_html(200);
+        let text = relay.text();
+        assert_eq!(text.matches(&format!("action=\"{}\"", network::OFFLOAD)).count(), 1);
+        assert!(text.contains(if install { "Install hardware forwarding" } else { "Remove hardware forwarding" }));
+        assert_eq!(text.contains("Hardware (IPA)"), connected && hardware);
+        assert!(text.contains("skip the router's firewall rules, speed limits, Smart QoS and parental control"));
+        let body = format!("csrf={}&once={}&install={}", relay.input("csrf"), relay.input("once"), if install { 1 } else { 0 });
+        post(&c, network::OFFLOAD, peer(226, 2), &cookie, &body).await.assert_see_other(network::RELAY);
+        assert_eq!(device::calls(&c.app).last().unwrap(), &("/api/wifi-relay/offload".into(), json!({"install":install})));
+    }
+    let _d = devices(&c, true);
+    let core = get_with(&c, network::MIHOMO, peer(226, 2), &cookie).await;
+    core.assert_secure_html(200);
+    assert!(core.text().contains("Turn on China IP direct"));
+    let body = format!("csrf={}&once={}&enable=1", core.input("csrf"), core.input("once"));
+    post(&c, network::CHINA_DIRECT, peer(226, 2), &cookie, &body).await.assert_see_other(network::MIHOMO);
+    assert_eq!(device::calls(&c.app).last().unwrap(), &("/api/mihomo/cn-direct".into(), json!({"enabled":true})));
+}
