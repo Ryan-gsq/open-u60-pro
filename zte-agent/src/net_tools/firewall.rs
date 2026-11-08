@@ -1,8 +1,6 @@
 //! Bounded restore batches for generated, agent-owned firewall plans.
 //! Preserve command order (including table COMMIT boundaries); a failed batch
 //! is partially applied and must be unwound by its caller's durable journal.
-use std::collections::HashSet;
-use std::net::IpAddr;
 use std::process::Command;
 use std::time::Duration;
 
@@ -100,37 +98,6 @@ impl Batch {
     }
 }
 
-/// Read a chain once instead of spawning one `-C` per local address. Only
-/// exact-address exclusions of the requested target count as present.
-pub fn exclusions(
-    tool: &str,
-    table: &str,
-    chain: &str,
-    target: &str,
-) -> Result<HashSet<IpAddr>, String> {
-    let text = Cmd::new(tool, &["-w", "2", "-t", table, "-S", chain]).run()?;
-    Ok(parse_exclusions(&text, chain, target))
-}
-
-fn parse_exclusions(text: &str, chain: &str, target: &str) -> HashSet<IpAddr> {
-    text.lines()
-        .filter_map(|line| {
-            let a: Vec<_> = line.split_whitespace().collect();
-            if a.len() != 6 || a[..3] != ["-A", chain, "-d"] || a[4..] != ["-j", target] {
-                return None;
-            }
-            let (ip, prefix) = a[3]
-                .split_once('/')
-                .map_or((a[3], None), |(ip, p)| (ip, Some(p)));
-            let ip: IpAddr = ip.parse().ok()?;
-            if prefix.is_some_and(|p| p != if ip.is_ipv4() { "32" } else { "128" }) {
-                return None;
-            }
-            Some(ip)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,13 +133,5 @@ mod tests {
         ] {
             assert!(entry(&cmd).is_none());
         }
-    }
-    #[test]
-    fn snapshots_match_only_exact_unconditional_exclusions() {
-        let text = "-A U60_X -d 192.0.2.1/32 -j RETURN\n-A U60_X -d 192.0.2.0/24 -j RETURN\n-A U60_X -d 2001:db8::1/128 -j RETURN\n-A U60_X -p tcp -d 192.0.2.2 -j RETURN\n-A OTHER -d 192.0.2.3 -j RETURN";
-        assert_eq!(
-            parse_exclusions(text, "U60_X", "RETURN"),
-            ["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()].into()
-        );
     }
 }

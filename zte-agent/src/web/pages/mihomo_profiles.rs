@@ -132,7 +132,7 @@ fn extensions_form(data: &Value, hidden: Markup, open: bool, result: Option<(boo
                 (kit::section(Some("Applies to every profile"), Some(html! {
                     p.foot { "Source YAML -> Global Merge -> Global Script -> U60 network safeguards -> Mihomo validation. Saved content is shown here. Every profile must validate before anything is saved. Empty editors keep saved content; uncheck to disable. Paste {} or an identity main to replace saved content." }
                     p.foot { "Merge replaces lists; prepend-rules / append-rules add ordered entries (also proxies and proxy-groups). DNS merges one level, hosts replace. Scripts use synchronous main(config, profileName), without Node.js, network or filesystem access. Errors stop updates, not silently skip the script." }
-                    p.foot { "U60 owns controller, TUN, DNS listen/redir-host and IPv6. PROCESS-NAME cannot identify hotspot clients. Use domain/IP rules; use a fixed LAN IP for per-device rules." }
+                    p.foot { "U60 owns controller, TPROXY, DNS listen/redir-host and IPv6. PROCESS-NAME cannot identify hotspot clients. Use domain/IP rules; use a fixed LAN IP for per-device rules." }
                 }), html! {
                     li.it { label { input type="checkbox" name="merge_enabled" value="1" checked[data["merge_enabled"].as_bool() == Some(true)]; " Enable global Merge" span data-net-saved="merge" hidden[merge.is_empty() || !saved] { " (saved)" } } }
                     li.it.fld { label for="global-merge" { "Merge YAML" } textarea.net-yaml #global-merge name="merge" rows="8" maxlength="131072" autocomplete="off" spellcheck="false" { (merge) } }

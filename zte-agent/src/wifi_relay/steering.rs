@@ -97,6 +97,17 @@ pub(crate) fn command(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Whether an applied `@u60-relay-steer` still holds (`Transaction::reconcile`).
+pub(crate) fn present(args: &[String]) -> bool {
+    match args {
+        [what, iface, mask] if what == "rps" => {
+            !Path::new(&format!("/sys/class/net/{iface}")).exists() || u32::from_str_radix(mask, 16).ok() == rps(iface)
+        }
+        [what, value] if what == "backlog" => fs::read_to_string(BACKLOG).is_ok_and(|v| v.trim() == value),
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

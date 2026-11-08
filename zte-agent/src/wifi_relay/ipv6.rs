@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::net::IpAddr;
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -16,7 +15,7 @@ use super::{IFACE, JOURNAL, PREF, ROOT, TABLE};
 use crate::boottime::{BootClock, Clock};
 use crate::net_tools::{self as net, Cmd, Step, Transaction};
 
-const TAILNET: &str = "fd7a:115c:a1e0::/48";
+pub(super) const TAILNET: &str = "fd7a:115c:a1e0::/48";
 // A client may keep a previously advertised address after the vendor removes
 // it from br-lan. Keep only a bounded, session-owned return route, not the old
 // vendor address/configuration. Never carry this observation across reboot.
@@ -312,10 +311,7 @@ pub struct Upstream {
     revision: u64,
     lan_observed: BTreeMap<String, u64>,
     lan_sources: Vec<String>,
-    local: Vec<IpAddr>,
     maintained: Option<Instant>,
-    rules_checked: Option<Instant>,
-    rdns_table: &'static str,
     /// Consecutive ticks whose inspection reads failed (`Fault::Unreadable`).
     unreadable: u8,
 }
@@ -341,10 +337,7 @@ impl Upstream {
             revision: 0,
             lan_observed: BTreeMap::new(),
             lan_sources: Vec::new(),
-            local: Vec::new(),
             maintained: None,
-            rules_checked: None,
-            rdns_table: "filter",
             unreadable: 0,
         }
     }
@@ -402,6 +395,17 @@ impl Upstream {
             self.error = Some(e);
         }
         Ok(())
+    }
+
+    /// `net_guard`: re-applies the firewall and nft rules another writer
+    /// removed from both IPv6 plans (NAT66, forwarding, DNS). Addresses,
+    /// routes and the policy rule stay with `check_owned`, which also checks
+    /// for conflicts, waits for DAD and uses the current lease lifetimes.
+    pub fn reconcile(&mut self) -> net::Reconciled {
+        let firewall = |cmd: &Cmd| cmd.program != "ip";
+        let mut result = self.setup.reconcile_only(firewall);
+        result.extend(self.network.reconcile_only(firewall));
+        result
     }
 
     pub fn tick(&mut self) -> Result<(), String> {
@@ -465,14 +469,13 @@ impl Upstream {
             self.lan_prefix.as_deref(),
             now(),
         )?;
-        let local = vendor_local_addresses(&live, self.lan_prefix.as_deref())?;
         let sources: Vec<_> = self.lan_observed.keys().cloned().collect();
         if self.path.as_ref().is_some_and(|p| same_path(p, &live))
             && sources == self.lan_sources
             && self.ra_mtu == Some(ra_mtu)
         {
             // Checks stay prompt; only redundant lifetime writes are throttled.
-            let checked = self.check_owned(&live, &sources, &local);
+            let checked = self.check_owned(&live, &sources);
             self.tolerate(checked)?;
             if !lease_maintenance_due(
                 self.maintained,
@@ -544,27 +547,14 @@ impl Upstream {
     }
 
     /// Each active tick of an unchanged path: RA ownership, owned addresses,
-    /// routes and policy rule, and (when addresses change or the audit is due)
-    /// the local DNS exemptions. Missing objects are re-added with their
-    /// existing undo records; none of this changes the upstream identity.
-    fn check_owned(
-        &mut self,
-        live: &Lease,
-        sources: &[String],
-        local: &[IpAddr],
-    ) -> Result<(), Fault> {
+    /// routes and policy rule, with conflict checks, DAD and current lease
+    /// lifetimes (`net_guard` covers the firewall and nft rules). Missing
+    /// objects are re-added with their existing undo records; none of this
+    /// changes the upstream identity.
+    fn check_owned(&mut self, live: &Lease, sources: &[String]) -> Result<(), Fault> {
         maintain_ra()?;
         self.repair_addresses(live)?;
-        self.repair_routes(live, sources)?;
-        if local != self.local
-            || self
-                .rules_checked
-                .is_none_or(|at| at.elapsed() >= net::EXEMPTION_AUDIT)
-        {
-            self.follow_local(local)?;
-            self.rules_checked = Some(Instant::now());
-        }
-        Ok(())
+        self.repair_routes(live, sources)
     }
 
     /// A failed read is not evidence that the owned path changed: keep it for
@@ -591,28 +581,6 @@ impl Upstream {
             }
             Err(fault) => Err(fault.message()),
         }
-    }
-
-    fn follow_local(&mut self, local: &[IpAddr]) -> Result<(), Fault> {
-        let current: Vec<_> = local.iter().copied().filter(IpAddr::is_ipv6).collect();
-        let previous: Vec<_> = self.local.iter().copied().filter(IpAddr::is_ipv6).collect();
-        for (table, chain) in [("nat", "U60_R6_DNS"), (self.rdns_table, "U60_R6_RDNS")] {
-            let present = net::firewall::exclusions("ip6tables", table, chain, "ACCEPT")
-                .map_err(Fault::Unreadable)?;
-            let rule = |address: &IpAddr| {
-                net::rule(
-                    "ip6tables",
-                    table,
-                    chain,
-                    &["-d", &address.to_string(), "-j", "ACCEPT"],
-                    true,
-                )
-            };
-            net::sync_exemptions(&mut self.network, &present, &current, &previous, rule)
-                .map_err(Fault::Conflict)?;
-        }
-        self.local = local.to_vec();
-        Ok(())
     }
 
     fn repair_addresses(&mut self, lease: &Lease) -> Result<(), Fault> {
@@ -676,13 +644,7 @@ impl Upstream {
                 all_sources.push(ula.clone());
             }
         }
-        let expected = network_plan(
-            lease,
-            self.lan_prefix.as_ref().unwrap(),
-            &all_sources,
-            false,
-            &[],
-        )
+        let expected = network_plan(lease, self.lan_prefix.as_ref().unwrap(), &all_sources)
         .into_iter()
         .filter(|s| s.apply.program == "ip" && s.apply.args.get(1).is_some_and(|v| v == "route"));
         for step in expected {
@@ -724,22 +686,11 @@ impl Upstream {
             TABLE,
             PREF,
         )?;
-        for chain in ["U60_R6_NAT", "U60_R6_DNS", "U60_R6_RDNS"] {
-            if Cmd::new("ip6tables", &["-w", "2", "-t", "nat", "-S", chain])
-                .run()
-                .is_ok()
-            {
-                return Err("IPv6 relay chains are already in use".into());
-            }
+        if Cmd::new("ip6tables", &["-w", "2", "-t", "nat", "-S", "U60_R6_NAT"]).run().is_ok() {
+            return Err("IPv6 relay chains are already in use".into());
         }
-        if Cmd::new(
-            "ip6tables",
-            &["-w", "2", "-t", "filter", "-S", "U60_R6_RDNS"],
-        )
-        .run()
-        .is_ok()
-        {
-            return Err("IPv6 relay DNS guard is already in use".into());
+        if super::dns_nft::occupied("ip6") {
+            return Err("IPv6 relay DNS table is already in use".into());
         }
         let lan = Cmd::new("ip", &["-j", "-6", "addr", "show", "dev", "br-lan"]).run()?;
         let (lan_prefixes, linklocal) = lan_state(&lan)?;
@@ -784,45 +735,19 @@ impl Upstream {
         }) {
             return Err("Upstream IPv6 prefix overlaps a retained LAN prefix".into());
         }
-        let local_snapshot = vendor_local_addresses(lease, Some(&ula))?;
         self.lan_sources = sources.clone();
         if !sources.contains(&ula) {
             sources.push(ula.clone());
         }
         let local = Cmd::new("ip", &["-j", "-6", "addr", "show"]).run()?;
         let dns_lease = safe_dns_lease(lease, &sources, &local)?;
-        self.rdns_table = rdns_table(&dns_lease);
-        let mihomo_dns = Cmd::new(
-            "ip6tables",
-            &[
-                "-w",
-                "2",
-                "-t",
-                "nat",
-                "-C",
-                "PREROUTING",
-                "-i",
-                "br-lan",
-                "-j",
-                "U60_MH_DNS",
-            ],
-        )
-        .run()
-        .is_ok();
-        self.network.apply_network(network_plan(
-            &dns_lease,
-            &ula,
-            &sources,
-            mihomo_dns,
-            &net::local_addresses()?,
-        ))?;
+        self.network.apply_network(network_plan(&dns_lease, &ula, &sources))?;
         let route = Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"]).run()?;
         if !route.contains(&format!("dev {IFACE}")) {
             return Err("IPv6 routing did not select Wi-Fi".into());
         }
         // Advertising is last. Undo withdraws RA before removing NAT/routes.
         self.network.apply(ra_step(&ula, linklocal, mtu))?;
-        self.local = local_snapshot;
         Ok(ula)
     }
 
@@ -839,11 +764,9 @@ impl Upstream {
         self.ra_mtu = None;
         self.phase = "off";
         self.maintained = None;
-        self.rules_checked = None;
         self.unreadable = 0;
         self.lan_observed.clear();
         self.lan_sources.clear();
-        self.local.clear();
         if let Some(path) = self.session.take().and_then(|s| lease_file(&s)) {
             let _ = fs::remove_file(path);
         }
@@ -1086,20 +1009,6 @@ fn observe_lan(
     Ok(())
 }
 
-fn vendor_local_addresses(lease: &Lease, ula: Option<&str>) -> Result<Vec<IpAddr>, String> {
-    let own = ula
-        .and_then(cidr)
-        .map(|(a, _)| Ipv6Addr::from(u128::from(a) + 1));
-    let mut local: Vec<_> = crate::httpd::mobile::interfaces()
-        .map_err(|_| "Cannot observe current local addresses")?.into_iter()
-        .filter(|i| i.name != IFACE && i.name != "u60mh0")
-        .map(|i| i.addr).filter(|a| !matches!(a, IpAddr::V6(a) if Some(*a) == own || lease.addresses.iter().any(|s| s.address == *a)))
-        .collect();
-    local.sort_unstable();
-    local.dedup();
-    Ok(local)
-}
-
 fn lan_route(source: &str, action: &str) -> Cmd {
     Cmd::new(
         "ip",
@@ -1332,17 +1241,7 @@ fn address_step(ip: Ipv6Addr, prefix: u8, iface: &str, valid: u32, preferred: u3
     step
 }
 
-fn network_plan(
-    l: &Lease,
-    ula: &str,
-    sources: &[String],
-    mihomo_dns: bool,
-    local: &[std::net::IpAddr],
-) -> Vec<Step> {
-    let mut local = local.to_vec();
-    local.extend(l.addresses.iter().map(|a| std::net::IpAddr::V6(a.address)));
-    local.sort_unstable();
-    local.dedup();
+fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
     let mut p = Vec::new();
     for a in &l.addresses {
         p.push(address_step(a.address, 128, IFACE, a.valid, a.preferred));
@@ -1484,117 +1383,10 @@ fn network_plan(
         &["-j", "U60_R6_FWD"],
         true,
     ));
-    p.extend(net::chain("ip6tables", "nat", "U60_R6_DNS"));
-    for dest in ["::1/128", TAILNET, "fe80::/10"]
-        .into_iter()
-        .chain(sources.iter().map(String::as_str))
-    {
-        p.push(net::rule(
-            "ip6tables",
-            "nat",
-            "U60_R6_DNS",
-            &["-d", dest, "-j", "ACCEPT"],
-            false,
-        ));
-    }
-    p.extend(net::local_exclusions(
-        "ip6tables",
-        "nat",
-        "U60_R6_DNS",
-        "ACCEPT",
-        &local,
-    ));
-    // External client DNS goes through local dnsmasq (Mihomo still wins).
-    for proto in ["tcp", "udp"] {
-        p.push(net::rule(
-            "ip6tables",
-            "nat",
-            "U60_R6_DNS",
-            &["-p", proto, "-j", "REDIRECT", "--to-ports", "53"],
-            false,
-        ));
-    }
-    // Local management DNS is not rewritten; other router DNS follows
-    // the Wi-Fi RDNSS instead of the vendor's SIM-only resolver.
-    let upstream_dns = upstream_dns(l);
-    let dns_table = rdns_table(l);
-    p.extend(net::chain("ip6tables", dns_table, "U60_R6_RDNS"));
-    for dest in ["::1/128", TAILNET, "fe80::/10"]
-        .into_iter()
-        .chain(sources.iter().map(String::as_str))
-    {
-        p.push(net::rule(
-            "ip6tables",
-            dns_table,
-            "U60_R6_RDNS",
-            &["-d", dest, "-j", "ACCEPT"],
-            false,
-        ));
-    }
-    p.extend(net::local_exclusions(
-        "ip6tables",
-        dns_table,
-        "U60_R6_RDNS",
-        "ACCEPT",
-        &local,
-    ));
-    if let Some(dns) = upstream_dns {
-        for proto in ["tcp", "udp"] {
-            p.push(net::rule(
-                "ip6tables",
-                "nat",
-                "U60_R6_RDNS",
-                &[
-                    "-p",
-                    proto,
-                    "-j",
-                    "DNAT",
-                    "--to-destination",
-                    &format!("[{dns}]:53"),
-                ],
-                false,
-            ));
-        }
-    } else {
-        p.push(net::rule(
-            "ip6tables",
-            dns_table,
-            "U60_R6_RDNS",
-            &["-j", "REJECT"],
-            false,
-        ));
-    }
-    for proto in ["tcp", "udp"] {
-        let mut jump = net::rule(
-            "ip6tables",
-            "nat",
-            "PREROUTING",
-            &[
-                "-i",
-                "br-lan",
-                "-p",
-                proto,
-                "--dport",
-                "53",
-                "-j",
-                "U60_R6_DNS",
-            ],
-            true,
-        );
-        if mihomo_dns {
-            jump.apply.args[6] = "2".into();
-        }
-        p.push(jump);
-        // Ordinary router DNS using a nonlocal IPv6 resolver must not retain
-        // its SIM resolver. Without RDNSS, fail fast so IPv4 DNS can be used.
-        p.push(net::rule(
-            "ip6tables",
-            dns_table,
-            "OUTPUT",
-            &["-p", proto, "--dport", "53", "-j", "U60_R6_RDNS"],
-            true,
-        ));
-    }
+    // External client DNS through local dnsmasq (Mihomo still wins); router
+    // DNS through the Wi-Fi RDNSS instead of the SIM-only resolver, or
+    // rejected without one so IPv4 DNS is used (`dns_nft`).
+    p.push(super::dns_nft::v6(upstream_dns(l), sources));
     p.push(net::ip_step("-6", "rule", &["pref", PREF, "lookup", TABLE]));
     p
 }
@@ -1663,17 +1455,6 @@ fn upstream_dns(l: &Lease) -> Option<Ipv6Addr> {
     l.dns.iter().copied().find(|a| !a.is_unicast_link_local())
 }
 
-/// Where `U60_R6_RDNS` lives: NAT redirects to `upstream_dns`; without one the
-/// filter table rejects router DNS so IPv4 DNS is used. The plan and the
-/// exemption audit must agree, or the audit reads the wrong table.
-fn rdns_table(l: &Lease) -> &'static str {
-    if upstream_dns(l).is_some() {
-        "nat"
-    } else {
-        "filter"
-    }
-}
-
 fn maintain_ra() -> Result<(), Fault> {
     ra::maintain()
 }
@@ -1722,8 +1503,6 @@ mod tests {
             &lease(),
             "fd12:3456:789a::/64",
             &["fd12:3456:789a::/64".into()],
-            false,
-            &[],
         );
         let vendor = net::rule(
             "ip6tables",
@@ -1736,42 +1515,29 @@ mod tests {
         assert!(plan
             .iter()
             .any(|s| s.apply.args.windows(2).any(|a| a == ["-N", "U60_R6_OUT"])));
-        let local = ["2001:db8:2::1".parse().unwrap()];
-        for mihomo_dns in [false, true] {
-            let plan = network_plan(
-                &lease(),
-                "fd12:3456:789a::/64",
-                &["fd12:3456:789a::/64".into()],
-                mihomo_dns,
-                &local,
-            );
-            assert!(
-                net::foreign_identity(&plan).is_empty(),
-                "{:?}",
-                net::foreign_identity(&plan)
-            );
-        }
+        let plan = network_plan(
+            &lease(),
+            "fd12:3456:789a::/64",
+            &["fd12:3456:789a::/64".into()],
+        );
+        assert!(
+            net::foreign_identity(&plan).is_empty(),
+            "{:?}",
+            net::foreign_identity(&plan)
+        );
         assert!(net::foreign_identity(&setup_plan()).is_empty());
     }
 
     #[test]
-    fn the_exemption_audit_reads_the_table_the_plan_used() {
+    fn router_dns_follows_the_upstream_resolver_or_is_rejected_without_one() {
         let mut linklocal = lease();
         linklocal.dns = vec!["fe80::53".parse().unwrap()];
-        for l in [lease(), linklocal] {
-            let plan = network_plan(&l, "fd12:3456:789a::/64", &[], false, &[]);
-            let created = plan
-                .iter()
-                .find(|s| s.apply.args.windows(2).any(|w| w == ["-N", "U60_R6_RDNS"]))
-                .unwrap();
-            assert!(
-                created
-                    .apply
-                    .args
-                    .windows(2)
-                    .any(|w| w == ["-t", rdns_table(&l)]),
-                "{l:?}"
-            );
+        for (l, upstream) in [(lease(), upstream_dns(&lease()).unwrap().to_string()), (linklocal, "none".into())] {
+            let plan = network_plan(&l, "fd12:3456:789a::/64", &["fd12:3456:789a::/64".into()]);
+            let dns: Vec<_> = plan.iter().filter(|s| s.apply.program == "@u60-relay-nft").collect();
+            assert_eq!(dns.len(), 1);
+            assert_eq!(dns[0].apply.args, ["v6".to_owned(), upstream, "fd12:3456:789a::/64".into()]);
+            assert_eq!(dns[0].undo.args, ["remove", "ip6"]);
         }
     }
 
@@ -1946,8 +1712,6 @@ mod tests {
             &lease(),
             "fd12::/64",
             &["2001:db8:3::/64".into()],
-            false,
-            &[],
         );
         assert!(plan
             .iter()
@@ -2010,8 +1774,6 @@ mod tests {
             &l,
             "fd12:3456:789a::/64",
             &["fd12:3456:789a::/64".into()],
-            false,
-            &[],
         );
         assert!(!plan.iter().any(|s| s
             .apply
@@ -2026,8 +1788,6 @@ mod tests {
             &lease(),
             "fd12:3456:789a::/64",
             &["fd12:3456:789a::/64".into(), "2001:db8:2::/64".into()],
-            false,
-            &[],
         );
         for s in &p {
             assert!(!s.apply.args.iter().any(|a| a == "replace" || a == "flush"));
@@ -2078,40 +1838,30 @@ mod tests {
     }
 
     #[test]
-    fn nat66_keeps_mihomo_first_and_guards_native_lan_forwarding() {
-        for active in [false, true] {
-            let p = network_plan(
-                &lease(),
-                "fd12:3456:789a::/64",
-                &["fd12:3456:789a::/64".into()],
-                active,
-                &[],
-            );
-            let jumps: Vec<_> = p
-                .iter()
-                .filter(|s| s.apply.args.windows(2).any(|w| w == ["-I", "PREROUTING"]))
-                .collect();
-            assert_eq!(jumps.len(), 2);
-            assert!(jumps
-                .iter()
-                .all(|s| s.apply.args[6] == if active { "2" } else { "1" }));
-            let snat = p
-                .iter()
-                .find(|s| s.apply.args.windows(2).any(|w| w == ["-I", "POSTROUTING"]))
-                .unwrap();
-            assert!(snat.apply.args.windows(2).any(|w| w == ["-o", IFACE]));
-            assert!(p.iter().any(|s| s
-                .apply
-                .args
-                .windows(2)
-                .any(|w| w == ["--ctstate", "ESTABLISHED,RELATED"])));
-            assert!(!p
-                .iter()
-                .any(|s| s.apply.args.windows(2).any(|w| w == ["throw", "fc00::/7"])));
-            assert!(p
-                .iter()
-                .any(|s| s.apply.args.windows(2).any(|w| w == ["throw", TAILNET])));
-        }
+    fn nat66_guards_native_lan_forwarding_and_leaves_dns_to_nft() {
+        let p = network_plan(
+            &lease(),
+            "fd12:3456:789a::/64",
+            &["fd12:3456:789a::/64".into()],
+        );
+        assert!(!p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["--dport", "53"])), "no legacy DNS rules");
+        assert_eq!(p.iter().filter(|s| s.apply.program == "@u60-relay-nft").count(), 1);
+        let snat = p
+            .iter()
+            .find(|s| s.apply.args.windows(2).any(|w| w == ["-I", "POSTROUTING"]))
+            .unwrap();
+        assert!(snat.apply.args.windows(2).any(|w| w == ["-o", IFACE]));
+        assert!(p.iter().any(|s| s
+            .apply
+            .args
+            .windows(2)
+            .any(|w| w == ["--ctstate", "ESTABLISHED,RELATED"])));
+        assert!(!p
+            .iter()
+            .any(|s| s.apply.args.windows(2).any(|w| w == ["throw", "fc00::/7"])));
+        assert!(p
+            .iter()
+            .any(|s| s.apply.args.windows(2).any(|w| w == ["throw", TAILNET])));
     }
 
     #[test]
@@ -2120,39 +1870,21 @@ mod tests {
             &lease(),
             "fd12:3456:789a::/64",
             &["fd12:3456:789a::/64".into()],
-            false,
-            &[],
         );
-        for chain in ["U60_R6_DNS", "U60_R6_RDNS"] {
-            let rules: Vec<_> = p
-                .iter()
-                .filter(|s| s.apply.args.windows(2).any(|w| w == ["-A", chain]))
-                .collect();
-            assert!(!rules.iter().any(|s| s
-                .apply
-                .args
-                .windows(2)
-                .any(|w| w == ["-d", "fc00::/7"])));
-            for local in [TAILNET, "fd12:3456:789a::/64", "fe80::/10"] {
-                assert!(rules
-                    .iter()
-                    .any(|s| s.apply.args.windows(2).any(|w| w == ["-d", local])));
-            }
-        }
+        // Only the LAN's own prefixes stay local, not all of fc00::/7 (the
+        // ruleset adds ::1, the tailnet and link-local: `dns_nft`).
+        let dns = p.iter().find(|s| s.apply.program == "@u60-relay-nft").unwrap();
+        assert_eq!(&dns.apply.args[2..], ["fd12:3456:789a::/64"]);
+        assert_ne!(dns.apply.args[1], "none");
         let mut no_dns = lease();
         no_dns.dns.clear();
         let p = network_plan(
             &no_dns,
             "fd12:3456:789a::/64",
             &["fd12:3456:789a::/64".into()],
-            false,
-            &[],
         );
-        assert!(p
-            .iter()
-            .any(|s| s.apply.args.windows(2).any(|w| w == ["-t", "filter"])
-                && s.apply.args.windows(2).any(|w| w == ["-A", "U60_R6_RDNS"])
-                && s.apply.args.ends_with(&["-j".into(), "REJECT".into()])));
+        let dns = p.iter().find(|s| s.apply.program == "@u60-relay-nft").unwrap();
+        assert_eq!(dns.apply.args[1], "none", "router DNS is rejected so IPv4 DNS is used");
         assert!(!p
             .iter()
             .any(|s| s.apply.args.iter().any(|a| a == "fc00::/7")));
@@ -2225,8 +1957,6 @@ mod tests {
             &lease(),
             "fd12:3456:789a::/64",
             &["fd12:3456:789a::/64".into()],
-            false,
-            &[],
         );
         let dad = p
             .iter()
@@ -2245,8 +1975,6 @@ mod tests {
             &lease(),
             "fd12:3456:789a::/64",
             &["fd12:3456:789a::/64".into()],
-            false,
-            &[],
         );
         let address = p
             .iter()
@@ -2283,8 +2011,6 @@ mod tests {
             &l,
             source,
             &[source.into(), "2001:db8:2::/64".into()],
-            false,
-            &[],
         );
         let ipv4 = super::super::relay_plan(
             &super::super::Lease {
@@ -2296,8 +2022,6 @@ mod tests {
             24,
             "192.168.0.1".parse().unwrap(),
             "255.255.255.0".parse().unwrap(),
-            false,
-            &[],
         );
         let mut ula_dns = l.clone();
         ula_dns.dns = vec!["fd99::53".parse().unwrap()];
@@ -2305,10 +2029,8 @@ mod tests {
             &ula_dns,
             source,
             &[source.into(), "2001:db8:2::/64".into()],
-            false,
-            &[],
         );
-        net::write_private(Path::new(&path),&serde_json::to_vec_pretty(&json!({"setup":setup_plan(),"network":network,"network_ula_dns":network_ula_dns,"ipv4":ipv4,"mihomo":crate::mihomo::proxy_plan(&["192.168.0.1".parse().unwrap(), "2001:db8:2::1".parse().unwrap()], false)})).unwrap()).unwrap();
+        net::write_private(Path::new(&path),&serde_json::to_vec_pretty(&json!({"setup":setup_plan(),"network":network,"network_ula_dns":network_ula_dns,"ipv4":ipv4,"mihomo":crate::mihomo::proxy_plan_with(|_| Ok("0".into())).unwrap()})).unwrap()).unwrap();
     }
 
     #[cfg(target_os = "linux")]

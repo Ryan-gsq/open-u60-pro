@@ -31,7 +31,7 @@ flowchart LR
     Client[热点或 USB LAN 客户端] --> LAN[br-lan]
     LAN --> Choice{Mihomo 是否开启}
     Choice -->|关| Route[系统策略路由]
-    Choice -->|开| Core[Mihomo TUN / 规则处理]
+    Choice -->|开| Core[Mihomo TPROXY / 规则处理]
     Core --> Route
     Router[U60 本机流量] --> Route
     Route -->|中继生效| Relay[表 60631 / u60sta0 / 上游 Wi-Fi]

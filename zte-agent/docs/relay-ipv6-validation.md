@@ -31,7 +31,7 @@ with a stable random ULA /64 plus stateful NAT66. Otherwise IPv4 relay remains
 available and cellular IPv6 is rejected. IPv6-only upstreams are not supported:
 the parent relay still requires an IPv4 DHCP lease.
 
-Mihomo's managed configuration permits IPv6 and its higher-priority marked TUN
+Mihomo's managed configuration permits IPv6 and its higher-priority marked TPROXY
 policy remains before relay routing. This does not make every request use a
 proxy node: DIRECT/private exclusions remain, and real node UDP/IPv6 capability
 is independent of NAT66. The UI says configured / Internet not verified; neither
@@ -83,7 +83,9 @@ The stock kernel lacks `xt_addrtype`; exact local-address exclusions replace it.
 Actual br-lan bridge traffic exposed an additional failure: TPROXY marked packets
 reached INPUT but the bridge/L3 transition discarded their assigned proxy socket.
 Disabling global bridge netfilter was only a diagnostic and was restored.
-The implementation now uses owned TUN routing, verified with both bridge hooks on.
+The implementation then used owned TUN routing, verified with both bridge hooks on.
+Superseded 2026-11-08: interception is TPROXY again, with both bridge hooks set
+to 0 while the core runs (`network-extensions.md`, Interception scope).
 
 Physical acceptance uses a test-only loopback HTTP server and only the network
 watchdogs, not the normal agent's other services. The 30-minute gate automatically

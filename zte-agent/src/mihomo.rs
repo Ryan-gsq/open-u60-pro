@@ -1,4 +1,5 @@
-//! Optional Mihomo process and LAN-only, dual-stack TUN interception.
+//! Optional Mihomo process and LAN-only, dual-stack TCP/UDP TPROXY
+//! interception in the agent's own nftables tables (owner decision 63).
 //! The agent owns lifecycle/routing; the separately distributed core owns
 //! proxy protocols. No enhanced/GPL implementation is incorporated here.
 
@@ -39,15 +40,18 @@ const CORE_SHA: &str = "ba408b317080ee265c46cb923a50018c1b82cbd708551cdd46a1e3e3
 const UI_URL: &str =
     "https://github.com/Zephyruso/zashboard/releases/download/v3.29.1/dist-no-fonts.zip";
 const UI_SHA: &str = "21371cd111b6b3d87774f3ea3ddeacdcb0f6aff8690a16d652daa3ea6e3b0145";
-const MARK: &str = "0x600/0xff00";
-const TABLE: &str = "60630";
-const PREF: &str = "18630";
-/// Sends the TUN's own subnet to `main`, ahead of Relay's catch-all table
-/// (18640): the kernel TCP stack answers its clients from that subnet.
-const LOCAL_PREF: &str = "18629";
-const TUN: &str = "u60mh0";
-const TUN4: &str = "198.18.0.1";
-const TUN6: &str = "fdfe:dcba:9876::1";
+/// TPROXY mark (`mark and 0xffff00ff or 0x700`) and its local-delivery
+/// table, ahead of Relay's catch-all table (18640).
+const MARK: &str = "0x700/0xff00";
+const TABLE: &str = "60625";
+const PREF: &str = "18620";
+/// Not 17893: the private download proxy listens there.
+const TPROXY_PORT: u16 = 17894;
+/// `ip` and `ip6` tables of this name (B31 lacks inet `fib`). ZTE rewrites
+/// only legacy iptables, never nftables.
+const NFT_TABLE: &str = "u60_mihomo";
+/// How often the active watchdog re-observes the egress without a change.
+const EGRESS_AUDIT: Duration = Duration::from_secs(15);
 pub const MAX_CONFIG: usize = 512 * 1024;
 
 struct Running {
@@ -56,14 +60,16 @@ struct Running {
     secret: String,
     local_name: String,
     runtime: Value,
-    local_addresses: Vec<std::net::IpAddr>,
-    rules_checked: Option<Instant>,
+    /// When to re-check `network` against ZTE's rewrites (`net_guard`).
+    guard: crate::net_guard::Cursor,
+    /// Last egress observation (`refresh_local_locked`).
+    observed: Option<Instant>,
     /// Egress this core's connections use: observed just before it started,
     /// then updated in place by non-stranding watchdog observations.
     uplink: Uplink,
     /// A stranding egress the watchdog saw, and since when it has held.
     stranding: Option<(Uplink, Instant)>,
-    /// What the mangle chain sends to the core: `all`, or China IP direct
+    /// What the nft chain sends to the core: `all`, or China IP direct
     /// with its set's digest (`cn_set::prepare`).
     interception: String,
 }
@@ -329,8 +335,8 @@ impl Mihomo {
             secret,
             local_name: "u60.home.arpa".into(),
             runtime: json!({"mode":"rule","log-level":"info"}),
-            local_addresses: Vec::new(),
-            rules_checked: None,
+            guard: crate::net_guard::Cursor::default(),
+            observed: None,
             uplink: Uplink::default(),
             stranding: None,
             interception: "all".into(),
@@ -357,7 +363,7 @@ impl Mihomo {
         json!({"installed": installed, "configured": configured,
             "running": i.run.is_some(), "version": VERSION, "dashboard_version": DASHBOARD_VERSION,
             "dashboard": if i.run.is_some() { Some(DASHBOARD) } else { None },
-            "scope": "lan_tcp_udp_dual_stack_tun", "experimental": true, "error": i.error,
+            "scope": "lan_tcp_udp_dual_stack_tproxy", "experimental": true, "error": i.error,
             "cn_direct": self.root.join(cn_set::FLAG).is_file(),
             "cn_direct_active": i.run.as_ref().is_some_and(|r| r.interception != "all"),
             "autostart": self.wants_restore(), "recovery_required": i.run.is_none() && journal})
@@ -460,20 +466,18 @@ impl Mihomo {
         });
     }
 
-    // B31 cannot match the live FIB LOCAL type. Reuse the active watchdog to
-    // refresh exact-address exemptions in place, including vendor IPv6
-    // renumbering: an address change alone (Tailscale, LAN, a non-egress
-    // interface) keeps the core running. Outside the relay (cellular) only an
-    // egress that strands the core's connections restarts it: another
-    // interface or a lost source address, settled for `EGRESS_SETTLE` and at
-    // most once per `EGRESS_RESTART_GAP`. The relay announces changes of its
-    // own path (`uplink_changed_locked`).
+    // The active watchdog re-checks the interception against ZTE's rewrites
+    // when `net_guard` says so (the nft tables match the router's own
+    // addresses live, so address changes need nothing). Outside the relay
+    // (cellular) only an egress that strands the core's connections restarts
+    // it: another interface or a lost source address, settled for
+    // `EGRESS_SETTLE` and at most once per `EGRESS_RESTART_GAP`. The relay
+    // announces changes of its own path (`uplink_changed_locked`).
     fn refresh_local_locked(&self) -> Result<(), String> {
-        let local = local_addresses()?;
         // The caller's network lock serializes every user of `run.network`, so
         // the journal leaves `inner` while device commands run: status, secret
-        // and dashboard requests never wait for iptables or a journal fsync.
-        let audit = {
+        // and dashboard requests never wait for a device tool or a journal fsync.
+        let (network, observe) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -482,24 +486,22 @@ impl Mihomo {
             let Some(run) = inner.run.as_mut() else {
                 return Ok(());
             };
-            let audit = run.local_addresses != local
-                || !run
-                    .rules_checked
-                    .is_some_and(|at| at.elapsed() < net::EXEMPTION_AUDIT);
             let settled = run
                 .stranding
                 .as_ref()
                 .is_some_and(|(_, since)| restart_due(*since, last_restart) <= Instant::now());
-            if !audit && !settled {
-                return Ok(());
+            let observe = settled || !run.observed.is_some_and(|at| at.elapsed() < EGRESS_AUDIT);
+            if observe {
+                run.observed = Some(Instant::now());
             }
-            audit.then(|| {
-                let network = std::mem::replace(&mut run.network, Transaction::new(PathBuf::new()));
-                (network, run.local_addresses.clone())
-            })
+            let network = run
+                .guard
+                .due()
+                .then(|| std::mem::replace(&mut run.network, Transaction::new(PathBuf::new())));
+            (network, observe)
         };
-        if let Some((mut network, previous)) = audit {
-            let synced = sync_local(&mut network, &local, &previous);
+        if let Some(mut network) = network {
+            let restored = network.reconcile();
             let mut inner = self
                 .inner
                 .lock()
@@ -507,15 +509,14 @@ impl Mihomo {
             let Some(run) = inner.run.as_mut() else {
                 // Unreachable under the network lock; never lose the journal.
                 drop(inner);
-                return network.rollback().and(synced);
+                return network.rollback();
             };
             run.network = network;
-            if synced.is_ok() {
-                run.local_addresses = local;
-                run.rules_checked = Some(Instant::now());
-            }
             drop(inner);
-            synced?;
+            crate::net_guard::report("mihomo", restored)?;
+        }
+        if !observe {
+            return Ok(());
         }
         let observed = Uplink::observe();
         let restart = {
@@ -867,38 +868,16 @@ impl Mihomo {
             std::net::TcpListener::bind(download::PROXY)
                 .map_err(|_| "Mihomo's private download proxy port is occupied")?,
         );
-        if Cmd::new("ip", &["link", "show", "dev", TUN]).run().is_ok() {
-            return Err("Mihomo's reserved TUN interface is already in use".into());
+        // A taken port would fail silently in the core: check it here.
+        let wildcard = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, TPROXY_PORT));
+        if std::net::TcpListener::bind(wildcard).is_err() || std::net::UdpSocket::bind(wildcard).is_err() {
+            return Err("Mihomo's transparent proxy port is occupied".into());
         }
-        for (family, tool) in [("-4", "iptables"), ("-6", "ip6tables")] {
-            net::reserve(tool, "mangle", &["U60_MH"], family, TABLE, PREF)?;
-            if Cmd::new("ip", &[family, "rule", "show"]).run()?.lines().any(|l| l.trim_start().starts_with(&format!("{LOCAL_PREF}:"))) {
-                return Err("A reserved network rule priority is already in use".into());
-            }
-            if Cmd::new("ip", &[family, "rule", "show"])
-                .run()?
-                .lines()
-                .any(|line| {
-                    line.split_whitespace()
-                        .collect::<Vec<_>>()
-                        .windows(2)
-                        .any(|w| w == ["lookup", TABLE])
-                })
-            {
-                return Err("Mihomo's reserved route table is referenced by another rule".into());
-            }
-            for (table, chain) in [
-                ("filter", "U60_MH_IN"),
-                ("filter", "U60_MH_FWD"),
-                ("nat", "U60_MH_DNS"),
-            ] {
-                if Cmd::new(tool, &["-w", "2", "-t", table, "-S", chain])
-                    .run()
-                    .is_ok()
-                {
-                    return Err("Mihomo reserved firewall chains are occupied".into());
-                }
-            }
+        for family in ["-4", "-6"] {
+            net::reserve("iptables", "mangle", &[], family, TABLE, PREF)?;
+        }
+        if FAMILIES.iter().any(|family| nft_has(&["table", family, NFT_TABLE])) {
+            return Err("Mihomo's nftables tables already exist; retry proxy cleanup".into());
         }
         if fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
             .unwrap_or_default()
@@ -907,56 +886,41 @@ impl Mihomo {
         {
             return Err("IPv4 forwarding must already be enabled by the router".into());
         }
-        let local_addresses = local_addresses()?;
-        if local_addresses
-            .iter()
-            .any(|a| a.to_string() == TUN4 || a.to_string() == TUN6)
-        {
-            return Err("Mihomo's reserved TUN address is already in use".into());
-        }
         // China IP direct is optional: an unusable list starts without it.
         let (china, china_error) = if self.root.join(cn_set::FLAG).is_file() {
             match cn_set::prepare(&self.root) {
-                Ok(digest) => (Some(digest), None),
+                Ok(list) => (Some(list), None),
                 Err(e) => (None, Some(e)),
             }
         } else {
             (None, None)
         };
-        let plan = proxy_plan(&local_addresses, china.is_some());
+        net::write_private(&self.root.join(NFT_GUARD), nft_guard().as_bytes())?;
+        net::write_private(
+            &self.root.join(NFT_INTERCEPT),
+            nft_intercept(china.as_ref().map(|(_, ranges)| ranges.as_slice())).as_bytes(),
+        )?;
+        let (guards, interception) = proxy_plan()?;
         let mut running = Running {
             child: None,
             network: Transaction::new(self.journal()),
             secret,
             local_name: local_name.into(),
             runtime,
-            local_addresses,
-            rules_checked: None,
+            guard: crate::net_guard::Cursor::default(),
+            observed: None,
             uplink: Uplink::observe(),
             stranding: None,
-            interception: china.unwrap_or_else(|| "all".into()),
+            interception: china.map_or_else(|| "all".into(), |(digest, _)| digest),
         };
-        let (guards, interception): (Vec<_>, Vec<_>) = plan
-            .into_iter()
-            .partition(|s| s.apply.args.windows(2).any(|w| w == ["-t", "filter"]));
-        // Guard DNS and the private TUN addresses before the core can bind.
-        // The authenticated controller itself always binds loopback.
+        // Guard DNS and the proxy port, and set the kernel up, before the
+        // core binds. The authenticated controller always binds loopback.
         if let Err(e) = running.network.apply_network(guards) {
-            return Err(running.network.rollback().err().unwrap_or(e));
-        }
-        // sing-tun v0.4.28 still creates an IPv6 oif rule with auto-route off.
-        // The TUN/routes vanish on core exit, but that rule survives SIGKILL.
-        // Journal its exact selector before the core can create it.
-        if let Err(e) = running.network.apply(Step::new(
-            Cmd::new("true", &[]),
-            Cmd::new("ip", &["-6", "rule", "del", "oif", TUN, "lookup", TABLE]),
-        )) {
             return Err(running.network.rollback().err().unwrap_or(e));
         }
         let mut cmd = Command::new(self.root.join("mihomo"));
         // With cellular off and Relay disconnected B31 has only link-local
-        // IPv6. The core must still create its private IPv6 TUN so it can stay
-        // enabled offline and use IPv6 when the next uplink becomes available.
+        // IPv6; the core must still listen on IPv6 to use the next uplink.
         cmd.env("SKIP_SYSTEM_IPV6_CHECK", "true");
         cmd.arg("-d")
             .arg(&self.root)
@@ -970,7 +934,7 @@ impl Mihomo {
             if matches!(running.child.as_mut().unwrap().try_wait(), Ok(None))
                 && core_ready(&running.secret)
                 && download::ready()
-                && Cmd::new("ip", &["link", "show", "dev", TUN]).run().is_ok()
+                && listening(TPROXY_PORT)
                 && dns::ready(local_name, lan, 1053)
             {
                 true
@@ -980,19 +944,13 @@ impl Mihomo {
             }
         });
         let result = if !ready {
-            Err("Mihomo controller, private download proxy, TUN or dual-stack TCP/UDP DNS did not become ready".into())
+            Err("Mihomo controller, private download proxy, transparent proxy port or dual-stack TCP/UDP DNS did not become ready".into())
         } else {
             running.network.apply_network(interception).and_then(|_| {
                 for (family, destination) in [("-4", "1.1.1.1"), ("-6", "2606:4700:4700::1111")] {
-                    let route = Cmd::new(
-                        "ip",
-                        &[family, "route", "get", destination, "mark", "0x600"],
-                    )
-                    .run()?;
-                    if !route.contains(&format!("dev {TUN}")) {
-                        return Err(
-                            "Firmware policy routing did not select Mihomo's TUN table".into()
-                        );
+                    let route = Cmd::new("ip", &[family, "route", "get", destination, "mark", "0x700"]).run()?;
+                    if !route.trim_start().starts_with("local") {
+                        return Err("Firmware policy routing did not deliver proxied traffic locally".into());
                     }
                 }
                 Ok(())
@@ -1179,18 +1137,6 @@ impl Mihomo {
     }
 }
 
-fn local_addresses() -> Result<Vec<std::net::IpAddr>, String> {
-    let mut addresses: Vec<_> = crate::httpd::mobile::interfaces()
-        .map_err(|_| "Cannot read local addresses for Mihomo exclusions")?
-        .into_iter()
-        .filter(|i| i.name != TUN)
-        .map(|i| i.addr)
-        .collect();
-    addresses.sort_unstable();
-    addresses.dedup();
-    Ok(addresses)
-}
-
 /// Deletes the conntrack entries of connections from the LAN subnet (IPv4:
 /// the only family IPA offloads). `conntrack -D` exits 1 when none matched.
 fn reset_lan_connections() -> Result<(), String> {
@@ -1200,40 +1146,6 @@ fn reset_lan_connections() -> Result<(), String> {
     Cmd::new("sh", &["-c", "conntrack -D -f ipv4 -s \"$1\" >/dev/null 2>&1; [ $? -le 1 ]", "sh", &subnet])
         .run()
         .map(|_| ())
-}
-
-/// The mangle exemption that keeps traffic to one of the router's own
-/// addresses out of the proxy (`proxy_plan` appends the same rule at start).
-fn exemption(address: &std::net::IpAddr) -> Step {
-    let tool = if address.is_ipv4() {
-        "iptables"
-    } else {
-        "ip6tables"
-    };
-    net::rule(
-        tool,
-        "mangle",
-        "U60_MH",
-        &["-d", &address.to_string(), "-j", "RETURN"],
-        true,
-    )
-}
-
-/// Each family's exemptions from one chain snapshot (`net::sync_exemptions`):
-/// new or externally deleted addresses are inserted ahead of the MARK rules.
-fn sync_local(
-    network: &mut Transaction,
-    local: &[std::net::IpAddr],
-    previous: &[std::net::IpAddr],
-) -> Result<(), String> {
-    for tool in ["iptables", "ip6tables"] {
-        let family = |a: &&std::net::IpAddr| a.is_ipv4() == (tool == "iptables");
-        let current: Vec<_> = local.iter().filter(family).copied().collect();
-        let previous: Vec<_> = previous.iter().filter(family).copied().collect();
-        let present = net::firewall::exclusions(tool, "mangle", "U60_MH", "RETURN")?;
-        net::sync_exemptions(network, &present, &current, &previous, exemption)?;
-    }
-    Ok(())
 }
 
 /// Identifies a configuration by content with the per-start secret masked.
@@ -1404,24 +1316,18 @@ fn config_with_lan_host(
         "skip-auth-prefixes",
         serde_yaml_ng::to_value(Vec::<String>::new()).unwrap(),
     );
-    set(m, "tproxy-port", Yaml::from(0));
+    set(m, "tproxy-port", Yaml::from(TPROXY_PORT));
     set(m, "allow-lan", Yaml::from(true));
     set(m, "bind-address", Yaml::from("*"));
     set(m, "ipv6", Yaml::from(true));
     set(m, "external-controller", Yaml::from(CONTROLLER));
     set(m, "secret", Yaml::from(secret));
+    // TPROXY (the agent's nft tables) instead of a TUN: the core terminates
+    // LAN TCP/UDP with kernel sockets at about a third of the TUN's CPU.
     set(
         m,
         "tun",
-        serde_yaml_ng::to_value(json!({
-            // Kernel TCP, gVisor UDP: gVisor TCP cut Relay forwarding from
-            // ~230 to ~66 Mbit/s on B31; gVisor still handles fragmented UDP.
-            "enable":true, "device":TUN, "stack":"mixed", "mtu":1500,
-            "auto-route":false, "auto-redirect":false, "auto-detect-interface":false,
-            "iproute2-table-index":60630, "inet6-address":["fdfe:dcba:9876::1/126"],
-            "dns-hijack":[], "strict-route":false
-        }))
-        .unwrap(),
+        serde_yaml_ng::to_value(json!({"enable":false})).unwrap(),
     );
     set(
         m,
@@ -1460,8 +1366,7 @@ fn config_with_lan_host(
     // redir-host avoids fake-IP addresses escaping when a subscription is
     // switched off; normal nameserver and routing rules are retained.
     set(dns, "enhanced-mode", Yaml::from("redir-host"));
-    // The pinned core derives the TUN's IPv4 /30 from this field,
-    // even in redir-host mode. Keep its internal listeners predictable.
+    // Unused in redir-host mode; pinned so no subscription can widen it.
     set(dns, "fake-ip-range", Yaml::from("198.18.0.1/30"));
     if !dns.contains_key(Yaml::from("nameserver")) {
         set(
@@ -1567,207 +1472,157 @@ fn clear_egress_overrides(value: &mut Yaml) {
     }
 }
 
-pub fn proxy_plan(local: &[std::net::IpAddr], china_direct: bool) -> Vec<Step> {
-    let mut plan = Vec::new();
-    for (family, tool, destination) in [("-4", "iptables", TUN4), ("-6", "ip6tables", TUN6)] {
-        plan.extend(net::chain(tool, "filter", "U60_MH_IN"));
-        for args in [
-            // The kernel TCP stack gets each intercepted connection as TCP
-            // the core injects on the TUN to this address. Only the core
-            // writes the TUN; clients sending here are rejected below.
-            vec!["-i", TUN, "-p", "tcp", "-d", destination, "-j", "ACCEPT"],
-            vec!["-i", TUN, "-j", "REJECT"],
-            vec!["-d", destination, "-j", "REJECT"],
-        ] {
-            plan.push(net::rule(tool, "filter", "U60_MH_IN", &args, false));
-        }
-        for proto in ["tcp", "udp"] {
-            plan.push(net::rule(
-                tool,
-                "filter",
-                "U60_MH_IN",
-                &[
-                    "-i", "br-lan", "-p", proto, "--dport", "1053", "-j", "ACCEPT",
-                ],
-                false,
-            ));
-        }
-        for iface in ["lo", "br-lan"] {
-            plan.push(net::rule(
-                tool,
-                "filter",
-                "U60_MH_IN",
-                &["-i", iface, "-j", "RETURN"],
-                false,
-            ));
-        }
-        for port in ["1053"] {
-            for proto in ["tcp", "udp"] {
-                plan.push(net::rule(
-                    tool,
-                    "filter",
-                    "U60_MH_IN",
-                    &["-p", proto, "--dport", port, "-j", "REJECT"],
-                    false,
-                ));
-            }
-        }
-        plan.push(net::rule(
-            tool,
-            "filter",
-            "INPUT",
-            &["-j", "U60_MH_IN"],
-            true,
-        ));
-        plan.extend(net::chain(tool, "filter", "U60_MH_FWD"));
-        for args in [
-            vec![
-                "-i", "br-lan", "-o", TUN, "-m", "mark", "--mark", MARK, "-j", "ACCEPT",
-            ],
-            vec![
-                "-i",
-                TUN,
-                "-o",
-                "br-lan",
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "ESTABLISHED,RELATED",
-                "-j",
-                "ACCEPT",
-            ],
-            vec!["-i", TUN, "-j", "REJECT"],
-            vec!["-o", TUN, "-j", "REJECT"],
-        ] {
-            plan.push(net::rule(tool, "filter", "U60_MH_FWD", &args, false));
-        }
-        plan.push(net::rule(
-            tool,
-            "filter",
-            "FORWARD",
-            &["-j", "U60_MH_FWD"],
-            true,
-        ));
-        let china_direct = china_direct && family == "-4";
-        if china_direct {
-            // Before the rule that uses it; destroyed after that rule's undo.
-            plan.push(Step::new(
-                Cmd::new("@u60-mihomo-cn4", &["load"]),
-                Cmd::new("@u60-mihomo-cn4", &["destroy"]),
-            ));
-        }
-        plan.extend(net::chain(tool, "mangle", "U60_MH"));
-        for proto in ["tcp", "udp"] {
-            plan.push(net::rule(
-                tool,
-                "mangle",
-                "U60_MH",
-                &["-p", proto, "--dport", "53", "-j", "RETURN"],
-                false,
-            ));
-        }
-        // DNS to the router is handled by its dedicated NAT chain; all other
-        // local/private/tailnet destinations remain reachable without proxy.
-        plan.extend(net::local_exclusions(
-            tool, "mangle", "U60_MH", "RETURN", local,
-        ));
-        let excluded: &[&str] = if family == "-4" {
-            &[
-                "0.0.0.0/8",
-                "10.0.0.0/8",
-                "100.64.0.0/10",
-                "127.0.0.0/8",
-                "169.254.0.0/16",
-                "172.16.0.0/12",
-                "192.168.0.0/16",
-                "198.18.0.0/30",
-                "224.0.0.0/3",
-            ]
+const NFT_GUARD: &str = "nft-guard.conf";
+const NFT_INTERCEPT: &str = "nft-intercept.conf";
+const FAMILIES: [&str; 2] = ["ip", "ip6"];
+
+/// Guards, applied before the core binds, then interception, applied once it
+/// listens; rollback runs in reverse. `old` reads a kernel setting's value.
+pub fn proxy_plan_with(old: impl Fn(&str) -> Result<String, String>) -> Result<(Vec<Step>, Vec<Step>), String> {
+    let mut guards = Vec::new();
+    // The core's TCP towards the LAN leaves through qcacld, which leaves TSQ
+    // at ~1 ms of data: one connection ran at ~60 instead of ~230 Mbit/s.
+    for key in ["tcp_pacing_ss_ratio", "tcp_pacing_ca_ratio"] {
+        guards.push(net::sysctl_step(key, "1000", &old(key)?)?);
+    }
+    // TPROXY loses its socket on the bridge-netfilter path (iptables and nft
+    // alike); LAN-to-LAN filtering such as guest isolation pauses meanwhile.
+    for key in ["bridge-nf-call-iptables", "bridge-nf-call-ip6tables"] {
+        guards.push(net::sysctl_step(key, "0", &old(key)?)?);
+    }
+    guards.push(Step::new(Cmd::new("@u60-mihomo-nft", &["guard"]), Cmd::new("@u60-mihomo-nft", &["remove"])));
+    let mut interception = Vec::new();
+    for (family, all) in [("-4", "default"), ("-6", "::/0")] {
+        interception.push(net::ip_step(family, "route", &["local", all, "dev", "lo", "table", TABLE]));
+        interception.push(net::ip_step(family, "rule", &["pref", PREF, "fwmark", MARK, "lookup", TABLE]));
+    }
+    interception.push(Step::new(Cmd::new("@u60-mihomo-nft", &["intercept"]), Cmd::new("@u60-mihomo-nft", &["release"])));
+    Ok((guards, interception))
+}
+
+pub fn proxy_plan() -> Result<(Vec<Step>, Vec<Step>), String> {
+    proxy_plan_with(net::sysctl_read)
+}
+
+/// The tables and their input guard: DNS and the proxy port only from the LAN.
+fn nft_guard() -> String {
+    FAMILIES
+        .iter()
+        .map(|family| {
+            let drop = format!("iifname != {{ \"br-lan\", \"lo\" }} meta l4proto {{ tcp, udp }} th dport {{ 1053, {TPROXY_PORT} }} drop");
+            net::nft_fill(family, NFT_TABLE, None, &[("input", "type filter hook input priority filter - 1; policy accept;", vec![drop])])
+        })
+        .collect()
+}
+
+/// LAN TCP/UDP to the core, except DNS (redirected to its listener), the
+/// router's own addresses, private/multicast ranges and, with China IP
+/// direct, China IPv4 (kernel NAT, so IPA can carry it).
+fn nft_intercept(china: Option<&[String]>) -> String {
+    let mut text = String::new();
+    for family in FAMILIES {
+        let (address, private) = if family == "ip" {
+            ("ip", "0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/3")
         } else {
-            &["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"]
+            ("ip6", "::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8")
         };
-        for dest in excluded {
-            plan.push(net::rule(
-                tool,
-                "mangle",
-                "U60_MH",
-                &["-d", dest, "-j", "RETURN"],
-                false,
-            ));
+        let china = china.filter(|r| family == "ip" && !r.is_empty());
+        let mark = "meta mark set mark and 0xffff00ff or 0x700 accept";
+        let mut prerouting = vec![
+            "iifname != \"br-lan\" return".to_owned(),
+            "meta l4proto { tcp, udp } th dport 53 return".to_owned(),
+            "fib daddr type local return".to_owned(),
+            format!("{address} daddr {{ {private} }} return"),
+        ];
+        if china.is_some() {
+            prerouting.push("ip daddr @china return".to_owned());
         }
-        if china_direct {
-            plan.push(net::rule(
-                tool,
-                "mangle",
-                "U60_MH",
-                &["-m", "set", "--match-set", cn_set::SET, "dst", "-j", "RETURN"],
-                false,
-            ));
-        }
-        for proto in ["tcp", "udp"] {
-            plan.push(net::rule(
-                tool,
-                "mangle",
-                "U60_MH",
-                &["-p", proto, "-j", "MARK", "--set-xmark", MARK],
-                false,
-            ));
-        }
-        // With auto-route disabled the pinned core still installs its
-        // IPv6 default in this reserved table. Rust owns the IPv4 default.
-        if family == "-4" {
-            plan.push(net::ip_step(
-                family,
-                "route",
-                &["default", "dev", TUN, "table", TABLE],
-            ));
-        }
-        let subnet = if family == "-4" { "198.18.0.0/30" } else { "fdfe:dcba:9876::/126" };
-        plan.push(net::ip_step(
+        prerouting.push(format!("meta l4proto tcp socket transparent 1 {mark}"));
+        prerouting.push(format!("meta l4proto {{ tcp, udp }} tproxy to :{TPROXY_PORT} {mark}"));
+        let dns = vec!["iifname \"br-lan\" meta l4proto { tcp, udp } th dport 53 redirect to :1053".to_owned()];
+        // Ahead of the relay's DNS chains (`dns_nft::PRIORITY`), so the
+        // core's DNS wins while it runs.
+        text.push_str(&net::nft_fill(
             family,
-            "rule",
-            &["pref", LOCAL_PREF, "to", subnet, "lookup", "main"],
-        ));
-        plan.push(net::ip_step(
-            family,
-            "rule",
-            &["pref", PREF, "fwmark", MARK, "lookup", TABLE],
-        ));
-        plan.extend(net::chain(tool, "nat", "U60_MH_DNS"));
-        for proto in ["tcp", "udp"] {
-            plan.push(net::rule(
-                tool,
-                "nat",
-                "U60_MH_DNS",
-                &[
-                    "-p",
-                    proto,
-                    "--dport",
-                    "53",
-                    "-j",
-                    "REDIRECT",
-                    "--to-ports",
-                    "1053",
-                ],
-                false,
-            ));
-        }
-        plan.push(net::rule(
-            tool,
-            "nat",
-            "PREROUTING",
-            &["-i", "br-lan", "-j", "U60_MH_DNS"],
-            true,
-        ));
-        plan.push(net::rule(
-            tool,
-            "mangle",
-            "PREROUTING",
-            &["-i", "br-lan", "-j", "U60_MH"],
-            true,
+            NFT_TABLE,
+            china.map(|ranges| ("china", "type ipv4_addr; flags interval; auto-merge;", ranges)),
+            &[
+                ("prerouting", "type filter hook prerouting priority mangle - 1; policy accept;", prerouting),
+                ("dns", "type nat hook prerouting priority dstnat - 2; policy accept;", dns),
+            ],
         ));
     }
-    plan
+    text
+}
+
+fn nft(args: &[&str]) -> Result<String, String> {
+    Cmd::new("nft", args).run()
+}
+
+/// `-t` leaves out set elements: listing the China set's thousands of ranges
+/// made each check about 40 ms.
+fn nft_has(object: &[&str]) -> bool {
+    let mut args = vec!["-t", "list"];
+    args.extend_from_slice(object);
+    nft(&args).is_ok()
+}
+
+/// `@u60-mihomo-nft guard|intercept|release|remove`.
+pub(crate) fn nft_command(args: &[String]) -> Result<(), String> {
+    let file = |name: &str| Path::new(ROOT).join(name).to_string_lossy().into_owned();
+    match args {
+        [a] if a == "guard" => nft(&["-f", &file(NFT_GUARD)]).map(|_| ()),
+        [a] if a == "intercept" => nft(&["-f", &file(NFT_INTERCEPT)]).map(|_| ()),
+        [a] if a == "release" => {
+            for family in FAMILIES {
+                for object in [["chain", family, NFT_TABLE, "prerouting"], ["chain", family, NFT_TABLE, "dns"], ["set", family, NFT_TABLE, "china"]] {
+                    if nft_has(&object) {
+                        let mut delete = vec!["delete"];
+                        delete.extend_from_slice(&object);
+                        nft(&delete)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        [a] if a == "remove" => {
+            for family in FAMILIES {
+                if nft_has(&["table", family, NFT_TABLE]) {
+                    nft(&["delete", "table", family, NFT_TABLE])?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err("Invalid Mihomo nftables command".into()),
+    }
+}
+
+/// Whether an applied `@u60-mihomo-nft` step still holds, rule for rule
+/// against the file it loaded (one terse listing per family).
+pub(crate) fn nft_present(args: &[String]) -> Result<bool, String> {
+    let file = match args {
+        [a] if a == "guard" => NFT_GUARD,
+        [a] if a == "intercept" => NFT_INTERCEPT,
+        _ => return Ok(true),
+    };
+    let Ok(text) = fs::read_to_string(Path::new(ROOT).join(file)) else { return Ok(true) };
+    Ok(FAMILIES.iter().all(|family| {
+        let own = text.split("table ").filter(|t| t.starts_with(&format!("{family} "))).collect::<Vec<_>>().join("table ");
+        net::nft_holds(family, NFT_TABLE, &own)
+    }))
+}
+
+/// Whether some socket listens on `port` (`/proc/net/tcp*`, hex port, state 0A).
+fn listening(port: u16) -> bool {
+    let needle = format!(":{port:04X} ");
+    ["/proc/net/tcp6", "/proc/net/tcp"].iter().any(|path| {
+        fs::read_to_string(path).is_ok_and(|text| {
+            text.lines().skip(1).any(|line| {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                f.len() > 3 && format!("{} ", f[1]).ends_with(&needle) && f[3] == "0A"
+            })
+        })
+    })
 }
 
 pub fn status(state: &crate::handlers::AppState) -> (u16, Value) {
@@ -2153,15 +2008,8 @@ mod tests {
         assert_eq!(v["listeners"][0]["listen"], "127.0.0.1");
         assert_eq!(v["listeners"].as_sequence().unwrap().len(), 1);
         assert_eq!(v["listeners"][0]["users"][0]["password"], "private");
-        assert_eq!(v["tun"]["enable"].as_bool(), Some(true));
-        assert_eq!(v["tun"]["device"].as_str(), Some(TUN));
-        assert_eq!(v["tun"]["auto-route"].as_bool(), Some(false));
-        assert_eq!(v["tun"]["auto-redirect"].as_bool(), Some(false));
-        assert_eq!(v["tun"]["iproute2-table-index"].as_u64(), Some(60630));
-        // Kernel TCP (about 3x gVisor's relay throughput); gVisor keeps UDP.
-        assert_eq!(v["tun"]["stack"].as_str(), Some("mixed"));
-        assert_eq!(v["dns"]["fake-ip-range"].as_str(), Some("198.18.0.1/30"));
-        assert_eq!(v["tproxy-port"].as_u64(), Some(0));
+        assert_eq!(v["tun"]["enable"].as_bool(), Some(false));
+        assert_eq!(v["tproxy-port"].as_u64(), Some(u64::from(TPROXY_PORT)));
         assert_eq!(v["dns"]["ipv6"].as_bool(), Some(true));
         assert!(managed_config("- not-a-mapping", "x").is_err());
         assert!(managed_config("dns: []", "x").is_err());
@@ -2193,95 +2041,88 @@ mod tests {
     }
 
     #[test]
-    fn exemptions_are_the_same_rules_the_proxy_plan_installs() {
-        let address: std::net::IpAddr = "192.168.0.1".parse().unwrap();
-        let planned = proxy_plan(&[address], false);
-        assert!(
-            net::foreign_identity(&planned).is_empty(),
-            "prejournaled undos never match another writer's rule"
-        );
-        let installed = planned
+    fn transparent_plan_tunes_the_kernel_and_restores_the_values_it_found() {
+        let (guards, interception) = proxy_plan_with(|key| Ok(format!("old-{key}"))).unwrap();
+        for (key, value) in [
+            ("tcp_pacing_ss_ratio", "1000"),
+            ("tcp_pacing_ca_ratio", "1000"),
+            ("bridge-nf-call-iptables", "0"),
+            ("bridge-nf-call-ip6tables", "0"),
+        ] {
+            let step = guards
+                .iter()
+                .find(|s| s.apply.program == "@u60-sysctl" && s.apply.args[0] == key)
+                .expect("kernel setting");
+            assert_eq!(step.apply.args, [key, value]);
+            assert_eq!(step.undo.args, [key.to_owned(), format!("old-{key}")]);
+        }
+        assert_eq!(guards.last().unwrap().apply.args, ["guard"]);
+        assert_eq!(guards.last().unwrap().undo.args, ["remove"]);
+        for family in ["-4", "-6"] {
+            assert!(interception.iter().any(|s| s.apply.args[0] == family
+                && s.apply.args[1] == "route"
+                && s.apply.args.iter().any(|a| a == "local")
+                && s.apply.args.windows(2).any(|w| w == ["table", TABLE])));
+            assert!(interception.iter().any(|s| s.apply.args[0] == family
+                && s.apply.args.windows(2).any(|w| w == ["pref", PREF])
+                && s.apply.args.windows(2).any(|w| w == ["fwmark", MARK])));
+        }
+        assert_eq!(interception.last().unwrap().apply.args, ["intercept"]);
+        assert_eq!(interception.last().unwrap().undo.args, ["release"]);
+        assert!(guards
             .iter()
-            .find(|s| {
-                s.apply.args.iter().any(|a| a == "192.168.0.1")
-                    && s.undo.args.contains(&"RETURN".to_owned())
-            })
-            .expect("plan exempts the router's own address");
-        assert_eq!(installed.undo, exemption(&address).undo);
-        let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
-        assert_eq!(exemption(&v6).apply.program, "ip6tables");
-        assert_eq!(&exemption(&v6).apply.args[4..6], ["-I", "U60_MH"]);
+            .chain(&interception)
+            .all(|s| !s.apply.args.iter().any(|a| a == "-F" || a == "flush")));
+        assert!(proxy_plan_with(|_| Err("unreadable".into())).is_err());
     }
 
     #[test]
-    fn transparent_plan_handles_both_protocols_and_families_without_changing_defaults() {
-        let local = [
-            "192.0.2.1".parse().unwrap(),
-            "2001:db8:2::1".parse().unwrap(),
-        ];
-        let plan = proxy_plan(&local, false);
-        assert!(!plan
-            .iter()
-            .any(|s| s.apply.args.iter().any(|a| a == "addrtype")));
-        for address in local {
-            assert!(plan.iter().any(|s| s
-                .apply
-                .args
-                .windows(2)
-                .any(|w| w == ["-d", &address.to_string()])));
+    fn the_guard_admits_dns_and_the_proxy_port_only_from_the_lan() {
+        let guard = nft_guard();
+        for family in FAMILIES {
+            assert!(guard.contains(&format!("table {family} {NFT_TABLE} {{")));
         }
-        for tool in ["iptables", "ip6tables"] {
-            for proto in ["tcp", "udp"] {
-                assert!(plan.iter().any(|s| s.apply.program == tool
-                    && s.apply.args.windows(2).any(|a| a == ["-p", proto])
-                    && s.apply.args.iter().any(|a| a == "--set-xmark")));
+        assert!(guard.contains(&format!("dport {{ 1053, {TPROXY_PORT} }} drop")));
+        assert!(guard.contains("iifname != { \"br-lan\", \"lo\" }"));
+    }
+
+    #[test]
+    fn china_direct_returns_before_tproxy_and_only_for_ipv4() {
+        let ranges = vec!["1.0.1.0/24".to_owned(), "1.0.2.0/23".to_owned()];
+        let text = nft_intercept(Some(&ranges));
+        let (v4, v6) = text.split_at(text.find("table ip6 ").unwrap());
+        assert!(v4.contains("elements = { 1.0.1.0/24, 1.0.2.0/23 }"));
+        let china = v4.find("ip daddr @china return").unwrap();
+        assert!(china < v4.find("tproxy to").unwrap());
+        assert!(v4.find("fib daddr type local return").unwrap() < china);
+        assert!(!v6.contains("china"));
+        for part in [v4, v6] {
+            assert!(part.find("th dport 53 return").unwrap() < part.find("tproxy to").unwrap());
+            assert!(part.contains(&format!("tproxy to :{TPROXY_PORT}")));
+            assert!(part.contains("redirect to :1053"));
+        }
+        assert!(!nft_intercept(None).contains("china"));
+        assert!(!nft_intercept(Some(&[])).contains("china"));
+    }
+
+    #[test]
+    fn a_re_apply_declares_and_flushes_each_chain_and_set_before_filling_it() {
+        let guard = nft_guard();
+        let intercept = nft_intercept(Some(&["1.0.1.0/24".to_owned()]));
+        let at = |text: &str, needle: &str| text.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        for family in FAMILIES {
+            let flush = at(&guard, &format!("flush chain {family} {NFT_TABLE} input"));
+            let rule = at(&guard[flush..], "drop") + flush;
+            assert!(at(&guard, "chain input { type filter hook input") < flush && flush < rule);
+            for chain in ["prerouting", "dns"] {
+                let flush = at(&intercept, &format!("flush chain {family} {NFT_TABLE} {chain}"));
+                assert!(at(&intercept, &format!("chain {chain} {{ type")) < flush);
             }
         }
-        // The kernel TCP stack receives each intercepted connection as TCP
-        // injected on the TUN to its own address; everything else from the
-        // TUN, and anything else to that address, stays rejected.
-        for (tool, address) in [("iptables", "198.18.0.1"), ("ip6tables", "fdfe:dcba:9876::1")] {
-            let guard: Vec<_> = plan
-                .iter()
-                .filter(|s| s.apply.program == tool && s.apply.args.windows(2).any(|w| w == ["-A", "U60_MH_IN"]))
-                .map(|s| s.apply.args[s.apply.args.iter().position(|a| a == "U60_MH_IN").unwrap() + 1..].join(" "))
-                .collect();
-            assert_eq!(guard[0], format!("-i {TUN} -p tcp -d {address} -j ACCEPT"));
-            assert_eq!(guard[1], format!("-i {TUN} -j REJECT"));
-            assert_eq!(guard[2], format!("-d {address} -j REJECT"));
-        }
-        // The kernel TCP stack answers from the TUN subnet; that must reach
-        // the TUN through main before Relay's catch-all table sends it out.
-        for (family, subnet) in [("-4", "198.18.0.0/30"), ("-6", "fdfe:dcba:9876::/126")] {
-            let rule = plan
-                .iter()
-                .find(|s| s.apply.args.first().is_some_and(|f| f == family) && s.apply.args.iter().any(|a| a == subnet))
-                .expect("TUN subnet exemption");
-            assert_eq!(rule.apply.args, ["rule", "add", "pref", LOCAL_PREF, "to", subnet, "lookup", "main"].iter().fold(vec![family.to_owned()], |mut v, a| { v.push((*a).to_owned()); v }));
-            assert!(LOCAL_PREF.parse::<u32>().unwrap() < "18640".parse::<u32>().unwrap(), "before Relay's table");
-        }
-        assert!(plan
-            .iter()
-            .filter(|s| s.apply.program == "ip" && !s.apply.args.iter().any(|a| a == LOCAL_PREF))
-            .all(|s| s.apply.args.iter().any(|a| a == TABLE)));
-        assert!(plan
-            .iter()
-            .all(|s| !s.apply.args.iter().any(|a| a == "-F" || a == "flush")));
-    }
-
-    #[test]
-    fn china_direct_returns_before_the_mark_and_its_set_outlives_the_rule() {
-        let plan = proxy_plan(&["192.0.2.1".parse().unwrap()], true);
-        let position = |f: &dyn Fn(&Step) -> bool| plan.iter().position(f).unwrap();
-        let load = position(&|s| s.apply.program == "@u60-mihomo-cn4");
-        let rule = position(&|s| s.apply.args.iter().any(|a| a == cn_set::SET));
-        let mark = position(&|s| s.apply.program == "iptables" && s.apply.args.iter().any(|a| a == "--set-xmark"));
-        assert!(load < rule && rule < mark, "the set loads first and is consulted before marking");
-        assert_eq!(plan[load].undo.args, ["destroy"], "undo runs in reverse: rule deleted, then the set");
-        assert_eq!(plan.iter().filter(|s| s.apply.args.iter().any(|a| a == cn_set::SET)).count(), 1);
-        assert!(plan.iter().all(|s| s.apply.program != "ip6tables" || !s.apply.args.iter().any(|a| a == "set")));
-        assert!(plan.iter().all(|s| !s.apply.args.iter().any(|a| a == "-F" || a == "flush")));
-        assert!(!proxy_plan(&[], false).iter().any(|s| s.apply.program.starts_with('@')));
+        let flush = at(&intercept, "flush set ip u60_mihomo china");
+        assert!(at(&intercept, "set china { type") < flush && flush < at(&intercept, "elements = { 1.0.1.0/24 }"));
+        assert!(at(&intercept, "flush chain ip u60_mihomo prerouting") < at(&intercept, "tproxy to"));
+        assert_eq!(guard.matches("drop").count(), 2, "one rule per family, written once");
     }
 
     #[test]

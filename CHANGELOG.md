@@ -8,6 +8,13 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 - Wi-Fi relay hardware forwarding: an owner-installed IPACM entry (loaded after a restart) lets the Qualcomm IPA carry relayed IPv4 NAT, with a `main` default route and IPACM hardware mode kept while relaying unless an owner speed limit, power saver or IPA disable needs the CPU path. Receive steering (RPS) and a deeper backlog help the traffic that stays on the CPU.
 - Mihomo China IP direct: China IPv4 destinations can bypass the core in the kernel, so relayed connections to them can be offloaded; LAN connections are reset when the interception changes.
+- One guard for the agent's network changes: after a ZTE firewall/QoS/Wi-Fi script runs, a firmware event, or once a minute, the relay and Mihomo re-check their rules, routes and kernel settings (IPv4 and IPv6 relay, Mihomo) and re-apply whatever ZTE removed, logged with the commands restored; one change that cannot be re-applied does not stop the rest.
+- Relay hardware forwarding self-check: IPACM is re-armed after each relay connect and whenever relayed connections are seen on the CPU path in hardware mode; the page reports hardware forwarding only while it is actually carrying them.
+
+### Changed
+
+- Relay DNS (IPv4 and IPv6) moved into the agent's own nftables tables, matching the router's addresses live instead of maintaining and auditing one exemption rule per address.
+- Mihomo intercepts LAN TCP/UDP by TPROXY through the agent's own nftables tables instead of a TUN: one connection runs at about 190-238 instead of 125-132 Mbit/s, with roughly half the core CPU. While the core runs, TCP pacing ratios are raised and bridge netfilter is turned off (LAN-to-LAN filtering such as guest isolation pauses); both are restored when it stops.
 
 ### Fixed
 

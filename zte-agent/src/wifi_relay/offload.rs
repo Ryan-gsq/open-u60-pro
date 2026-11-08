@@ -37,6 +37,12 @@ pub(super) const METRIC: &str = "60631";
 /// The LAN subnet always has its connected route there.
 pub(super) const GUARDED: [&str; 3] = ["100.64.0.0/10", "169.254.0.0/16", "224.0.0.0/4"];
 const AUDIT: Duration = Duration::from_secs(15);
+/// Relayed IPv4 still forwarded by the kernel faster than this, in packets/s
+/// back towards the LAN, means IPA is not carrying it (a working offload
+/// leaves a few hundred packets per test; a failed one ~12,000/s at 240 Mbit/s).
+const CPU_PATH_PPS: f64 = 1500.0;
+const REARM_GAP: Duration = Duration::from_secs(60);
+const REARMS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -228,13 +234,18 @@ pub(super) struct Runtime {
     /// This session owns IPACM's hardware mode (journaled undo exists).
     owned: bool,
     hardware: bool,
+    /// No sign that hardware mode leaves relayed connections on the CPU.
+    effective: bool,
+    forwarded: Option<(u64, Instant)>,
+    rearms: u32,
+    rearmed: Option<Instant>,
     reason: Option<String>,
     checked: Option<Instant>,
 }
 
 impl Runtime {
     pub(super) fn off() -> Self {
-        Self { route: false, owned: false, hardware: false, reason: None, checked: None }
+        Self { route: false, owned: false, hardware: false, effective: true, forwarded: None, rearms: 0, rearmed: None, reason: None, checked: None }
     }
 
     /// Called with the session's network plan applied.
@@ -275,7 +286,7 @@ impl Runtime {
                 self.owned = true;
             }
             self.hardware = true;
-            self.reason = None;
+            self.verify();
             return;
         }
         let result = if self.owned { command(&["hw".into()]) } else { tx.apply(mode_step(false)) };
@@ -291,8 +302,48 @@ impl Runtime {
         };
     }
 
+    /// After the relay's `main` route exists: a SW→HW switch makes IPACM
+    /// take the new WAN over (a reconnect sometimes left every connection
+    /// on the CPU while the mode read hardware; re-arming fixed it 3/3).
+    pub(super) fn kick(&mut self) {
+        if self.route && self.hardware {
+            eprintln!("[relay] re-arming IPACM for the new uplink");
+            rearm();
+            self.forwarded = None;
+        }
+    }
+
+    /// Hardware mode is only claimed while relayed IPv4 is not seen on the
+    /// CPU path; otherwise re-arm IPACM, at most `REARMS` times per session.
+    fn verify(&mut self) {
+        let Some(packets) = Cmd::new("iptables", &["-w", "2", "-t", "filter", "-L", "U60_RELAY_FWD", "-nvx"]).run().ok().and_then(|t| return_packets(&t)) else {
+            return;
+        };
+        let now = Instant::now();
+        let Some((before, at)) = self.forwarded.replace((packets, now)) else { return };
+        let rate = packets.saturating_sub(before) as f64 / now.duration_since(at).as_secs_f64().max(1.0);
+        self.effective = rate < CPU_PATH_PPS;
+        if self.effective {
+            self.rearms = 0;
+            self.reason = None;
+            return;
+        }
+        if self.rearms >= REARMS {
+            self.reason = Some(format!("IPACM is in hardware mode, but relayed connections stay on the CPU (re-armed {REARMS} times); reconnect the relay"));
+            return;
+        }
+        if self.rearmed.is_none_or(|at| at.elapsed() >= REARM_GAP) {
+            eprintln!("[relay] relayed IPv4 on the CPU path at {rate:.0} packets/s in hardware mode; re-arming IPACM");
+            rearm();
+            self.rearms += 1;
+            self.rearmed = Some(Instant::now());
+            self.forwarded = None;
+        }
+        self.reason = Some("Hardware mode was not carrying relayed connections; IPACM was re-armed".into());
+    }
+
     pub(super) fn status(&self) -> Value {
-        json!({"route": self.route, "hardware": self.hardware, "reason": self.reason})
+        json!({"route": self.route, "hardware": self.hardware && self.effective, "mode": if self.hardware { "hardware" } else { "software" }, "reason": self.reason})
     }
 
     /// The `main` route failed: IPACM never sees a WAN, so stop auditing.
@@ -301,6 +352,23 @@ impl Runtime {
         self.hardware = false;
         self.reason = Some(format!("Hardware forwarding route was not added: {error}"));
     }
+}
+
+fn rearm() {
+    let _ = command(&["sw".into()]);
+    std::thread::sleep(Duration::from_secs(1));
+    if let Err(e) = command(&["hw".into()]) {
+        eprintln!("[relay] IPACM re-arm failed: {e}");
+    }
+}
+
+/// Packets of `U60_RELAY_FWD`'s upstream-to-LAN TCP accept rule (`iptables
+/// -L -nvx`). TCP only: IPA may leave UDP (QUIC) on the CPU by design.
+fn return_packets(listing: &str) -> Option<u64> {
+    listing.lines().find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        (f.len() > 6 && f[2] == "ACCEPT" && f[3] == "tcp" && f[5] == IFACE && f[6] == "br-lan").then(|| f[0].parse().ok()).flatten()
+    })
 }
 
 /// `main` default through the relay plus its unreachable guards, for a plan
@@ -363,5 +431,12 @@ mod tests {
         // An upstream inside a guarded range keeps its own connected route.
         assert_eq!(route_plan("100.64.0.1", "100.64.0.0/10").len(), GUARDED.len());
         assert!(command(&["on".into()]).is_err());
+    }
+
+    #[test]
+    fn the_cpu_path_counter_is_the_upstream_to_lan_tcp_accept_rule() {
+        let listing = "Chain U60_RELAY_FWD (1 references)\n    pkts      bytes target     prot opt in     out     source               destination\n      12     1000 ACCEPT     all  --  br-lan u60sta0  0.0.0.0/0            0.0.0.0/0\n  150537 225000000 ACCEPT     tcp  --  u60sta0 br-lan  0.0.0.0/0            0.0.0.0/0            ctstate RELATED,ESTABLISHED\n   90000 120000000 ACCEPT     all  --  u60sta0 br-lan  0.0.0.0/0            0.0.0.0/0            ctstate RELATED,ESTABLISHED\n       0        0 DROP       all  --  u60sta0 *       0.0.0.0/0            0.0.0.0/0\n";
+        assert_eq!(return_packets(listing), Some(150537), "UDP on the CPU is not a hardware failure");
+        assert_eq!(return_packets("Chain U60_RELAY_FWD\n"), None);
     }
 }

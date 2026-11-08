@@ -4,6 +4,7 @@
 
 pub(crate) mod ipv6;
 pub(crate) mod dns;
+pub(crate) mod dns_nft;
 pub(crate) mod portal;
 mod dfs_switch;
 pub(crate) mod hotspot;
@@ -74,9 +75,8 @@ struct Session {
     tuning: saved::Tuning,
     association: Association,
     offload: offload::Runtime,
-    /// IPv4 addresses whose exact DNS exemptions this session maintains.
-    local: Vec<std::net::IpAddr>,
-    rules_checked: Option<Instant>,
+    /// When to re-check `network` against ZTE's rewrites (`net_guard`).
+    guard: crate::net_guard::Cursor,
     /// Last DHCP renew requested after a recovered association.
     renewed: Option<Instant>,
 }
@@ -86,33 +86,6 @@ struct Session {
 const RENEW_SPACING: Duration = Duration::from_secs(30);
 
 impl Session {
-    /// The DNS chain's exact-address exemptions follow the router's IPv4
-    /// addresses in place (`net::sync_exemptions`), audited periodically.
-    fn follow_local(&mut self) -> Result<(), String> {
-        let local: Vec<_> = net::local_addresses()?
-            .into_iter()
-            .filter(std::net::IpAddr::is_ipv4)
-            .collect();
-        if local == self.local
-            && self
-                .rules_checked
-                .is_some_and(|at| at.elapsed() < net::EXEMPTION_AUDIT)
-        {
-            return Ok(());
-        }
-        let present = net::firewall::exclusions("iptables", "nat", "U60_RELAY_DNS", "ACCEPT")?;
-        net::sync_exemptions(
-            &mut self.network,
-            &present,
-            &local,
-            &self.local,
-            dns_exemption,
-        )?;
-        self.local = local;
-        self.rules_checked = Some(Instant::now());
-        Ok(())
-    }
-
     /// The lease file proves only that udhcpc has not given the lease up. A
     /// recovered association may be a roam onto another network with the same
     /// SSID: a renew there is NAKed, the deconfig removes the lease and the
@@ -134,16 +107,6 @@ impl Session {
         self.renewed = Some(Instant::now());
         eprintln!("[relay] association recovered; DHCP renew requested");
     }
-}
-
-fn dns_exemption(address: &std::net::IpAddr) -> Step {
-    net::rule(
-        "iptables",
-        "nat",
-        "U60_RELAY_DNS",
-        &["-d", &address.to_string(), "-j", "ACCEPT"],
-        true,
-    )
 }
 
 struct Inner {
@@ -363,11 +326,16 @@ impl WifiRelay {
                     let resolvers = if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() };
                     let gateway = lease.gateway;
                     let dns = dns::reconcile(&resolvers);
-                    let exemptions = s.follow_local();
                     s.offload.audit(&mut s.network);
+                    let guarded = if s.guard.due() {
+                        let mut result = s.network.reconcile();
+                        result.extend(s.ipv6.reconcile());
+                        crate::net_guard::report("relay", result)
+                    } else {
+                        Ok(())
+                    };
                     s.dns_error = dns
-                        .and(exemptions)
-                        .and(portal::reconcile_web())
+                        .and(guarded)
                         .and(s.width.as_mut().map_or(Ok(()), |w| tune_width(w, gateway)))
                         .err();
                     let before = s.ipv6.revision();
@@ -581,8 +549,7 @@ impl WifiRelay {
             tuning: saved::Tuning::Off,
             association: Association::default(),
             offload: offload::Runtime::off(),
-            local: Vec::new(),
-            rules_checked: None,
+            guard: crate::net_guard::Cursor::default(),
             renewed: None,
         };
         let result = (|| {
@@ -750,8 +717,8 @@ impl WifiRelay {
             let lan_mask: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.netmask"]).run()?.parse().map_err(|_| "Invalid LAN mask")?;
             let prefix = validate_lease(&lease, lan_ip, lan_mask)?;
             net::reserve("iptables", "filter", &["U60_RELAY_FWD"], "-4", TABLE, PREF)?;
-            if Cmd::new("iptables", &["-w", "2", "-t", "nat", "-S", "U60_RELAY_DNS"]).run().is_ok() {
-                return Err("Relay DNS chain is already occupied".into());
+            if dns_nft::occupied("ip") {
+                return Err("Relay DNS table is already occupied".into());
             }
             if Cmd::new("ip6tables", &["-w", "2", "-t", "filter", "-S", "U60_RELAY_V6"]).run().is_ok() {
                 return Err("Relay IPv6 guard chain is already occupied".into());
@@ -768,15 +735,7 @@ impl WifiRelay {
             if fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default().trim() != "1" {
                 return Err("Router IPv4 forwarding is disabled".into());
             }
-            let mihomo_dns = Cmd::new("iptables", &["-w", "2", "-t", "nat", "-C", "PREROUTING", "-i", "br-lan", "-j", "U60_MH_DNS"]).run().is_ok();
-            let local = net::local_addresses()?;
-            session.network.apply_network(relay_plan(
-                &lease, prefix, lan_ip, lan_mask, mihomo_dns, &local,
-            ))?;
-            session.local = local
-                .into_iter()
-                .filter(std::net::IpAddr::is_ipv4)
-                .collect();
+            session.network.apply_network(relay_plan(&lease, prefix, lan_ip, lan_mask))?;
             let route = Cmd::new("ip", &["-4", "route", "get", "1.1.1.1"]).run()?;
             if !route.contains(&format!("dev {IFACE}")) {
                 return Err("Firmware policy routing did not select the Wi-Fi upstream".into());
@@ -789,8 +748,9 @@ impl WifiRelay {
             session.offload = offload::Runtime::start(&mut session.network, offload::config());
             if session.offload.route {
                 let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(lease.ip) & u32::from(lease.subnet)));
-                if let Err(e) = session.network.apply_network(offload::route_plan(&lease.gateway.to_string(), &subnet)) {
-                    session.offload.no_route(e);
+                match session.network.apply_network(offload::route_plan(&lease.gateway.to_string(), &subnet)) {
+                    Ok(()) => session.offload.kick(),
+                    Err(e) => session.offload.no_route(e),
                 }
             }
             let dns = lease.dns.first().copied().unwrap_or(lease.gateway).to_string();
@@ -1261,12 +1221,12 @@ fn input_guards() -> Vec<Step> {
     p
 }
 
-fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr, mihomo_dns: bool, local: &[std::net::IpAddr]) -> Vec<Step> {
+fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) -> Vec<Step> {
     let address = format!("{}/{prefix}", l.ip);
     let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(l.ip) & u32::from(l.subnet)));
     let lan_net = format!("{}/{}", Ipv4Addr::from(u32::from(lan) & u32::from(mask)), u32::from(mask).count_ones());
     let gw = l.gateway.to_string();
-    let dns = l.dns.first().copied().unwrap_or(l.gateway).to_string();
+    let dns = l.dns.first().copied().unwrap_or(l.gateway);
     let mut p = vec![net::ip_step("-4", "addr", &[&address, "dev", IFACE])];
     p.push(net::ip_step("-4", "route", &[&subnet, "dev", IFACE, "scope", "link", "src", &l.ip.to_string(), "table", TABLE]));
     // Other RFC1918 subnets can host the hotel's portal/DNS. Only our own
@@ -1279,13 +1239,14 @@ fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr, mihomo_dns:
     p.push(net::ip_step("-4", "route", &["default", "via", &gw, "dev", IFACE, "table", TABLE]));
     p.extend(net::chain("iptables", "filter", "U60_RELAY_FWD"));
     p.push(net::rule("iptables", "filter", "U60_RELAY_FWD", &["-i", "br-lan", "-o", IFACE, "-j", "ACCEPT"], false));
-    p.push(net::rule(
-        "iptables",
-        "filter",
-        "U60_RELAY_FWD",
-        &["-i", IFACE, "-o", "br-lan", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-        false,
-    ));
+    // TCP first, on its own: its counter is the hardware forwarding check
+    // (`offload::Runtime::verify`); UDP may legitimately stay on the CPU.
+    for proto in [&["-p", "tcp"][..], &[]] {
+        let mut args = vec!["-i", IFACE, "-o", "br-lan"];
+        args.extend_from_slice(proto);
+        args.extend(["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]);
+        p.push(net::rule("iptables", "filter", "U60_RELAY_FWD", &args, false));
+    }
     for flag in ["-i", "-o"] {
         p.push(net::rule("iptables", "filter", "U60_RELAY_FWD", &[flag, IFACE, "-j", "DROP"], false));
     }
@@ -1293,44 +1254,10 @@ fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr, mihomo_dns:
     // Core/router UDP sockets may retain a previously selected SIM source.
     // Translate only our owned Wi-Fi egress, not cellular or local traffic.
     p.push(net::rule("iptables", "nat", "POSTROUTING", &["-o", IFACE, "-j", "MASQUERADE"], true));
-    p.extend(net::chain("iptables", "nat", "U60_RELAY_DNS"));
-    // Keep local DNS (including u60.home.arpa) in dnsmasq. ACCEPT ends only
-    // NAT processing; the existing INPUT/FORWARD filtering still applies.
-    p.extend(net::local_exclusions("iptables", "nat", "U60_RELAY_DNS", "ACCEPT", local));
-    p.push(net::rule("iptables", "nat", "U60_RELAY_DNS", &["-d", &l.ip.to_string(), "-j", "ACCEPT"], false));
-    for dest in ["127.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", &lan_net] {
-        p.push(net::rule("iptables", "nat", "U60_RELAY_DNS", &["-d", dest, "-j", "ACCEPT"], false));
-    }
-    for proto in ["tcp", "udp"] {
-        p.push(net::rule("iptables", "nat", "U60_RELAY_DNS", &["-p", proto, "-j", "DNAT", "--to-destination", &format!("{dns}:53")], false));
-    }
-    for proto in ["tcp", "udp"] {
-        // Precede vendor DNS interception, but leave Mihomo first regardless
-        // of which extension was enabled first. Undo still deletes by spec.
-        let mut step = net::rule(
-            "iptables",
-            "nat",
-            "PREROUTING",
-            &["-i", "br-lan", "-p", proto, "--dport", "53", "-j", "U60_RELAY_DNS"],
-            true,
-        );
-        if mihomo_dns {
-            step.apply.args[6] = "2".into();
-        }
-        p.push(step);
-        // Router/dnsmasq's ordinary DNS must follow the hotel resolver too,
-        // while local and Tailnet lookups remain exempt in the same chain.
-        p.push(net::rule("iptables", "nat", "OUTPUT", &["-p", proto, "--dport", "53", "-j", "U60_RELAY_DNS"], true));
-        // OUTPUT DNAT can retain a socket's previously selected SIM source.
-        // SNAT only this resolver traffic, not arbitrary router connections.
-        p.push(net::rule(
-            "iptables",
-            "nat",
-            "POSTROUTING",
-            &["-o", IFACE, "-d", &dns, "-p", proto, "--dport", "53", "-j", "MASQUERADE"],
-            true,
-        ));
-    }
+    // DNS through the Wi-Fi resolver, local, LAN and tailnet lookups kept
+    // (`dns_nft`). The MASQUERADE above also covers router DNS that the
+    // output chain redirects from a socket bound to a SIM source.
+    p.push(dns_nft::v4(dns, &lan_net));
     // Skip only the vendor's offline-portal chain, not the rest of NAT or any
     // filter policy. Direct management and configured port forwards survive.
     for tool in ["iptables", "ip6tables"] {
@@ -1983,35 +1910,29 @@ mod tests {
     #[test]
     fn no_default_main_route_or_persistent_wifi_is_overwritten() {
         let l = Lease { ip: "10.0.0.2".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.0.0.1".parse().unwrap(), dns: vec![] };
-        let p = relay_plan(&l, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap(), false, &[]);
+        let p = relay_plan(&l, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
         assert!(p.iter().any(|s| s.apply.program == "iptables" && s.apply.args.ends_with(&["-o".into(), IFACE.into(), "-j".into(), "MASQUERADE".into()])));
         assert!(p.iter().filter(|s| s.apply.args.iter().any(|a| a == "default")).all(|s| s.apply.args.iter().any(|a| a == TABLE)));
         assert!(p.iter().all(|s| s.apply.program != "uci"));
         assert!(p.last().unwrap().apply.args.iter().any(|a| a == PREF));
         assert!(p.iter().all(|s| !s.apply.args.windows(2).any(|w| w == ["throw", "10.0.0.0/8"])));
         assert!(p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["throw", "192.168.0.0/24"])));
-        for active in [false, true] {
-            let p = relay_plan(&l, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap(), active, &[]);
-            assert!(p
-                .iter()
-                .filter(|s| s.apply.args.windows(2).any(|w| w == ["-I", "PREROUTING"]))
-                .all(|s| s.apply.args[6] == if active { "2" } else { "1" }));
-        }
+        assert!(p
+            .iter()
+            .filter(|s| s.apply.args.windows(2).any(|w| w == ["-I", "PREROUTING"]))
+            .all(|s| s.apply.args[6] == "1"));
     }
 
     #[test]
     fn relay_web_traffic_bypasses_vendor_offline_redirect_without_bypassing_filtering() {
         let l = Lease { ip: "10.0.0.2".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.0.0.1".parse().unwrap(), dns: vec![] };
-        let local = ["192.168.0.1".parse().unwrap(), "fd00::1".parse().unwrap()];
-        for active in [false, true] {
-            let p = relay_plan(&l, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap(), active, &local);
-            for tool in ["iptables", "ip6tables"] {
-                let rule = p.iter().find(|s| s.apply.program == tool && s.apply.args.windows(2).any(|w| w == ["-I", "redirect_chain"])).expect("missing vendor offline-portal bypass");
-                assert!(rule.apply.args.windows(2).any(|w| w == ["-t", "nat"]));
-                assert_eq!(&rule.apply.args[6..], &["1", "-i", "br-lan", "-m", "comment", "--comment", "zte-agent-wifi-relay", "-j", "RETURN"]);
-                assert!(rule.undo.args.windows(2).any(|w| w == ["-D", "redirect_chain"]));
-                assert_eq!(&rule.apply.args[7..], &rule.undo.args[6..]);
-            }
+        let p = relay_plan(&l, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
+        for tool in ["iptables", "ip6tables"] {
+            let rule = p.iter().find(|s| s.apply.program == tool && s.apply.args.windows(2).any(|w| w == ["-I", "redirect_chain"])).expect("missing vendor offline-portal bypass");
+            assert!(rule.apply.args.windows(2).any(|w| w == ["-t", "nat"]));
+            assert_eq!(&rule.apply.args[6..], &["1", "-i", "br-lan", "-m", "comment", "--comment", "zte-agent-wifi-relay", "-j", "RETURN"]);
+            assert!(rule.undo.args.windows(2).any(|w| w == ["-D", "redirect_chain"]));
+            assert_eq!(&rule.apply.args[7..], &rule.undo.args[6..]);
         }
     }
 
@@ -2028,8 +1949,6 @@ mod tests {
             24,
             "192.168.0.1".parse().unwrap(),
             "255.255.255.0".parse().unwrap(),
-            false,
-            &[],
         );
         let jump = plan
             .iter()
@@ -2070,34 +1989,17 @@ mod tests {
             gateway: "10.0.0.1".parse().unwrap(),
             dns: vec!["10.0.0.53".parse().unwrap()],
         };
-        let local = [
+        let plan = relay_plan(
+            &l,
+            24,
             "192.168.0.1".parse().unwrap(),
-            "2001:db8::1".parse().unwrap(),
-        ];
-        for mihomo_dns in [false, true] {
-            let plan = relay_plan(
-                &l,
-                24,
-                "192.168.0.1".parse().unwrap(),
-                "255.255.255.0".parse().unwrap(),
-                mihomo_dns,
-                &local,
-            );
-            assert!(
-                net::foreign_identity(&plan).is_empty(),
-                "{:?}",
-                net::foreign_identity(&plan)
-            );
-            // Maintained exemptions reuse the plan's own undo records.
-            let planned = plan
-                .iter()
-                .find(|s| {
-                    s.undo.args.windows(2).any(|w| w == ["-D", "U60_RELAY_DNS"])
-                        && s.undo.args.contains(&"192.168.0.1".to_owned())
-                })
-                .unwrap();
-            assert_eq!(planned.undo, dns_exemption(&local[0]).undo);
-        }
+            "255.255.255.0".parse().unwrap(),
+        );
+        assert!(
+            net::foreign_identity(&plan).is_empty(),
+            "{:?}",
+            net::foreign_identity(&plan)
+        );
         assert!(net::foreign_identity(&input_guards()).is_empty());
     }
 
@@ -2129,57 +2031,25 @@ mod tests {
     }
 
     #[test]
-    fn relay_dns_keeps_router_lan_and_tailnet_resolution_before_upstream_dnat() {
+    fn relay_dns_is_one_nft_step_for_the_wifi_resolver_and_the_lan_subnet() {
         let l = Lease {
             ip: "10.20.1.2".parse().unwrap(),
             subnet: "255.255.240.0".parse().unwrap(),
             gateway: "10.20.0.1".parse().unwrap(),
             dns: vec!["10.20.0.53".parse().unwrap()],
         };
-        let p = relay_plan(&l, 20, "192.168.8.1".parse().unwrap(), "255.255.255.0".parse().unwrap(), false, &[]);
-        let dns_rules: Vec<_> = p.iter().filter(|s| s.apply.args.windows(2).any(|w| w == ["-A", "U60_RELAY_DNS"])).collect();
-        assert_eq!(dns_rules.len(), 7);
-        assert!(dns_rules[0].apply.args.windows(2).any(|w| w == ["-d", "10.20.1.2"]));
-        for (rule, destination) in dns_rules[1..5].iter().zip(["127.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "192.168.8.0/24"]) {
-            assert!(rule.apply.args.windows(2).any(|w| w == ["-d", destination]));
-        }
-        assert!(dns_rules[..5].iter().all(|s| s.apply.args.last().unwrap() == "ACCEPT"));
-        for (rule, proto) in dns_rules[5..].iter().zip(["tcp", "udp"]) {
-            assert!(rule.apply.args.windows(2).any(|w| w == ["-p", proto]));
-            assert!(rule.apply.args.ends_with(&["-j".into(), "DNAT".into(), "--to-destination".into(), "10.20.0.53:53".into()]));
-        }
-    }
-
-    #[test]
-    fn relay_dns_covers_both_protocols_router_queries_and_mihomo_enable_order() {
-        let l = Lease {
-            ip: "10.20.1.2".parse().unwrap(),
-            subnet: "255.255.240.0".parse().unwrap(),
-            gateway: "10.20.0.1".parse().unwrap(),
-            dns: vec!["10.20.0.53".parse().unwrap()],
-        };
-        for active in [false, true] {
-            let p = relay_plan(&l, 20, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap(), active, &[]);
-            for proto in ["tcp", "udp"] {
-                let protocol = |s: &&Step| s.apply.args.windows(2).any(|w| w == ["-p", proto]);
-                let jumps: Vec<_> = p.iter().filter(protocol).filter(|s| s.apply.args.last().is_some_and(|s| s == "U60_RELAY_DNS")).collect();
-                assert_eq!(jumps.len(), 2);
-                assert!(jumps.iter().all(|s| s.apply.args.windows(2).any(|w| w == ["--dport", "53"])));
-                let downstream = jumps.iter().find(|s| s.apply.args.windows(2).any(|w| w == ["-I", "PREROUTING"])).unwrap();
-                assert_eq!(downstream.apply.args[6], if active { "2" } else { "1" });
-                assert!(downstream.apply.args.windows(2).any(|w| w == ["-i", "br-lan"]));
-                assert!(jumps.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["-I", "OUTPUT"])));
-                let snat = p
-                    .iter()
-                    .filter(protocol)
-                    .find(|s| s.apply.args.windows(2).any(|w| w == ["-I", "POSTROUTING"]) && s.apply.args.last().is_some_and(|s| s == "MASQUERADE"))
-                    .unwrap();
-                for pair in [["-o", IFACE], ["-d", "10.20.0.53"], ["--dport", "53"]] {
-                    assert!(snat.apply.args.windows(2).any(|w| w == pair));
-                }
-                assert!(jumps.iter().all(|s| s.undo.args.windows(2).any(|w| w[0] == "-D")));
-            }
-        }
+        let p = relay_plan(&l, 20, "192.168.8.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
+        let dns: Vec<_> = p.iter().filter(|s| s.apply.program == "@u60-relay-nft").collect();
+        assert_eq!(dns.len(), 1);
+        assert_eq!(dns[0].apply.args, ["v4", "10.20.0.53", "192.168.8.0/24"]);
+        assert_eq!(dns[0].undo.args, ["remove", "ip"]);
+        assert!(!p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["--dport", "53"])), "no legacy DNS rules");
+        // Router DNS redirected from a socket bound to a SIM source still
+        // leaves with the relay's address.
+        assert!(p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["-I", "POSTROUTING"])
+            && s.apply.args.ends_with(&["-o".into(), IFACE.into(), "-j".into(), "MASQUERADE".into()])));
+        let gateway_only = relay_plan(&Lease { dns: vec![], ..l }, 20, "192.168.8.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
+        assert!(gateway_only.iter().any(|s| s.apply.program == "@u60-relay-nft" && s.apply.args[1] == "10.20.0.1"));
     }
 
     fn lease_with(dns: &[&str]) -> Lease {

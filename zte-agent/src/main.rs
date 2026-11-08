@@ -31,6 +31,7 @@ mod lan_test;
 mod live_activity;
 mod modem_ext;
 mod mihomo;
+mod net_guard;
 mod net_tools;
 mod network_ext;
 mod oos_policy;
@@ -185,6 +186,7 @@ fn main() {
     let standby_rx = standby_guard::subscribe(&event_bus);
     events::start(&state, &event_bus);
     state.dashboard.start(Arc::clone(&state),Arc::clone(&event_bus));
+    net_guard::start(&event_bus);
     event_bus.start();
 
     Arc::clone(&state.cache).start_event_invalidation(cache_events);

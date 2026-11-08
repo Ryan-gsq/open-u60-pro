@@ -2,9 +2,9 @@
 
 2026-11-08。中继的 IPv4 NAT 转发主要交给高通 IPA 硬件（IPACM + WDI3）完成；
 CPU 转发路径保留，作为兜底，并加上 RPS/backlog 作辅助。代码：
-`wifi_relay/offload.rs`（配置、HW 模式、main 路由）、`wifi_relay/steering.rs`
-（RPS/backlog）、`mihomo/cn_set.rs`（国内直连分流），以及 `wifi_relay/hotspot.rs`
-的同主信道 CSA 修复。
+`wifi_relay/offload.rs`（配置、HW 模式、main 路由、硬件自检）、`wifi_relay/steering.rs`
+（RPS/backlog）、`mihomo/cn_set.rs`（国内直连分流）、`net_guard.rs`（统一对齐 ZTE
+的改动），以及 `wifi_relay/hotspot.rs` 的同主信道 CSA 修复。
 
 ## 为什么要做
 
@@ -34,7 +34,8 @@ br-lan 上的 HTB + fq_codel）都压在一个 A55 核上。Speedtest.cn 的云�
 3. **IPACM 处于 HW 模式**（`/sbin/ipacm_switch.sh on`，发 SIGUSR2；`off` 发 SIGUSR1，
    并设置 `zwrt_router.tmp_router.close_ipa_acce=1`）。
 
-另外，流量不能被打上 0x600 标记送进 Mihomo TUN（见"国内直连"）。
+另外，流量不能被 Mihomo 的 nft 表 TPROXY 进核心（见"国内直连"）：核心终结的连接
+不经过转发路径，IPA 无从卸载。
 驱动层的 STA 卸载本来就是开着的（`gIPAConfig=0x46d`；dmesg 中有
 `wlan_ipa_setup_iface mode:0` 和 offload enable=1），问题完全出在 IPACM 这一层。
 
@@ -116,6 +117,18 @@ ip -4 route add default via <网关> dev u60sta0 metric 60631 table main
 - 如果检测到 `ipa_disable=1`、省电模式，或者 `total_limit_switch` /
   `st_total_limit_switch` 开着，就不再强切，页面显示原因。
 
+**硬件自检和重新挂载**（只看 TCP：`U60_RELAY_FWD` 里单独有一条 TCP 回程放行规则，自检读
+它的计数；UDP 例如 QUIC 可能本来就走 CPU，不算硬件失效）：中继重连后，偶尔会出现模式显示 HW、但所有连接仍在 CPU 上
+转发的情况（`U60_RELAY_FWD` 回程计数每秒十几万包）；先切 SW 再切 HW 每次都能恢复（3/3）。
+所以：
+
+- main 路由加好之后立刻做一次 SW→HW（`Runtime::kick`，日志
+  `re-arming IPACM for the new uplink`）；
+- 之后每次 15 秒检查时，如果模式是 HW，就比较回程计数的速率，≥1500 包/秒说明连接还在
+  CPU 上，再做一次 SW→HW（每次会话最多 3 次，间隔至少 60 秒）；
+- 页面的 `hardware` 只有在模式是 HW、并且没有发现这种情况时才是 true，`mode` 另外给出
+  IPACM 的模式。
+
 断开时的处理（这个开关是整机的，会连带影响蜂窝）：只有在本次会话把 SW 切成了 HW 时，
 才恢复成 SW，也就是 ZTE 智能 QoS 原来的选择；如果连接时已经是 HW，就保持不动。
 所以中继关闭时，蜂窝路径和原厂行为完全一样。中继连着时，备用蜂窝的流量也会走 HW，
@@ -125,25 +138,65 @@ ip -4 route add default via <网关> dev u60sta0 metric 60631 table main
 
 这是用户可选的开关，在 Mihomo 页面上，状态存成 `/data/zte-agent-mihomo/cn-direct`
 文件。开启后，核心启动时从它自己的 `GeoIP.dat`（geodata 模式；protobuf 格式，
-只读 `CN` 条目的 IPv4 段，至少 1000 段才算有效）生成 `cn4.ipset`，再通过 plan 步骤
-`@u60-mihomo-cn4 load` 载入 `u60_mh_cn4`（hash:net）。U60_MH 在 MARK 之前加一条
-`-m set --match-set u60_mh_cn4 dst -j RETURN`。回滚时先删规则，再销毁 set。
+只读 `CN` 条目的 IPv4 段，至少 1000 段才算有效）生成 nft 集合 `china`（`ip
+u60_mihomo` 表里，interval 类型），拦截链在 TPROXY 之前加一条
+`ip daddr @china return`。集合和规则随拦截链一起装上、一起删掉。
 
 GeoIP.dat 不可用时，这次启动就不启用绕过，Mihomo 照常启动并给出提示。只处理 IPv4，
-因为 IPA 不卸载 NAT66，IPv6 仍然全部进 Mihomo。
+因为 IPA 不卸载 NAT66；IPv6 仍然全部进 Mihomo（用户选择：不做国内 IPv6 绕过，
+TPROXY 下 IPv6 已经能跑满线路）。
 
 行为变化：**域名规则命中代理、但解析出来是国内 IP 的连接，也会直连。**
 当前订阅里 `GEOIP,CN,直连` 排在最后一条 `MATCH` 之前；DNS 是 `redir-host`，所以内核
-看到的是真实 IP，按 ipset 分流可以生效。如果改成 fake-ip，地址都在 198.18.x，
+看到的是真实 IP，按集合分流可以生效。如果改成 fake-ip，地址都在 198.18.x，
 这个开关就匹配不到任何流量。
 
 **conntrack 重置**：在 Mihomo 开关、国内直连开关或国内 IP 列表的摘要发生变化时，
 执行 `conntrack -D -f ipv4 -s <LAN 网段>`。返回码 ≤1 都按成功处理，没有条目可删时
 返回 1。目的是让已建立的连接和已经被卸载的连接按新的路径重建；IPACM 收到 DESTROY
 事件会删掉对应的硬件表项。上游变化导致的核心重启不改变拦截范围，因此不会重置连接。
-`proxy_plan` 里仍然没有任何 `-F` 或 `flush`（测试会检查）。
+`proxy_plan` 里没有任何 `-F` 或 `flush`（测试会检查）。
 
-### 5. RPS 和 backlog（辅助）
+Mihomo 的拦截本身（TPROXY、nft 表、`tcp_pacing_*_ratio`、brnf）见
+`docs/research/2026-11-08-mihomo-tproxy-single-flow.md` 和
+`network-extensions.md` 的 Interception scope 一节。
+
+### 5. 统一对齐 ZTE 的改动（`net_guard.rs`）
+
+ZTE 会从很多地方改写 legacy iptables、sysctl 和路由：fw3 重载、Wi-Fi/QoS/限速/IPA
+脚本、WAN 事件。以前每样东西各自有检查（例如 `redirect_chain` 每个 tick 查一次），
+现在统一成一处：
+
+- 中继（IPv4 的 network，加上 IPv6 的 setup/network 两个事务）和 Mihomo 都把自己的改动
+  记在 `Transaction` 里。IPv6 只交给这里检查防火墙和 nft 规则（NAT66、转发、DNS）；地址、
+  路由和策略规则仍由 IPv6 每个 tick 的 `check_owned` 修复，因为它还要检查冲突（前缀被改、
+  DAD 失败、路由或优先级被别人占用会撤掉 IPv6）、等 DAD，并使用租约当前的生存时间
+  （`Transaction::reconcile_only`）。`apply`/`apply_network` 会把
+  能复查的步骤（iptables 的 `-N/-I/-A`、`ip route/rule/addr add`、`@u60-sysctl`、
+  `@u60-mihomo-nft`、`@u60-relay-steer`）连同撤销一起记进内存里的期望状态，
+  `remove`/`rollback` 时删掉。`Transaction::reconcile` 按原顺序逐条检查
+  （`iptables -C`/`-S`、`ip ... show`、读 sysctl、`nft list`），缺了就原样重做。
+- `net_guard` 只决定什么时候查：inotify 监视 20 个 ZTE 脚本的 `IN_OPEN`
+  （`fw3`、`firewall_*.sh`、`module_firewall_*.sh`、`wifi_isolate_*`、`isolate_exclude.sh`、
+  `speedlimit.sh`、`mwan_speedlimit.sh`、`qos_set.sh`、`smart_set_qos_policy.sh`、
+  `ipacm_switch.sh`、`router_common.sh`、`15-mwan3` 等），订阅 ubus 事件
+  `zwrt_wlan`、`zwrt_router.msg`、`zwrt_smart_mng.msg`、`network.interface`；
+  触发后安静 2 秒再查；没有触发时每 60 秒兜底一次。没有任何 owner 时什么都不跑。
+- 每次恢复都会记日志，写明重做了哪些命令：
+  `[guard] relay: restored after another writer removed them: ...`。某一条查不了或重做失败时，
+  其余的照常处理；失败写进日志（同样的失败只记一次）并显示在页面上。
+- agent 的 nft 表（Mihomo 的 `u60_mihomo`、中继 DNS 的 `u60_relay`）都用 `net::nft_fill`
+  生成：同一个 `nft -f` 事务里先声明表、集合和链（已存在则无操作），再清空，最后写入规则，
+  所以重做不会让规则重复。检查时用 `nft -t list table`（不列出国内 IP 集合的几千个元素），
+  每个协议族一次，并逐条链比对规则数（`net::nft_holds`），被清空或删掉一部分的链也会被补回。
+- IPA 模式不在这里：它有自己的 15 秒检查（要考虑用户限制，见第 3 节）。
+
+实测到的 ZTE 改写（2026-11-08）：中继每次连上之后，ZTE 都会把
+`bridge-nf-call-ip(6)tables` 改回 1，并清空 nat 表的 `redirect_chain`（中继放在里面的
+RETURN 会跟着消失）；`fw3 reload` 也会把 brnf 改回 1。三者都被自动恢复了。手工删掉
+IPv6 的 `U60_R6_NAT`/`U60_R6_FWD` 跳转后 4 秒补回。
+
+### 6. RPS 和 backlog（辅助）
 
 中继连接时，`u60sta0` 和 `wlan2` 所有接收队列的 `rps_cpus` 设为"没有处理过 Wi-Fi
 中断的 CPU"（从 `/proc/interrupts` 计算，B31 上是 `c`）；`netdev_max_backlog`
@@ -153,7 +206,7 @@ IPv6/NAT66、每条连接的头几个包，以及设备本机的流量。
 之前单独开 RPS 的效果：单连接 141.7 → 196.8 Mbit/s，4 连接 184 → 238.5；在 backlog
 为 1000 时看到过 softnet 丢包。RPS 和 HW 同时开的组合效果还没有实测。
 
-### 6. 热点同主信道 CSA
+### 7. 热点同主信道 CSA
 
 热点已经在 36 信道、只是带宽不同时（例如 36/40），用一次 CSA 切到 36/20 会被驱动
 拒绝（`CSA failed ... ret -22`），清理会一直卡在 "Hotspot refused the channel switch"。
@@ -175,7 +228,10 @@ IPv6/NAT66、每条连接的头几个包，以及设备本机的流量。
 - **继续保留的兼容项**：5G 非 DFS 20 MHz 暂存、`disableDfsCS`、2.4G 的
   disable/set/enable、portal、DNS、udhcpc 续租、resume 和残留进程清理、NAT66、
   60631 策略路由、带宽调优（width\*、llstats）。
-- **不再需要做**：关闭 `bridge-nf-call-iptables`、精简 iptables 链。卸载以后这些收益很小。
+- **不再需要做**：精简 iptables 链。卸载以后收益很小。
+- **brnf**：Mihomo 运行时 `bridge-nf-call-ip(6)tables=0`（TPROXY 在 bridge-netfilter
+  路径上拿不到套接字），停止时恢复原值。期间 br-lan 内部的二层流量不再经过 iptables，
+  访客热点隔离之类按 LAN 内部过滤的规则会失效（用户已接受）。中继本身不需要改 brnf。
 
 ## 已验证 / 未验证
 
@@ -223,3 +279,44 @@ speedtest.cn（云测节点评估模式，单连接）：
   进入 Mihomo（GeoSite CN → DIRECT，由 Mihomo 用户态转发），速度和 Clash 路径相同。
   要让这种情况也走硬件，需要另外决定：关闭中继的 IPv6/NAT66，或者让国内目标优先走
   IPv4。也可以把国内 IPv6 段也在内核绕过，但它只能走 NAT66 的 CPU 路径，不会被卸载。
+
+## Mihomo 改用 TPROXY 后的复测（2026-11-08）
+
+Mac 连 G（52/160），上游 W_Game；curl 绑定 en0、用路由器 DNS 解析（Mac 上的 Clash
+Verge TUN 开着，不绑定会先经过它）。tuna 镜像下载 15 秒；CPU 是 12 秒采样，
+"总 CPU" 是 4 核平均，Mihomo 按单核计。
+
+| 路径 | 单连接 Mbit/s | 4 连接 | 总 CPU | Mihomo | 回程内核包 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| IPv4 国内（国内直连，HW） | 220.6 / 237.2 | 230.3 | 10% | 0–3% | 18–83 |
+| IPv6 国内（TPROXY → DIRECT） | 238.0 / 190.6 | 235.2 | 48–51% | 31–39% | 0 |
+| IPv4 国内（临时关国内直连，TPROXY） | 238.6 / 238.1 | — | 48–51% | 41–44% | 0 |
+
+- 之前的 TUN：IPv4/IPv6 单连接 125–132，Mihomo 约 90%。
+- UDP：IPv4 NTP（国内直连关时经 TProxy → DIRECT）双向正常；IPv6 UDP（QUIC 和其他
+  DIRECT 流量）在连接表里有 MB 级双向流量。走代理节点 `JP-hy2-gou-IPv6` 的 UDP 123/443/5353
+  只有上行没有回包，这是节点那边的限制，不是拦截的问题。
+- DNS：LAN 的 53（包括发往 8.8.8.8 的）被重定向到 1053，ZTE 的 legacy INPUT 不需要另外放行。
+- 退出中继：Mihomo 保持运行，nft 表、sysctl、pref 18620 规则和 17894/1053 监听都在；
+  agent 重启时中继还没连上，Mihomo 也能正常起来。重连后 kick 执行，HW 正常。
+- 对齐器：手工把 brnf 改成 1、清空 `redirect_chain`（v4 和 v6）、删掉 main 默认路由，
+  再只读打开一次 `/sbin/fw3` 触发 inotify，4–7 秒全部恢复；不触发时 60 秒兜底在
+  42 秒恢复了 brnf。`ipacm_switch.sh off` 后 3 秒切回 HW，之后下载仍然走硬件。
+- speedtest.cn 这次弹出拼图验证，没有跑。
+
+## 还能提速的地方（2026-11-08 测试）
+
+省电关闭后，speedtest.cn 经中继 244–253 Mbps，直连 W_Game 291–295；用 tuna 镜像持续下载时，
+中继和直连一样都在 230 左右（镜像那端的上限）。
+
+| 尝试 | 结果 | 结论 |
+| --- | --- | --- |
+| `u60sta0` 省电关闭（手动 `iw`，中继重连后恢复默认） | 166–218 → 244–250 | 有效，用户选择手动关、不集成 |
+| 禁用 CPU 深度休眠（C3/C4）+ performance 调频 | 250.5 / 253.1；U60→网关 ping 约少 0.5–1 ms | 在噪声范围内，增加耗电，已恢复 |
+| 信道 52 繁忙度 | 4% | 没有外部争用 |
+| 两段链路速率 | 上游 2161 Mbps、到 Mac 2402 Mbps（160 MHz HE 2×2） | 远高于 300，不是瓶颈 |
+
+剩下约 15% 的差距只在短时测速里出现：同一块射频、同一条信道上跑两段 Wi-Fi，中继比直连多
+约 3–4 ms 的最小 RTT（Mac→上游网关 5.3–6.5 ms，直连 2.1 ms），影响 TCP 起步。软件层面没有
+找到明显的手段；能消掉这一跳的是有线上行。线路更快时，Mihomo 路径（单流约 238 Mbps，Mihomo
+占单核 31–44%）会先于硬件路径成为瓶颈。

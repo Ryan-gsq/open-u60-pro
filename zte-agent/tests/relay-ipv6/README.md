@@ -110,17 +110,19 @@ docker run --rm --privileged --network none \
   u60-relay-ipv6-qa:local python3 /qa/real_core.py
 ```
 
-This runner creates an actual Linux bridge with a member veth, asserts both
-bridge-netfilter switches remain on, and applies default-DROP INPUT/FORWARD.
-A veth only named `br-lan` is not an adequate substitute: it missed the B31
-TPROXY/bridge failure. The current managed TUN uses `mixed` (kernel TCP,
-gVisor UDP), not the earlier all-gVisor stack. The runner exercises whichever
-stack the supplied current test artifact generates. Its acceptance cases cover
-dual-stack TCP, UDP 1400/2000 bytes (including source fragmentation), persistent
-UDP across uplink changes, local-address addition/removal, offline cellular state
-and controller failure. Earlier passing gVisor runs do not establish that a new
-mixed-stack build passes; rerun with matching current artifacts. Cleanup asserts
-the TUN and table/rule references disappear.
+This runner creates an actual Linux bridge with a member veth, starts with both
+bridge-netfilter switches on (as B31 boots), and applies default-DROP
+INPUT/FORWARD. A veth only named `br-lan` is not an adequate substitute: it
+missed the B31 TPROXY/bridge failure. Interception is TPROXY through the agent's
+`u60_mihomo` nftables tables; the core's start sets both bridge switches to 0
+and its rollback restores them (the runner asserts they are back on). Its
+acceptance cases cover dual-stack TCP, UDP 1400/2000 bytes (including source
+fragmentation), persistent UDP across uplink changes, local-address
+addition/removal, offline cellular state and controller failure. The runner was
+adapted from the earlier TUN design on 2026-11-08 and has not been rerun since;
+earlier TUN passes say nothing about TPROXY, so rerun with matching current
+artifacts (the container needs nftables with TPROXY/socket support). Cleanup
+asserts the nft tables, rule pref 18620 and table 60625 disappear.
 It uses DIRECT nodes and controlled network namespaces, not paid proxy servers.
 The core test also creates two profiles, switches them while running, applies
 global Merge+Script, and asserts the managed rule order before uplink transitions.

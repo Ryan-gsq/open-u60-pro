@@ -1,74 +1,37 @@
 //! China IPv4 ranges that bypass Mihomo in the kernel (owner choice, owner
 //! decision 63): such connections use the kernel NAT, so on the relay they
 //! can move to the IPA hardware path. Built from the core's own `GeoIP.dat`
-//! (geodata mode). Connections whose domain rule would have picked a proxy
-//! but whose address is in China go direct too. The set lives only while
-//! the core runs; its restore input is prepared before the start.
+//! (geodata mode) into the `china` set of Mihomo's nft table. Connections
+//! whose domain rule would have picked a proxy but whose address is in China
+//! go direct too. IPv6 stays with the core (it cannot be offloaded).
 
 use std::{
     fs,
     io::{BufReader, Read},
     net::Ipv4Addr,
     path::Path,
-    process::Command,
-    time::Duration,
 };
 
 use sha2::{Digest, Sha256};
 
-use crate::net_tools::{self as net, Cmd};
-
 pub(super) const FLAG: &str = "cn-direct";
-pub(super) const SET: &str = "u60_mh_cn4";
 const SOURCE: &str = "GeoIP.dat";
-const INPUT: &str = "cn4.ipset";
 /// A real list has thousands of ranges; fewer means a wrong or empty file.
 const MIN_RANGES: usize = 1000;
 const MAX_ENTRY: u64 = 64 * 1024 * 1024;
 
-/// Writes the set's restore input; returns its digest, which identifies the
-/// interception for conntrack resets.
-pub(super) fn prepare(root: &Path) -> Result<String, String> {
+/// The ranges, with a digest that identifies the interception for conntrack
+/// resets.
+pub(super) fn prepare(root: &Path) -> Result<(String, Vec<String>), String> {
     let file = fs::File::open(root.join(SOURCE))
         .map_err(|_| "China IP direct needs GeoIP.dat (geodata-mode with a GEOIP rule)")?;
     let ranges = china_v4(&mut BufReader::new(file))?;
     if ranges.len() < MIN_RANGES {
         return Err("GeoIP.dat has no usable China IPv4 ranges".into());
     }
-    let input = restore_input(&ranges);
-    net::write_private(&root.join(INPUT), input.as_bytes())?;
-    Ok(format!("cn:{:x}", Sha256::digest(input.as_bytes()))[..19].to_owned())
-}
-
-fn restore_input(ranges: &[(Ipv4Addr, u8)]) -> String {
-    let mut input = format!(
-        "create {SET} hash:net family inet hashsize 4096 maxelem {}\nflush {SET}\n",
-        (ranges.len() * 2).max(65536)
-    );
-    for (ip, prefix) in ranges {
-        input.push_str(&format!("add {SET} {ip}/{prefix}\n"));
-    }
-    input
-}
-
-/// `@u60-mihomo-cn4 load|destroy`.
-pub(crate) fn command(args: &[String]) -> Result<(), String> {
-    match args {
-        [a] if a == "load" => {
-            let input = fs::read(Path::new(super::ROOT).join(INPUT)).map_err(|_| "China IP set input is missing")?;
-            let mut cmd = Command::new("ipset");
-            cmd.args(["-exist", "restore"]);
-            net::run_input(cmd, Duration::from_secs(20), input).map(|_| ())
-        }
-        [a] if a == "destroy" => {
-            // Undo of a set that never loaded (or ipset gone): nothing to do.
-            if Cmd::new("ipset", &["list", "-n", SET]).run().is_err() {
-                return Ok(());
-            }
-            Cmd::new("ipset", &["destroy", SET]).run().map(|_| ())
-        }
-        _ => Err("Invalid China IP set command".into()),
-    }
+    let ranges: Vec<String> = ranges.iter().map(|(ip, prefix)| format!("{ip}/{prefix}")).collect();
+    let digest = format!("cn:{:x}", Sha256::digest(ranges.join(",").as_bytes()))[..19].to_owned();
+    Ok((digest, ranges))
 }
 
 fn varint(r: &mut impl Read) -> Result<Option<u64>, String> {
@@ -209,8 +172,5 @@ mod tests {
         let ranges = china_v4(&mut list.as_slice()).unwrap();
         assert_eq!(ranges, [("1.0.1.0".parse().unwrap(), 24), ("36.0.0.0".parse().unwrap(), 10)]);
         assert!(china_v4(&mut &list[..list.len() - 1]).is_err(), "truncated input is an error");
-        let input = restore_input(&ranges);
-        assert!(input.starts_with(&format!("create {SET} hash:net family inet")));
-        assert!(input.ends_with(&format!("add {SET} 36.0.0.0/10\n")));
     }
 }

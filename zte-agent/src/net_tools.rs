@@ -1,10 +1,8 @@
 //! Private device effects shared by the optional network modules. No shell,
 //! bounded commands, private atomic files and an on-disk rollback journal.
 
-use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::net::IpAddr;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -92,66 +90,6 @@ pub fn route_target(args: &[String]) -> (&str, &str) {
 
 pub type NetworkLock = Arc<Mutex<()>>;
 
-pub fn local_addresses() -> Result<Vec<IpAddr>, String> {
-    let mut addresses: Vec<_> = crate::httpd::mobile::interfaces()
-        .map_err(|_| "Cannot read local addresses for network exclusions")?
-        .into_iter()
-        .map(|i| i.addr)
-        .collect();
-    addresses.sort_unstable();
-    addresses.dedup();
-    Ok(addresses)
-}
-
-// B31 has no xt_addrtype. Exact address exemptions use basic iptables matches,
-// and callers include newly owned addresses before installing interception.
-pub fn local_exclusions(
-    tool: &str,
-    table: &str,
-    chain: &str,
-    target: &str,
-    addresses: &[IpAddr],
-) -> Vec<Step> {
-    addresses
-        .iter()
-        .filter(|a| a.is_ipv4() == (tool == "iptables"))
-        .map(|a| {
-            rule(
-                tool,
-                table,
-                chain,
-                &["-d", &a.to_string(), "-j", target],
-                false,
-            )
-        })
-        .collect()
-}
-
-/// Exact-address exemptions are re-read from their chain at most this often.
-pub const EXEMPTION_AUDIT: Duration = Duration::from_secs(15);
-
-/// Bring one chain's exact-address exemptions in line with `current`, given a
-/// single snapshot of that chain (`present`): missing ones (new, or deleted by
-/// another writer) are inserted ahead of the rules they exempt, then the
-/// `previous` ones that are no longer current are removed. Each rule keeps its
-/// own journal entry, so a failure part-way is retried against a fresh
-/// snapshot without duplicates. The caller filters both lists by family.
-pub fn sync_exemptions(
-    network: &mut Transaction,
-    present: &HashSet<IpAddr>,
-    current: &[IpAddr],
-    previous: &[IpAddr],
-    rule: impl Fn(&IpAddr) -> Step,
-) -> Result<(), String> {
-    for address in current.iter().filter(|a| !present.contains(a)) {
-        network.ensure(rule(address))?;
-    }
-    for address in previous.iter().filter(|a| !current.contains(a)) {
-        network.remove(&rule(address).undo)?;
-    }
-    Ok(())
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cmd {
     pub program: String,
@@ -191,11 +129,17 @@ impl Cmd {
         if self.program == "@u60-relay-ipa" {
             return crate::wifi_relay::offload::command(&self.args).map(|_| String::new());
         }
+        if self.program == "@u60-sysctl" {
+            return sysctl_command(&self.args).map(|_| String::new());
+        }
+        if self.program == "@u60-mihomo-nft" {
+            return crate::mihomo::nft_command(&self.args).map(|_| String::new());
+        }
         if self.program == "@u60-relay-steer" {
             return crate::wifi_relay::steering::command(&self.args).map(|_| String::new());
         }
-        if self.program == "@u60-mihomo-cn4" {
-            return crate::mihomo::cn_set::command(&self.args).map(|_| String::new());
+        if self.program == "@u60-relay-nft" {
+            return crate::wifi_relay::dns_nft::command(&self.args).map(|_| String::new());
         }
         if self.program == "@u60-relay-roam" {
             return match self.args.as_slice() {
@@ -211,6 +155,9 @@ impl Cmd {
             } else {
                 Err("Invalid relay disconnect recovery".into())
             };
+        }
+        if self.program.starts_with('@') {
+            return Err(format!("{UNKNOWN_STEP} {}", self.program));
         }
         let out = run(self.command(), Duration::from_secs(8))?;
         if self.program == "hostapd_cli"
@@ -256,6 +203,13 @@ impl Cmd {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
+        // A journal from another agent version can hold an internal step this
+        // build does not have. It cannot be undone here; stopping on it would
+        // block every later cleanup (a removed step once kept the relay down).
+        if error.starts_with(UNKNOWN_STEP) {
+            eprintln!("[net] skipped an undo this agent version does not know: {} {}", self.program, self.args.join(" "));
+            return Ok(());
+        }
         // OFF during a channel switch/CAC makes that runtime snapshot obsolete.
         if crate::wifi_relay::hotspot::skip_undo(self) {
             return Ok(());
@@ -357,6 +311,162 @@ impl Cmd {
         } else {
             "Cannot restore an owned network change".into()
         })
+    }
+
+    /// Whether this applied change can be re-checked and re-applied as is
+    /// (`Transaction::reconcile`). Radio, daemon and journal-only steps cannot.
+    fn checkable(&self) -> bool {
+        match self.program.as_str() {
+            "iptables" | "ip6tables" => self.args.iter().any(|a| matches!(a.as_str(), "-N" | "-I" | "-A")),
+            "ip" => self.args.get(2).map(String::as_str) == Some("add"),
+            "@u60-sysctl" | "@u60-mihomo-nft" | "@u60-relay-steer" => true,
+            "@u60-relay-nft" => self.args.first().is_some_and(|a| a != "remove"),
+            _ => false,
+        }
+    }
+
+    /// Whether the effect of this (applied) command is still in place.
+    fn present(&self) -> Result<bool, String> {
+        let value = |name: &str| self.args.windows(2).find(|w| w[0] == name).map(|w| w[1].as_str());
+        match self.program.as_str() {
+            "iptables" | "ip6tables" => {
+                let Some(at) = self.args.iter().position(|a| matches!(a.as_str(), "-N" | "-I" | "-A")) else { return Ok(true) };
+                let mut check = self.clone();
+                if check.args[at] == "-N" {
+                    check.args[at] = "-S".into();
+                } else {
+                    if check.args[at] == "-I" && check.args.get(at + 2).is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit())) {
+                        check.args.remove(at + 2);
+                    }
+                    check.args[at] = "-C".into();
+                }
+                Ok(check.run().is_ok())
+            }
+            "ip" => {
+                let family = self.args[0].as_str();
+                match self.args[1].as_str() {
+                    "rule" => {
+                        let Some(pref) = value("pref") else { return Ok(true) };
+                        let rules = Cmd::new("ip", &[family, "rule", "show"]).run()?;
+                        Ok(rules.lines().any(|l| l.trim_start().starts_with(&format!("{pref}:"))))
+                    }
+                    "route" => {
+                        let (kind, destination) = route_target(&self.args);
+                        let table = value("table").unwrap_or("main");
+                        let mut show = vec![family, "route", "show", "table", table, "type", kind, "exact", destination];
+                        if let Some(device) = value("dev") {
+                            show.extend(["dev", device]);
+                        }
+                        Ok(Cmd::new("ip", &show).run().is_ok_and(|s| !s.is_empty()))
+                    }
+                    "addr" => {
+                        let Some(device) = value("dev") else { return Ok(true) };
+                        let all = Cmd::new("ip", &["-o", family, "addr", "show", "dev", device]).run()?;
+                        Ok(all.split_whitespace().any(|s| s == self.args[3]))
+                    }
+                    _ => Ok(true),
+                }
+            }
+            "@u60-sysctl" => Ok(match self.args.as_slice() {
+                [key, wanted] => sysctl_path(key).and_then(|p| fs::read_to_string(p).ok()).is_some_and(|v| v.trim() == wanted),
+                _ => true,
+            }),
+            "@u60-mihomo-nft" => crate::mihomo::nft_present(&self.args),
+            "@u60-relay-steer" => Ok(crate::wifi_relay::steering::present(&self.args)),
+            "@u60-relay-nft" => Ok(crate::wifi_relay::dns_nft::present(&self.args)),
+            _ => Ok(true),
+        }
+    }
+}
+
+const UNKNOWN_STEP: &str = "Unknown agent step";
+
+/// Rules per chain in nft text: a ruleset written by `nft_fill` (its filled
+/// blocks) or an `nft -t list table` listing (hook lines are not rules).
+pub fn nft_chain_rules(text: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut current: Option<(String, usize)> = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix("chain ").and_then(|l| l.strip_suffix(" {")) {
+            current = Some((name.to_owned(), 0));
+        } else if line == "}" {
+            if let Some((name, n)) = current.take() {
+                counts.insert(name, n);
+            }
+        } else if let Some((_, n)) = current.as_mut() {
+            if !line.is_empty() && !line.starts_with("type ") {
+                *n += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Whether `table` holds every chain of `expected` (an `nft_fill` ruleset)
+/// with as many rules: a flushed or partly deleted chain counts as missing.
+pub fn nft_holds(family: &str, table: &str, expected: &str) -> bool {
+    let want = nft_chain_rules(expected);
+    Cmd::new("nft", &["-t", "list", "table", family, table]).run().is_ok_and(|listing| {
+        let have = nft_chain_rules(&listing);
+        want.iter().all(|(chain, n)| have.get(chain) == Some(n))
+    })
+}
+
+/// One family's table objects as one idempotent `nft -f` transaction: declare
+/// the table, the set `(name, spec, elements)` and the chains `(name, hook,
+/// rules)` (a no-op when present; an empty hook is a regular chain), flush
+/// them, then fill them. A re-apply (`Transaction::reconcile`) never
+/// duplicates rules.
+pub fn nft_fill(family: &str, table: &str, set: Option<(&str, &str, &[String])>, chains: &[(&str, &str, Vec<String>)]) -> String {
+    let mut declare = format!("table {family} {table} {{\n");
+    let mut flush = String::new();
+    let mut fill = format!("table {family} {table} {{\n");
+    if let Some((name, spec, elements)) = set {
+        declare.push_str(&format!("\tset {name} {{ {spec} }}\n"));
+        flush.push_str(&format!("flush set {family} {table} {name}\n"));
+        fill.push_str(&format!("\tset {name} {{ {spec} elements = {{ {} }} }}\n", elements.join(", ")));
+    }
+    for (name, hook, rules) in chains {
+        declare.push_str(&format!("\tchain {name} {{ {hook} }}\n"));
+        flush.push_str(&format!("flush chain {family} {table} {name}\n"));
+        fill.push_str(&format!("\tchain {name} {{\n"));
+        for rule in rules {
+            fill.push_str(&format!("\t\t{rule}\n"));
+        }
+        fill.push_str("\t}\n");
+    }
+    format!("{declare}}}\n{flush}{fill}}}\n")
+}
+
+/// Kernel settings an owner may change for its lifetime (`@u60-sysctl`).
+fn sysctl_path(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "tcp_pacing_ss_ratio" => "/proc/sys/net/ipv4/tcp_pacing_ss_ratio",
+        "tcp_pacing_ca_ratio" => "/proc/sys/net/ipv4/tcp_pacing_ca_ratio",
+        "bridge-nf-call-iptables" => "/proc/sys/net/bridge/bridge-nf-call-iptables",
+        "bridge-nf-call-ip6tables" => "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
+        _ => return None,
+    })
+}
+
+pub fn sysctl_read(key: &str) -> Result<String, String> {
+    let path = sysctl_path(key).ok_or("Unknown kernel setting")?;
+    Ok(fs::read_to_string(path).map_err(|_| "Cannot read a kernel setting")?.trim().to_owned())
+}
+
+/// The step that sets `key` to `value` and restores `old`.
+pub fn sysctl_step(key: &str, value: &str, old: &str) -> Result<Step, String> {
+    sysctl_path(key).ok_or("Unknown kernel setting")?;
+    Ok(Step::new(Cmd::new("@u60-sysctl", &[key, value]), Cmd::new("@u60-sysctl", &[key, old])))
+}
+
+fn sysctl_command(args: &[String]) -> Result<(), String> {
+    match args {
+        [key, value] if value.parse::<u32>().is_ok_and(|v| v <= 100_000) => {
+            let path = sysctl_path(key).ok_or("Unknown kernel setting")?;
+            fs::write(path, value).map_err(|_| "Cannot set a kernel setting".into())
+        }
+        _ => Err("Invalid kernel setting".into()),
     }
 }
 
@@ -563,11 +673,28 @@ impl Step {
     }
 }
 
+/// What `Transaction::reconcile` re-applied and could not.
+#[derive(Debug, Default)]
+pub struct Reconciled {
+    pub restored: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+impl Reconciled {
+    pub fn extend(&mut self, other: Reconciled) {
+        self.restored.extend(other.restored);
+        self.failed.extend(other.failed);
+    }
+}
+
 /// The caller first reserves empty chain names, route tables and rule priorities.
 /// Save each undo BEFORE applying it, so interruption is recoverable at startup.
 pub struct Transaction {
     path: PathBuf,
     undo: Vec<Cmd>,
+    /// Applied, re-checkable changes with their undo, in apply order
+    /// (`reconcile`). Memory only: the journal is for rollback.
+    desired: Vec<(Cmd, Cmd)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -588,6 +715,7 @@ impl Transaction {
         Self {
             path,
             undo: Vec::new(),
+            desired: Vec::new(),
         }
     }
 
@@ -605,8 +733,38 @@ impl Transaction {
         Self {
             path: path.into(),
             undo: journal.undo,
+            desired: Vec::new(),
         }
         .rollback()
+    }
+
+    fn remember(&mut self, step: &Step) {
+        if step.apply.checkable() && !self.desired.iter().any(|(_, undo)| *undo == step.undo) {
+            self.desired.push((step.apply.clone(), step.undo.clone()));
+        }
+    }
+
+    /// Re-applies, in their original order, the changes another writer
+    /// removed since (ZTE's firewall reloads, scripts, sysctls); `net_guard`
+    /// decides when. One change that cannot be checked or re-applied does
+    /// not stop the rest.
+    pub fn reconcile(&mut self) -> Reconciled {
+        self.reconcile_only(|_| true)
+    }
+
+    /// `reconcile` limited to the changes `keep` selects (an owner that
+    /// repairs the rest itself, with stricter checks).
+    pub fn reconcile_only(&mut self, keep: impl Fn(&Cmd) -> bool) -> Reconciled {
+        let mut result = Reconciled::default();
+        for (apply, _) in self.desired.clone().into_iter().filter(|(apply, _)| keep(apply)) {
+            let line = format!("{} {}", apply.program, apply.args.join(" "));
+            match apply.present().and_then(|present| if present { Ok(false) } else { apply.run().map(|_| true) }) {
+                Ok(true) => result.restored.push(line),
+                Ok(false) => {}
+                Err(e) => result.failed.push(format!("{line}: {e}")),
+            }
+        }
+        result
     }
 
     fn save(&self) -> Result<(), String> {
@@ -621,9 +779,11 @@ impl Transaction {
     }
 
     pub fn apply(&mut self, step: Step) -> Result<(), String> {
-        self.undo.push(step.undo);
+        self.undo.push(step.undo.clone());
         self.save()?;
-        step.apply.run().map(|_| ())
+        step.apply.run()?;
+        self.remember(&step);
+        Ok(())
     }
 
     /// A network plan with supported firewall runs batched into restore. Every
@@ -646,9 +806,11 @@ impl Transaction {
             if let Some(batch) = firewall::Batch::collect(&steps[at..]) {
                 let count = batch.count;
                 batch.run()?;
+                steps[at..at + count].iter().for_each(|s| self.remember(s));
                 at += count;
             } else {
                 steps[at].apply.run()?;
+                self.remember(&steps[at]);
                 at += 1;
             }
         }
@@ -659,32 +821,25 @@ impl Transaction {
     /// Save even on retries: a prior failed save may have changed only RAM.
     pub fn ensure(&mut self, step: Step) -> Result<(), String> {
         if !self.undo.contains(&step.undo) {
-            self.undo.push(step.undo);
+            self.undo.push(step.undo.clone());
         }
         self.save()?;
-        step.apply.run().map(|_| ())
-    }
-
-    /// Undo one journaled change now and forget it. Only for independent
-    /// objects (an exact-address firewall exemption), never a dependency
-    /// chain, because the remaining undos keep their order.
-    pub fn remove(&mut self, undo: &Cmd) -> Result<(), String> {
-        let Some(index) = self.undo.iter().position(|c| c == undo) else {
-            return Ok(());
-        };
-        self.undo[index].undo()?;
-        self.undo.remove(index);
-        self.save()
+        step.apply.run()?;
+        self.remember(&step);
+        Ok(())
     }
 
     pub fn rollback(&mut self) -> Result<(), String> {
         while let Some(c) = self.undo.last() {
             if let Err(error) = c.undo() {
+                let left = self.undo.clone();
+                self.desired.retain(|(_, u)| left.contains(u));
                 self.save()?;
                 return Err(format!("Network cleanup paused: {error}. Retry cleanup in the panel; if it persists, use network-recover over USB ADB"));
             }
             self.undo.pop();
         }
+        self.desired.clear();
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -805,6 +960,29 @@ pub fn reserve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nft_rule_counts_match_between_a_written_ruleset_and_its_listing() {
+        let written = nft_fill(
+            "ip",
+            "u60_t",
+            Some(("s", "type ipv4_addr; flags interval;", &["1.0.0.0/8".to_owned()])),
+            &[("pre", "type filter hook prerouting priority 0; policy accept;", vec!["ip daddr @s return".into(), "accept".into()]), ("sub", "", vec!["return".into()])],
+        );
+        let listing = "table ip u60_t {\n\tset s {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t}\n\n\tchain pre {\n\t\ttype filter hook prerouting priority filter; policy accept;\n\t\tip daddr @s return\n\t\taccept\n\t}\n\n\tchain sub {\n\t\treturn\n\t}\n}\n";
+        let want = nft_chain_rules(&written);
+        assert_eq!(want, nft_chain_rules(listing));
+        assert_eq!(want.get("pre"), Some(&2));
+        let flushed = listing.replace("\t\tip daddr @s return\n\t\taccept\n", "");
+        assert_eq!(nft_chain_rules(&flushed).get("pre"), Some(&0), "a flushed chain is not present");
+    }
+
+    #[test]
+    fn an_undo_from_another_agent_version_is_skipped_not_executed() {
+        let removed = Cmd::new("@u60-removed-step", &["on"]);
+        assert!(removed.run().unwrap_err().starts_with(UNKNOWN_STEP), "never executed as a program");
+        assert!(removed.undo().is_ok(), "does not block the rest of the cleanup");
+    }
 
     #[test]
     fn core_tun_recovery_matches_only_its_exact_rule_including_detached_interfaces() {
@@ -1014,44 +1192,6 @@ mod tests {
         let mut tx = Transaction::new(journal.clone());
         tx.apply_network(Vec::new()).unwrap();
         assert!(!journal.exists(), "an empty batch writes nothing");
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn exemptions_follow_addresses_in_place_from_one_chain_snapshot() {
-        let dir = std::env::temp_dir().join(format!("u60-exemptions-{}", std::process::id()));
-        private_dir(&dir).unwrap();
-        let journal = dir.join("journal.json");
-        let step = |address: &IpAddr| touch_step(&dir.join(address.to_string().replace(':', "_")));
-        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
-        let (a, b, c) = (ip("10.0.0.1"), ip("2001:db8::7"), ip("100.64.0.9"));
-        let mut tx = Transaction::new(journal.clone());
-        for address in [a, b] {
-            tx.apply(step(&address)).unwrap();
-        }
-        let undos = |tx: &Transaction| tx.undo.len();
-        sync_exemptions(&mut tx, &[a, b].into(), &[b, c], &[a, b], step).unwrap();
-        assert!(!dir.join("10.0.0.1").exists());
-        assert!(dir.join("2001_db8__7").exists() && dir.join("100.64.0.9").exists());
-        assert_eq!(
-            undos(&tx),
-            2,
-            "the removed address leaves the journal, the new one joins it"
-        );
-        // An externally deleted rule is repaired with its existing undo; one
-        // still in the snapshot is never inserted twice.
-        fs::remove_file(dir.join("100.64.0.9")).unwrap();
-        sync_exemptions(&mut tx, &[b].into(), &[b, c], &[b, c], step).unwrap();
-        assert!(dir.join("100.64.0.9").exists());
-        assert_eq!(undos(&tx), 2);
-        assert_eq!(
-            serde_json::from_slice::<Journal>(&fs::read(&journal).unwrap())
-                .unwrap()
-                .undo,
-            tx.undo
-        );
-        tx.rollback().unwrap();
-        assert!(!dir.join("2001_db8__7").exists() && !dir.join("100.64.0.9").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1299,56 +1439,6 @@ mod tests {
         assert_eq!(tx.undo.len(), 1);
         tx.rollback().unwrap();
         assert!(!file.exists());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn remove_undoes_and_forgets_exactly_one_journaled_change() {
-        let dir = std::env::temp_dir().join(format!("u60-remove-{}", std::process::id()));
-        private_dir(&dir).unwrap();
-        let journal = dir.join("journal.json");
-        let (first, second) = (dir.join("effect-1"), dir.join("effect-2"));
-        let mut tx = Transaction::new(journal.clone());
-        tx.apply(touch_step(&first)).unwrap();
-        tx.apply(touch_step(&second)).unwrap();
-        let first_undo = touch_step(&first).undo;
-        tx.remove(&first_undo).unwrap();
-        assert!(!first.exists() && second.exists());
-        assert_eq!(
-            serde_json::from_slice::<Journal>(&fs::read(&journal).unwrap())
-                .unwrap()
-                .undo,
-            vec![touch_step(&second).undo]
-        );
-        tx.remove(&first_undo).unwrap();
-        assert!(
-            second.exists(),
-            "removing an unknown change touches nothing"
-        );
-        tx.rollback().unwrap();
-        assert!(!second.exists() && !journal.exists());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_failed_removal_stays_journaled_for_recovery() {
-        let dir = std::env::temp_dir().join(format!("u60-remove-fail-{}", std::process::id()));
-        private_dir(&dir).unwrap();
-        let journal = dir.join("journal.json");
-        let blocker = dir.join("blocker");
-        let mut tx = Transaction::new(journal.clone());
-        tx.apply(Step::new(
-            Cmd::new("mkdir", &[blocker.to_str().unwrap()]),
-            Cmd::new("rmdir", &[blocker.to_str().unwrap()]),
-        ))
-        .unwrap();
-        fs::write(blocker.join("busy"), b"x").unwrap();
-        let undo = Cmd::new("rmdir", &[blocker.to_str().unwrap()]);
-        assert!(tx.remove(&undo).is_err());
-        assert!(journal.exists());
-        fs::remove_file(blocker.join("busy")).unwrap();
-        tx.remove(&undo).unwrap();
-        assert!(!blocker.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

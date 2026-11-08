@@ -127,7 +127,8 @@ def acceptance():
     ip("link", "set", "lo", "up")
     run("sysctl", "-w", "net.ipv4.ip_forward=1", "net.ipv6.conf.all.forwarding=1")
     # A veth merely named br-lan misses br_netfilter's early L3 pass. B31
-    # enables both bridge hooks: TPROXY loses its socket before actual L3 input.
+    # enables both bridge hooks: TPROXY loses its socket before actual L3 input,
+    # so the core's start sets both to 0 and its rollback restores them.
     bridge_hooks = [Path("/proc/sys/net/bridge/bridge-nf-call-" + family) for family in ["iptables", "ip6tables"]]
     assert all(path.read_text().strip() == "1" for path in bridge_hooks)
     for address, iface in [("192.168.0.1/24", "br-lan"), ("10.9.0.2/24", "rmnet_data0")]:
@@ -171,19 +172,15 @@ def acceptance():
             seen = ns("lan", "python3", "-c", CLIENT, kind, "2001:db8:3::1").stdout.strip()
             assert seen == "2001:db8:2::123", ("new local GUA was intercepted", kind, seen)
         ip("-6", "addr", "del", "2001:db8:3::1/128", "dev", "br-lan")
-        # The watchdog rebuilds interception by restarting the core. A fixed
-        # sleep can inspect an empty/in-progress nft chain on a loaded VM.
+        # Local addresses are matched live (nft `fib daddr type local`), so
+        # nothing is rebuilt; require real LAN TCP replies on both families.
         deadline = time.monotonic() + 25
         while True:
-            rules = run("ip6tables", "-t", "mangle", "-S", "U60_MH", check=False)
-            if rules.returncode == 0 and "2001:db8:3::1" not in rules.stdout:
-                # The chain can also be empty during rollback. Require real
-                # LAN TCP replies on both families, not just an absent rule.
-                replies = [ns("lan", "python3", "-c", CLIENT, "1", destination, check=False)
-                           for destination in [V4, V6]]
-                if all(r.returncode == 0 and r.stdout.strip() == source for r, source in
-                       zip(replies, ["10.9.0.2", "2001:db8:9::2"])):
-                    break
+            replies = [ns("lan", "python3", "-c", CLIENT, "1", destination, check=False)
+                       for destination in [V4, V6]]
+            if all(r.returncode == 0 and r.stdout.strip() == source for r, source in
+                   zip(replies, ["10.9.0.2", "2001:db8:9::2"])):
+                break
             if test.poll() is not None or time.monotonic() >= deadline:
                 raise AssertionError("local IPv6 bypass did not converge after address removal")
             time.sleep(0.2)
@@ -251,10 +248,10 @@ def acceptance():
     assert "rmnet_data0" in ip("-4", "route", "get", V4)
     assert "rmnet_data0" in ip("-6", "route", "get", V6)
     assert all(path.read_text().strip() == "1" for path in bridge_hooks)
-    assert not any(i["ifname"] == "u60mh0" for i in json.loads(ip("-j", "link")))
+    assert "u60_mihomo" not in run("nft", "list", "tables").stdout
     for family in ["-4", "-6"]:
-        assert "60630" not in ip(family, "rule", "show")
-        assert "60630" not in ip(family, "route", "show", "table", "all")
+        assert "18620:" not in ip(family, "rule", "show")
+        assert "60625" not in ip(family, "route", "show", "table", "all")
     print("PASS real bridge, managed core lifecycle, dual-stack TCP/UDP, Wi-Fi NAT, fallback and clean rollback", flush=True)
 
 

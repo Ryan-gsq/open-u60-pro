@@ -29,20 +29,6 @@ pub(super) fn web_bypass(tool: &str) -> Step {
     )
 }
 
-pub(super) fn reconcile_web() -> Result<(), String> {
-    for tool in ["iptables", "ip6tables"] {
-        let rule = web_bypass(tool);
-        let mut check = rule.undo;
-        check.args[4] = "-C".into();
-        if check.run().is_err() {
-            // The matching undo is already journaled before relay activation.
-            // Vendor WAN events can replace redirect_chain while STA stays up.
-            rule.apply.run()?;
-        }
-    }
-    Ok(())
-}
-
 fn plan_with(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Option<Step>, String> {
     match current(run)?.as_str() {
         "0" => Ok(None),

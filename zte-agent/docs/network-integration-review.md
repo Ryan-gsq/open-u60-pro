@@ -509,7 +509,7 @@ flow has fixture tests; unrestricted real GitHub downloads remain environment-de
 
 | Severity | Finding | Resolution/evidence |
 | --- | --- | --- |
-| P1 | Actual B31 bridge-netfilter loses the early TPROXY socket; rule hits alone falsely suggested working interception. | Replace TPROXY with owned gVisor TUN routing. Actual Linux bridge, both bridge hooks on, default-DROP firewall, seven uplink stages and fragmented UDP pass. B31 isolated and physical proxy paths also pass. |
+| P1 | Actual B31 bridge-netfilter loses the early TPROXY socket; rule hits alone falsely suggested working interception. | Replace TPROXY with owned gVisor TUN routing (superseded 2026-11-08: TPROXY with bridge hooks off while the core runs). Actual Linux bridge, both bridge hooks on, default-DROP firewall, seven uplink stages and fragmented UDP pass. B31 isolated and physical proxy paths also pass. |
 | P2 | A one-time local address snapshot misses vendor renumbering. | Active core watcher refreshes local exclusions, excluding its own TUN. Add/remove local GUA TCP/UDP regression passes; restart preserves selections/mode. |
 | P2 | DNS URL `#interface` fragments can bypass the managed uplink. | Validate decoded final bare fragment against known proxy/group names; preserve parameter-only suffixes and reject unknown interface bindings. |
 | P2 | First valid subscription save times out downloading absent rule databases. | Prepare required official databases with bounded downloads/checksums before validation; preserve the old YAML on failure and report dependency errors. |

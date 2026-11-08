@@ -83,7 +83,7 @@ first-match ordering (append after MATCH will normally never be reached).
 The basic merge behavior follows Clash Verge Rev's merge implementation, but
 this is not full desktop parity: the U60 managed network fields win last.
 
-U60 enforces controller/authentication, ports, TUN, DNS listen/redir-host and
+U60 enforces controller/authentication, ports, TPROXY, DNS listen/redir-host and
 IPv6 after extensions. This intentionally differs from desktop fake-IP settings.
 PROCESS-NAME cannot identify programs on hotspot clients; use domain/IP rules.
 Local 127.0.0.1 hosts entries refer to the resolving client, not a shared Mac.
@@ -183,39 +183,41 @@ database or subscription is embedded in the Rust binary.
 
 ### Interception scope
 
-- LAN bridge `br-lan` only, TCP/UDP and IPv4/IPv6 through an owned `u60mh0`
-  Mihomo TUN, MTU 1500. The B31 bridge-netfilter path loses the early
-  TPROXY socket association; a veth only named `br-lan` missed this failure.
-  TUN avoids changing global bridge filters or tracking physical bridge ports.
-  The TUN stack is `mixed`: kernel TCP, gVisor UDP (gVisor handles fragmented
-  UDP). The kernel TCP stack answers clients from the TUN subnet; an owned rule
-  at priority `18629` sends `198.18.0.0/30` and `fdfe:dcba:9876::/126` to
-  `main`, ahead of Relay's catch-all table, which otherwise sent those replies
-  out over Wi-Fi. The core injects each intercepted TCP connection on the TUN
-  to its own address, so `U60_MH_IN` accepts exactly TCP from `u60mh0` to
-  `198.18.0.1`/`fdfe:dcba:9876::1` before rejecting all other TUN input and
-  anything else sent to those addresses (without it every TCP connection was
-  rejected). Measured 2026-10-27 through a 5 GHz Relay, flows routed DIRECT,
-  the Mac's own proxy bypassed: gVisor for TCP 66-68 Mbit/s, `mixed` 128-139,
-  no Mihomo 213-246. CPU was not saturated with gVisor; with `mixed` most of
-  the remaining cost is system time copying through the core. Deployed as
-  agent `3d3b91a3` (no manual rules): DIRECT TCP, proxied HTTPS, UDP DNS
-  through the core and AAAA answers checked; 119-131 Mbit/s with the same test.
-  Switching the stack on a running core (`PATCH /configs`) deleted the TUN and
-  left it disabled; the stack only changes through a clean core start.
-- Dedicated fwmark `0x600/0xff00`, policy-route table `60630`, priority
-  `18630`; owned chains start `U60_MH`. Existing tables/chains/priorities are
-  checked before use. Main default routes are not replaced.
-- Core auto-route/auto-redirect/interface detection are disabled. The pinned
-  core still creates an IPv6 TUN default and `oif u60mh0` rule in table 60630;
-  the exact rule is journaled before spawn and removed even after SIGKILL.
-  Rust installs the IPv4 TUN route and marked rules. Only marked LAN-to-TUN and
-  established/related TUN-to-LAN forwarding are allowed; private TUN addresses
-  and unexpected TUN input/forwarding are rejected.
+- LAN bridge `br-lan` only, TCP/UDP and IPv4/IPv6, by TPROXY to the core's
+  `tproxy-port` 17894 (2026-11-08; it replaced the owned `u60mh0` TUN, which
+  ran 125-132 Mbit/s single flow at about 90% core CPU against 190-238 at
+  31-44% now). The rules live in the agent's own nftables tables `ip
+  u60_mihomo` and `ip6 u60_mihomo` (ZTE rewrites only iptables-legacy): a
+  prerouting chain at `mangle - 1` returns non-`br-lan` input, DNS, local
+  destinations (`fib daddr type local`, so router addresses need no per-address
+  exemption), private/multicast ranges and, with China IP direct, the IPv4
+  `china` set; it then marks established transparent sockets and TPROXYs the
+  rest with mark `0x700/0xff00`. Rule pref `18620` sends that mark to table
+  `60625` (`local default dev lo`, both families). A `dns` chain at `dstnat - 1`
+  redirects LAN TCP/UDP 53 to 1053, and an `input` chain drops 1053/17894 from
+  anything but `br-lan`/`lo`. The kernel has no `NFT_FIB_INET`, so the tables
+  are per family, not `inet`.
+- TPROXY needs `bridge-nf-call-iptables=0` and `bridge-nf-call-ip6tables=0`:
+  with the bridge-netfilter path on, B31 loses the early socket association
+  (rule counters rose while TCP stalled and UDP got no answer; a veth only named
+  `br-lan` missed this). While the core runs these are 0 and restored to their
+  old values on stop; LAN-to-LAN filtering such as guest isolation pauses
+  meanwhile. `tcp_pacing_ss_ratio`/`tcp_pacing_ca_ratio` are 1000 while it runs
+  (200/120 restored): qcacld leaves TSQ at about 1 ms of data, which held one
+  core-to-LAN TCP connection at about 60-70 Mbit/s. Both are `@u60-sysctl`
+  steps in the start transaction; ZTE resets brnf after relay connects and on
+  `fw3 reload`, and `net_guard` sets it back. See
+  `docs/research/2026-11-08-mihomo-tproxy-single-flow.md`.
+- Port 17894 (17893 is the private download proxy), table, priority and the
+  absence of both nft tables are checked before use; a taken port fails the
+  start instead of failing silently in the core. Main default routes are not
+  replaced. The start is verified with `ip route get ... mark 0x700` (must be
+  `local`) in both families.
+- Core TUN, auto-route/auto-redirect and interface detection are disabled.
 - Core validation/start skips its heuristic "existing global IPv6 address"
   check. B31 can have only link-local addresses with cellular off and no Relay;
-  the private dual-stack TUN must still start in that state. No WAN route or
-  modem switch is created to make the check pass.
+  the core must still listen on IPv6 in that state. No WAN route or modem switch
+  is created to make the check pass.
 - LAN DNS TCP/UDP 53 redirects to port 1053; managed DNS uses `redir-host`,
   retaining submitted upstream nameservers/policies. The current HTTPS management
   name (`u60.home.arpa` by default) is forced to the actual `br-lan` IPv4 address
@@ -226,10 +228,10 @@ database or subscription is embedded in the Rust binary.
   own applications do not automatically use the LAN transparent proxy.
 - UDP and IPv6 destination reachability still require capable nodes/services.
   Dual-stack interception is an implementation target, not a tested no-leak
-  guarantee. Unsupported TUN/IPv6 NAT fails startup and triggers rollback.
+  guarantee. Unsupported TPROXY/nftables fails startup and triggers rollback.
 - If the core exits, the watchdog removes interception. This is fail-open/direct,
-  not an anonymity kill switch. Firmware firewall reloads are not continuously
-  repaired by this first integration; inspect actual routes after such changes.
+  not an anonymity kill switch. Firmware rewrites (firewall reloads, ZTE scripts,
+  sysctl resets) are repaired by `net_guard` (`relay-hw-offload.md`, section 5).
 
 Generated network plans journal every undo with one durable write before any
 effect. Supported contiguous firewall runs use `iptables-restore` or
@@ -269,18 +271,15 @@ RSS hard cap. Validation logs only its elapsed time, background flag and result.
 source/runtime YAML are private (`0600`, parent `0700`) and never rendered back.
 Only import configurations from sources you trust: nodes/providers can of
 course cause outbound requests and choose proxy destinations.
-The subscription's TUN object is replaced by the managed one. Node/provider
+The subscription's TUN object is replaced by a disabled one. Node/provider
 interface and mark overrides are removed; DNS URL fragments may select declared
-proxies/groups but not an arbitrary interface. Local-address exclusions refresh
-on the existing active watchdog, in place: only the exact-address firewall
-exemptions are added or removed (each with its own journal entry), so an
-address change alone (Tailscale, LAN or another non-egress interface) does not
-restart the core or drop connections. Relay IPv4 and IPv6 also update their
-local DNS exemptions in place. Its own
-TUN addresses are excluded from change detection. Exact-address exclusions are
-audited in chain snapshots at most every 15 seconds even when addresses are
-unchanged; a missing chain remains a reported recovery problem, not permission
-to flush or take over another writer's rules. The relay announces changes of
+proxies/groups but not an arbitrary interface. Router addresses are matched live
+by `fib daddr type local`, so an address change alone (Tailscale, LAN or another
+non-egress interface) does not restart the core or drop connections; the relay's
+DNS tables match them the same way. The interception is
+re-checked by `net_guard` (after a ZTE script or firmware event, else once a
+minute); a missing piece is re-applied as journaled, never by flushing or taking
+over another writer's rules. The relay announces changes of
 its own path, and such an uplink change restarts the core. For any other egress
 (cellular) the watchdog compares the effective egress with the core's reference
 egress whenever addresses change and at each 15 s audit, and restarts only when
@@ -431,10 +430,16 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
 - Nonlocal LAN DNS is forwarded to the lease's upstream resolver before vendor
   DNS interception. DNS addressed to the router/own LAN/tailnet/link-local stays
   local, preserving dnsmasq's management-name answers. The router's ordinary
-  TCP/UDP DNS queries also use the hotel resolver, with narrow resolver-only
-  masquerading when needed. When Mihomo is on its earlier LAN DNS rule takes
-  precedence, irrespective of enable order. Invalid or conflicting DHCP DNS
-  addresses are rejected before network changes.
+  TCP/UDP DNS queries also use the hotel resolver; the relay's `-o u60sta0`
+  MASQUERADE covers a socket still bound to a SIM source. The rules live in
+  the agent's nftables table `ip u60_relay` (IPv6: `ip6 u60_relay`,
+  `wifi_relay/dns_nft.rs`): a LAN chain at prerouting `dstnat - 1` and a router
+  chain at output `-101` (the output hook takes no `dstnat` keyword), both just
+  ahead of legacy NAT. `fib daddr type local` matches the router's own
+  addresses live, so no per-address exemption is kept or audited. Mihomo's
+  redirect sits at `dstnat - 2` and takes precedence while it runs,
+  irrespective of enable order. Invalid or conflicting DHCP DNS addresses are
+  rejected before network changes.
 - B31's offline DNS/HTTP portal follows its cellular-only WAN status. While
   relay is connected, Rust temporarily sets `zwrt_redirect.redirect.switch=0`
   without committing UCI and restarts dnsmasq once (SIGHUP does not reload this
@@ -468,8 +473,8 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
 - IPv6 mode adds guarded NAT66 through `u60sta0`, including the LAN's existing
   IPv6 prefixes so clients retaining a cellular address do not bypass NAT or
   lose the selected Wi-Fi exit. Router/core connections also use Wi-Fi and
-  masquerade an old selected source if needed. Mihomo's earlier `60630` marked
-  TUN route is retained, so LAN TCP/UDP interception still wins.
+  masquerade an old selected source if needed. Mihomo's marked rule (pref
+  `18620`) precedes Relay's table, so LAN TCP/UDP interception still wins.
   LAN address/prefix changes are reconciled even when the upstream lease is
   unchanged. Owned br-lan routes retain previously observed client prefixes
   only for their observed valid lifetime, capped at two hours; they never
@@ -731,7 +736,7 @@ never URLs. Zashboard's bridge uses the pass cookie instead of a bearer token.
 
 These counts, sizes and browser/device results describe the 2026-10-26 checkout,
 not the current tree. The actual-core acceptance at that point used all-gVisor
-TUN; the current `mixed` stack and its later measurements are described under
+TUN; the current TPROXY interception and its measurements are described under
 [Interception scope](#interception-scope). Rerun current artifacts for a new
 acceptance claim; source changes alone do not extend these results.
 
