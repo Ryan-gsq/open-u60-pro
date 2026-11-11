@@ -56,6 +56,7 @@ mod tls;
 mod ttl;
 mod ubus;
 mod usb;
+mod usb_net;
 // Retired renderer fixtures; production serves only the responsive console.
 #[cfg(test)]
 mod web;
@@ -156,6 +157,12 @@ fn main() {
 
     // Q1: a separate process restarts this agent if it dies unexpectedly.
     guard::spawn();
+
+    // macOS has no RNDIS driver: while ZTE's ADB composition is in place,
+    // offer CDC ECM as USB configuration 2 (owner decision 66). Early, so a
+    // USB left down by a ZTE rebuild while the agent was stopped comes back
+    // first.
+    usb_net::start();
 
     if let Err(error) = network_clock::restore_floor() {
         eprintln!("[clock] {error}");

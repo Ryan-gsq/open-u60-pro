@@ -205,7 +205,7 @@
 
 **仍待设备验证**：中继与 Mihomo 都关闭时的准入探针；D3 的启动错误、3 次短期退出、车主取消、撤销失败与分项计时；OTA 试运行中的 Q1 与同 boot 旧槽执行本版日志；IPA 矩阵其余各项（首次安装需重启、同 boot 再装、移除、车主限制出现/解除、指纹不符、main 路由失败、配置写入属主/SELinux/下次开机加载）与 D11 的 ≥220 Mbit/s 硬件下载；v4 中继控制器的失败路径（有效会话上扫描、换网前校验失败、错密码、装路由后失败、重复断开、12 s 内关联恢复与超时、清理失败、厂商异步 Wi-Fi reload、两个 Slow 请求期间取消、租约 DNS 变化）；v5 的首租/单播续租/广播重绑定全周期、错误 ICMPv6、IPv6 租约过期与重装期间的蜂窝防护、合法 LAN/本地/组播路径、脚本与自身事件重叠、M13；v2 的规则反例（前置 `DST-PORT,443`、来源条件、组合规则、>64 段、两次变化相隔 <200 ms）、反方向切到 DIRECT 的 UDP、`NFT_BREAK`、每日刷新规则集时的吞吐与 CPU；v3 的 204 但 provider 为空退到 `COMPATIBLE`、客户端超时而核心已 apply；能转发 UDP 的节点上的代理 UDP/QUIC；所有蜂窝场景。
 
-**本次留在 B31 上的备份**（`/data/zte-agent-backup/`，待车主决定删除）：`pre-v6-agent/zte-agent.orig`（部署前的 agent，sha256 `106caee6…`，回退测试用）；`v6-saved-wifi/saved-wifi.json.orig`（迁移测试改 `width_mode` 前）；`v6-profiles/profiles.json.orig`、`selected.json.orig`（扩展覆盖测试前；`profiles.json` 已按它写回）。旧的 `fw-reload-test/`、`ipacm/`、`zwrt_router/` 保持不变。测试结束时 B31 处于正常服务：中继 W_Game、IPv6 与 NAT66 开、硬件路径、省电关，Mihomo 规则模式运行、选组与 `cn-direct` 为测试前的值。
+**本次留在 B31 上的备份**（`/data/zte-agent-backup/`；2026-11-11 已按车主要求连同 `fw-reload-test/`、`ipacm/`、`zwrt_router/` 全部删除）：`pre-v6-agent/zte-agent.orig`（部署前的 agent，sha256 `106caee6…`，回退测试用）；`v6-saved-wifi/saved-wifi.json.orig`（迁移测试改 `width_mode` 前）；`v6-profiles/profiles.json.orig`、`selected.json.orig`（扩展覆盖测试前；`profiles.json` 已按它写回）。测试结束时 B31 处于正常服务：中继 W_Game、IPv6 与 NAT66 开、硬件路径、省电关，Mihomo 规则模式运行、选组与 `cn-direct` 为测试前的值。
 
 ## 设备验收后的修复（2026-11-10）
 

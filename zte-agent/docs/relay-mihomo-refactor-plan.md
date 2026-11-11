@@ -20,7 +20,7 @@
 | 12 | v1.19.33 源码确认热重载会暂停接入、更新 DNS 并保留可用映射；204 不能证明 provider、实际选组或监听正常。旧 UDP、hy2、长时间内存及重载耗时须实测。 |
 | 13 | 核心按 interval 更新 provider 时即便内容相同也可改 mtime。测试订阅有 11 个每日更新的 rule-provider；相同内容不能引发重编、换表或重置。 |
 
-reload 前规则/sysctl 快照在设备 `/data/zte-agent-backup/fw-reload-test/`；IPACM 和 zwrt_router 的既有备份按[项目约定](../../CLAUDE.md)保留。更多原理与实测见[硬件转发](relay-hw-offload.md)、[网络扩展](network-extensions.md)和[TPROXY 单流测量](../../docs/research/2026-11-08-mihomo-tproxy-single-flow.md)。
+reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-test/`；它和 IPACM、zwrt_router 的旧备份已于 2026-11-11 按车主要求删除（[项目约定](../../CLAUDE.md)）。更多原理与实测见[硬件转发](relay-hw-offload.md)、[网络扩展](network-extensions.md)和[TPROXY 单流测量](../../docs/research/2026-11-08-mihomo-tproxy-single-flow.md)。
 
 ## 2. 发布顺序
 

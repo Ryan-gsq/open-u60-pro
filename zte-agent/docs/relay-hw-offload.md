@@ -83,10 +83,11 @@ br-lan 上的 HTB + fq_codel）都压在一个 A55 核上。Speedtest.cn 的云�
 - 卸载：删掉条目和 `installed` 记录，**保留 `.orig` 备份**。当前的中继连接立刻改走 CPU
   （见第 3 节末），下次重启后 IPACM 也会忘掉这个接口。OTA 切换 A/B 槽位后，overlay 的上层目录不同，
   需要重新安装。
-- 手工备份：`/data/zte-agent-backup/ipacm/` 里有原厂文件 `IPACM_cfg.xml.orig`
-  （`a0f361c5…`）、安装后的 `IPACM_cfg.xml`（`4b90dd39…`），以及 `restore-stock.sh`；
-  开发机上的副本放在仓库旁边的 `../backups/ipacm/`。agent 不在时，可以用这个脚本恢复
-  原厂文件，然后重启整机。不要只重启 ipacm。
+- 手工备份：原厂文件 `IPACM_cfg.xml.orig`（`a0f361c5…`）、安装后的 `IPACM_cfg.xml`
+  （`4b90dd39…`）和 `restore-stock.sh` 现在只在开发机上，放在仓库旁边的 `../backups/ipacm/`。
+  设备上的 `/data/zte-agent-backup/ipacm/` 已于 2026-11-11 按车主要求删除；agent 状态目录里的
+  `/data/zte-agent-relay/ipacm/IPACM_cfg.xml.orig` 与原厂文件相同。agent 不在时，把这个目录推到
+  设备上运行脚本恢复原厂文件，然后重启整机。不要只重启 ipacm。
 - **写入方式（H5，v1 记录风险，v4 修复）**：原先是 `O_TRUNC` 就地改写，截断与写完之间 agent
   被杀或掉电会留下半份或空的唯一生效配置。现在（`offload::rewrite`）先在同一文件系统写完整副本
   （父目录 `/etc/data` 与 `/etc/data/ipa` 同属一个文件系统时放在父目录，IPACM 监视的目录只看到一次
