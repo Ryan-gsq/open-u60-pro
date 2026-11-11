@@ -502,10 +502,6 @@ input:checked + .sw::after { transform: translateX(20px); }
 .relay-panel>.relay-btn{width:100%;margin:1rem 0;}
 .relay-caution,.relay-private{display:flex;gap:.5rem;color:var(--muted);font-size:.75rem;}
 .relay-connect{display:grid;grid-template-columns:minmax(0,1fr);gap:.8rem;margin-top:1rem;}
-.relay-bandwidth{display:grid;gap:.4rem;min-width:0;}
-.relay-bandwidth label{margin:0;font-size:.85rem;}
-.relay-bandwidth select{width:100%;max-width:100%;min-width:0;min-height:48px;padding:.6rem .75rem;border:1px solid var(--field-border);border-radius:12px;text-align:left;background:var(--card);}
-.relay-bandwidth small{color:var(--muted);font-size:.75rem;}
 .relay-networks{min-width:0;display:grid;gap:.5rem;border:0;margin:0;padding:0;max-height:22rem;overflow:auto;}
 .relay-network{display:flex;align-items:center;gap:.65rem;padding:.8rem;border:1px solid var(--sep);border-radius:13px;cursor:pointer;}
 .relay-network:has(:checked){border-color:var(--accent);background:var(--tint-blue);}

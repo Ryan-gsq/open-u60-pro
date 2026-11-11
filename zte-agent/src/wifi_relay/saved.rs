@@ -9,37 +9,15 @@ use std::path::Path;
 
 use super::{net, Network, JOURNAL};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum Tuning {
-    #[default]
-    Off,
-    Auto,
-}
-
-impl Tuning {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Auto => "auto",
-        }
-    }
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "off" => Ok(Self::Off),
-            "auto" => Ok(Self::Auto),
-            _ => Err("Choose negotiated bandwidth or automatic tuning".into()),
-        }
-    }
-}
-
+/// A remembered network. Older stores also hold `width_mode` (the retired
+/// width tuning): it is ignored, so a saved `auto` reads as keeping the
+/// negotiated width, and dropped at the next write; the previous agent reads
+/// a store without it as `off`.
 #[derive(Serialize, Deserialize)]
 struct Saved {
     ssid: String,
     security: String,
     password: String,
-    #[serde(default)]
-    width_mode: Tuning,
 }
 
 pub(super) fn key(ssid: &str, security: &str) -> String {
@@ -70,60 +48,20 @@ pub(super) fn password(network: &Network) -> Result<Option<String>, String> {
         .map(|n| n.password))
 }
 
-pub(super) fn tuning(network: &Network) -> Result<Tuning, String> {
-    Ok(load(Path::new(JOURNAL))?
-        .into_iter()
-        .find(|n| n.ssid == network.ssid && n.security == network.security)
-        .map_or(Tuning::Off, |n| n.width_mode))
+/// Saves the password of a successful connection the owner asked to
+/// remember. An unchecked Remember never erases a previously saved credential.
+pub(super) fn remember(network: &Network, password: Option<&str>) -> Result<(), String> {
+    remember_at(Path::new(JOURNAL), network, password)
 }
 
-/// Persist the per-network choice even when the owner does not save a password.
-/// An unchecked Remember never erases a previously saved credential.
-pub(super) fn remember(
-    network: &Network,
-    password: Option<&str>,
-    width_mode: Tuning,
-) -> Result<(), String> {
-    remember_at(Path::new(JOURNAL), network, password, width_mode)
-}
-
-fn remember_at(
-    root: &Path,
-    network: &Network,
-    password: Option<&str>,
-    width_mode: Tuning,
-) -> Result<(), String> {
+fn remember_at(root: &Path, network: &Network, password: Option<&str>) -> Result<(), String> {
+    let Some(password) = password else { return Ok(()) };
     let mut saved = load(root)?;
-    let password = password
-        .map(str::to_owned)
-        .or_else(|| {
-            saved
-                .iter()
-                .find(|n| n.ssid == network.ssid && n.security == network.security)
-                .map(|n| n.password.clone())
-        })
-        .unwrap_or_default();
     saved.retain(|n| n.ssid != network.ssid || n.security != network.security);
     if saved.len() >= 32 {
-        return Err("At most 32 Wi-Fi network preferences can be saved".into());
+        return Err("At most 32 Wi-Fi networks can be saved".into());
     }
-    saved.push(Saved {
-        ssid: network.ssid.clone(),
-        security: network.security.into(),
-        password,
-        width_mode,
-    });
-    write(root, &saved)
-}
-
-pub(super) fn set_tuning(id: &str, width_mode: Tuning) -> Result<(), String> {
-    let root = Path::new(JOURNAL);
-    let mut saved = load(root)?;
-    let entry = saved
-        .iter_mut()
-        .find(|n| key(&n.ssid, &n.security) == id)
-        .ok_or("Saved network not found")?;
-    entry.width_mode = width_mode;
+    saved.push(Saved { ssid: network.ssid.clone(), security: network.security.into(), password: password.to_owned() });
     write(root, &saved)
 }
 
@@ -156,7 +94,7 @@ pub(super) fn annotate(status: &mut Value) {
 fn annotate_with(status: &mut Value, saved: &[Saved]) {
     status["saved_networks"] = json!(saved
         .iter()
-        .map(|n| json!({"id":key(&n.ssid,&n.security),"ssid":n.ssid,"security":n.security,"width_mode":n.width_mode,"remembered":!n.password.is_empty() || n.security == "open"}))
+        .map(|n| json!({"id":key(&n.ssid,&n.security),"ssid":n.ssid,"security":n.security,"remembered":!n.password.is_empty() || n.security == "open"}))
         .collect::<Vec<_>>());
     if let Some(networks) = status["networks"].as_array_mut() {
         for network in networks {
@@ -166,7 +104,6 @@ fn annotate_with(status: &mut Value, saved: &[Saved]) {
             });
             network["remembered"] =
                 json!(entry.is_some_and(|n| !n.password.is_empty() || n.security == "open"));
-            network["width_mode"] = json!(entry.map_or(Tuning::Off, |n| n.width_mode));
         }
     }
 }
@@ -174,50 +111,27 @@ fn annotate_with(status: &mut Value, saved: &[Saved]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// v6: a store with the retired `width_mode` (`auto` included) loads
+    /// with its passwords, reads as keeping the negotiated width, and loses
+    /// the field at the next write; an unchecked Remember stores nothing.
     #[test]
-    fn tuning_migrates_old_credentials_and_is_private_per_network() {
-        let old: Vec<Saved> = serde_json::from_str(
-            r#"[{"ssid":"Home","security":"wpa2","password":"private-password"}]"#,
-        )
-        .unwrap();
-        assert_eq!(old[0].width_mode, Tuning::Off);
-        let root = std::env::temp_dir().join(format!("u60-tuning-{}", std::process::id()));
-        write(&root, &old).unwrap();
-        let network = Network {
-            id: "scan".into(),
-            ssid: "Home".into(),
-            security: "wpa2",
-            bssid: "02:00:00:00:00:01".into(),
-            frequency: 5260,
-            supported: true,
-            signal: -40,
-        };
-        remember_at(&root, &network, None, Tuning::Auto).unwrap();
-        let other = Network {
-            ssid: "Other".into(),
-            ..network.clone()
-        };
-        remember_at(&root, &other, None, Tuning::Off).unwrap();
+    fn a_saved_width_choice_is_ignored_and_dropped_and_passwords_stay() {
+        let root = std::env::temp_dir().join(format!("u60-saved-v6-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("saved-wifi.json"), r#"[{"ssid":"Home","security":"wpa2","password":"private-password","width_mode":"auto"},{"ssid":"Cafe","security":"wpa2","password":"","width_mode":"off"}]"#).unwrap();
         let stored = load(&root).unwrap();
-        assert_eq!(
-            stored[0].password, "private-password",
-            "changing mode preserves saved credentials"
-        );
-        assert_eq!(stored[0].width_mode, Tuning::Auto);
-        assert!(
-            stored[1].password.is_empty(),
-            "preference alone must not opt into credential storage"
-        );
-        let mut status = json!({"networks":[{"ssid":"Home","security":"wpa2"},{"ssid":"Home","security":"open"},{"ssid":"Other","security":"wpa2"}]});
-        annotate_with(&mut status, &stored);
-        assert_eq!(status["networks"][0]["width_mode"], "auto");
-        assert_eq!(status["networks"][1]["width_mode"], "off");
-        assert_eq!(status["networks"][2]["remembered"], false);
-        assert!(!status.to_string().contains("private-password"));
-        assert!(
-            Tuning::parse("observe").is_err(),
-            "web choice has only two stable values"
-        );
+        assert_eq!((stored[0].password.as_str(), stored.len()), ("private-password", 2));
+        let network = Network { id: "scan".into(), ssid: "Other".into(), security: "wpa2", bssid: "02:00:00:00:00:01".into(), frequency: 5260, supported: true, signal: -40 };
+        remember_at(&root, &network, None).unwrap();
+        assert_eq!(load(&root).unwrap().len(), 2, "an unchecked Remember stores nothing");
+        remember_at(&root, &network, Some("other-password")).unwrap();
+        let text = std::fs::read_to_string(root.join("saved-wifi.json")).unwrap();
+        assert!(!text.contains("width_mode"), "dropped at the next write");
+        assert!(text.contains("private-password") && text.contains("other-password"));
+        let mut status = json!({"networks":[{"ssid":"Home","security":"wpa2"},{"ssid":"Cafe","security":"wpa2"}]});
+        annotate_with(&mut status, &load(&root).unwrap());
+        assert_eq!((status["networks"][0]["remembered"].as_bool(), status["networks"][1]["remembered"].as_bool()), (Some(true), Some(false)));
+        assert!(!status.to_string().contains("width_mode") && !status.to_string().contains("private-password"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -227,7 +141,6 @@ mod tests {
             ssid: "Hotel".into(),
             security: "wpa2".into(),
             password: "private-password".into(),
-            width_mode: Tuning::Auto,
         }];
         let mut status = json!({"networks":[{"ssid":"Hotel","security":"wpa2"},{"ssid":"Hotel","security":"open"}]});
         annotate_with(&mut status, &saved);
@@ -244,7 +157,6 @@ mod tests {
             ssid: "Test".into(),
             security: "wpa2".into(),
             password: "qa-password".into(),
-            width_mode: Tuning::Off,
         }];
         write(&root, &saved).unwrap();
         assert_eq!(load(&root).unwrap()[0].password, "qa-password");

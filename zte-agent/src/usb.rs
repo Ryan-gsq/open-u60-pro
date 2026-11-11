@@ -12,8 +12,10 @@ pub fn usb_status(_state: &AppState) -> (u16, Value) {
 }
 
 pub fn usb_mode_set(state: &AppState, body: &[u8]) -> (u16, Value) {
-    let Ok(_network) = state.network_lock.try_lock() else { return (409, json!({"ok":false,"error":"A network operation is in progress; retry after it finishes"})); };
-    if state.wifi_relay.owns_network() { return (409, json!({"ok":false,"error":"Disconnect or recover Wi-Fi relay before changing USB mode"})); }
+    let _claim = match crate::netfx::admission::admit(&state.network_lock, crate::netfx::admission::VENDOR_WRITE, || state.wifi_relay.owns_network().then(|| "Disconnect or recover Wi-Fi relay before changing USB mode".to_owned())) {
+        Ok(claim) => claim,
+        Err(e) => return (409, json!({"ok":false,"error":e})),
+    };
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),

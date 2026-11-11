@@ -1,37 +1,52 @@
-//! China IPv4 ranges that bypass Mihomo in the kernel (owner choice, owner
-//! decision 63): such connections use the kernel NAT, so on the relay they
-//! can move to the IPA hardware path. Built from the core's own `GeoIP.dat`
-//! (geodata mode) into the `china` set of Mihomo's nft table. Connections
-//! whose domain rule would have picked a proxy but whose address is in China
-//! go direct too. IPv6 stays with the core (it cannot be offloaded).
+//! IPv4 ranges of `GEOIP` codes from the core's own `GeoIP.dat` (geodata
+//! mode), for the kernel's rule chain (`routing`). Only the requested codes
+//! are read; a code the file lacks is absent from the result.
 
 use std::{
+    collections::HashMap,
     fs,
     io::{BufReader, Read},
     net::Ipv4Addr,
+    os::unix::fs::MetadataExt,
     path::Path,
+    sync::{Arc, Mutex},
 };
 
-use sha2::{Digest, Sha256};
-
-pub(super) const FLAG: &str = "cn-direct";
 const SOURCE: &str = "GeoIP.dat";
-/// A real list has thousands of ranges; fewer means a wrong or empty file.
-const MIN_RANGES: usize = 1000;
 const MAX_ENTRY: u64 = 64 * 1024 * 1024;
 
-/// The ranges, with a digest that identifies the interception for conntrack
-/// resets.
-pub(super) fn prepare(root: &Path) -> Result<(String, Vec<String>), String> {
-    let file = fs::File::open(root.join(SOURCE))
-        .map_err(|_| "China IP direct needs GeoIP.dat (geodata-mode with a GEOIP rule)")?;
-    let ranges = china_v4(&mut BufReader::new(file))?;
-    if ranges.len() < MIN_RANGES {
-        return Err("GeoIP.dat has no usable China IPv4 ranges".into());
+/// Ranges per code (upper case) as nft elements; empty for a code with only
+/// IPv6 ranges.
+pub(super) type Lists = HashMap<String, Vec<String>>;
+
+/// The last read, kept while the file and the requested codes are the same:
+/// a mode or proxy-group change must not re-read 16 MB on the router.
+#[derive(Default)]
+pub(super) struct Cache(Mutex<Option<((u64, i64, u64), Vec<String>, Arc<Lists>)>>);
+
+impl Cache {
+    pub(super) fn get(&self, root: &Path, codes: &[String]) -> Result<Arc<Lists>, String> {
+        if codes.is_empty() {
+            return Ok(Arc::default());
+        }
+        let path = root.join(SOURCE);
+        let stamp = fs::metadata(&path).map(|m| (m.len(), m.mtime(), m.ino())).map_err(|_| "GeoIP.dat is not available")?;
+        let mut codes: Vec<String> = codes.iter().map(|c| c.to_ascii_uppercase()).collect();
+        codes.sort();
+        codes.dedup();
+        let mut cache = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, read, lists)) = cache.as_ref() {
+            if *at == stamp && *read == codes {
+                return Ok(Arc::clone(lists));
+            }
+        }
+        let file = fs::File::open(&path).map_err(|_| "Cannot read GeoIP.dat")?;
+        let found = geoip_v4(&mut BufReader::new(file), &codes)?;
+        let lists: Lists = found.into_iter().map(|(code, ranges)| (code, ranges.iter().map(|(ip, prefix)| format!("{ip}/{prefix}")).collect())).collect();
+        let lists = Arc::new(lists);
+        *cache = Some((stamp, codes, Arc::clone(&lists)));
+        Ok(lists)
     }
-    let ranges: Vec<String> = ranges.iter().map(|(ip, prefix)| format!("{ip}/{prefix}")).collect();
-    let digest = format!("cn:{:x}", Sha256::digest(ranges.join(",").as_bytes()))[..19].to_owned();
-    Ok((digest, ranges))
 }
 
 fn varint(r: &mut impl Read) -> Result<Option<u64>, String> {
@@ -81,24 +96,23 @@ fn field(r: &mut impl Read) -> Result<Raw, String> {
 
 /// `GeoIPList { repeated GeoIP entry = 1 }`, `GeoIP { string country_code
 /// = 1; repeated CIDR cidr = 2 }`, `CIDR { bytes ip = 1; uint32 prefix = 2 }`
-/// (v2ray / meta-rules-dat). IPv4 ranges of the `CN` entry only.
-fn china_v4(r: &mut impl Read) -> Result<Vec<(Ipv4Addr, u8)>, String> {
-    let mut ranges = Vec::new();
+/// (v2ray / meta-rules-dat). IPv4 ranges of the `wanted` codes (upper case).
+fn geoip_v4(r: &mut impl Read, wanted: &[String]) -> Result<HashMap<String, Vec<(Ipv4Addr, u8)>>, String> {
+    let mut lists: HashMap<String, Vec<(Ipv4Addr, u8)>> = HashMap::new();
     while let Some((number, payload)) = field(r)? {
         let (1, Some(entry)) = (number, payload) else { continue };
         let mut entry = entry.as_slice();
-        let mut cn = false;
+        let mut code = None;
         let mut cidrs = Vec::new();
         while let Some((number, payload)) = field(&mut entry)? {
             match (number, payload) {
-                (1, Some(code)) => cn = code.eq_ignore_ascii_case(b"cn"),
+                (1, Some(name)) => code = Some(String::from_utf8_lossy(&name).to_ascii_uppercase()),
                 (2, Some(cidr)) => cidrs.push(cidr),
                 _ => {}
             }
         }
-        if !cn {
-            continue;
-        }
+        let Some(code) = code.filter(|c| wanted.contains(c)) else { continue };
+        let ranges = lists.entry(code).or_default();
         for cidr in cidrs {
             let (mut ip, mut prefix) = (None, 0u64);
             let mut cidr = cidr.as_slice();
@@ -115,9 +129,11 @@ fn china_v4(r: &mut impl Read) -> Result<Vec<(Ipv4Addr, u8)>, String> {
             }
         }
     }
-    ranges.sort_unstable();
-    ranges.dedup();
-    Ok(ranges)
+    for ranges in lists.values_mut() {
+        ranges.sort_unstable();
+        ranges.dedup();
+    }
+    Ok(lists)
 }
 
 enum Field {
@@ -165,12 +181,31 @@ mod tests {
     }
 
     #[test]
-    fn only_the_china_entrys_ipv4_ranges_are_read_and_normalized() {
+    fn only_the_wanted_entries_ipv4_ranges_are_read_and_normalized() {
         let cn = message(&[(1, b"CN"), (2, &cidr(&[1, 0, 1, 7], 24)), (2, &cidr(&[0x24, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 32)), (2, &cidr(&[36, 0, 0, 0], 10))]);
-        let us = message(&[(1, b"US"), (2, &cidr(&[8, 8, 8, 0], 24))]);
-        let list = [message(&[(1, &us)]), message(&[(1, &cn)])].concat();
-        let ranges = china_v4(&mut list.as_slice()).unwrap();
-        assert_eq!(ranges, [("1.0.1.0".parse().unwrap(), 24), ("36.0.0.0".parse().unwrap(), 10)]);
-        assert!(china_v4(&mut &list[..list.len() - 1]).is_err(), "truncated input is an error");
+        let us = message(&[(1, b"us"), (2, &cidr(&[8, 8, 8, 0], 24))]);
+        let jp = message(&[(1, b"JP"), (2, &cidr(&[1, 1, 1, 0], 24))]);
+        let list = [message(&[(1, &us)]), message(&[(1, &cn)]), message(&[(1, &jp)])].concat();
+        let lists = geoip_v4(&mut list.as_slice(), &["CN".into(), "US".into()]).unwrap();
+        assert_eq!(lists["CN"], [("1.0.1.0".parse().unwrap(), 24), ("36.0.0.0".parse().unwrap(), 10)]);
+        assert_eq!(lists["US"], [("8.8.8.0".parse().unwrap(), 24)], "codes compare case-insensitively");
+        assert!(!lists.contains_key("JP"), "unrequested codes are skipped");
+        assert!(geoip_v4(&mut &list[..list.len() - 1], &["CN".into()]).is_err(), "truncated input is an error");
+    }
+
+    #[test]
+    fn a_code_without_ipv4_is_present_and_empty() {
+        let v6 = message(&[(1, b"V6ONLY"), (2, &cidr(&[0x24, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 32))]);
+        let list = message(&[(1, &v6)]);
+        let lists = geoip_v4(&mut list.as_slice(), &["V6ONLY".into(), "XX".into()]).unwrap();
+        assert_eq!(lists.get("V6ONLY"), Some(&Vec::new()), "never matches IPv4");
+        assert!(!lists.contains_key("XX"), "missing: its rules cannot be checked");
+    }
+
+    #[test]
+    fn no_codes_need_no_file() {
+        let lists = Cache::default().get(Path::new("/nonexistent"), &[]).unwrap();
+        assert!(lists.is_empty());
+        assert!(Cache::default().get(Path::new("/nonexistent"), &["CN".into()]).is_err());
     }
 }

@@ -2,6 +2,8 @@
 //! choice and delay tests. Only these fixed operations exist. The controller
 //! secret never leaves the router, URLs are built from validated segments, the
 //! delay target is a constant, and nothing here can reload or restart the core.
+//! Mode and group changes go through the Mihomo controller, which narrows
+//! what skips the core before the change and follows it after.
 
 use std::time::Duration;
 
@@ -79,6 +81,47 @@ fn call(
         .map(|m| m.chars().filter(|c| !c.is_control()).take(160).collect::<String>())
         .filter(|m| !m.is_empty());
     Err(detail.unwrap_or_else(|| format!("Mihomo refused the request (HTTP {status})")))
+}
+
+/// A routing write for the controller (`controller::Write`): the core's
+/// status and body as they are, for the console and the dashboard bridge.
+pub(crate) fn raw_call(base: &str, secret: &str, method: &str, segments: &[String], body: &Value, wait: Duration) -> Result<(u16, Vec<u8>), String> {
+    let mut url = reqwest::Url::parse(&format!("http://{base}/")).map_err(|_| "Invalid controller address")?;
+    url.path_segments_mut().map_err(|_| "Invalid controller address")?.clear().extend(segments);
+    let agent = ureq::Agent::config_builder().proxy(None).http_status_as_error(false).timeout_global(Some(wait)).build().new_agent();
+    let auth = format!("Bearer {secret}");
+    let sent = match method {
+        "PUT" => agent.put(url.as_str()).header("Authorization", &auth).send_json(body),
+        "PATCH" => agent.patch(url.as_str()).header("Authorization", &auth).send_json(body),
+        _ => return Err("Unsupported controller request".into()),
+    };
+    let mut response = sent.map_err(|_| "Mihomo did not answer".to_owned())?;
+    let status = response.status().as_u16();
+    let bytes = response.body_mut().with_config().limit(MAX_BODY).read_to_vec().unwrap_or_default();
+    Ok((status, bytes))
+}
+
+/// The core's error message from a refused write, bounded and printable.
+fn refused(status: u16, body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(|m| m.chars().filter(|c| !c.is_control()).take(160).collect::<String>()))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| format!("Mihomo refused the request (HTTP {status})"))
+}
+
+impl Mihomo {
+    /// A mode or group change through the controller (tightened first).
+    fn routed(&self, method: &'static str, segments: Vec<String>, body: Value) -> Result<(), Failure> {
+        if !self.running() {
+            return Err(off());
+        }
+        match self.routing_write(super::controller::Write { method, segments, body }) {
+            Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+            Ok((status, body)) => Err((503, refused(status, &body))),
+            Err(error) => Err((503, error)),
+        }
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -177,7 +220,8 @@ pub fn select(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Value) {
     finish((|| {
         let request = parse(body)?;
         let (group, name) = (name_field(&request, "group")?, name_field(&request, "name")?);
-        state.mihomo.controller("PUT", &["proxies", &group], &[], Some(&json!({"name": name})), Duration::from_secs(3))?;
+        // Ordered with every switch; what may skip the core follows it.
+        state.mihomo.routed("PUT", vec!["proxies".into(), group.clone()], json!({"name": name}))?;
         Ok(json!({"group": group, "now": name}))
     })())
 }
@@ -209,7 +253,7 @@ pub fn mode(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Value) {
             .as_str()
             .filter(|mode| MODES.contains(mode))
             .ok_or((400, "Choose rule, global or direct".to_owned()))?;
-        state.mihomo.controller("PATCH", &["configs"], &[], Some(&json!({"mode": mode})), Duration::from_secs(3))?;
+        state.mihomo.routed("PATCH", vec!["configs".into()], json!({"mode": mode}))?;
         Ok(json!({"mode": mode}))
     })())
 }

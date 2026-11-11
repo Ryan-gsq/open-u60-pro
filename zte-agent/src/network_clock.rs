@@ -22,14 +22,6 @@ impl WifiClock {
         self.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
-    /// 2026-10-28：只推进本次启动已通过网络校验的 UTC，不读取系统时间或磁盘下界。
-    /// 校时占用锁或锁已损坏时立即返回 None，不阻塞 watcher，也不发起网络请求。
-    pub(crate) fn verified_utc(&self) -> Option<u64> {
-        let last = self.last.try_lock().ok()?;
-        let (utc, at) = (*last)?;
-        utc.checked_add(at.elapsed().as_secs())
-    }
-
     pub(crate) fn sync_with(&self, fresh: bool, check: impl FnOnce(&mut Option<(u64, Instant)>) -> Result<(), String>) -> Result<(), String> {
         let mut last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if fresh {
@@ -198,69 +190,6 @@ mod tests {
         assert_eq!(clock.error(), None);
         assert!(clock.sync_with(false, |_| Err("Cannot set verified system UTC".into())).is_err());
         assert!(clock.last.lock().unwrap().is_none(), "Failures invalidate a previously verified cache too");
-    }
-
-    #[test]
-    fn verified_utc_is_none_without_this_boots_verified_result() {
-        let clock = WifiClock::new();
-        assert_eq!(clock.verified_utc(), None);
-        // 本地下界即使看似可信，也不能替代本次启动的网络校验。
-        assert_eq!(floor(Some(floor(None) + 100)), floor(None) + 100);
-        clock.sync_with(false, |_| Ok(())).unwrap();
-        assert_eq!(clock.verified_utc(), None);
-    }
-
-    #[test]
-    fn verified_utc_advances_only_from_the_verified_monotonic_anchor() {
-        let clock = WifiClock::new();
-        let utc = floor(None) + 100;
-        let at = Instant::now() - Duration::from_secs(120);
-        clock.sync_with(false, |last| {
-            *last = Some((utc, at));
-            Ok(())
-        }).unwrap();
-        let earliest = utc + at.elapsed().as_secs();
-        let verified = clock.verified_utc().unwrap();
-        let latest = utc + at.elapsed().as_secs();
-        assert!((earliest..=latest).contains(&verified));
-        assert!(verified >= utc + 120);
-        assert!(clock.verified_utc().unwrap() >= verified);
-    }
-
-    #[test]
-    fn verified_utc_does_not_wait_for_an_in_progress_check() {
-        let clock = WifiClock::new();
-        clock.sync_with(false, |last| {
-            *last = Some((floor(None), Instant::now()));
-            // 同线程持有校时锁；getter 若改用阻塞锁，本测试会卡住。
-            assert_eq!(clock.verified_utc(), None);
-            Ok(())
-        }).unwrap();
-        assert!(clock.verified_utc().is_some());
-    }
-
-    #[test]
-    fn verified_utc_is_invalidated_by_any_failed_check() {
-        for fresh in [false, true] {
-            let clock = WifiClock::new();
-            clock.sync_with(false, |last| {
-                *last = Some((floor(None), Instant::now()));
-                Ok(())
-            }).unwrap();
-            assert!(clock.verified_utc().is_some());
-            assert!(clock.sync_with(fresh, |_| Err("Clock verification failed".into())).is_err());
-            assert_eq!(clock.verified_utc(), None);
-        }
-    }
-
-    #[test]
-    fn verified_utc_does_not_wrap_on_overflow() {
-        let clock = WifiClock::new();
-        clock.sync_with(false, |last| {
-            *last = Some((u64::MAX, Instant::now() - Duration::from_secs(1)));
-            Ok(())
-        }).unwrap();
-        assert_eq!(clock.verified_utc(), None);
     }
 
     #[test]

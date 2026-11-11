@@ -50,6 +50,10 @@ impl Wireless {
 /// reload re-runs `zte_post_wifi.sh`, which spins forever when a radio is
 /// disabled but its SSID is not; `wifi_watchdog` sees the script's open.
 fn reload_wifi_async() {
+    use crate::netfx::admission::{occupy, release, VENDOR_WIFI_RELOAD};
+    // The reload goes on after this request answers: the relay waits for the
+    // hotspot to settle before it scans or connects (section 4.6).
+    occupy(VENDOR_WIFI_RELOAD, std::time::Duration::from_secs(120));
     match Command::new("ubus")
         .args(["call", "zwrt_wlan", "reload"])
         .stdin(Stdio::null())
@@ -63,12 +67,27 @@ fn reload_wifi_async() {
             // let the child linger as a zombie until the next reap.
             let spawned = try_spawn_named("wifi-reload", move || {
                 let _ = child.wait();
+                // Settled: the 5 GHz hotspot reads ENABLED twice, 2 s apart
+                // (else the 120 s bound ends the occupation).
+                let mut stable = 0;
+                for _ in 0..60 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    stable = if crate::wifi_relay::hotspot_enabled("wlan2") { stable + 1 } else { 0 };
+                    if stable == 2 {
+                        break;
+                    }
+                }
+                release(VENDOR_WIFI_RELOAD);
             });
             if let Err(e) = spawned {
                 eprintln!("[wifi] cannot spawn wifi-reload: {e}");
+                release(VENDOR_WIFI_RELOAD);
             }
         }
-        Err(e) => eprintln!("[wifi] reload spawn failed: {e}"),
+        Err(e) => {
+            eprintln!("[wifi] reload spawn failed: {e}");
+            release(VENDOR_WIFI_RELOAD);
+        }
     }
 }
 
@@ -320,8 +339,10 @@ pub fn wifi_status(_state: &AppState) -> (u16, Value) {
 // ---------------------------------------------------------------------------
 
 pub fn wifi_set(state: &AppState, body: &[u8]) -> (u16, Value) {
-    let Ok(_network) = state.network_lock.try_lock() else { return (409, json!({"ok":false,"error":"A network operation is in progress; retry after it finishes"})); };
-    if state.wifi_relay.owns_network() { return (409, json!({"ok":false,"error":"Disconnect or recover Wi-Fi relay before changing hotspot settings"})); }
+    let _claim = match crate::netfx::admission::admit(&state.network_lock, crate::netfx::admission::VENDOR_WRITE, || state.wifi_relay.owns_network().then(|| "Disconnect or recover Wi-Fi relay before changing hotspot settings".to_owned())) {
+        Ok(claim) => claim,
+        Err(e) => return (409, json!({"ok":false,"error":e})),
+    };
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
@@ -497,8 +518,10 @@ pub fn guest_status(_state: &AppState) -> (u16, Value) {
 // ---------------------------------------------------------------------------
 
 pub fn guest_set(state: &AppState, body: &[u8]) -> (u16, Value) {
-    let Ok(_network) = state.network_lock.try_lock() else { return (409, json!({"ok":false,"error":"A network operation is in progress; retry after it finishes"})); };
-    if state.wifi_relay.owns_network() { return (409, json!({"ok":false,"error":"Disconnect or recover Wi-Fi relay before changing Guest WiFi"})); }
+    let _claim = match crate::netfx::admission::admit(&state.network_lock, crate::netfx::admission::VENDOR_WRITE, || state.wifi_relay.owns_network().then(|| "Disconnect or recover Wi-Fi relay before changing Guest WiFi".to_owned())) {
+        Ok(claim) => claim,
+        Err(e) => return (409, json!({"ok":false,"error":e})),
+    };
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),

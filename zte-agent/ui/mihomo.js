@@ -135,8 +135,8 @@
     title.textContent = view.title;
     detail.textContent = view.detail;
     facts.replaceChildren(...M.facts(status).map(([label, value]) => { const pair = el('div'); pair.append(el('dt', '', label), el('dd', '', value)); return pair; }));
-    problem.hidden = !status?.error;
-    problem.textContent = status?.error || '';
+    problem.hidden = !status?.error && !status?.notice;
+    problem.textContent = status?.error || status?.notice || '';
     const disabled = busy || loading || !API.connected;
     toggle.textContent = view.toggleLabel;
     toggle.className = `button ${view.running ? 'danger' : 'primary'}`;

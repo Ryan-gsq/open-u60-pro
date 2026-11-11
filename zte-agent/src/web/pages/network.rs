@@ -25,15 +25,16 @@ pub const SWITCH: &str = "/ui/router/mihomo/switch";
 pub const INSTALL: &str = "/ui/router/mihomo/install";
 pub const CONFIG: &str = "/ui/router/mihomo/config";
 pub const OPEN: &str = "/ui/router/mihomo/open";
-pub const CHINA_DIRECT: &str = "/ui/router/mihomo/china-direct";
+pub const DIRECT_BYPASS: &str = "/ui/router/mihomo/direct-bypass";
 pub const RELAY: &str = "/ui/relay";
 pub const SCAN: &str = "/ui/relay/scan";
 pub const CONNECT: &str = "/ui/relay/connect";
 pub const DISCONNECT: &str = "/ui/relay/disconnect";
 pub const CLOCK: &str = "/ui/relay/clock";
 pub const FORGET: &str = "/ui/relay/forget";
-pub const TUNING: &str = "/ui/relay/tuning";
 pub const OFFLOAD: &str = "/ui/relay/offload";
+pub const OFFLOAD_SWITCH: &str = "/ui/relay/offload-switch";
+pub const POWER_SAVE: &str = "/ui/relay/power-save";
 
 pub fn mihomo_card(pd: &PageData) -> Markup {
     let Some(status) = pd.read(0) else {
@@ -68,6 +69,21 @@ pub fn mihomo_card(pd: &PageData) -> Markup {
     )
 }
 
+/// The controller's state (`mihomo::controller::Phase`), as the page says it.
+fn state_label(s: &serde_json::Value) -> String {
+    match s["state"].as_str() {
+        Some("running") => "Running".into(),
+        Some("starting") => "Starting".into(),
+        Some("restarting") => format!("Restarting{}", s["reason"].as_str().map(|r| format!(" ({r})")).unwrap_or_default()),
+        Some("reloading") => "Reloading its DNS settings".into(),
+        // D3: interception is withdrawn while the core is down.
+        Some("backoff") => "Not running: LAN traffic goes direct until a retry works".into(),
+        Some("cleanup_pending") => "Network changes not cleaned up".into(),
+        None if s["running"] == true => "Running".into(),
+        _ => "Off".into(),
+    }
+}
+
 pub fn mihomo_page(pd: &PageData) -> Markup {
     let Some(s) = pd.read(0) else {
         return html! { p.msg.err { "Mihomo status unavailable" } };
@@ -80,10 +96,17 @@ pub fn mihomo_page(pd: &PageData) -> Markup {
         (kit::section(Some("Mihomo"), Some(html! {
             p.foot { "Mihomo " (s["version"].as_str().unwrap_or("")) " and Zashboard " (s["dashboard_version"].as_str().unwrap_or("")) ". Attempts to start after an agent restart or reboot only when its enabled choice is saved. Switching off clears that choice. No subscription or paid node is included." }
             @if let Some(e) = s["error"].as_str() { p.foot.err role="alert" { (e) } }
+            @if let Some(n) = s["notice"].as_str() { p.foot.err role="alert" { (n) } }
         }), html! {
             (kit::kv_row(None, "Core", if installed { "Installed" } else { "Not installed" }))
             (kit::kv_row(None, "Configuration", if s["configured"].as_bool() == Some(true) { "Saved privately" } else { "Not configured" }))
-            (kit::kv_row(None, "Clash proxy", if on { "Running" } else { "Off" }))
+            (kit::kv_row(None, "Clash proxy", &state_label(s)))
+            @if s["direct_fallback"] == true {
+                (kit::kv_row(None, "Failed starts or exits", &s["failures"].as_u64().unwrap_or(0).to_string()))
+                @if let Some(retry) = s["retry_in_s"].as_u64() {
+                    (kit::kv_row(None, "Next retry", &format!("in {retry} s")))
+                }
+            }
             (kit::kv_row(None, "After a restart", match s["autostart"].as_bool() {
                 Some(true) => "Automatic start enabled",
                 Some(false) => "Stays off",
@@ -113,16 +136,29 @@ pub fn mihomo_page(pd: &PageData) -> Markup {
         }
         @if installed && !recovery { (super::mihomo_profiles::panel(pd)) }
         @if installed && !recovery {
-            @let china = s["cn_direct"].as_bool() == Some(true);
-            form method="post" action=(CHINA_DIRECT) {
+            @let bypass = s["cn_direct"].as_bool() == Some(true);
+            form method="post" action=(DIRECT_BYPASS) {
                 (pd.csrf()) (once_field(&pd.once()))
-                input type="hidden" name="enable" value=(if china { "0" } else { "1" });
-                (kit::section(Some("China IP direct"), Some(html! {
-                    p.foot { "China IPv4 addresses (the core's GeoIP.dat) bypass Mihomo in the kernel, so on the Wi-Fi relay they can use hardware forwarding. A domain rule that picks a proxy no longer applies when its address is in China. Changing this restarts a running core and resets LAN connections." }
+                input type="hidden" name="enable" value=(if bypass { "0" } else { "1" });
+                (kit::section(Some("Bypass Mihomo for DIRECT rules"), Some(html! {
+                    p.foot { "In rule mode the kernel checks the rules top-down, in Mihomo's order: IPv4 that a rule sends DIRECT by address, port or network (IP-CIDR, any GEOIP code, DST-PORT, NETWORK, rule sets with addresses) skips Mihomo, so on the Wi-Fi relay it can use hardware forwarding; what such a rule sends to a proxy still goes to Mihomo. DNS is always fake-ip: only domains a rule sends to DIRECT itself get real addresses; a domain behind a proxy group or a refreshed rule set always gets a fake one and goes through Mihomo, so switching a group can never leave a client on a direct address. A proxy rule the kernel cannot check (IP-ASN, NOT, binary rule sets, a file rule set) ends the chain there; a DIRECT one is skipped. Direct mode: all IPv4 skips Mihomo; global mode: nothing. IPv6 always goes through Mihomo. Changing this reloads the core's DNS settings behind its interception (a restart if the reload cannot be confirmed; nothing goes direct meanwhile) and resets only connections that lose the bypass." }
                 }), html! {
-                    (kit::kv_row(None, "Setting", if china { "On" } else { "Off" }))
-                    @if on { (kit::kv_row(None, "Running core", if s["cn_direct_active"].as_bool() == Some(true) { "China IPs bypass the proxy" } else { "All traffic through the proxy" })) }
-                    li { button.it.cv.snd type="submit" { (if china { "Turn off China IP direct" } else { "Turn on China IP direct" }) } }
+                    (kit::kv_row(None, "Setting", if bypass { "On" } else { "Off" }))
+                    @if on {
+                        @let kernel = &s["kernel"];
+                        @let returns = kernel["returns"].as_u64().unwrap_or(0);
+                        (kit::kv_row(None, "Running core", &match kernel["bypass"].as_str() {
+                            Some("rules") => format!("IPv4 matched by {returns} DIRECT rule{} bypasses the proxy", if returns == 1 { "" } else { "s" }),
+                            Some("all_ipv4") => "All IPv4 bypasses the proxy (direct mode)".to_owned(),
+                            _ => "All traffic through the proxy".to_owned(),
+                        }))
+                        @if bypass {
+                            @if let Some(reason) = kernel["reason"].as_str() {
+                                (kit::kv_row(None, if kernel["bypass"] == "rules" { "Chain ends at" } else { "Why" }, reason))
+                            }
+                        }
+                    }
+                    li { button.it.cv.snd type="submit" { (if bypass { "Turn off DIRECT bypass" } else { "Turn on DIRECT bypass" }) } }
                 }))
             }
         }
@@ -160,18 +196,11 @@ pub fn relay_page(pd: &PageData) -> Markup {
                 }
                 @if connected {
                     div.relay-address { span { "UPSTREAM IPv4" } code { (s["address"].as_str().unwrap_or("")) } }
-                    @if let (Some(frequency), Some(width)) = (s["frequency"].as_u64(), s["width"].as_u64()) {
+                    @if let Some(frequency) = s["frequency"].as_u64() {
                         div.relay-address {
                             span { "UPSTREAM LINK" }
-                            span { (if frequency < 3000 { "2.4 GHz" } else { "5 GHz" }) " \u{b7} " (width) " MHz" @if let Some(state) = s["width_state"].as_str() { " \u{b7} " (state) } }
+                            span { (if frequency < 3000 { "2.4 GHz" } else { "5 GHz" }) " \u{b7} negotiated bandwidth" }
                         }
-                    }
-                    div.relay-address {
-                        span { "BANDWIDTH POLICY" }
-                        span { (width_label(s["width_mode"].as_str().unwrap_or("off"))) }
-                    }
-                    @if let Some(id) = s["saved_network_id"].as_str().filter(|id| !id.is_empty()) {
-                        (width_form(pd, id, "relay-active-width", s["width_mode"].as_str().unwrap_or("off"), true))
                     }
                     div.relay-address {
                         span { "AFTER A RESTART" }
@@ -185,7 +214,7 @@ pub fn relay_page(pd: &PageData) -> Markup {
                         span { "UPSTREAM IPv6 / NAT66" }
                         span {
                             (match s["ipv6"]["state"].as_str().unwrap_or("off") {
-                                "configured" => "Configured (internet not verified)",
+                                "configured" => "Configured, forwarded by the CPU (internet not verified)",
                                 "detecting" => "Discovering upstream IPv6",
                                 "no_upstream" => "No usable upstream IPv6; IPv4 only",
                                 "unsupported" => "Unavailable; IPv4 only",
@@ -200,6 +229,7 @@ pub fn relay_page(pd: &PageData) -> Markup {
                         div.relay-address { span { "LAN IPv6 PREFIX" } code { (s["ipv6"]["lan_prefix"].as_str().unwrap_or("")) } }
                     }
                     @if let Some(e) = s["ipv6"]["error"].as_str() { p.msg.err { (e) } }
+                    p.relay-copy { "The router's parental control and URL filter do not apply to devices using the relay: relayed traffic is accepted ahead of them, and hardware-forwarded connections skip the router's filtering altogether. Only relayed IPv4 can be hardware forwarded; IPv6 (NAT66) and traffic through Clash use the CPU." }
                     @if let Some(e) = s["clock_error"].as_str() {
                         div.msg.info role="status" {
                             strong { "Wi-Fi connected; time not verified." }
@@ -252,7 +282,6 @@ pub fn relay_page(pd: &PageData) -> Markup {
                                             " / " (n["signal"].as_i64().unwrap_or(0)) " dBm / "
                                             (if n["supported"].as_bool() != Some(true) { "Unsupported" } else if n["security"].as_str() == Some("open") { "Open" } else { "WPA2" })
                                         }
-                                        small { "Saved bandwidth: " (width_label(n["width_mode"].as_str().unwrap_or("off"))) }
                                     }
                                     @if n["remembered"].as_bool() == Some(true) { span.badge.gr { "Saved" } }
                                 }
@@ -269,14 +298,6 @@ pub fn relay_page(pd: &PageData) -> Markup {
                             input type="checkbox" name="confirmed" value="1" checked required;
                             span { "I accept hotspot reconnection and possible cellular data charges." }
                         }
-                        div.relay-bandwidth {
-                            label for="relay-connect-width" { "Bandwidth" }
-                            select #relay-connect-width name="width_mode" {
-                                option value="saved" selected { "Use saved choice" }
-                                (width_options("saved"))
-                            }
-                            small { "New networks keep negotiated bandwidth. Each Wi-Fi remembers its choice." }
-                        }
                         button.relay-btn.relay-primary type="submit" { "Connect to Wi-Fi" (kit::icon(kit::Icon::Arrows)) }
                         p.relay-private { (kit::icon(kit::Icon::Lock)) "Password stays private on U60. After a successful connection, the last selected remembered or open network can reconnect after restart. Disconnect clears that choice; a dropped link does not reconnect automatically while the agent runs." }
                     }
@@ -288,21 +309,18 @@ pub fn relay_page(pd: &PageData) -> Markup {
             @if let Some(saved) = s["saved_networks"].as_array().filter(|s| !s.is_empty()) {
                 section.relay-panel {
                     h2 { "Saved Wi-Fi networks" }
-                    p.relay-copy { "Bandwidth choices are saved separately from passwords. Scan and select a network to connect. Forget removes its choice and any remembered password without disconnecting an active relay." }
-                    @for (index, network) in saved.iter().enumerate() {
+                    p.relay-copy { "Scan and select a network to connect. Forget removes any remembered password without disconnecting an active relay." }
+                    @for network in saved {
                         @let id = network["id"].as_str().unwrap_or("");
                         @let active = connected && s["saved_network_id"].as_str() == Some(id);
-                        @let mode = network["width_mode"].as_str().unwrap_or("off");
                         div.relay-connect {
                             div.relay-head {
                                 span.relay-network-name {
                                     strong { (network["ssid"].as_str().unwrap_or("")) }
                                     small { (if network["security"].as_str() == Some("open") { "Open network; no password needed" } else if network["remembered"].as_bool() == Some(true) { "Password remembered; leave it empty when connecting" } else { "Password not saved; enter it when connecting" }) }
-                                    small { "Saved bandwidth: " (width_label(mode)) }
                                 }
                                 @if active { span.badge.gr { "Connected" } }
                             }
-                            (width_form(pd, id, &format!("relay-saved-width-{index}"), mode, active))
                             form method="post" action=(FORGET) {
                                 (pd.csrf()) (once_field(&pd.once()))
                                 input type="hidden" name="id" value=(id);
@@ -321,6 +339,33 @@ pub fn relay_page(pd: &PageData) -> Markup {
                 p { "Refresh this page to read the current state. No background scanning or polling runs while relay is off and no startup restoration is pending." }
             }
             (offload_panel(pd, s, connected))
+            (power_save_panel(pd, s, connected))
+        }
+    }
+}
+
+fn power_save_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Markup {
+    let power = &s["power_save"];
+    let auto_off = power["auto_off"].as_bool() != Some(false);
+    html! {
+        section.relay-panel aria-labelledby="power-save-heading" {
+            form.relay-head method="post" action=(POWER_SAVE) {
+                (pd.csrf()) (once_field(&pd.once()))
+                input type="hidden" name="auto_off" value=(if auto_off { "0" } else { "1" });
+                div {
+                    h2 #power-save-heading { "Turn off Wi-Fi power save" }
+                    p.relay-copy { "On the upstream link, at every relay connection." }
+                }
+                button.sw type="submit" role="switch" aria-checked=(if auto_off { "true" } else { "false" }) aria-labelledby="power-save-heading" {}
+            }
+            p.relay-copy { "Power save lets the U60 doze between beacons while the upstream router holds its traffic. With it off, short speed tests through the relay ran faster (about 170–220 to 245–250 Mbit/s) and the radio uses a little more power. A change applies to the current connection at once. This is not the router's power saver mode." }
+            @if connected {
+                div.relay-address {
+                    span { "THIS CONNECTION" }
+                    span { (if power["off"].as_bool() == Some(true) { "Power save off" } else { "Power save on" }) }
+                }
+                @if let Some(error) = power["error"].as_str() { p.msg.err { (error) } }
+            }
         }
     }
 }
@@ -329,10 +374,19 @@ fn offload_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Marku
     let offload = &s["offload"];
     let config = offload["config"].as_str().unwrap_or("unavailable");
     let installed = matches!(config, "loaded" | "reboot_required");
+    let enabled = offload["enabled"].as_bool() != Some(false);
     html! {
         section.relay-panel aria-labelledby="offload-heading" {
-            h2 #offload-heading { "Hardware forwarding" }
-            p.relay-copy { "Qualcomm IPA carries relayed IPv4 NAT traffic without the CPU. Offloaded connections skip the router's firewall rules, speed limits, Smart QoS and parental control. IPv6/NAT66 and Mihomo traffic stay on the CPU. While relaying, the router's Smart QoS choice of CPU forwarding is overridden and restored when the relay ends; an owner speed limit or power saver mode keeps the CPU path." }
+            form.relay-head method="post" action=(OFFLOAD_SWITCH) {
+                (pd.csrf()) (once_field(&pd.once()))
+                input type="hidden" name="enabled" value=(if enabled { "0" } else { "1" });
+                div {
+                    h2 #offload-heading { "Hardware forwarding" }
+                    p.relay-copy { "Turning it on or off applies to the current relay connection at once." }
+                }
+                button.sw type="submit" role="switch" aria-checked=(if enabled { "true" } else { "false" }) aria-labelledby="offload-heading" {}
+            }
+            p.relay-copy { "Qualcomm IPA carries relayed IPv4 NAT traffic without the CPU. Offloaded connections skip the router's firewall rules, speed limits, Smart QoS and parental control. IPv6/NAT66 and traffic through Mihomo stay on the CPU. While relaying, the router's Smart QoS choice of CPU forwarding is overridden and restored when the relay ends or hardware forwarding is turned off; an owner speed limit or power saver mode keeps the CPU path. A change of path resets existing LAN IPv4 connections once." }
             div.relay-address {
                 span { "CONFIGURATION" }
                 span { (match config {
@@ -346,7 +400,13 @@ fn offload_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Marku
             @if connected {
                 div.relay-address {
                     span { "RELAY PATH" }
-                    span { (if offload["hardware"].as_bool() == Some(true) { "Hardware (IPA)" } else { "CPU" }) }
+                    span { (relay_path(offload)) }
+                }
+                @if let Some(mihomo) = offload["ipv4_through_mihomo"].as_str().filter(|m| *m != "none") {
+                    div.relay-address {
+                        span { "PUBLIC IPv4" }
+                        span { (if mihomo == "all" { "Handled by Mihomo (on the CPU)" } else { "Handled by Mihomo, except what its DIRECT rules bypass" }) }
+                    }
                 }
                 @if let Some(reason) = offload["reason"].as_str() { p.relay-copy { (reason) } }
             }
@@ -354,7 +414,7 @@ fn offload_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Marku
                 form method="post" action=(OFFLOAD) {
                     (pd.csrf()) (once_field(&pd.once()))
                     input type="hidden" name="install" value=(if installed { "0" } else { "1" });
-                    p.relay-copy { (if installed { "Removing affects new relay connections at once and is complete after a restart." } else { "Adds the relay interface to the IPA configuration (a backup is kept). Takes effect after a router restart." }) }
+                    p.relay-copy { (if installed { "Removing moves the current relay connection to the CPU at once; the IPA service forgets the interface at the next restart." } else { "Adds the relay interface to the IPA configuration (a backup is kept). Takes effect at once if the router already loaded it since its last restart, otherwise after a restart." }) }
                     p.actions { button.relay-btn.relay-secondary type="submit" { (if installed { "Remove hardware forwarding" } else { "Install hardware forwarding" }) } }
                 }
             }
@@ -362,50 +422,26 @@ fn offload_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Marku
     }
 }
 
-fn width_label(mode: &str) -> &'static str {
-    if mode == "auto" { "Auto tuning" } else { "Keep negotiated bandwidth" }
-}
-
-fn width_options(selected: &str) -> Markup {
-    html! {
-        @for mode in ["off", "auto"] {
-            option value=(mode) selected[selected == mode] { (width_label(mode)) }
-        }
-    }
-}
-
-fn width_form(pd: &PageData, id: &str, select_id: &str, mode: &str, active: bool) -> Markup {
-    html! {
-        form method="post" action=(TUNING) {
-            (pd.csrf()) (once_field(&pd.once()))
-            input type="hidden" name="id" value=(id);
-            div.relay-bandwidth {
-                label for=(select_id) { "Bandwidth" }
-                select id=(select_id) name="width_mode" { (width_options(mode)) }
-            }
-            p.relay-copy { "Auto tuning may briefly interrupt traffic while adjusting bandwidth." }
-            @if active {
-                label.relay-consent {
-                    input type="checkbox" name="confirmed" value="1" checked required;
-                    span { "Applying reconnects this Wi-Fi and briefly interrupts internet access. Cellular data may be used if already enabled." }
-                }
-            } @else {
-                input type="hidden" name="confirmed" value="1";
-                p.relay-copy { "Saved for the next connection. If this Wi-Fi is connected when you apply, it will reconnect." }
-            }
-            p.actions { button.relay-btn.relay-secondary type="submit" { "Apply" } }
-        }
+/// The relay's IPv4 path: hardware mode alone is not offloading; it is
+/// confirmed once relayed traffic under load stays off the CPU.
+fn relay_path(offload: &serde_json::Value) -> &'static str {
+    match (offload["state"].as_str(), offload["hardware"].as_bool(), offload["offload_confirmed"].as_bool()) {
+        (_, Some(true), Some(true)) => "Hardware (IPA), confirmed under load",
+        (_, Some(true), _) => "Hardware (IPA) mode; offloading not yet confirmed under load",
+        (Some("releasing"), _, _) => "Leaving hardware forwarding",
+        (Some("engaging"), _, _) => "Engaging hardware forwarding",
+        _ => "CPU",
     }
 }
 
 pub fn custom_post(path: &str) -> bool {
-    [CONFIG, CONNECT, FORGET, CLOCK, TUNING, super::reservations::APPLY].contains(&path)
+    [CONFIG, CONNECT, FORGET, CLOCK, super::reservations::APPLY].contains(&path)
 }
 
 pub async fn post(ctx: Ctx, req: Request) -> Response {
     let nonce = CspNonce::of(&req);
     let path = req.uri().path().to_owned();
-    let home = if path == super::reservations::APPLY { super::reservations::PATH } else if [CONNECT, FORGET, CLOCK, TUNING].contains(&path.as_str()) { RELAY } else { MIHOMO };
+    let home = if path == super::reservations::APPLY { super::reservations::PATH } else if [CONNECT, FORGET, CLOCK].contains(&path.as_str()) { RELAY } else { MIHOMO };
     let (parts, body) = req.into_parts();
     let Some(p) = session::find_session(&ctx.app.auth, &parts.headers) else {
         return session::reply_unread(&parts.headers, body, session::login_redirect(&HttpMethod::POST, home, None)).await;
@@ -421,29 +457,20 @@ pub async fn post(ctx: Ctx, req: Request) -> Response {
     if !session::verify_post(&ctx.app.auth, &parts.headers, &p, form.get("csrf")) {
         return render::form_refused(&nonce, home);
     }
-    let width_mode = if path == CONNECT || path == TUNING {
-        if form.get("confirmed") != Some("1") {
-            return render::error(400, "Confirmation required", "Confirm the hotspot interruption and possible cellular data charges.", &nonce);
-        }
-        match form.get("width_mode") {
-            Some(mode @ ("off" | "auto")) => Some(mode),
-            None | Some("saved") if path == CONNECT => None,
-            _ => return render::error(400, "Invalid bandwidth choice", "Choose negotiated bandwidth or experimental Auto. When connecting, you can also use the network’s saved choice.", &nonce),
-        }
-    } else { None };
-    let api_path = if path == super::reservations::APPLY { "/api/router/reservations" } else if path == CONNECT { "/api/wifi-relay/connect" } else if path == FORGET { "/api/wifi-relay/forget" } else if path == CLOCK { "/api/wifi-relay/clock" } else if path == TUNING { "/api/wifi-relay/tuning" } else { "/api/mihomo/config" };
+    if path == CONNECT && form.get("confirmed") != Some("1") {
+        return render::error(400, "Confirmation required", "Confirm the hotspot interruption and possible cellular data charges.", &nonce);
+    }
+    let api_path = if path == super::reservations::APPLY { "/api/router/reservations" } else if path == CONNECT { "/api/wifi-relay/connect" } else if path == FORGET { "/api/wifi-relay/forget" } else if path == CLOCK { "/api/wifi-relay/clock" } else { "/api/mihomo/config" };
     let (method, data, success) = if path == super::reservations::APPLY {
         (Method::Post, json!({"action":form.get("action").unwrap_or(""),"id":form.get("id").unwrap_or(""),"name":form.get("name").unwrap_or(""),"mac":form.get("mac").unwrap_or(""),"ip":form.get("ip").unwrap_or("")}), "Reservation updated. Reconnect the client to renew its IPv4 lease.")
     } else if path == FORGET {
         (Method::Post, json!({"id":form.get("id").unwrap_or("")}), "Saved Wi-Fi choice and any remembered password removed. Active relay is unchanged.")
     } else if path == CLOCK {
         (Method::Post, json!({}), "Time verified over Wi-Fi. Relay connection was not restarted.")
-    } else if path == TUNING {
-        (Method::Post, json!({"id":form.get("id").unwrap_or(""),"width_mode":width_mode,"confirmed":true}), "Wi-Fi bandwidth choice saved.")
     } else if path == CONNECT {
         (
             Method::Post,
-            json!({"network":form.get("network").unwrap_or(""),"password":form.get("password").unwrap_or(""),"confirmed":true,"ipv6":form.get("ipv6")==Some("1"),"remember":form.get("remember")==Some("1"),"width_mode":width_mode}),
+            json!({"network":form.get("network").unwrap_or(""),"password":form.get("password").unwrap_or(""),"confirmed":true,"ipv6":form.get("ipv6")==Some("1"),"remember":form.get("remember")==Some("1")}),
             "Wi-Fi relay connected. Internet access still needs verification; a hotel may require web login.",
         )
     } else {

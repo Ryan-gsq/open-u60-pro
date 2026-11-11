@@ -230,6 +230,9 @@ pub fn lane(method: Method, path: &str) -> Lane {
     let slow = match (method, path) {
         (Post, "/api/router/reservations") => true,
         (Get, "/api/mihomo/status" | "/api/mihomo/profiles" | "/api/mihomo/extensions" | "/api/wifi-relay/status") => false,
+        // A cancellation: it must get in while long connects or scans hold
+        // both Slow permits (it cancels them before waiting for the lock).
+        (Post, "/api/wifi-relay/disconnect") => false,
         (Get, p) if p.starts_with("/api/mihomo/profiles/") => false,
         (_, p) if p.starts_with("/api/mihomo/") || p.starts_with("/api/wifi-relay/") => true,
         (Get, "/api/network/client-details") => true,
@@ -286,10 +289,10 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
     // Vendor firewall writers can reload tables, removing our upstream INPUT
     // guards. Refuse them while either extension owns live rules.
     let _network = if *method != Method::Get && (path.starts_with("/api/router/firewall/") || path == "/api/router/domain-filter") {
-        let Ok(lock) = state.network_lock.try_lock() else { return (409, error_body("A network operation is in progress; retry after it finishes")); };
-        if state.wifi_relay.owns_network() || state.mihomo.owns_network() {
-            return (409, error_body("Stop or recover Wi-Fi relay and Mihomo before changing the vendor firewall"));
-        }
+        let lock = match crate::netfx::admission::admit(&state.network_lock, crate::netfx::admission::VENDOR_WRITE, || (state.wifi_relay.owns_network() || state.mihomo.owns_network()).then(|| "Stop or recover Wi-Fi relay and Mihomo before changing the vendor firewall".to_owned())) {
+            Ok(claim) => claim,
+            Err(e) => return (409, error_body(&e)),
+        };
         Some(lock)
     } else { None };
     match (method, path) {
@@ -517,9 +520,9 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Post, "/api/wifi-relay/connect") => crate::wifi_relay::change(state, "connect", body),
         (&Method::Post, "/api/wifi-relay/disconnect") => crate::wifi_relay::change(state, "disconnect", body),
         (&Method::Post, "/api/wifi-relay/clock") => crate::wifi_relay::change(state, "clock", body),
-        (&Method::Post, "/api/wifi-relay/tuning") => crate::wifi_relay::change(state, "tuning", body),
         (&Method::Post, "/api/wifi-relay/forget") => crate::wifi_relay::change(state, "forget", body),
         (&Method::Post, "/api/wifi-relay/offload") => crate::wifi_relay::change(state, "offload", body),
+        (&Method::Post, "/api/wifi-relay/power-save") => crate::wifi_relay::change(state, "power-save", body),
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
         // LAN HTTPS (docs/web-ui.md, "LAN HTTPS"): read-only for the apps.
         (&Method::Get, "/api/https") => state.tls.status_json(),
@@ -866,6 +869,7 @@ mod tests {
         ] {
             assert_eq!(lane(method, path), Lane::Slow, "{path}");
         }
+        assert_eq!(lane(Method::Post, "/api/wifi-relay/disconnect"), Lane::General, "a cancel never waits behind two slow connects");
     }
 
     #[test]

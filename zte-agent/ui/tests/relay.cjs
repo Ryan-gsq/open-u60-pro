@@ -24,7 +24,6 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     }
     if(url==='/api/wifi-relay/disconnect'){status={...off,networks:scan,saved_networks:saved};reply(status);return true;}
     if(url==='/api/wifi-relay/clock'){status={...status,clock_error:null};reply(status);return true;}
-    if(url==='/api/wifi-relay/tuning'){saved.find(s=>s.id===body.id).width_mode=body.width_mode;status={...status,saved_networks:saved};reply(status);return true;}
     if(url==='/api/wifi-relay/forget'){const i=saved.findIndex(s=>s.id===body.id);if(i>=0)saved.splice(i,1);status={...status,saved_networks:saved};reply(status);return true;}
     return false;
   });
@@ -63,33 +62,34 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     await said('#relay-networks .action-status','Wi-Fi association failed');assert.equal(await page.locator('#relay-networks .action-status').getAttribute('data-error'),'true');
     assert.deepEqual(last().body,{network:'home5',password:'correct horse',confirmed:true,ipv6:true,remember:true});refuse=null;
 
-    // A remembered network connects with an empty password; the saved bandwidth is expressed by omission.
+    // A remembered network connects with an empty password; no bandwidth choice is sent.
     await pick('Hotel');assert.equal(await page.locator('#relay-password').inputValue(),'correct horse','the typed draft survives a different choice until it is cleared');await page.locator('#relay-password').fill('');
     await page.getByRole('button',{name:'Connect to Wi-Fi'}).click();
     assert.match(await text('.confirm-dialog'),/Connect to Hotel Guest\?/);assert.match(await text('.confirm-dialog'),/briefly reconnect/);await confirm('Connect');
     await said('#relay-status .relay-state','WI-FI LINKED');
     assert.deepEqual(last().body,{network:'hotel5',password:'',confirmed:true,ipv6:true,remember:true});
     assert.match(await text('#relay-status h3'),/Hotel Guest/);const facts=await text('#relay-status .relay-facts');
-    for(const word of ['192.168.8.23','192.168.8.1','5 GHz · 80 MHz · stable','Auto tuning','Configured \\(internet not verified\\)','2001:db8::2','fd00:1::/64','Automatic reconnect enabled'])assert.match(facts,new RegExp(word));
+    for(const word of ['192.168.8.23','192.168.8.1','5 GHz · negotiated bandwidth','Configured, forwarded by the CPU \\(internet not verified\\)','2001:db8::2','fd00:1::/64','Automatic reconnect enabled'])assert.match(facts,new RegExp(word));
+    assert.doesNotMatch(facts,/Auto tuning|80 MHz|Bandwidth policy/,'an older status’s width fields are not shown');
+    assert.match(await text('#relay-status .relay-scope'),/parental control and URL filter do not apply/);assert.equal(await page.locator('#relay-width').count(),0,'no bandwidth selector');
     assert.equal(await page.getByRole('button',{name:'Disconnect relay'}).isVisible(),true);assert.match(await text('#relay-networks .action-status'),/Internet is not verified/);
     assert.match(await text('#relay-saved .relay-saved-item:has-text("Hotel Guest")'),/Connected/);
 
     // Disconnect is confirmed; the page returns to the off state.
     await page.getByRole('button',{name:'Disconnect relay'}).click();assert.match(await text('.confirm-dialog'),/restored/);await confirm('Disconnect relay');
-    await said('#relay-status .relay-state','RELAY OFF');assert.equal(last().url,'/api/wifi-relay/disconnect');
+    await said('#relay-status .relay-state','RELAY OFF');assert.equal(last().url,'/api/wifi-relay/disconnect');assert.equal(await page.locator('#relay-status .relay-scope').isHidden(),true,'the scope note is for a connected relay');
 
     // Open networks never send a password; options map onto the request.
     await pick('Cafe');assert.equal(await page.locator('#relay-password').isDisabled(),true);assert.equal(await page.locator('input[name=remember]').isDisabled(),true);
-    await page.locator('#relay-width').selectOption('off');await page.locator('input[name=ipv6]').uncheck();
+    await page.locator('input[name=ipv6]').uncheck();
     await page.getByRole('button',{name:'Connect to Wi-Fi'}).click();await confirm('Connect');await said('#relay-status .relay-state','WI-FI LINKED');
-    assert.deepEqual(last().body,{network:'cafe24',password:'',confirmed:true,ipv6:false,remember:false,width_mode:'off'});
-    assert.match(await text('#relay-status .relay-facts'),/Off/);
+    assert.deepEqual(last().body,{network:'cafe24',password:'',confirmed:true,ipv6:false,remember:false});
+    assert.match(await text('#relay-status .relay-facts'),/Off/);assert.equal(await page.locator('#relay-status .relay-scope').isVisible(),true);
 
-    // Saved networks: bandwidth and forgetting are explicit, confirmed changes.
+    // Saved networks: forgetting is an explicit, confirmed change; there is no bandwidth choice.
     const item=page.locator('#relay-saved .relay-saved-item:has-text("Hotel Guest")');
-    assert.equal(await item.getByRole('button',{name:'Save bandwidth'}).isDisabled(),true,'unchanged');
-    await item.locator('select').selectOption('off');await item.getByRole('button',{name:'Save bandwidth'}).click();await confirm('Save bandwidth');
-    await said('#relay-saved .action-status','Bandwidth choice saved');assert.deepEqual(last().body,{id:'k-hotel',width_mode:'off',confirmed:true});
+    assert.equal(await item.locator('select').count(),0);assert.equal(await item.getByRole('button',{name:'Save bandwidth'}).count(),0);
+    assert.equal(fixture.requests.some(r=>r.url==='/api/wifi-relay/tuning'),false);
     await page.locator('#relay-saved .relay-saved-item:has-text("Cafe")').getByRole('button',{name:'Forget'}).click();assert.match(await text('.confirm-dialog'),/active relay stays connected/);await confirm('Forget network');
     await said('#relay-saved .action-status','Network forgotten');assert.deepEqual(last().body,{id:'k-cafe'});assert.equal(await page.locator('.relay-saved-item').count(),1);
 

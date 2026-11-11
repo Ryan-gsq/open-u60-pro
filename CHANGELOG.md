@@ -10,14 +10,30 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 - Mihomo China IP direct: China IPv4 destinations can bypass the core in the kernel, so relayed connections to them can be offloaded; LAN connections are reset when the interception changes.
 - One guard for the agent's network changes: after a ZTE firewall/QoS/Wi-Fi script runs, a firmware event, or once a minute, the relay and Mihomo re-check their rules, routes and kernel settings (IPv4 and IPv6 relay, Mihomo) and re-apply whatever ZTE removed, logged with the commands restored; one change that cannot be re-applied does not stop the rest.
 - Relay hardware forwarding self-check: IPACM is re-armed after each relay connect and whenever relayed connections are seen on the CPU path in hardware mode; the page reports hardware forwarding only while it is actually carrying them.
+- Mihomo controller (relay/Mihomo refactor v2–v3, not yet accepted on the device): one serial owner of the core, its tables and routing writes. Planned restarts keep LAN traffic held instead of letting it go direct; an unexpected core exit falls back to direct traffic only after it is confirmed, shows "going direct", and retries with backoff (5/15/30/60 s, then every 5 min). Mode, group and rule-set changes narrow what bypasses the core first and reset only connections that lost DIRECT. A DIRECT bypass change hot-reloads the same configuration and is verified before it counts. The agent refreshes `http` rule sets itself, and domains behind proxy groups or refreshed rule sets always get fake-ip answers, so neither a provider refresh nor a cached real address can send proxied traffic direct.
+- Agent guard: if the agent dies, a small separate process restarts it (not during an OTA trial or a deliberate stop); the new agent takes over this boot's Mihomo interception without a direct window.
+- Admission for conflicting changes: router writes and relay operations register briefly instead of holding a network lock across device work; a vendor Wi-Fi reload counts as in progress until the hotspot is back.
 
 ### Changed
 
 - Relay DNS (IPv4 and IPv6) moved into the agent's own nftables tables, matching the router's addresses live instead of maintaining and auditing one exemption rule per address.
 - Mihomo intercepts LAN TCP/UDP by TPROXY through the agent's own nftables tables instead of a TUN: one connection runs at about 190-238 instead of 125-132 Mbit/s, with roughly half the core CPU. While the core runs, TCP pacing ratios are raised and bridge netfilter is turned off (LAN-to-LAN filtering such as guest isolation pauses); both are restored when it stops.
+- Relay firewall (v5, not yet accepted on the device): denials are rules in the relay's own nftables tables `ip`/`ip6 u60_relay` ahead of ZTE's rules, set up before the station interface comes up and kept until it is gone; legacy iptables keeps only the accepts that must pass ZTE's rejects, the portal RETURN (now kept ahead of every vendor rule in `redirect_chain`) and IPv4 MASQUERADE. NAT66 moved to nftables; one IPv6 cellular OUTPUT reject replaces two.
+- Network guard timing: a check once a ZTE trigger has been quiet 2 s (owners are woken), again 5 s after a repair, and held kernel settings such as Mihomo's bridge-netfilter values are sampled every 0.5 s for 3 s after each trigger.
+- Connection resets report what conntrack actually did (deleted, nothing matched, failed and retried).
+- The relay page states that the router's parental control and URL filter do not apply to relayed devices, and that IPv6 relay traffic stays on the CPU.
+
+### Removed
+
+- Wi-Fi relay bandwidth tuning (v6): the per-network bandwidth choice, `POST /api/wifi-relay/tuning` and its sampler are gone; the relay keeps the negotiated width and still resets it once after each association. A saved "Auto tuning" choice reads as keeping the negotiated bandwidth.
 
 ### Fixed
 
+- An agent restart no longer drops the Wi-Fi relay: the new agent takes over the connection the previous one left (association, lease, routes, IPv6), so IPv4 does not stop and the proxy is back in about 7 s instead of about 84 s.
+- A relay switch restarts Mihomo once instead of three times: losing the uplink restarts nothing, and IPv6 added later to the same interface keeps the core running. A configuration validated once is reused for the rest of the boot.
+- Mihomo shows a notice when a node in use has only an IPv6 server address and the uplink has no IPv6, instead of looking healthy while every proxied connection fails.
+- The relay creates its station interface after its firewall guard, so a teardown removes the interface before the guard.
+- Switching the relay between 5 GHz networks no longer waits for the hotspot's radar check: the station is handed over and the hotspot only steps back to a non-DFS channel, about 8-11 s instead of 75-85 s. Mihomo restarts only if the access point changed; reconnecting to the same access point keeps IPv6 as it is (about 1 s without IPv6 instead of about 10 s).
 - Relay hotspot channel changes that keep the primary channel and change only the width (for example 36/40 to 36/20) now go through another non-DFS channel instead of failing cleanup with "Hotspot refused the channel switch".
 
 ## [2.4.0] - 2026-11-04

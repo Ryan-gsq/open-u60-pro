@@ -1,15 +1,16 @@
 //! Private device effects shared by the optional network modules. No shell,
 //! bounded commands, private atomic files and an on-disk rollback journal.
 
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+pub use crate::netfx::exec::{owned_child, owned_reader, run, run_input, stop_child};
+pub use crate::netfx::files::{private_dir, write_private};
 
 pub mod firewall;
 
@@ -126,6 +127,9 @@ impl Cmd {
         if self.program == "@u60-relay-portal" {
             return crate::wifi_relay::portal::command(&self.args).map(|_| String::new());
         }
+        if self.program == "@u60-relay-portal-return" {
+            return crate::wifi_relay::portal::place_return(&self.args).map(|_| String::new());
+        }
         if self.program == "@u60-relay-ipa" {
             return crate::wifi_relay::offload::command(&self.args).map(|_| String::new());
         }
@@ -138,8 +142,11 @@ impl Cmd {
         if self.program == "@u60-relay-steer" {
             return crate::wifi_relay::steering::command(&self.args).map(|_| String::new());
         }
+        if self.program == "@u60-relay-power-save" {
+            return crate::wifi_relay::power_save::command(&self.args).map(|_| String::new());
+        }
         if self.program == "@u60-relay-nft" {
-            return crate::wifi_relay::dns_nft::command(&self.args).map(|_| String::new());
+            return crate::wifi_relay::uplink::command(&self.args).map(|_| String::new());
         }
         if self.program == "@u60-relay-roam" {
             return match self.args.as_slice() {
@@ -199,6 +206,12 @@ impl Cmd {
         if crate::wifi_relay::hotspot::skip_undo(self) {
             return Ok(());
         }
+        if crate::wifi_relay::power_save::is_restore(self) {
+            if let Err(e) = self.run() {
+                crate::netlog!("[relay] upstream Wi-Fi power save not restored: {e}");
+            }
+            return Ok(());
+        }
         let error = match self.run() {
             Ok(_) => return Ok(()),
             Err(error) => error,
@@ -207,7 +220,7 @@ impl Cmd {
         // build does not have. It cannot be undone here; stopping on it would
         // block every later cleanup (a removed step once kept the relay down).
         if error.starts_with(UNKNOWN_STEP) {
-            eprintln!("[net] skipped an undo this agent version does not know: {} {}", self.program, self.args.join(" "));
+            crate::netlog!("[net] skipped an undo this agent version does not know: {} {}", self.program, self.args.join(" "));
             return Ok(());
         }
         // OFF during a channel switch/CAC makes that runtime snapshot obsolete.
@@ -315,12 +328,11 @@ impl Cmd {
 
     /// Whether this applied change can be re-checked and re-applied as is
     /// (`Transaction::reconcile`). Radio, daemon and journal-only steps cannot.
-    fn checkable(&self) -> bool {
+    pub(crate) fn checkable(&self) -> bool {
         match self.program.as_str() {
             "iptables" | "ip6tables" => self.args.iter().any(|a| matches!(a.as_str(), "-N" | "-I" | "-A")),
             "ip" => self.args.get(2).map(String::as_str) == Some("add"),
-            "@u60-sysctl" | "@u60-mihomo-nft" | "@u60-relay-steer" => true,
-            "@u60-relay-nft" => self.args.first().is_some_and(|a| a != "remove"),
+            "@u60-sysctl" | "@u60-mihomo-nft" | "@u60-relay-steer" | "@u60-relay-power-save" | "@u60-relay-portal-return" => true,
             _ => false,
         }
     }
@@ -373,7 +385,8 @@ impl Cmd {
             }),
             "@u60-mihomo-nft" => crate::mihomo::nft_present(&self.args),
             "@u60-relay-steer" => Ok(crate::wifi_relay::steering::present(&self.args)),
-            "@u60-relay-nft" => Ok(crate::wifi_relay::dns_nft::present(&self.args)),
+            "@u60-relay-power-save" => crate::wifi_relay::power_save::present(&self.args),
+            "@u60-relay-portal-return" => crate::wifi_relay::portal::return_first(&self.args),
             _ => Ok(true),
         }
     }
@@ -381,7 +394,7 @@ impl Cmd {
 
 const UNKNOWN_STEP: &str = "Unknown agent step";
 
-/// Rules per chain in nft text: a ruleset written by `nft_fill` (its filled
+/// Rules per chain in nft text: a definition (`netfx::effect::table`, its
 /// blocks) or an `nft -t list table` listing (hook lines are not rules).
 pub fn nft_chain_rules(text: &str) -> std::collections::BTreeMap<String, usize> {
     let mut counts = std::collections::BTreeMap::new();
@@ -400,42 +413,6 @@ pub fn nft_chain_rules(text: &str) -> std::collections::BTreeMap<String, usize> 
         }
     }
     counts
-}
-
-/// Whether `table` holds every chain of `expected` (an `nft_fill` ruleset)
-/// with as many rules: a flushed or partly deleted chain counts as missing.
-pub fn nft_holds(family: &str, table: &str, expected: &str) -> bool {
-    let want = nft_chain_rules(expected);
-    Cmd::new("nft", &["-t", "list", "table", family, table]).run().is_ok_and(|listing| {
-        let have = nft_chain_rules(&listing);
-        want.iter().all(|(chain, n)| have.get(chain) == Some(n))
-    })
-}
-
-/// One family's table objects as one idempotent `nft -f` transaction: declare
-/// the table, the set `(name, spec, elements)` and the chains `(name, hook,
-/// rules)` (a no-op when present; an empty hook is a regular chain), flush
-/// them, then fill them. A re-apply (`Transaction::reconcile`) never
-/// duplicates rules.
-pub fn nft_fill(family: &str, table: &str, set: Option<(&str, &str, &[String])>, chains: &[(&str, &str, Vec<String>)]) -> String {
-    let mut declare = format!("table {family} {table} {{\n");
-    let mut flush = String::new();
-    let mut fill = format!("table {family} {table} {{\n");
-    if let Some((name, spec, elements)) = set {
-        declare.push_str(&format!("\tset {name} {{ {spec} }}\n"));
-        flush.push_str(&format!("flush set {family} {table} {name}\n"));
-        fill.push_str(&format!("\tset {name} {{ {spec} elements = {{ {} }} }}\n", elements.join(", ")));
-    }
-    for (name, hook, rules) in chains {
-        declare.push_str(&format!("\tchain {name} {{ {hook} }}\n"));
-        flush.push_str(&format!("flush chain {family} {table} {name}\n"));
-        fill.push_str(&format!("\tchain {name} {{\n"));
-        for rule in rules {
-            fill.push_str(&format!("\t\t{rule}\n"));
-        }
-        fill.push_str("\t}\n");
-    }
-    format!("{declare}}}\n{flush}{fill}}}\n")
 }
 
 /// Kernel settings an owner may change for its lifetime (`@u60-sysctl`).
@@ -462,12 +439,18 @@ pub fn sysctl_step(key: &str, value: &str, old: &str) -> Result<Step, String> {
 
 fn sysctl_command(args: &[String]) -> Result<(), String> {
     match args {
-        [key, value] if value.parse::<u32>().is_ok_and(|v| v <= 100_000) => {
-            let path = sysctl_path(key).ok_or("Unknown kernel setting")?;
-            fs::write(path, value).map_err(|_| "Cannot set a kernel setting".into())
-        }
+        [key, value] => sysctl_write(key, value),
         _ => Err("Invalid kernel setting".into()),
     }
+}
+
+/// Writes one of the kernel settings an owner may hold.
+pub fn sysctl_write(key: &str, value: &str) -> Result<(), String> {
+    if !value.parse::<u32>().is_ok_and(|v| v <= 100_000) {
+        return Err("Invalid kernel setting".into());
+    }
+    let path = sysctl_path(key).ok_or("Unknown kernel setting")?;
+    fs::write(path, value).map_err(|_| "Cannot set a kernel setting".into())
 }
 
 fn has_oif_rule(rules: &str, oif: &str, table: &str) -> bool {
@@ -476,184 +459,6 @@ fn has_oif_rule(rules: &str, oif: &str, table: &str) -> bool {
         words.windows(2).any(|w| w == ["oif", oif])
             && words.windows(2).any(|w| w == ["lookup", table])
     })
-}
-
-pub fn run(command: Command, timeout: Duration) -> Result<String, String> {
-    run_with_input(command, timeout, None)
-}
-
-pub fn run_input(command: Command, timeout: Duration, input: Vec<u8>) -> Result<String, String> {
-    run_with_input(command, timeout, Some(input))
-}
-
-fn run_with_input(
-    mut command: Command,
-    timeout: Duration,
-    input: Option<Vec<u8>>,
-) -> Result<String, String> {
-    crate::httpd::gate::debug_assert_may_block();
-    use std::os::unix::process::CommandExt;
-    // Kill the command's whole process group, including descendants that
-    // would otherwise keep its output pipes open beyond the deadline.
-    command.process_group(0);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if input.is_some() {
-        command.stdin(Stdio::piped());
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Cannot run device tool: {e}"))?;
-    let writer = input.map(|bytes| {
-        let mut stdin = child.stdin.take().unwrap();
-        std::thread::spawn(move || stdin.write_all(&bytes))
-    });
-    // Drain both pipes while waiting; a verbose tool must not deadlock on a full pipe.
-    let read = |pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let r = pipe.take(256 * 1024 + 1).read_to_end(&mut bytes);
-            (r, bytes)
-        })
-    };
-    let stdout = read(Box::new(child.stdout.take().unwrap()));
-    let stderr = read(Box::new(child.stderr.take().unwrap()));
-    let deadline = Instant::now() + timeout;
-    // These tools usually finish within a few milliseconds; a fixed 20 ms
-    // poll made every one of the hundreds of firewall/route commands wait
-    // for it. Back off from 1 ms so long-running tools still poll cheaply.
-    let mut pause = Duration::from_millis(1);
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(pause);
-                pause = (pause * 2).min(Duration::from_millis(20));
-            }
-            _ => {
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err("Device tool timed out".to_owned());
-            }
-        }
-    };
-    // A tool can exit successfully while leaving a background child holding
-    // stdout/stderr. These tools are synchronous; no descendants are owned.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let (_, out) = stdout.join().map_err(|_| "Device tool reader failed")?;
-    let (_, err) = stderr.join().map_err(|_| "Device tool reader failed")?;
-    let written = writer.map(|writer| {
-        writer
-            .join()
-            .map_err(|_| "Device tool input failed")
-            .and_then(|r| r.map_err(|_| "Device tool input failed"))
-    });
-    let status = result?;
-    if out.len() > 256 * 1024 || err.len() > 256 * 1024 {
-        return Err("Device tool output exceeded its limit".into());
-    }
-    if !status.success() {
-        // Tool output may contain credentials or nearby SSIDs. Do not expose it.
-        return Err(format!("Device tool failed ({status})"));
-    }
-    if let Some(written) = written {
-        written?;
-    }
-    Ok(String::from_utf8_lossy(&out).trim().to_owned())
-}
-
-pub fn private_dir(path: &Path) -> Result<(), String> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .map_err(|e| e.to_string())?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())
-}
-
-pub fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
-    let parent = path.parent().ok_or("Invalid private path")?;
-    private_dir(parent)?;
-    let tmp = path.with_extension("new");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&tmp)
-        .map_err(|e| e.to_string())?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|e| e.to_string())?;
-    file.write_all(data)
-        .and_then(|_| file.sync_all())
-        .map_err(|e| e.to_string())?;
-    fs::rename(tmp, path).map_err(|e| e.to_string())
-}
-
-/// The child cannot outlive the agent on Linux, unless its exec changes the
-/// SELinux domain: the kernel then clears the parent-death signal (B31:
-/// wpa_supplicant, odhcp6c), and its owner must stop such leftovers when it
-/// recovers (`wifi_relay::stop_strays`). The supervisor additionally reaps
-/// exits and rolls back its network rules while the agent is running.
-pub fn owned_child(mut cmd: Command) -> Result<Child, String> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        let parent = unsafe { libc::getpid() };
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
-                    || libc::getppid() != parent
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    // Linux's parent-death signal follows the spawning THREAD. A tokio
-    // blocking worker may retire while the agent is still alive, so every
-    // long-lived child must be spawned by this one persistent thread.
-    type Spawn = (Command, mpsc::SyncSender<Result<Child, String>>);
-    static SPAWNER: OnceLock<mpsc::Sender<Spawn>> = OnceLock::new();
-    let sender = SPAWNER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Spawn>();
-        std::thread::Builder::new()
-            .name("net-children".into())
-            .spawn(move || {
-                while let Ok((mut cmd, reply)) = rx.recv() {
-                    let result = cmd
-                        .spawn()
-                        .map_err(|e| format!("Cannot start network process: {e}"));
-                    if let Err(mpsc::SendError(Ok(mut child))) = reply.send(result) {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                }
-            })
-            .expect("network child spawner");
-        tx
-    });
-    let (tx, rx) = mpsc::sync_channel(1);
-    sender
-        .send((cmd, tx))
-        .map_err(|_| "Network child spawner stopped")?;
-    rx.recv().map_err(|_| "Network child spawner stopped")?
-}
-
-pub fn stop_child(child: &mut Option<Child>) {
-    if let Some(mut c) = child.take() {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
 }
 
 pub fn key<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -738,10 +543,64 @@ impl Transaction {
         .rollback()
     }
 
+    /// A journal a previous agent wrote in this boot, taken over as it is:
+    /// its undo list stays, nothing runs (`adopt` re-takes each step).
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let journal: Journal = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|_| "Network recovery journal is invalid")?;
+        if journal.boot != boot_id() {
+            return Err("The network journal is from another boot".into());
+        }
+        Ok(Self { path: path.into(), undo: journal.undo, desired: Vec::new() })
+    }
+
+    /// Whether `path` holds a journal of this boot.
+    pub fn current(path: &Path) -> bool {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Journal>(&bytes).ok())
+            .is_some_and(|journal| journal.boot == boot_id())
+    }
+
+    /// The journaled undo whose program and first argument match `undo`
+    /// (a kernel setting's original value, kept across agent restarts).
+    pub fn journaled(&self, program: &str, first: &str) -> Option<&Cmd> {
+        self.undo.iter().find(|u| u.program == program && u.args.first().map(String::as_str) == Some(first))
+    }
+
+    /// Whether `undo` is journaled (an adopted journal's record of a step).
+    pub fn holds(&self, undo: &Cmd) -> bool {
+        self.undo.contains(undo)
+    }
+
+    /// Re-takes a step of an adopted journal: journaled if it is not, applied
+    /// only if its effect is gone (a previous agent may have died before or
+    /// after applying it), then kept for `reconcile`.
+    pub fn adopt(&mut self, step: Step) -> Result<(), String> {
+        if !self.undo.contains(&step.undo) {
+            self.undo.push(step.undo.clone());
+            self.save()?;
+        }
+        if !step.apply.present()? {
+            step.apply.run()?;
+        }
+        self.remember(&step);
+        Ok(())
+    }
+
     fn remember(&mut self, step: &Step) {
+        // A held kernel setting is also sampled right after ZTE's scripts
+        // run (`net_guard::hold`), until its undo is about to run.
+        if let ("@u60-sysctl", [key, value]) = (step.apply.program.as_str(), step.apply.args.as_slice()) {
+            crate::net_guard::hold(&self.owner(), key, value);
+        }
         if step.apply.checkable() && !self.desired.iter().any(|(_, undo)| *undo == step.undo) {
             self.desired.push((step.apply.clone(), step.undo.clone()));
         }
+    }
+
+    fn owner(&self) -> String {
+        self.path.to_string_lossy().into_owned()
     }
 
     /// Re-applies, in their original order, the changes another writer
@@ -830,6 +689,7 @@ impl Transaction {
     }
 
     pub fn rollback(&mut self) -> Result<(), String> {
+        crate::net_guard::release(&self.owner(), None);
         while let Some(c) = self.undo.last() {
             if let Err(error) = c.undo() {
                 let left = self.undo.clone();
@@ -845,6 +705,23 @@ impl Transaction {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Undoes only the changes with these undo commands, newest first, and
+    /// forgets them; the rest stays applied and journaled. For an optional
+    /// part of a live plan the owner turns off (hardware forwarding).
+    pub fn release(&mut self, undos: &[Cmd]) -> Result<(), String> {
+        for undo in undos.iter().rev() {
+            let Some(at) = self.undo.iter().rposition(|u| u == undo) else { continue };
+            if let ("@u60-sysctl", Some(key)) = (undo.program.as_str(), undo.args.first()) {
+                crate::net_guard::release(&self.owner(), Some(key));
+            }
+            undo.undo()?;
+            self.undo.remove(at);
+            self.desired.retain(|(_, u)| u != undo);
+            self.save()?;
+        }
+        Ok(())
     }
 }
 
@@ -963,10 +840,10 @@ mod tests {
 
     #[test]
     fn nft_rule_counts_match_between_a_written_ruleset_and_its_listing() {
-        let written = nft_fill(
+        let written = crate::netfx::effect::table(
             "ip",
             "u60_t",
-            Some(("s", "type ipv4_addr; flags interval;", &["1.0.0.0/8".to_owned()])),
+            &[("s", "type ipv4_addr; flags interval;", &["1.0.0.0/8".to_owned()])],
             &[("pre", "type filter hook prerouting priority 0; policy accept;", vec!["ip daddr @s return".into(), "accept".into()]), ("sub", "", vec!["return".into()])],
         );
         let listing = "table ip u60_t {\n\tset s {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t}\n\n\tchain pre {\n\t\ttype filter hook prerouting priority filter; policy accept;\n\t\tip daddr @s return\n\t\taccept\n\t}\n\n\tchain sub {\n\t\treturn\n\t}\n}\n";
@@ -975,6 +852,49 @@ mod tests {
         assert_eq!(want.get("pre"), Some(&2));
         let flushed = listing.replace("\t\tip daddr @s return\n\t\taccept\n", "");
         assert_eq!(nft_chain_rules(&flushed).get("pre"), Some(&0), "a flushed chain is not present");
+    }
+
+    #[test]
+    fn release_undoes_only_the_named_steps_in_reverse_and_keeps_the_rest_journaled() {
+        let dir = std::env::temp_dir().join(format!("u60-release-{}", std::process::id()));
+        let path = dir.join("journal.json");
+        let mut tx = Transaction::new(path.clone());
+        let step = |name: &str| Step::new(Cmd::new("true", &[name]), Cmd::new("true", &[&format!("undo-{name}")]));
+        for name in ["a", "b", "c"] {
+            tx.apply(step(name)).unwrap();
+        }
+        tx.release(&[step("b").undo, Cmd::new("true", &["never-applied"])]).unwrap();
+        let journal: Journal = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(journal.undo, vec![step("a").undo, step("c").undo]);
+        tx.rollback().unwrap();
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// v4 release blocker: a reconcile after a release (brnf given back)
+    /// never writes the running value again.
+    #[test]
+    fn a_reconcile_after_a_release_never_reapplies_the_released_step() {
+        let dir = std::env::temp_dir().join(format!("u60-late-reconcile-{}", std::process::id()));
+        let mut tx = Transaction::new(dir.join("journal.json"));
+        // The setting's own step, with an undo this host can run.
+        let step = Step::new(sysctl_step("bridge-nf-call-iptables", "0", "1").unwrap().apply, Cmd::new("true", &["restore-brnf"]));
+        // As if applied: journaled and kept for `reconcile`.
+        tx.undo.push(step.undo.clone());
+        tx.remember(&step);
+        // Read before the reconcile, which (as root on Linux) writes the
+        // real setting; put it back afterwards.
+        let original = sysctl_read("bridge-nf-call-iptables").ok();
+        let before = tx.reconcile();
+        assert_eq!(before.restored.len() + before.failed.len(), 1 - usize::from(original.as_deref() == Some("0")), "a live step is checked: {before:?}");
+        tx.release(&[step.undo.clone()]).unwrap();
+        if let Some(original) = &original {
+            let _ = sysctl_write("bridge-nf-call-iptables", original);
+        }
+        let after = tx.reconcile();
+        assert!(after.restored.is_empty() && after.failed.is_empty(), "released: nothing is written back");
+        assert_eq!(sysctl_read("bridge-nf-call-iptables").ok(), original, "the released value stays as it was put back");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1040,33 +960,6 @@ mod tests {
                 "-j",
                 "U60_MH"
             ]
-        );
-    }
-
-    #[test]
-    fn runtime_file_is_private_and_atomic() {
-        let dir = std::env::temp_dir().join(format!("u60-private-{}", std::process::id()));
-        let path = dir.join("config.json");
-        write_private(&path, b"secret").unwrap();
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(fs::read(&path).unwrap(), b"secret");
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn commands_are_not_shell_interpreted() {
-        let mut c = Command::new("printf");
-        c.args(["%s", "$(touch /no-such-file); ' &"]);
-        assert_eq!(
-            run(c, Duration::from_secs(1)).unwrap(),
-            "$(touch /no-such-file); ' &"
         );
     }
 
@@ -1294,27 +1187,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn piped_tool_input_is_bounded_by_the_same_process_deadline() {
-        assert_eq!(
-            run_input(
-                Command::new("cat"),
-                Duration::from_secs(1),
-                b"test input".to_vec()
-            )
-            .unwrap(),
-            "test input"
-        );
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 10"]);
-        let start = Instant::now();
-        assert_eq!(
-            run_input(command, Duration::from_millis(50), vec![0; 1024 * 1024]).unwrap_err(),
-            "Device tool timed out"
-        );
-        assert!(start.elapsed() < Duration::from_secs(2));
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "Mutates firewall; only run in an empty disposable network namespace"]
@@ -1442,12 +1314,4 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn short_lived_command_timeout_is_bounded() {
-        let mut command = Command::new("sleep");
-        command.arg("10");
-        let before = Instant::now();
-        assert!(run(command, Duration::from_millis(80)).is_err());
-        assert!(before.elapsed() < Duration::from_secs(2));
-    }
 }

@@ -296,6 +296,30 @@ pub async fn serve(ctx: Ctx, mut req: Request, owner: SessionId) -> Response {
     if method == Method::PATCH && endpoint == "/configs" && !safe_patch(&bytes) {
         return plain(403, "Only mode and log-level can be changed here");
     }
+    // A mode, group or rule-set write goes through the controller, ordered
+    // with every switch: what may skip the core is narrowed before the core
+    // changes and follows it after (section 5.4). Refused during a restart.
+    if routing_write(&method, endpoint) {
+        if !ctx.app.mihomo.accepts_writes() {
+            return busy();
+        }
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(if bytes.is_empty() { b"{}" } else { &bytes }) else {
+            return plain(400, "Invalid request");
+        };
+        let segments: Vec<String> = endpoint.trim_start_matches('/').split('/').map(crate::httpd::api::percent_decode).collect();
+        let method = if method == Method::PATCH { "PATCH" } else { "PUT" };
+        return match ctx.app.mihomo.routing_write_async(super::controller::Write { method, segments, body }).await {
+            Ok((status, body)) => {
+                let mut r = Response::new(Body::from(body));
+                *r.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                r.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                r
+            }
+            Err(error) if error.contains("restarting") => busy(),
+            Err(_) => plain(502, "Mihomo did not answer"),
+        };
+    }
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     let client = CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -306,7 +330,7 @@ pub async fn serve(ctx: Ctx, mut req: Request, owner: SessionId) -> Response {
             .build()
             .unwrap()
     });
-    let mut request = client.request(method, format!("http://{CONTROLLER}{endpoint}{query}")).bearer_auth(secret).body(bytes);
+    let mut request = client.request(method.clone(), format!("http://{CONTROLLER}{endpoint}{query}")).bearer_auth(secret).body(bytes);
     if let Some(ct) = parts.headers.get(CONTENT_TYPE) {
         request = request.header(CONTENT_TYPE, ct);
     }
@@ -445,6 +469,11 @@ fn allowed(method: &Method, path: &str) -> bool {
         Method::POST => path == "/cache/dns/flush" || path == "/cache/fakeip/flush",
         _ => false,
     }
+}
+
+/// The writes that can change what skips the core in the kernel.
+fn routing_write(method: &Method, endpoint: &str) -> bool {
+    (*method == Method::PATCH && endpoint == "/configs") || (*method == Method::PUT && (endpoint.starts_with("/proxies/") || endpoint.starts_with("/providers/rules/")))
 }
 
 fn safe_patch(bytes: &[u8]) -> bool {
@@ -658,7 +687,7 @@ mod tests {
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
-                let _held = core.inner.lock().unwrap();
+                let _held = core.shared.lock().unwrap();
                 ready_tx.send(()).unwrap();
                 let _ = release_rx.recv_timeout(Duration::from_secs(2));
             });

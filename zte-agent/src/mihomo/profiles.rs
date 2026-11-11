@@ -427,37 +427,33 @@ impl Mihomo {
         next: &Library,
         require_off: bool,
     ) -> Result<(), String> {
-        // Downloads, scripts and validation finish before taking the shared
-        // network lock. Relay and cellular intent must remain responsive.
-        let _network = self
-            .lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _operation = self
-            .operation
-            .try_lock()
-            .map_err(|_| "A Mihomo operation is in progress")?;
-        // Recheck under the lifecycle locks: a concurrent start may have
-        // completed during validation or after the early delete check.
-        if (require_off || (old.selected.is_some() && next.selected.is_none())) && self.running() {
-            return Err(
-                "Turn off Clash or select another profile before changing the active one".into(),
-            );
+        // Downloads, scripts and validation finish first; the relay's
+        // network lock is never taken here (I2).
+        {
+            let _operation = self
+                .operation
+                .try_lock()
+                .map_err(|_| "A Mihomo operation is in progress")?;
+            if (require_off || (old.selected.is_some() && next.selected.is_none())) && self.running() {
+                return Err(
+                    "Turn off Clash or select another profile before changing the active one".into(),
+                );
+            }
+            self.save_library(next)?;
         }
         let changed = old.selected != next.selected
             || selected(old).map(|p| &p.compiled) != selected(next).map(|p| &p.compiled);
-        let restart = changed.then(|| self.capture_runtime()).flatten();
-        self.save_library(next)?;
-        if let Some(restart) = restart {
-            if self
-                .disable_locked()
-                .and_then(|()| self.resume_runtime(&restart))
-                .is_err()
-            {
+        if changed {
+            // A running core restarts with it; the controller falls back to
+            // the configuration that ran before if the new one fails.
+            if let Err(error) = self.config_changed() {
                 // Keep the previous selection and processed config together.
                 self.save_library(old)?;
-                let restored = self.resume_runtime(&restart).is_ok();
-                return Err(if restored { "Profile could not start; previous profile restored" } else { "Profile could not start; previous selection restored but proxy is off. Check recovery status" }.into());
+                return Err(if self.running() {
+                    format!("Profile could not start; previous profile restored ({error})")
+                } else {
+                    format!("Profile could not start; previous selection restored but proxy is off. Check recovery status ({error})")
+                });
             }
         }
         Ok(())

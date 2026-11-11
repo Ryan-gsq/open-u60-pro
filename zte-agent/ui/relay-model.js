@@ -1,11 +1,10 @@
 'use strict';
 ((globalThis) => {
   const band = frequency => Number(frequency) < 3000 ? '2.4 GHz' : '5 GHz';
-  const widthLabel = mode => mode === 'auto' ? 'Auto tuning' : 'Keep negotiated bandwidth';
   const securityLabel = network => !network.supported ? 'Unsupported' : network.security === 'open' ? 'Open' : 'WPA2';
   const level = dbm => { const value = Number(dbm); return value >= -55 ? 'strong' : value >= -67 ? 'good' : value >= -78 ? 'fair' : 'weak'; };
   const ipv6Labels = {
-    configured: 'Configured (internet not verified)', detecting: 'Discovering upstream IPv6', no_upstream: 'No usable upstream IPv6; IPv4 only',
+    configured: 'Configured, forwarded by the CPU (internet not verified)', detecting: 'Discovering upstream IPv6', no_upstream: 'No usable upstream IPv6; IPv4 only',
     unsupported: 'Unavailable; IPv4 only', expired: 'Upstream IPv6 expired; IPv4 only', error: 'IPv6 setup failed; IPv4 only'
   };
   const ipv6Label = state => ipv6Labels[state] || 'Off';
@@ -34,9 +33,9 @@
     const data = status || {};
     if (data.connected !== true) return [];
     const ipv6 = data.ipv6 || {}, rows = [['Upstream IPv4', data.address || '—', true], ['Gateway', data.gateway || '—', true]];
-    const frequency = Number(data.frequency), width = Number(data.width);
-    rows.push(['Upstream link', Number.isFinite(frequency) && frequency > 0 ? [band(frequency), Number.isFinite(width) && width > 0 ? `${width} MHz` : '', data.width_state || ''].filter(Boolean).join(' · ') : '—', false]);
-    rows.push(['Bandwidth policy', widthLabel(data.width_mode), false]);
+    const frequency = Number(data.frequency);
+    // The relay keeps the negotiated bandwidth (width tuning was retired).
+    rows.push(['Upstream link', Number.isFinite(frequency) && frequency > 0 ? `${band(frequency)} · negotiated bandwidth` : '—', false]);
     rows.push(['Upstream IPv6 / NAT66', ipv6Label(ipv6.state), false]);
     if (ipv6.upstream === true) rows.push(['Upstream IPv6', ipv6.address || '—', true], ['LAN IPv6 prefix', ipv6.lan_prefix || '—', true]);
     rows.push(['After a restart', data.autostart === true ? 'Automatic reconnect enabled' : data.autostart === false ? 'Stays off; no restart choice saved' : 'Unknown', false]);
@@ -56,11 +55,12 @@
     return '';
   }
 
-  function connectRequest({id, password, remember, ipv6, widthMode}) {
-    const body = {network: id, password: String(password || ''), confirmed: true, ipv6: ipv6 !== false, remember: remember === true};
-    if (widthMode === 'off' || widthMode === 'auto') body.width_mode = widthMode;
-    return body;
+  function connectRequest({id, password, remember, ipv6}) {
+    return {network: id, password: String(password || ''), confirmed: true, ipv6: ipv6 !== false, remember: remember === true};
   }
+
+  // What the router's own filters and hardware forwarding cover (D8).
+  const scope = 'The router’s parental control and URL filter do not apply to devices using the relay: relayed traffic is accepted ahead of them, and hardware-forwarded connections skip the router’s filtering altogether. Only relayed IPv4 can be hardware forwarded; IPv6 (NAT66) and traffic through Clash use the CPU.';
 
   const savedNote = entry => entry.security === 'open' ? 'Open network; no password needed' : entry.remembered ? 'Password remembered; leave it empty when connecting' : 'Password not saved; enter it when connecting';
 
@@ -72,6 +72,6 @@
   const usable = networks => (Array.isArray(networks) ? networks : []).filter(network => network && typeof network.id === 'string').map((network, index) => ({network, index}))
     .sort((a, b) => (b.network.supported === true) - (a.network.supported === true) || a.index - b.index).map(item => item.network);
 
-  const api = {band, widthLabel, securityLabel, level, ipv6Label, view, facts, passwordProblem, connectRequest, savedNote, consent, usable};
+  const api = {band, securityLabel, level, ipv6Label, view, facts, passwordProblem, connectRequest, scope, savedNote, consent, usable};
   if (typeof module === 'object' && module.exports) module.exports = api; else globalThis.OpenU60Relay = api;
 })(globalThis);

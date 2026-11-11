@@ -31,8 +31,10 @@ mod lan_test;
 mod live_activity;
 mod modem_ext;
 mod mihomo;
+mod guard;
 mod net_guard;
 mod net_tools;
+mod netfx;
 mod network_ext;
 mod oos_policy;
 mod ota;
@@ -99,6 +101,9 @@ fn main() {
     if std::env::var("U60_RELAY_DHCP6").ok().as_deref() == Some("1") {
         std::process::exit(wifi_relay::ipv6::callback(args.get(1).map(String::as_str).unwrap_or(""), args.get(2).map(String::as_str).unwrap_or("")));
     }
+    if args.get(1).map(String::as_str) == Some("guard") {
+        std::process::exit(guard::cli(&args[2..]));
+    }
     if args.get(1).map(String::as_str) == Some("network-recover") {
         let lock = Arc::new(std::sync::Mutex::new(()));
         let result = mihomo::Mihomo::new(Arc::clone(&lock)).recover()
@@ -148,6 +153,9 @@ fn main() {
     if let Err(error) = auth::startup::write_local_token(&state.auth, std::path::Path::new(auth::startup::LOCAL_TOKEN)) {
         eprintln!("[auth] local token unavailable: {error}");
     }
+
+    // Q1: a separate process restarts this agent if it dies unexpectedly.
+    guard::spawn();
 
     if let Err(error) = network_clock::restore_floor() {
         eprintln!("[clock] {error}");
@@ -204,7 +212,7 @@ fn main() {
         .start(charger_rx, Arc::clone(&state.cache));
     state.sms_forward.start(sms_rx, service_rx, wan_status_rx);
     state.tailscale.auto_start();
-    state.mihomo.start();
+    state.mihomo.start(state.tls.name().to_owned());
     state.mihomo.start_profiles();
     state.wifi_relay.start();
     restore_network(&state);

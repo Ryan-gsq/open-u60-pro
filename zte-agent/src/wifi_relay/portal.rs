@@ -1,32 +1,96 @@
 //! B31's offline DNS portal follows cellular state, not our Wi-Fi uplink.
 //! Suppress it with one volatile UCI delta; never commit or restore a snapshot.
+//! LAN web traffic also skips the vendor's offline redirect (`redirect_chain`,
+//! both families) through a RETURN that must sit before every vendor rule
+//! there: a present rule (`-C`) behind a DNAT proves nothing.
 
 use crate::net_tools::{Cmd, Step};
 
 const KEY: &str = "zwrt_redirect.redirect.switch";
 const PACKAGE: &str = "zwrt_redirect";
+const CHAIN: &str = "redirect_chain";
+const COMMENT: &str = "zte-agent-wifi-relay";
+/// The RETURN, as given to iptables.
+const BYPASS: [&str; 7] = ["-i", "br-lan", "-m", "comment", "--comment", COMMENT, "-j"];
 
 pub(super) fn plan() -> Result<Option<Step>, String> {
     plan_with(&mut |cmd| cmd.run())
 }
 
+fn bypass() -> Vec<&'static str> {
+    let mut rule = BYPASS.to_vec();
+    rule.push("RETURN");
+    rule
+}
+
+/// Skips only the vendor's offline-portal chain, not the rest of NAT or any
+/// filter policy: direct management and configured port forwards survive.
+/// Applied (and re-checked) as `@u60-relay-portal-return`, which places it
+/// first; its undo is the plain `-D` every agent version runs.
 pub(super) fn web_bypass(tool: &str) -> Step {
-    crate::net_tools::rule(
-        tool,
-        "nat",
-        "redirect_chain",
-        &[
-            "-i",
-            "br-lan",
-            "-m",
-            "comment",
-            "--comment",
-            "zte-agent-wifi-relay",
-            "-j",
-            "RETURN",
-        ],
-        true,
-    )
+    let rule = crate::net_tools::rule(tool, "nat", CHAIN, &bypass(), true);
+    Step::new(Cmd::new("@u60-relay-portal-return", &[tool]), rule.undo)
+}
+
+/// Where the RETURN is in a `-S redirect_chain` listing.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Place {
+    First,
+    /// Behind a vendor rule (a DNAT may come first).
+    Late,
+    Absent,
+}
+
+fn place(listing: &str) -> Place {
+    let ours = format!("-A {CHAIN} {}", bypass().join(" "));
+    let mut vendor = false;
+    for line in listing.lines().map(str::trim).filter(|l| l.starts_with(&format!("-A {CHAIN} "))) {
+        if line == ours {
+            return if vendor { Place::Late } else { Place::First };
+        }
+        vendor = true;
+    }
+    Place::Absent
+}
+
+fn tool(args: &[String]) -> Result<&'static str, String> {
+    match args {
+        [tool] if tool == "iptables" => Ok("iptables"),
+        [tool] if tool == "ip6tables" => Ok("ip6tables"),
+        _ => Err("Invalid relay portal bypass".into()),
+    }
+}
+
+fn listing(tool: &str) -> Result<String, String> {
+    Cmd::new(tool, &["-w", "2", "-t", "nat", "-S", CHAIN]).run()
+}
+
+/// `@u60-relay-portal-return <tool>`: puts the RETURN first. One behind a
+/// vendor rule is moved in one restore transaction (deleted and inserted
+/// first together), so it is never missing and nothing of the vendor's is
+/// touched.
+pub(crate) fn place_return(args: &[String]) -> Result<(), String> {
+    let tool = tool(args)?;
+    let input = moves(place(&listing(tool)?));
+    match input {
+        None => Ok(()),
+        Some(input) => crate::net_tools::firewall::restore(&format!("{tool}-restore"), input),
+    }
+}
+
+/// The restore transaction that puts the RETURN first from `at`.
+pub(super) fn moves(at: Place) -> Option<String> {
+    let rule = bypass().join(" ");
+    match at {
+        Place::First => None,
+        Place::Absent => Some(format!("*nat\n-I {CHAIN} 1 {rule}\nCOMMIT\n")),
+        Place::Late => Some(format!("*nat\n-D {CHAIN} {rule}\n-I {CHAIN} 1 {rule}\nCOMMIT\n")),
+    }
+}
+
+/// Whether the RETURN is in place: present and ahead of every vendor rule.
+pub(crate) fn return_first(args: &[String]) -> Result<bool, String> {
+    Ok(place(&listing(tool(args)?)?) == Place::First)
 }
 
 fn plan_with(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Option<Step>, String> {
@@ -158,6 +222,24 @@ mod tests {
         fn action(&mut self, action: &str) -> Result<(), String> {
             command_with(&[action.into()], &mut |cmd| self.run(cmd))
         }
+    }
+
+    #[test]
+    fn the_redirect_return_must_come_before_every_vendor_rule() {
+        let ours = "-A redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN";
+        let dnat = "-A redirect_chain -i br-lan -p tcp -m tcp --dport 80 -j DNAT --to-destination 192.168.0.1:8080";
+        assert_eq!(place(&format!("-N redirect_chain\n{ours}\n{dnat}\n")), Place::First);
+        assert_eq!(place(&format!("-N redirect_chain\n{dnat}\n{ours}\n")), Place::Late, "present (-C succeeds) but behind the DNAT");
+        assert_eq!(place(&format!("-N redirect_chain\n{dnat}\n")), Place::Absent);
+        assert_eq!(place("-N redirect_chain\n-A redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay-old -j RETURN\n"), Place::Absent);
+        assert_eq!(moves(Place::First), None);
+        assert_eq!(moves(Place::Absent).unwrap(), format!("*nat\n-I redirect_chain 1 {}\nCOMMIT\n", &ours[18..]));
+        // Moved in one transaction: delete and insert commit together.
+        assert_eq!(moves(Place::Late).unwrap(), format!("*nat\n-D redirect_chain {0}\n-I redirect_chain 1 {0}\nCOMMIT\n", &ours[18..]));
+        let step = web_bypass("ip6tables");
+        assert_eq!((step.apply.program.as_str(), step.apply.args.as_slice()), ("@u60-relay-portal-return", &["ip6tables".to_owned()][..]));
+        assert_eq!(step.undo.args.join(" "), format!("-w 2 -t nat -D redirect_chain {}", &ours[18..]), "an undo the previous agent runs");
+        assert!(step.apply.checkable() && tool(&["inet".to_owned()]).is_err());
     }
 
     #[test]

@@ -251,12 +251,14 @@ pub fn status(_state: &crate::handlers::AppState) -> (u16, Value) {
     }
 }
 
+/// Reservations serialize their own writes and reloads; they do not
+/// conflict with the relay or Mihomo (section 4.6).
+static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn change(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Value) {
     let result = (|| {
-        let _lock = state
-            .network_lock
-            .try_lock()
-            .map_err(|_| "A network operation is in progress")?;
+        let _lock = crate::netfx::admission::enter(&WRITES, crate::netfx::admission::WAIT)
+            .ok_or("A network operation is in progress")?;
         let request: Value =
             serde_json::from_slice(body).map_err(|_| "Invalid reservation request")?;
         supported()?;

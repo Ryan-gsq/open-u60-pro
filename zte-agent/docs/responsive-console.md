@@ -34,7 +34,7 @@ Battery and USB power use measured voltage × current with µV/µA conversion, i
 
 Three pages under **Network** drive the optional Rust extensions described in [network-extensions.md](network-extensions.md). None of them polls while idle; Relay re-reads its status every five seconds only while a restore is in progress, and every change asks for confirmation first. A request that gets no reply is shown as uncertain and the status is read again instead of assuming success. All text from the router is rendered with `textContent`.
 
-- **Wi-Fi Relay** (`#network/relay`): scan, pick an upstream, connect and disconnect, explicit clock check, saved networks (forget, per-network bandwidth choice) and the compatibility notes. Passwords go only in the request body.
+- **Wi-Fi Relay** (`#network/relay`): scan, pick an upstream, connect and disconnect, explicit clock check, saved networks (forget; the per-network bandwidth choice was retired in v6), what the router's parental control, URL filter and hardware forwarding cover while connected (D8), and the compatibility notes. Passwords go only in the request body.
 - **Clash / Mihomo** (`#network/mihomo`): install the pinned core, start and stop, up to 16 configuration profiles (add by subscription URL, file or paste; edit, refresh, select, delete) and the global Merge and Script. A subscription URL is fetched only when the editor is opened; saved YAML is never returned to the browser.
 - **Clash proxies** (`#network/proxies`): routing mode, node choice per selector group (rolled back on failure) and delay tests (three at a time, at most 30 nodes per group). The Mihomo controller secret never leaves the router; the agent performs these fixed operations itself.
 

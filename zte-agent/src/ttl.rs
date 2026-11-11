@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 const CONFIG_PATH: &str = "/data/local/tmp/ttl_config.json";
 const CONFIG_TEMP_PATH: &str = "/data/local/tmp/ttl_config.json.tmp";
-const CHAIN: &str = "OPENU60_TTL";
+const CHAIN: &str = crate::netfx::ids::TTL_CHAIN;
 const WAN_INTERFACE: &str = "rmnet_data0";
 const DEFAULT_TTL: u8 = 64;
 

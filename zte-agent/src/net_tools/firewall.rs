@@ -92,10 +92,33 @@ impl Batch {
     }
 
     pub(super) fn run(self) -> Result<(), String> {
-        let mut command = Command::new(self.program);
-        command.args(["--noflush", "--wait", "2"]);
-        super::run_input(command, Duration::from_secs(8), self.input.into_bytes()).map(|_| ())
+        restore(&self.program, self.input)
     }
+}
+
+/// One `iptables-restore`/`ip6tables-restore --noflush` transaction: each
+/// table's lines commit together or not at all.
+pub(crate) fn restore(program: &str, input: String) -> Result<(), String> {
+    let mut command = Command::new(program);
+    command.args(["--noflush", "--wait", "2"]);
+    super::run_input(command, Duration::from_secs(8), input.into_bytes()).map(|_| ())
+}
+
+/// The restore transactions `Transaction::apply_network` runs for `steps`
+/// (program, input), skipping the steps between them: isolated acceptance.
+#[cfg(test)]
+pub(crate) fn inputs(steps: &[Step]) -> Vec<(String, String)> {
+    let (mut out, mut at) = (Vec::new(), 0);
+    while at < steps.len() {
+        match Batch::collect(&steps[at..]) {
+            Some(batch) => {
+                at += batch.count;
+                out.push((batch.program, batch.input));
+            }
+            None => at += 1,
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -21,16 +21,35 @@ pub(super) fn prepare(
     let before = Cmd::new("iw", &["dev", "wlan2", "info"]).run()?;
     let (frequency, bandwidth, center) =
         width::parse_channel(&before).ok_or("Cannot snapshot hotspot channel")?;
-    // A switch that keeps the primary channel is refused (`switch_with`).
-    let staging = channels
-        .staging_5ghz()
-        .filter(|staging| *staging != frequency || bandwidth == 20)
-        .or_else(|| channels.staging_5ghz_avoiding(frequency))
-        .ok_or("No enabled non-DFS hotspot staging channel")?;
+    let staging = staging(channels, frequency, bandwidth).ok_or("No enabled non-DFS hotspot staging channel")?;
     tx.apply(Step::new(
         command(staging, 20, staging),
         command(frequency, bandwidth, center),
     ))
+}
+
+/// A switch to another 5 GHz upstream keeps the session's hotspot journal,
+/// whose undo still returns the hotspot to the owner's channel: the hotspot
+/// only goes back to the non-DFS staging channel, where the next
+/// association takes it along again. On the DFS channel it followed the
+/// station to, a new association does not complete (B31, 2026-11-10), and
+/// the owner's 160 MHz channel would first need a radar check of about
+/// 60 s. Leaving a DFS channel needs none; nothing is journaled here.
+pub(super) fn restage(channels: &Channels) -> Result<(), String> {
+    dfs_switch::allow();
+    let before = Cmd::new("iw", &["dev", "wlan2", "info"]).run()?;
+    let (frequency, bandwidth, _) = width::parse_channel(&before).ok_or("Cannot read the hotspot channel")?;
+    let staging = staging(channels, frequency, bandwidth).ok_or("No enabled non-DFS hotspot staging channel")?;
+    command(staging, 20, staging).run().map(|_| ())
+}
+
+/// The non-DFS 20 MHz channel to stage at from `frequency`/`bandwidth`: a
+/// switch that keeps the primary channel is refused (`switch_with`).
+fn staging(channels: &Channels, frequency: u32, bandwidth: u32) -> Option<u32> {
+    channels
+        .staging_5ghz()
+        .filter(|staging| *staging != frequency || bandwidth == 20)
+        .or_else(|| channels.staging_5ghz_avoiding(frequency))
 }
 
 /// File reads only: the three-second relay watcher must not spawn extra UCI
@@ -280,6 +299,16 @@ fn switch_with(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn a_handed_over_hotspot_leaves_its_dfs_channel_for_the_non_dfs_staging_one() {
+        let channels = Channels::parse("\t* 5180 MHz [36]\n\t* 5200 MHz [40]\n\t* 5260 MHz [52]\n\t  Radar detection\n");
+        assert_eq!(staging(&channels, 5260, 160), Some(5180), "from the channel the station took it to");
+        assert_eq!(staging(&channels, 5180, 20), Some(5180), "already staged");
+        assert_eq!(staging(&channels, 5180, 160), Some(5200), "a width-only switch is refused, so through another channel");
+        let only = Channels::parse("\t* 5180 MHz [36]\n\t* 5260 MHz [52]\n\t  Radar detection\n");
+        assert_eq!(staging(&only, 5180, 160), None);
+    }
 
     #[test]
     fn external_off_wins_over_runtime_restore() {

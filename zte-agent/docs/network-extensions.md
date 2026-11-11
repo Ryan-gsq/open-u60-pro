@@ -5,6 +5,7 @@ not a released or fully device-accepted firmware. Dated validation below and in
 `relay-ipv6-validation.md` records the builds tested, not acceptance of every later
 change. The iOS/Android interfaces and the Next.js public site are unchanged.
 Do not assume successful unit tests prove B31 forwarding works.
+Product overview of Mihomo and the Wi-Fi relay: [mihomo-relay-prd.md](mihomo-relay-prd.md).
 
 ## Console pages
 
@@ -83,8 +84,9 @@ first-match ordering (append after MATCH will normally never be reached).
 The basic merge behavior follows Clash Verge Rev's merge implementation, but
 this is not full desktop parity: the U60 managed network fields win last.
 
-U60 enforces controller/authentication, ports, TPROXY, DNS listen/redir-host and
-IPv6 after extensions. This intentionally differs from desktop fake-IP settings.
+U60 enforces controller/authentication, ports, TPROXY, DNS listen/fake-ip (with a
+rule-mode filter generated from the rules; the subscription's own filter becomes
+a real-address prefix) and IPv6 after extensions.
 PROCESS-NAME cannot identify programs on hotspot clients; use domain/IP rules.
 Local 127.0.0.1 hosts entries refer to the resolving client, not a shared Mac.
 
@@ -188,11 +190,13 @@ database or subscription is embedded in the Rust binary.
   ran 125-132 Mbit/s single flow at about 90% core CPU against 190-238 at
   31-44% now). The rules live in the agent's own nftables tables `ip
   u60_mihomo` and `ip6 u60_mihomo` (ZTE rewrites only iptables-legacy): a
-  prerouting chain at `mangle - 1` returns non-`br-lan` input, DNS, local
+  prerouting chain at `mangle - 1` returns non-`br-lan` input, DNS and local
   destinations (`fib daddr type local`, so router addresses need no per-address
-  exemption), private/multicast ranges and, with China IP direct, the IPv4
-  `china` set; it then marks established transparent sockets and TPROXYs the
-  rest with mark `0x700/0xff00`. Rule pref `18620` sends that mark to table
+  exemption), sends the fake-ip range `198.18.0.0/16` to the core, returns
+  private/multicast ranges and then what the core's mode and rules send DIRECT
+  by address (the DIRECT bypass, below); the rest goes to the `to_core` chain,
+  which marks established transparent sockets and TPROXYs the rest with mark
+  `0x700/0xff00`. Rule pref `18620` sends that mark to table
   `60625` (`local default dev lo`, both families). A `dns` chain at `dstnat - 1`
   redirects LAN TCP/UDP 53 to 1053, and an `input` chain drops 1053/17894 from
   anything but `br-lan`/`lo`. The kernel has no `NFT_FIB_INET`, so the tables
@@ -206,7 +210,8 @@ database or subscription is embedded in the Rust binary.
   (200/120 restored): qcacld leaves TSQ at about 1 ms of data, which held one
   core-to-LAN TCP connection at about 60-70 Mbit/s. Both are `@u60-sysctl`
   steps in the start transaction; ZTE resets brnf after relay connects and on
-  `fw3 reload`, and `net_guard` sets it back. See
+  `fw3 reload`, and `net_guard` sets it back (read every 0.5 s for 3 s after
+  each ZTE trigger; see the relay's firewall layout). See
   `docs/research/2026-11-08-mihomo-tproxy-single-flow.md`.
 - Port 17894 (17893 is the private download proxy), table, priority and the
   absence of both nft tables are checked before use; a taken port fails the
@@ -218,20 +223,149 @@ database or subscription is embedded in the Rust binary.
   check. B31 can have only link-local addresses with cellular off and no Relay;
   the core must still listen on IPv6 in that state. No WAN route or modem switch
   is created to make the check pass.
-- LAN DNS TCP/UDP 53 redirects to port 1053; managed DNS uses `redir-host`,
-  retaining submitted upstream nameservers/policies. The current HTTPS management
-  name (`u60.home.arpa` by default) is forced to the actual `br-lan` IPv4 address
-  with host overrides enabled, so DNS interception does not lose local management.
-  Hardcoded DoH is not universally blocked. Other local/private/tailnet traffic
-  bypasses proxy.
+- LAN DNS TCP/UDP 53 redirects to port 1053; managed DNS is always `fake-ip`
+  (owner decision 64), retaining submitted upstream nameservers/policies: pool
+  `198.18.0.1/16`, no IPv6 pool (it would fall in the ULA range the chain returns;
+  such domains answer AAAA empty), TTL 1 s, `profile.store-fake-ip`. The
+  rule-mode `fake-ip-filter` is generated from the configuration alone
+  (`Routes::dns`; group choices and the mode never change it, owner choices
+  Q2/Q3 of 2026-11-10): local names and Windows' connectivity check keep real
+  addresses. With the DIRECT bypass off, so does the subscription's own
+  blacklist and every other name is fake. With it on, top-down up to the last
+  rule that could ever let traffic skip the core (an address rule whose target
+  is DIRECT or a `select` group that can reach DIRECT, a `MATCH` like it, or
+  the end): a domain rule sent to `DIRECT` itself from a fixed list keeps real
+  addresses; every other domain rule fakes them (a group can be switched away
+  from DIRECT later, and a client holding a real address would keep reaching it
+  directly); a rule set that is refreshed or reloaded fakes its current names,
+  and one sent anywhere but DIRECT may gain any name, so everything after it is
+  fake; `NOT`/`SUB-RULE` and logical rules naming such sets likewise end the real
+  addresses. The subscription's own blacklist follows the rules, then
+  `MATCH,real-ip` (or `MATCH,fake-ip` after such a set). A switch therefore needs
+  no DNS change; the bypass switch does: a hot reload of the same configuration
+  (`PUT /configs?force=false` with the whole managed configuration, same secret,
+  mode, log level, egress interface and ports), tightened first. A 204 is not
+  proof: the mode, egress interface and every group's choice must read back as
+  before (no group fallen back to `COMPATIBLE`), every rule set and listener must
+  be there, and a name whose answer must change (`routing::reload_probe`: the
+  never-resolving `u60-reload-probe.invalid` when the default changed, else a
+  fixed DIRECT name) must answer as the new filter says on 1053 (fake or not). A
+  timeout is an unknown result decided by the same read-back. Anything not proven
+  falls back to a planned restart behind the interception. Status `state` is
+  `reloading` meanwhile; Zashboard's writes get 503. The log line
+  `[mihomo] reload answered=… verified=… elapsed_ms=…` records each reload. The current
+  HTTPS management name (`u60.home.arpa` by default) is forced to the actual
+  `br-lan` IPv4 address with host overrides enabled, so DNS interception does not
+  lose local management. Hardcoded DoH is not universally blocked. Other
+  local/private/tailnet traffic bypasses proxy.
 - No blanket `OUTPUT` proxying: this avoids core self-proxy loops. The router's
   own applications do not automatically use the LAN transparent proxy.
 - UDP and IPv6 destination reachability still require capable nodes/services.
   Dual-stack interception is an implementation target, not a tested no-leak
   guarantee. Unsupported TPROXY/nftables fails startup and triggers rollback.
-- If the core exits, the watchdog removes interception. This is fail-open/direct,
-  not an anonymity kill switch. Firmware rewrites (firewall reloads, ZTE scripts,
-  sysctl resets) are repaired by `net_guard` (`relay-hw-offload.md`, section 5).
+- Bypass Mihomo for DIRECT rules (`cn-direct`, the name of its first, China-only
+  form; owner choice): IPv4 the core would send DIRECT by address skips it in the
+  kernel (kernel NAT, so on the relay IPA can carry it). Rule mode: the rules are
+  compiled top-down, in the core's order, after the private ranges return
+  (`Routes::compile`): a rule matching by address, port or network (`IP-CIDR`,
+  any `GEOIP` code from the core's GeoIP.dat, `DST-PORT`, `SRC-PORT`,
+  `SRC-IP-CIDR`, `NETWORK`, compilable `AND`/`OR`, text/YAML `ipcidr`/`classical`
+  rule sets) returns when its target reaches DIRECT through `select` groups and
+  goes to the core otherwise; domain rules are left to fake-ip, process rules
+  never match (process lookup is off). A DIRECT rule the kernel cannot check is
+  skipped; a non-DIRECT one (`IP-ASN`, `NOT`, `SRC-GEOIP`, binary `mrs` address
+  sets, a rule set not downloaded yet, a `file` rule set the core reloads whenever
+  the file changes, a code GeoIP.dat lacks, any `GEOIP` without geodata mode) ends
+  the chain there, keeping earlier returns. `MATCH,DIRECT` or no `MATCH` (the
+  core's default) returns the rest. Plain ranges of adjacent rules with one
+  verdict share an `ip_<n>` set, each `GEOIP` code has a `geo_<code>` set. Status
+  `kernel`: `bypass` `rules` with `returns` (DIRECT rules in the chain) and
+  `reason` (where it ends early), or `none` with the reason. Direct mode: all
+  IPv4. Global mode or the switch off: nothing. IPv6 always goes through the core.
+  Clients that bypass the core's DNS (DoH, hard-coded IPs) are routed by address
+  only.
+- Rule sets never change behind the kernel (owner choice Q2): the managed
+  configuration drops `interval` from `http` rule providers, so the core never
+  refreshes one by itself; the controller refreshes each at the subscription's
+  interval (`PUT /providers/rules/<name>`, the next one 10 min later if it fails)
+  with the same order as any routing write: that set counts as unknown first
+  (skipped where it sends DIRECT, the chain ends where it does not), then the
+  content is read back and the new plan loaded. A manual refresh in Zashboard
+  goes the same way.
+- Routing writes are ordered (`relay-mihomo-architecture.md` section 5.4): a
+  mode or group change from the console, and `PATCH /configs`,
+  `PUT /proxies/*` and `PUT /providers/rules/*` from Zashboard, go through the
+  controller: while anything is bypassed, the kernel first stops bypassing
+  (the hold table, confirmed by its generation marker; if it cannot be
+  confirmed the write is refused and nothing changes), then the core changes,
+  its mode and choices are read back, LAN IPv4 connections to what lost DIRECT
+  are reset (only those ranges when both chains are plain destinations, every
+  LAN IPv4 connection otherwise or beyond 64 ranges; nothing when nothing lost
+  it), and the new plan is loaded. During a restart Zashboard's writes get 503
+  and console changes wait. Every 60 s the controller reads the core's mode and
+  choices back and follows any difference the same way.
+- Controller (`mihomo/controller.rs`): one thread for owner commands, routing
+  writes, egress changes, core exits, retries, `net_guard` repairs and rule-set
+  refreshes; it never takes the relay's network lock, so an association or a
+  5 GHz CAC never delays an exit or a repair. Pages read its published snapshot:
+  `state` (`off`, `starting`, `running`, `restarting`, `backoff`,
+  `cleanup_pending`), `generation`, `tables` (target and confirmed generation),
+  `direct_fallback`, `failures`, `retry_in_s`. Each core process has one reaper
+  (`waitid` without reaping first, so a stop never signals a reused process id);
+  an exit of an older generation is ignored.
+- Starting: the input guard, kernel settings and policy routes go in before the
+  core; interception (the hold table: nothing skips the core) once it listens;
+  the plan only from the mode and choices the ready core reports. `to_core` ends
+  with a TCP/UDP drop in every interception table: TPROXY without a listening
+  core skips only its own rule (`NFT_BREAK`), and the packet would otherwise be
+  forwarded directly. A connection the core already holds keeps reaching it
+  before any DIRECT return (`socket transparent 1 socket wildcard 0`), so a
+  switch to DIRECT does not cut it; a new SYN to a remote port 17894 is not taken
+  for one.
+- Planned restart (egress change, profile change, a reload that was not proven): the hold
+  table first, then the old core stops, the new one starts behind the
+  interception; nothing goes direct meanwhile. A new profile that fails falls
+  back to the configuration that ran before. An IPv4 egress change the relay
+  announces restarts the core at once; an IPv6-only change must hold for 5 s and
+  such restarts are at least 60 s apart; outside the relay the 15 s audit
+  restarts only for an egress that strands connections.
+- D3: a core exit the agent sees, or a planned restart that finally fails,
+  withdraws interception, the kernel settings and the policy routes; LAN traffic
+  goes direct while fake-ip addresses fail fast (TCP reset, UDP port
+  unreachable). Retries follow D2: 5, 15, 30, 60 s, then every 5 min; three
+  failures within 60 s go to 5 min at once; 5 min running clears the count. The
+  owner turning it off cancels any retry. A start from D3 keeps the fake-ip
+  reject (and the input guard) until the full table takes over, then resets LAN
+  IPv4 and IPv6 connections that went direct. A start the owner asked for that
+  fails releases what it took and stays off; a boot restore keeps retrying.
+- The agent itself dying (owner choice Q1): the resident drop keeps LAN traffic
+  from going direct, and a guard process the agent started (`zte-agent guard`,
+  `src/guard.rs`) runs the boot launcher again. The new agent adopts this boot's
+  tables and journal while the owner wants Mihomo on (the hold table, the
+  original kernel values kept from the journal), starts a new core and loads the
+  plan; nothing passes direct and DNS comes back with the core. The guard never
+  starts a second agent (the launcher's lock and identity check), leaves an OTA
+  trial to the update helper (`pending` marker) and an operator's stop to the
+  operator (`/tmp/zte-agent-run/stopped`), and after three failed attempts rolls
+  the network changes back (`network-recover`, direct) while it keeps trying
+  every 5 min. The ended agent's log is kept as `/tmp/zte-agent.previous.log`.
+- Firmware rewrites (firewall reloads, ZTE scripts, sysctl resets) are repaired
+  by `net_guard` (`relay-hw-offload.md`, section 5); the tables are compared with
+  their generation marker and rule counts and reloaded whole.
+
+The tables are `netfx::effect::NftTables`: both families are replaced whole in
+one `nft -f` batch (stale sets go with them) carrying a generation marker, a rule
+comment in the unhooked chain `state`. The marker read back with `nft -t` (no set
+elements, so a large GeoIP set never meets an output limit) decides whether the
+kernel holds a batch: a tool that failed or timed out may still have committed,
+and a batch that cannot be read back stays the target and is loaded again; the
+previous table or a table name that exists is never taken for the new one. A table
+name without the agent's marker is never taken over; a previous agent's table
+(marker present) is adopted or cleaned up. The journal keeps the format of
+earlier versions (`{boot, undo}`) and only undo commands the deployed previous
+agent runs (`@u60-sysctl`, `ip ... del`, `@u60-mihomo-nft remove`, tables last
+in, first out); `tests/mihomo-qa` checks that the previous agent's
+`network-recover` undoes it completely.
 
 Generated network plans journal every undo with one durable write before any
 effect. Supported contiguous firewall runs use `iptables-restore` or
@@ -243,8 +377,9 @@ A failed restore is never retried blindly as individual commands. Because an
 interrupted plan also runs the undo of steps that never ran, no such undo may
 match another writer's identical rule: a rule in a chain the agent does not own
 jumps to an owned `U60_*` chain or matches only the agent's own interfaces or
-comment (the relay's broad cellular IPv6 reject lives in `U60_RELAY_OUT`, the
-IPv6 relay's in `U60_R6_OUT`; a unit test checks every prejournaled plan). File fsync is
+comment (the relay's denials, the cellular IPv6 rejects among them, are rules
+in its own nftables tables, not in legacy chains; a unit test checks every
+prejournaled plan). File fsync is
 retained; this is not a claim that runtime network journals survive power loss
 as an atomic rename transaction. Previous-boot runtime journals are discarded.
 
@@ -277,8 +412,9 @@ proxies/groups but not an arbitrary interface. Router addresses are matched live
 by `fib daddr type local`, so an address change alone (Tailscale, LAN or another
 non-egress interface) does not restart the core or drop connections; the relay's
 DNS tables match them the same way. The interception is
-re-checked by `net_guard` (after a ZTE script or firmware event, else once a
-minute); a missing piece is re-applied as journaled, never by flushing or taking
+re-checked by `net_guard` (once a ZTE script or firmware event has been quiet
+2 s, 5 s again after a repair, else once a minute); a missing piece is
+re-applied as journaled, never by flushing or taking
 over another writer's rules. The relay announces changes of
 its own path, and such an uplink change restarts the core. For any other egress
 (cellular) the watchdog compares the effective egress with the core's reference
@@ -422,8 +558,8 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   from an old udhcpc cannot overwrite or delete a newer connection's lease.
   Leases are checked for host/gateway validity and LAN/tailnet/link-local
   conflicts before routes/NAT are applied. The long-lived udhcpc renews leases.
-- IPv4 policy table `60631`, priority `18640`, owned chains `U60_RELAY_*`;
-  NAT and guarded forwarding exist before the final route rule is installed.
+- IPv4 policy table `60631`, priority `18640`; NAT and guarded forwarding
+  exist before the final route rule is installed (firewall layout below).
   Existing cellular main defaults remain untouched. Own LAN, tailnet and
   link-local management routes fall through; other private subnets may belong
   to the hotel's portal/resolvers and use Wi-Fi instead of cellular.
@@ -433,7 +569,7 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   TCP/UDP DNS queries also use the hotel resolver; the relay's `-o u60sta0`
   MASQUERADE covers a socket still bound to a SIM source. The rules live in
   the agent's nftables table `ip u60_relay` (IPv6: `ip6 u60_relay`,
-  `wifi_relay/dns_nft.rs`): a LAN chain at prerouting `dstnat - 1` and a router
+  `wifi_relay/uplink.rs`): a LAN chain at prerouting `dstnat - 1` and a router
   chain at output `-101` (the output hook takes no `dstnat` keyword), both just
   ahead of legacy NAT. `fib daddr type local` matches the router's own
   addresses live, so no per-address exemption is kept or audited. Mihomo's
@@ -446,7 +582,10 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   vendor option). The existing DHCP service and management names remain in use.
   Owned, LAN-scoped `RETURN` rules bypass only the vendor `redirect_chain` in
   IPv4/IPv6 NAT; other NAT/filter rules are not skipped. The relay watcher
-  repairs these rules if a vendor WAN event replaces the chain. Mihomo on/off
+  repairs these rules if a vendor WAN event replaces the chain, and keeps each
+  ahead of every vendor rule in it: a RETURN found behind one (a DNAT inserted
+  first) is deleted and inserted first in one `iptables-restore` transaction,
+  so it is never missing; `-C` alone proves nothing about the order. Mihomo on/off
   does not own this behavior. Disconnect/crash cleanup reverts only our exact
   uncommitted switch delta and restarts dnsmasq; a vendor/user commit or new
   value is preserved rather than overwritten with an old snapshot. After a
@@ -473,7 +612,9 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
 - IPv6 mode adds guarded NAT66 through `u60sta0`, including the LAN's existing
   IPv6 prefixes so clients retaining a cellular address do not bypass NAT or
   lose the selected Wi-Fi exit. Router/core connections also use Wi-Fi and
-  masquerade an old selected source if needed. Mihomo's marked rule (pref
+  masquerade an old selected source if needed. The masquerade is an nft rule
+  (`ip6 u60_relay`, postrouting `srcnat - 1`, only `oifname u60sta0`; B31 has
+  `CONFIG_NFT_MASQ=y`). Mihomo's marked rule (pref
   `18620`) precedes Relay's table, so LAN TCP/UDP interception still wins.
   LAN address/prefix changes are reconciled even when the upstream lease is
   unchanged. Owned br-lan routes retain previously observed client prefixes
@@ -568,6 +709,52 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   Asynchronous vendor reloads, external vendor-page changes and suspend races remain device
   acceptance risks; do not reconfigure the radios concurrently.
 
+### Firewall layout
+
+`wifi_relay/uplink.rs` builds both families of the relay's own nftables
+tables, `ip`/`ip6 u60_relay`, in one place (`relay-mihomo-architecture.md`
+section 4.3); `ipv6` only adds its parts while it has them. Every change
+replaces both families in one `nft -f` batch whose generation marker is read
+back (`netfx::effect::NftTables`); a table of that name without the agent's
+marker is never taken over. The filter chains run at `filter - 1`, just ahead
+of ZTE's legacy rules, so a drop there is final whatever ZTE inserts first;
+a return only leaves these chains, and ZTE's rules still apply after them.
+
+| Part | When | Rules |
+| --- | --- | --- |
+| Guard | From before `u60sta0` is raised (a scan too) until the station is deleted | Upstream INPUT: established/related and DHCP 67→68 return, the rest dropped; IPv6 dropped. All forwarding from or to `u60sta0` dropped. |
+| IPv6 discovery | IPv6 requested, before `odhcp6c` starts | Upstream IPv6 INPUT: established/related, RA (link-local source, hop limit 255), NS/NA (hop limit 255), ICMPv6 errors 1–4, DHCPv6 547→546; the rest dropped. |
+| Routes | From before the policy rule until the routes are released (the tables shrink back to the guard first) | IPv4 FORWARD: `br-lan → u60sta0` and established replies return before the drops. IPv6 FORWARD from `br-lan`: `rmnet*` rejected first, then `fc00::/7`, `fe80::/10`, `ff00::/8` return, the rest rejected. One IPv6 OUTPUT reject to `rmnet*`, covering IPv6 off, a lost lease and a withdrawn NAT66. IPv4 DNS chains. |
+| NAT66 | A valid IPv6 lease, from before its policy rule | Approved LAN sources to `u60sta0` and established replies return (ahead of the upstream drops); the masquerade; IPv6 DNS chains. |
+
+Legacy iptables keeps only what must pass ZTE's DROP/REJECT: `U60_RELAY_IN`
+(established replies, DHCP offers, IPv6's `U60_R6_IN`), `U60_RELAY_FWD` (with
+its own TCP reply rule, whose counter checks hardware forwarding),
+`U60_R6_FWD`, the portal `RETURN` and the IPv4 MASQUERADE (an nft masquerade
+must first be shown to keep IPA forwarding, D11). These chains hold accepts
+only, so a rule ZTE removed and the guard re-added at the end can neither open
+nor close anything else. The former `U60_RELAY_V6`, `U60_RELAY_OUT`,
+`U60_R6_OUT` and `U60_R6_NAT` are gone; the previous agent's journals still
+name them and remain undoable. This version's tables are journaled once, in
+the wireless plan, as `@u60-relay-nft remove ip|ip6`, which the previous
+agent runs too (`tests/relay-firewall-qa`).
+
+The core's own plain DNS keeps its destination once the core marks its
+sockets with a bit verified free on the device (M13, `ids::CORE_OUT_MARK`,
+then also Mihomo's `routing-mark`): off until then. ZTE's scripts use
+`0x3f00` and `0x40000000`, TPROXY `0xff00`, Tailscale `0xff0000`.
+
+`net_guard` decides when owners check (`relay-mihomo-architecture.md`
+section 4.4): after a ZTE script opens or a firmware event, a check once it
+has been quiet 2 s (owners are woken for it, not left to their next tick),
+and again 5 s after a check that had to restore something; once a minute
+otherwise. For 3 s after each trigger it reads the kernel settings an owner
+holds (`@u60-sysctl`, such as Mihomo's `bridge-nf-call-ip(6)tables=0`) every
+0.5 s and writes back one ZTE changed, only while that owner still holds it:
+an owner's release unregisters the setting before its undo runs. Opens of
+`ipacm_switch.sh` while the agent itself runs it count once; other scripts
+and events in that window still count.
+
 ### Hotel authentication
 
 Connect the phone to the **U60** hotspot. Turn Clash off, connect Relay, and
@@ -592,20 +779,59 @@ controlled B31 tests; hotel authorization, both radio bands and long-run behavio
 remain separate acceptance gates. The earlier design/benefit assessment is in
 [relay-ipv6-nat-assessment.md](relay-ipv6-nat-assessment.md).
 
+### Admission of conflicting changes
+
+The shared network lock is only held to check and register an operation
+(`netfx::admission`, `relay-mihomo-architecture.md` section 4.6), never across
+ubus, a Wi-Fi reload, a config write or a CAC. A relay operation the owner
+starts (scan, connect, its settings) registers itself and is refused while a
+router setting change is being applied; a disconnect always registers. The relay
+serializes its own operations and its 3 s watch on a private lock. Hotspot,
+guest Wi-Fi, LAN, USB and vendor firewall changes wait at most 3 s for a relay
+operation in progress (then 409 "in progress"), refuse at once while the relay
+or Mihomo owns the network (409 with the reason), and otherwise hold their own
+registration while they write. A hotspot or guest change also starts the
+vendor's asynchronous Wi-Fi reload, which stays registered until the 5 GHz
+hotspot reads `ENABLED` twice 2 s apart (at most 120 s): the relay does not scan
+or connect meanwhile. Fixed DHCP reservations only serialize their own writes.
+`POST /api/wifi-relay/disconnect` runs in the general lane, so it can cancel a
+connect or restore even while long operations fill both slow permits. Mihomo
+never takes the network lock. `scripts/probe-admission.sh` counts "in progress"
+and conflict refusals separately on a device.
+
 ### Hardware forwarding (IPA)
 
 Relayed IPv4 NAT is carried by the Qualcomm IPA once the owner installs the
-`u60sta0` IPACM entry and restarts the router (Relay page, `offload`). While
-connected the relay then adds a `main` default (metric 60631, with
+`u60sta0` IPACM entry and restarts the router (Relay page, `offload`). The
+owner's switch, and a removal or a reinstall in the same boot, apply to a
+connected relay at once (owner decision 64): releasing the path deletes the
+`main` default (IPACM loses its relay WAN) and restores the IPACM mode, then
+resets LAN IPv4 connections. While connected and switched on the relay adds a
+`main` default (metric 60631, with
 unreachable guards for the ranges its table throws) and keeps IPACM in
 hardware mode unless an owner speed limit, power saver or `ipa_disable`
 needs the CPU path; ZTE's Smart QoS (`Ai_mode`) switches it to software at
 boot and is overridden only while relaying. RPS and a 5000 backlog help the
-traffic that stays on the CPU. With Mihomo on, the optional China IP direct
-setting lets China IPv4 destinations bypass the core in the kernel, so they
+traffic that stays on the CPU. With Mihomo on, the optional DIRECT bypass lets
+IPv4 the core's mode and rules send DIRECT skip the core in the kernel, so it
 can be offloaded too. Offloaded connections skip iptables, tc and parental
 control. Design, measurements and open items:
 [relay-hw-offload.md](relay-hw-offload.md).
+
+### Upstream Wi-Fi power save
+
+The driver turns 802.11 power save on for every new `u60sta0` (`iw dev
+u60sta0 get power_save`); it is unrelated to ZTE's power saver mode. With it
+off, short single-connection tests through the relay went from 166-218 to
+244-250 Mbit/s (2026-11-08). By default each relay connection turns it off
+(owner decision 65, `wifi_relay/power_save.rs`): an `@u60-relay-power-save
+off` step in the session's network plan, so `net_guard` re-checks it with
+the rest and turns it off again after the driver or a script turns it back
+on. The Relay page switch (`POST /api/wifi-relay/power-save`) is saved as
+`/data/zte-agent-relay/keep-power-save` when the owner keeps the driver's
+default, and applies to a connected relay at once. Restoring it at teardown
+is best effort and never pauses a cleanup, because the interface is deleted
+next.
 
 ## Recovery
 
@@ -712,13 +938,14 @@ never URLs. Zashboard's bridge uses the pass cookie instead of a bearer token.
 | POST | `/api/mihomo/install` | Install the pinned core and dashboard |
 | PUT | `/api/mihomo/config` | Validate and save `{"yaml":"..."}` |
 | POST | `/api/mihomo/switch` | Start/stop with `{"enabled":true/false}` |
-| POST | `/api/mihomo/cn-direct` | `{"enabled":true/false}`: China IPv4 bypasses the core in the kernel; restarts a running core and resets LAN IPv4 connections |
+| POST | `/api/mihomo/cn-direct` | `{"enabled":true/false}`: the DIRECT bypass, IPv4 the core's mode and rules send DIRECT skips it in the kernel; a running core keeps running, LAN IPv4 connections are reset; status `kernel` (`bypass`, `returns`, `reason`) |
 | GET | `/api/wifi-relay/status` | Relay state and last scan, no BSSID/password |
 | POST | `/api/wifi-relay/scan` | Explicit scan, no background scanning |
 | POST | `/api/wifi-relay/connect` | `{"network":"opaque scan id","password":"...","confirmed":true,"ipv6":true}`; omitted IPv6 defaults on |
 | POST | `/api/wifi-relay/disconnect` | Restore runtime hotspot/routes |
 | POST | `/api/wifi-relay/clock` | Explicit fresh HTTPS time check; requires an active relay, never reconnects it |
-| POST | `/api/wifi-relay/offload` | `{"install":true/false}`: add/remove the IPACM `u60sta0` entry (loaded after a restart); status `offload.config` |
+| POST | `/api/wifi-relay/offload` | `{"install":true/false}`: add/remove the IPACM `u60sta0` entry (loaded after a restart, or at once if IPACM already loaded it this boot); `{"enabled":true/false}`: the runtime switch. A connected relay follows both at once; status `offload.config`, `offload.enabled` |
+| POST | `/api/wifi-relay/power-save` | `{"auto_off":true/false}`: turn the upstream Wi-Fi power save off at each connection (default) or keep the driver's; a connected relay follows at once; status `power_save.auto_off`, `power_save.off`, `power_save.error` |
 | GET | `/api/mihomo/profiles` | Profile library status, no URLs or YAML |
 | GET | `/api/mihomo/profiles/{id}` | Explicit private editor read (metadata and URL, never saved YAML) for one profile |
 | POST | `/api/mihomo/profiles` | Add, edit, select, refresh and delete profiles; set Merge and Script |
@@ -727,7 +954,7 @@ never URLs. Zashboard's bridge uses the pass cookie instead of a bearer token.
 | POST | `/api/mihomo/proxies/select` | `{"group":"...","name":"..."}`; slow lane |
 | POST | `/api/mihomo/proxies/delay` | `{"name":"..."}`; tests against a fixed URL, `0` means failed, `null` never tested; slow lane |
 | POST | `/api/mihomo/mode` | `{"mode":"rule\|global\|direct"}`; slow lane |
-| POST | `/api/wifi-relay/tuning`, `/api/wifi-relay/forget` | Bandwidth choice for a saved network; forget a saved network |
+| POST | `/api/wifi-relay/forget` | Forget a saved network (its remembered password); the bandwidth choice and `/api/wifi-relay/tuning` were retired in v6 |
 | POST | `/api/mihomo/dashboard` | Console login only; issues the Zashboard pass cookie and returns `{"url":"/ui/mihomo/dashboard/#/proxies"}`; 409 when Clash is off |
 | GET | `/ui/mihomo/dashboard/*` | Running-only local third-party panel, pass cookie required |
 | restricted | `/ui/mihomo/api/*` | Same-origin pass-cookie HTTP/WebSocket bridge |
@@ -906,6 +1133,8 @@ gave 92-117; back to 40 MHz 34 and 34; 20 MHz again 104 and 104, with the
 AP's rate to the STA rising from HE-MCS 1 to HE-MCS 9-11, 2 SS.
 
 ### 上游带宽自适应 V2（2026-10-28，阶段 A）
+
+> **已删除（v6，2026-11-10）。** 下面是自动调优的历史设计与实测记录。代码只保留每次关联后的一次宽度复位和热点需要的信道解析（`wifi_relay/width.rs`）；`width_watch.rs`、`llstats.rs`、`widths.json` 的读写、`/api/wifi-relay/tuning` 和页面选项都已删除，已保存的 `auto` 读作保持协商带宽。设备上旧的 `/data/zte-agent-relay/widths.json` 不再读写，回退到旧版 agent 时仍可用。
 
 已按 `width-v2-final-handoff` 实施；阶段 A 最初只做代码和本地验证，随后已获授权部署。
 阶段 B 与方案 A 的后续状态见本节末尾及真机验收记录，不能把阶段 A 快照当作当前设备状态。

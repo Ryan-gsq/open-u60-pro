@@ -65,18 +65,11 @@ fn send_command(event: &str, payload: &Value) -> Command {
     cmd
 }
 
-/// Run `uci get <key>` and return the value.
+/// Run `uci get <key>` and return the value, within 3 s (as `ubus -t 3`).
 pub fn uci_get(key: &str) -> Result<String, String> {
-    crate::httpd::gate::debug_assert_may_block();
-    let output = Command::new("uci")
-        .args(["get", key])
-        .output()
-        .map_err(|e| format!("uci exec: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("uci get {key}: {stderr}"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let mut command = Command::new("uci");
+    command.args(["get", key]);
+    crate::netfx::exec::run(command, std::time::Duration::from_secs(3)).map_err(|e| format!("uci get {key}: {e}"))
 }
 
 /// Run `uci -q show <target>`: one fork for a whole section, as

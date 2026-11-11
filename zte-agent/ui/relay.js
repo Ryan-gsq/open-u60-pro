@@ -17,6 +17,8 @@
   path.append(el('span', '', 'Wi-Fi'), el('b', '', '→'), el('span', '', 'U60 Pro'), el('b', '', '→'), el('span', '', 'Your devices'));
   const facts = el('dl', 'relay-facts');
   facts.hidden = true;
+  const scope = el('p', 'field-help relay-scope', R.scope);
+  scope.hidden = true;
   const problem = el('p', 'relay-problem');
   problem.setAttribute('role', 'alert');
   problem.hidden = true;
@@ -28,7 +30,7 @@
   actions.append(refresh, stop);
   const caution = el('p', 'field-help relay-caution', 'Hotspots may briefly reconnect. If Wi-Fi drops, SIM data may be used only if cellular data is already on. Relay never turns it on. Hotel login is completed in a browser on a connected device, never by ignoring certificate warnings.');
   const statusText = UI.status(statusPanel);
-  statusPanel.append(hero, path, facts, problem, clockBox, actions, caution, statusText);
+  statusPanel.append(hero, path, facts, scope, problem, clockBox, actions, caution, statusText);
 
   // ── Networks ────────────────────────────────────────────────────────────
   const netPanel = UI.panel(route, 'relay-networks', 'Upstream networks', 'Find nearby Wi-Fi and choose the one the U60 should use. Open and WPA2 networks are supported; WPA3-only, enterprise and hidden networks are not.');
@@ -41,11 +43,7 @@
   password.id = 'relay-password'; password.type = 'password'; password.name = 'password'; password.maxLength = 64; password.autocomplete = 'new-password'; password.spellcheck = false; password.placeholder = 'Network password';
   passwordLabel.htmlFor = password.id;
   passwordField.append(passwordLabel, password, el('small', 'field-help', 'Leave empty for open or remembered networks. It is stored on the router only if you choose to remember it.'));
-  const widthField = el('div', 'form-field'), widthLabel = el('label', '', 'Bandwidth'), width = el('select');
-  width.id = 'relay-width'; width.name = 'width_mode'; widthLabel.htmlFor = width.id;
-  for (const [value, text] of [['saved', 'Use saved choice'], ['off', R.widthLabel('off')], ['auto', R.widthLabel('auto')]]) width.add(new Option(text, value));
-  widthField.append(widthLabel, width, el('small', 'field-help', 'New networks keep the negotiated bandwidth. Each Wi-Fi remembers its own choice.'));
-  fields.append(passwordField, widthField);
+  fields.append(passwordField);
   function choice(name, text, checked) {
     const label = el('label', 'relay-choice'), input = el('input');
     input.type = 'checkbox'; input.name = name; input.checked = checked;
@@ -63,7 +61,7 @@
   netPanel.append(scanBar, connectForm, netText);
 
   // ── Saved networks ──────────────────────────────────────────────────────
-  const savedPanel = UI.panel(route, 'relay-saved', 'Saved Wi-Fi networks', 'Bandwidth choices are kept separately from passwords. Scan and select a network to connect. Forget removes a choice and any remembered password without disconnecting an active relay.');
+  const savedPanel = UI.panel(route, 'relay-saved', 'Saved Wi-Fi networks', 'Scan and select a network to connect. Forget removes any remembered password without disconnecting an active relay.');
   const savedList = el('div', 'relay-saved-list'), savedText = UI.status(savedPanel);
   savedPanel.append(savedList, savedText);
 
@@ -73,7 +71,8 @@
   for (const text of [
     'Keep both main hotspots enabled and Guest WiFi off. Do not change WiFi, LAN or USB settings while connected; the router refuses most of them.',
     'Open and WPA2-Personal networks on 2.4 GHz and 5 GHz channels the radio allows, including DFS. A DFS channel can delay the hotspot while it checks for radar.',
-    'With IPv6 on, the LAN gets SLAAC/NAT66 through the upstream. Cellular IPv6 stays blocked while the relay is connected, so nothing leaks around it.',
+    'With IPv6 on, the LAN gets SLAAC/NAT66 through the upstream, forwarded by the CPU. Cellular IPv6 stays blocked while the relay is connected, so nothing leaks around it.',
+    'The relay keeps the bandwidth it negotiates with the upstream network.',
     'Internet access and hotel authorization are not verified automatically. A dropped link is not reconnected while the agent runs; after an agent restart or reboot the saved choice is retried.'
   ]) notes.append(el('p', 'field-help', text));
 
@@ -98,6 +97,7 @@
       pair.append(el('dt', '', label), el('dd', literal ? 'mono' : '', value));
       return pair;
     }));
+    scope.hidden = !view.connected;
     const messages = [current?.error, current?.ipv6?.error].filter(Boolean);
     problem.hidden = messages.length === 0;
     problem.textContent = messages.join(' ');
@@ -122,7 +122,6 @@
       bars.setAttribute('aria-hidden', 'true');
       bars.append(el('i'), el('i'), el('i'), el('i'));
       name.append(el('strong', '', network.ssid), meta);
-      if (network.supported === true) name.append(el('small', '', `Saved bandwidth: ${R.widthLabel(network.width_mode)}`));
       row.append(radio, bars, name);
       if (network.remembered === true) row.append(el('span', 'tag', 'Saved'));
       return row;
@@ -148,18 +147,13 @@
     const saved = Array.isArray(current?.saved_networks) ? current.saved_networks : [];
     const rows = saved.map(entry => {
       const active = current?.connected === true && current.saved_network_id === entry.id;
-      const card = el('article', 'relay-saved-item'), head = el('div', 'relay-saved-head'), copyBox = el('div'), select = el('select'), actionsRow = el('div', 'form-actions');
+      const card = el('article', 'relay-saved-item'), head = el('div', 'relay-saved-head'), copyBox = el('div'), actionsRow = el('div', 'form-actions');
       copyBox.append(el('h3', '', entry.ssid), el('p', 'field-help', R.savedNote(entry)));
       head.append(copyBox);
       if (active) head.append(el('span', 'tag', 'Connected'));
-      select.setAttribute('aria-label', `Bandwidth for ${entry.ssid}`);
-      for (const mode of ['off', 'auto']) select.add(new Option(R.widthLabel(mode), mode));
-      select.value = entry.width_mode === 'auto' ? 'auto' : 'off';
-      const apply = button('Save bandwidth', () => saveBandwidth(entry, select.value, active)), forget = button('Forget', () => forgetNetwork(entry), 'danger');
-      apply.disabled = busy || select.value === (entry.width_mode === 'auto' ? 'auto' : 'off');
-      select.addEventListener('change', () => { apply.disabled = busy || select.value === (entry.width_mode === 'auto' ? 'auto' : 'off'); });
+      const forget = button('Forget', () => forgetNetwork(entry), 'danger');
       forget.disabled = busy;
-      actionsRow.append(select, apply, forget);
+      actionsRow.append(forget);
       card.append(head, actionsRow);
       return card;
     });
@@ -238,13 +232,8 @@
     if (!await confirm(`${view.stopLabel}?`, text, {label: view.stopLabel, destructive: true})) return;
     await act(statusText, '/api/wifi-relay/disconnect', {}, {timeoutMs: 3 * MINUTE, working: 'Restoring network settings…', done: 'Relay is off and network settings are restored.'});
   }
-  async function saveBandwidth(entry, mode, active) {
-    const text = active ? 'This network is connected. Applying a different bandwidth mode reconnects Wi-Fi, and the hotspot may briefly reconnect.' : 'The choice is saved now and used the next time you connect to this network.';
-    if (!await confirm('Save bandwidth choice?', text, {label: 'Save bandwidth'})) return;
-    await act(savedText, '/api/wifi-relay/tuning', {id: entry.id, width_mode: mode, confirmed: true}, {timeoutMs: 5 * MINUTE, working: active ? 'Applying and reconnecting…' : 'Saving…', done: 'Bandwidth choice saved.'});
-  }
   async function forgetNetwork(entry) {
-    if (!await confirm(`Forget ${entry.ssid}?`, 'Its bandwidth choice and any remembered password are removed. An active relay stays connected.', {label: 'Forget network', destructive: true})) return;
+    if (!await confirm(`Forget ${entry.ssid}?`, 'Any remembered password is removed. An active relay stays connected.', {label: 'Forget network', destructive: true})) return;
     await act(savedText, '/api/wifi-relay/forget', {id: entry.id}, {timeoutMs: MINUTE, working: 'Forgetting…', done: 'Network forgotten.'});
   }
   connectForm.addEventListener('submit', async event => {
@@ -253,7 +242,7 @@
     const issue = R.passwordProblem(network, password.value, network?.remembered === true);
     if (issue) { say(netText, issue, true); return; }
     if (!await confirm(`Connect to ${network.ssid}?`, R.consent(network, current), {label: 'Connect'})) return;
-    const body = R.connectRequest({id: network.id, password: password.value, remember: remember.input.checked && network.security !== 'open', ipv6: ipv6.input.checked, widthMode: width.value});
+    const body = R.connectRequest({id: network.id, password: password.value, remember: remember.input.checked && network.security !== 'open', ipv6: ipv6.input.checked});
     await act(netText, '/api/wifi-relay/connect', body, {
       timeoutMs: 5 * MINUTE,
       working: 'Connecting. This can take up to two minutes; the hotspot may briefly reconnect.',
@@ -279,7 +268,7 @@
       clearTimeout(pollTimer); clearTimeout(settleTimer);
       loadId++; settleId++;
       current = null; attempted = false; loading = false; busy = false; selectedId = '';
-      password.value = ''; width.value = 'saved'; remember.input.checked = ipv6.input.checked = true;
+      password.value = ''; remember.input.checked = ipv6.input.checked = true;
       for (const node of [statusText, netText, savedText]) say(node, '');
       draw();
     }

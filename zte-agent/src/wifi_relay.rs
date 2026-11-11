@@ -3,19 +3,19 @@
 //! replaced. Optional upstream IPv6 and downstream NAT66 use owned runtime state.
 
 pub(crate) mod ipv6;
+mod adopt;
 pub(crate) mod dns;
-pub(crate) mod dns_nft;
 pub(crate) mod portal;
 mod dfs_switch;
 pub(crate) mod hotspot;
-mod llstats;
 pub(crate) mod offload;
+pub(crate) mod power_save;
 mod resume;
 mod scan;
 pub(crate) mod steering;
+pub(crate) mod uplink;
 mod width;
-mod width_watch;
-use width_watch::{reset_width, LinkWidth, tune_width};
+use width::reset_width;
 
 use std::fs;
 use std::net::Ipv4Addr;
@@ -32,13 +32,13 @@ use sha2::{Digest, Sha256};
 use crate::boottime::{BootClock, BootInstant, Clock};
 use crate::net_tools::{self as net, Cmd, NetworkLock, Step, Transaction};
 
-const IFACE: &str = "u60sta0";
+const IFACE: &str = crate::netfx::ids::RELAY_IFACE;
 mod saved;
 const ROOT: &str = "/tmp/zte-agent-relay";
 const JOURNAL: &str = "/data/zte-agent-relay";
 const HOSTAPD: &str = "/data/vendor/wifi/hostapd";
-const TABLE: &str = "60631";
-const PREF: &str = "18640";
+const TABLE: &str = crate::netfx::ids::RELAY_TABLE;
+const PREF: &str = crate::netfx::ids::RELAY_PREF;
 
 #[derive(Clone, Serialize)]
 pub struct Network {
@@ -64,28 +64,103 @@ struct Session {
     wireless: Transaction,
     network: Transaction,
     dns: Transaction,
+    /// The relay's nftables tables (`uplink`), shared with `ipv6`.
+    uplink: uplink::Shared,
     dns_error: Option<String>,
-    supplicant: Option<Child>,
+    supplicant: Option<Helper>,
     dhcp: Option<Child>,
     dhcp_session: Option<String>,
     lease: Option<Lease>,
     selected: Option<Network>,
     ipv6: ipv6::Upstream,
-    width: Option<LinkWidth>,
-    tuning: saved::Tuning,
     association: Association,
     offload: offload::Runtime,
+    power_save: power_save::State,
     /// When to re-check `network` against ZTE's rewrites (`net_guard`).
     guard: crate::net_guard::Cursor,
     /// Last DHCP renew requested after a recovered association.
     renewed: Option<Instant>,
+    /// The relay's routes were installed (its policy rule is the plan's last
+    /// step): only then does a teardown change the uplink Mihomo uses.
+    routed: bool,
 }
 
 /// BusyBox udhcpc deconfigures when a second renew signal arrives while the
 /// first is still pending, so recovered associations renew at most this often.
 const RENEW_SPACING: Duration = Duration::from_secs(30);
 
+/// A helper process of the session: one this agent started, or one the
+/// previous agent left running and this one took over with the session
+/// (`adopt`), named by its process id and start time so a reused id is never
+/// taken for it.
+enum Helper {
+    Owned(Child),
+    Adopted(offload::Record),
+}
+
+impl Helper {
+    fn alive(&mut self) -> bool {
+        match self {
+            Helper::Owned(child) => matches!(child.try_wait(), Ok(None)),
+            Helper::Adopted(process) => same_process(*process),
+        }
+    }
+}
+
+/// Whether `process` still runs (a zombie has an empty command line; its
+/// parent, init for an adopted helper, reaps it).
+fn same_process(process: offload::Record) -> bool {
+    fs::read(format!("/proc/{}/cmdline", process.pid)).is_ok_and(|c| !c.is_empty())
+        && crate::netfx::exec::process_start(process.pid) == Some(process.start)
+}
+
+fn stop_helper(helper: &mut Option<Helper>) {
+    match helper.take() {
+        Some(Helper::Owned(child)) => net::stop_child(&mut Some(child)),
+        Some(Helper::Adopted(process)) => {
+            for signal in [libc::SIGTERM, libc::SIGKILL] {
+                if !same_process(process) {
+                    return;
+                }
+                // SAFETY: kill(2) on the process just re-identified by id and start time.
+                unsafe { libc::kill(process.pid as libc::pid_t, signal) };
+                for _ in 0..10 {
+                    if !same_process(process) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        None => {}
+    }
+}
+
 impl Session {
+    /// A session journaled under `journal`, before anything is applied.
+    fn new(journal: &Path) -> Self {
+        let uplink = uplink::Shared::new(journal.join("uplink.nft"));
+        Session {
+            wireless: Transaction::new(journal.join("wireless.json")),
+            network: Transaction::new(journal.join("network.json")),
+            dns: Transaction::new(journal.join("dns.json")),
+            ipv6: ipv6::Upstream::new(uplink.clone()),
+            uplink,
+            dns_error: None,
+            supplicant: None,
+            dhcp: None,
+            dhcp_session: None,
+            lease: None,
+            selected: None,
+            association: Association::default(),
+            offload: offload::Runtime::off(),
+            power_save: power_save::State::default(),
+            guard: crate::net_guard::Cursor::default(),
+            renewed: None,
+            routed: false,
+        }
+    }
+
     /// The lease file proves only that udhcpc has not given the lease up. A
     /// recovered association may be a roam onto another network with the same
     /// SSID: a renew there is NAKed, the deconfig removes the lease and the
@@ -105,15 +180,13 @@ impl Session {
             libc::kill(dhcp.id() as i32, libc::SIGUSR1);
         }
         self.renewed = Some(Instant::now());
-        eprintln!("[relay] association recovered; DHCP renew requested");
+        crate::netlog!("[relay] association recovered; DHCP renew requested");
     }
 }
 
 struct Inner {
     session: Option<Session>,
     scans: Vec<Network>,
-    /// Frequency and signal of every BSS in the last scan (hidden ones too).
-    neighbours: Vec<(u32, i32)>,
     error: Option<String>,
     /// SSID being reconnected after the agent started (`restore`).
     restoring: Option<String>,
@@ -122,7 +195,11 @@ struct Inner {
 }
 
 pub struct WifiRelay {
+    /// The shared admission lock: held only to check and register an
+    /// operation (`netfx::admission`), never across device work.
     lock: NetworkLock,
+    /// Serializes the relay's own operations and its 3 s watch.
+    op: Mutex<()>,
     inner: Mutex<Inner>,
     wake: Condvar,
     snapshot: Mutex<Value>,
@@ -131,25 +208,42 @@ pub struct WifiRelay {
 
 impl WifiRelay {
     pub fn new(lock: NetworkLock) -> Self {
-        let inner = Inner { session: None, scans: Vec::new(), neighbours: Vec::new(), error: None, restoring: None, restore_generation: 0 };
+        let inner = Inner { session: None, scans: Vec::new(), error: None, restoring: None, restore_generation: 0 };
         let snapshot = Self::snapshot(&inner);
-        Self { lock, inner: Mutex::new(inner), wake: Condvar::new(), snapshot: Mutex::new(snapshot), mihomo: None }
+        Self { lock, op: Mutex::new(()), inner: Mutex::new(inner), wake: Condvar::new(), snapshot: Mutex::new(snapshot), mihomo: None }
     }
 
     pub fn with_core(lock: NetworkLock, core: Arc<crate::mihomo::Mihomo>) -> Self {
         Self { mihomo: Some(core), ..Self::new(lock) }
     }
 
-    fn uplink_changed(&self) -> Result<(), String> {
-        self.mihomo.as_ref().map_or(Ok(()), |core| core.uplink_changed_locked())
+    /// Mihomo follows a change of the routes this relay installed.
+    fn uplink_changed(&self) {
+        if let Some(core) = &self.mihomo {
+            core.uplink_changed_locked();
+        }
     }
 
     pub fn active(&self) -> bool {
         self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).session.as_ref().is_some_and(|s| s.selected.is_some())
     }
 
+    /// A session, an operation in progress or effects left to recover.
     pub fn owns_network(&self) -> bool {
-        self.active() || recovery_pending(Path::new(JOURNAL))
+        self.active() || recovery_pending(Path::new(JOURNAL)) || crate::netfx::admission::held(crate::netfx::admission::RELAY_OPERATION)
+    }
+
+    /// An owner operation: refused while a router setting change is being
+    /// applied, registered so conflicting writes wait or refuse (section 4.6).
+    fn begin(&self) -> Result<crate::netfx::admission::Claim, String> {
+        use crate::netfx::admission::{begin, RELAY_OPERATION, VENDOR_WIFI_RELOAD, VENDOR_WRITE};
+        begin(&self.lock, RELAY_OPERATION, &[VENDOR_WRITE, VENDOR_WIFI_RELOAD])
+    }
+
+    /// The same for a teardown, which nothing may refuse.
+    fn begin_teardown(&self) -> crate::netfx::admission::Claim {
+        use crate::netfx::admission::{begin, RELAY_OPERATION};
+        begin(&self.lock, RELAY_OPERATION, &[]).expect("no blockers")
     }
 
     pub fn status(&self) -> Value {
@@ -167,13 +261,23 @@ impl WifiRelay {
             offload = json!({});
         }
         offload["config"] = json!(offload::config());
+        offload["enabled"] = json!(offload::enabled());
+        // Public IPv4 Mihomo intercepts stays on the CPU whatever IPA does.
+        offload["ipv4_through_mihomo"] = json!(self.mihomo.as_ref().map_or("none", |core| core.ipv4_share()));
         value["offload"] = offload;
+        let mut power = value["power_save"].take();
+        if !power.is_object() {
+            power = json!({});
+        }
+        power["auto_off"] = json!(power_save::auto_off(Path::new(JOURNAL)));
+        value["power_save"] = power;
         saved::annotate(&mut value);
+        value["connection_resets"] = crate::netfx::conntrack::history();
         value
     }
 
     fn recheck_clock_with(&self, check: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
-        let _lock = self.lock.try_lock().map_err(|_| "A network operation is in progress; retry after it finishes")?;
+        let _lock = crate::netfx::admission::enter(&self.op, crate::netfx::admission::WAIT).ok_or("A network operation is in progress; retry after it finishes")?;
         // The snapshot is published under the network lock, so the uplink
         // cannot change during this check. Do not hold a status lock over HTTPS.
         if self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner)["connected"] != true {
@@ -196,22 +300,21 @@ impl WifiRelay {
         json!({"connected": s.is_some_and(|s| s.selected.is_some() && s.lease.is_some()),
             "network_id": s.and_then(|s| s.selected.as_ref()).map(|n| &n.id),
             "saved_network_id": s.and_then(|s| s.selected.as_ref()).map(|n| saved::key(&n.ssid, n.security)),
-            "width_mode": s.map(|s| s.tuning),
             "ssid": s.and_then(|s| s.selected.as_ref()).map(|n| &n.ssid),
-            "frequency": s.and_then(|s| s.width.as_ref()).and_then(LinkWidth::primary).or_else(|| s.and_then(|s| s.selected.as_ref()).map(|n| n.frequency)),
-            "width": s.and_then(|s| s.width.as_ref()).and_then(LinkWidth::width),
-            "width_state": s.and_then(|s| s.width.as_ref()).and_then(LinkWidth::state),
+            "frequency": s.and_then(|s| s.selected.as_ref()).map(|n| n.frequency),
             "address": lease.map(|l| l.ip), "gateway": lease.map(|l| l.gateway), "networks": i.scans,
             "internet": "not_verified", "ipv6_relay": ipv6["nat66"], "ipv6": ipv6, "cellular_fallback": true,
             "association_state": s.map(|s| s.association.state),
             "association_recovering": s.is_some_and(|s| s.association.since.is_some()),
             "association_recovery_ms": s.map(|s| s.association.elapsed(BootClock.now()).as_millis() as u64),
             "offload": s.map(|s| s.offload.status()),
+            "power_save": s.map(|s| s.power_save.status()),
+            "tables": s.map(|s| s.uplink.status()),
             "restoring": i.restoring, "experimental": true, "error": i.error.as_ref().or_else(|| s.and_then(|s| s.dns_error.as_ref()))})
     }
 
     pub fn recover(&self) -> Result<(), String> {
-        stop_strays()?;
+        stop_strays(&[])?;
         let ipv6 = ipv6::recover();
         let ipv4 = Transaction::recover(&Path::new(JOURNAL).join("network.json"));
         let dns = Transaction::recover(&Path::new(JOURNAL).join("dns.json"));
@@ -233,6 +336,9 @@ impl WifiRelay {
 
     pub fn start(self: &Arc<Self>) {
         let this = Arc::clone(self);
+        // A settled ZTE trigger: the next tick checks at once (`net_guard`).
+        let waker = Arc::clone(self);
+        crate::net_guard::on_settled(move || waker.wake.notify_all());
         crate::system::spawn_named("relay-watch", move || {
             this.recover_idle();
             loop {
@@ -243,7 +349,7 @@ impl WifiRelay {
                 let (next, _) = this.wake.wait_timeout(i, Duration::from_secs(3)).unwrap_or_else(std::sync::PoisonError::into_inner);
                 drop(next);
                 let wait_started = Instant::now();
-                let _lock = this.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _lock = this.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let lock_ms = wait_started.elapsed().as_millis();
                 if !this.active() {
                     continue;
@@ -258,7 +364,7 @@ impl WifiRelay {
                 let recovering = s.association.since.is_some();
                 let link = s.association.observe(link, BootClock.now());
                 if previous != s.association.state {
-                    eprintln!("[relay] association state={} recovery_ms={} query_ms={query_ms} lock_ms={lock_ms}", s.association.state, s.association.elapsed(BootClock.now()).as_millis());
+                    crate::netlog!("[relay] association state={} recovery_ms={} query_ms={query_ms} lock_ms={lock_ms}", s.association.state, s.association.elapsed(BootClock.now()).as_millis());
                 }
                 if recovering && link == AssociationResult::Ready {
                     s.renew_lease();
@@ -267,9 +373,8 @@ impl WifiRelay {
                     .dhcp_session
                     .as_deref()
                     .and_then(|session| read_lease(session).ok());
-                let child_ok = [&mut s.supplicant, &mut s.dhcp]
-                    .iter_mut()
-                    .all(|c| c.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None))));
+                let child_ok = s.supplicant.as_mut().is_some_and(Helper::alive)
+                    && s.dhcp.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
                 let change = match s.lease.as_ref().map_or(LeaseChange::Replaced, |installed| {
                     lease_change(installed, current.as_ref())
                 }) {
@@ -282,21 +387,9 @@ impl WifiRelay {
                     || s.selected
                         .as_ref()
                         .is_some_and(|n| n.frequency < 3000 && hotspot::owner_off("wlan0"));
-                if link == AssociationResult::Expired
-                    || !child_ok
-                    || change == LeaseChange::Replaced
-                    || hotspot_off
-                {
-                    let reason = if hotspot_off {
-                        "hotspot_off"
-                    } else if !child_ok {
-                        "helper_exited"
-                    } else if change == LeaseChange::Replaced {
-                        "lease_changed"
-                    } else {
-                        "association_timeout"
-                    };
-                    eprintln!("[relay] teardown reason={reason} recovery_ms={} query_ms={query_ms} lock_ms={lock_ms}", s.association.elapsed(BootClock.now()).as_millis());
+                let decision = decide(link, child_ok, change, hotspot_off);
+                if let Decision::Teardown(reason) = decision {
+                    crate::netlog!("[relay] teardown reason={reason} recovery_ms={} query_ms={query_ms} lock_ms={lock_ms}", s.association.elapsed(BootClock.now()).as_millis());
                     let mut session = i.session.take().unwrap();
                     if hotspot_off {
                         i.restore_generation = i.restore_generation.wrapping_add(1);
@@ -313,31 +406,41 @@ impl WifiRelay {
                             else { "Wi-Fi relay disconnected or lease changed; previous routing restored. Cellular data is used only if already enabled. Scan and reconnect.".into() }),
                     );
                     this.publish(&i);
-                } else if link == AssociationResult::Recovering {
+                } else if decision == Decision::Hold {
                     // Only retain the configured path while its original lease
                     // and both helpers remain valid. No lease is extended here.
                     this.publish(&i);
                     continue;
                 } else {
-                    if let LeaseChange::Resolvers(next) = change {
+                    if let Decision::Keep(Some(next)) = decision {
                         s.lease = Some(next);
                     }
                     let lease = s.lease.as_ref().unwrap();
                     let resolvers = if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() };
-                    let gateway = lease.gateway;
                     let dns = dns::reconcile(&resolvers);
-                    s.offload.audit(&mut s.network);
+                    let changed_at = Instant::now();
+                    if s.offload.audit(&mut s.network) {
+                        // An owner limit came or went: the path changed.
+                        if let Err(e) = crate::netfx::conntrack::reset_since("relay forwarding path changed", crate::netfx::conntrack::Scope::Lan { v4: true, v6: false }, changed_at) {
+                            crate::netlog!("[relay] {e}");
+                        }
+                    }
+                    if let Some(Err(e)) = crate::netfx::conntrack::retry() {
+                        crate::netlog!("[relay] connection reset retry failed: {e}");
+                    }
                     let guarded = if s.guard.due() {
-                        let mut result = s.network.reconcile();
+                        // The tables and the upstream INPUT accepts first:
+                        // IPv6's own chain hooks into them.
+                        let mut result = s.uplink.reconcile();
+                        result.extend(s.wireless.reconcile_only(firewall_step));
+                        result.extend(s.network.reconcile());
                         result.extend(s.ipv6.reconcile());
+                        s.guard.after(&result);
                         crate::net_guard::report("relay", result)
                     } else {
                         Ok(())
                     };
-                    s.dns_error = dns
-                        .and(guarded)
-                        .and(s.width.as_mut().map_or(Ok(()), |w| tune_width(w, gateway)))
-                        .err();
+                    s.dns_error = dns.and(guarded).err();
                     let before = s.ipv6.revision();
                     let tick = s.ipv6.tick();
                     let changed = before != s.ipv6.revision();
@@ -355,13 +458,7 @@ impl WifiRelay {
                         // The core restart takes seconds; do not hold the
                         // session lock for it (the network lock still orders it).
                         drop(i);
-                        let uplink = this.uplink_changed();
-                        let mut i = this
-                            .inner
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        i.error = uplink.err();
-                        this.publish(&i);
+                        this.uplink_changed();
                     } else {
                         this.publish(&i);
                     }
@@ -371,15 +468,55 @@ impl WifiRelay {
     }
 
     /// Roll back what a previous process left (crash, update, reboot).
+    /// A connection the previous agent left working in this boot is taken
+    /// over instead (`adopt`, owner choice Q1).
     pub fn recover_idle(&self) {
-        let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _claim = self.begin_teardown();
+        let _lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // A request may have started the relay before this ran.
         let idle = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).session.is_none();
         if idle {
-            if let Err(e) = self.recover() {
+            if let Some(session) = self.adopt_previous() {
+                let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                i.session = Some(session);
+                i.error = None;
+                self.publish(&i);
+                self.wake.notify_all();
+                return;
+            }
+            // Routes a previous agent left may be what Mihomo (adopted after
+            // an agent restart) runs on: tell it once they are gone.
+            let routed = routes_journaled(Path::new(JOURNAL));
+            let recovered = self.recover();
+            if routed && !routes_journaled(Path::new(JOURNAL)) {
+                self.uplink_changed();
+            }
+            if let Err(e) = recovered {
                 let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 i.error = Some(e);
                 self.publish(&i);
+            }
+        }
+    }
+
+    /// The previous agent's working connection, when the owner left it on
+    /// and it still matches; `None` rolls back and restores as before.
+    fn adopt_previous(&self) -> Option<Session> {
+        let target = resume::load(Path::new(JOURNAL))?;
+        if !routes_journaled(Path::new(JOURNAL)) || hotspot::owner_off("wlan2") {
+            return None;
+        }
+        let lan = |key: &str| Cmd::new("uci", &["-q", "get", key]).run().ok()?.parse::<Ipv4Addr>().ok();
+        let (lan_ip, lan_mask) = (lan("network.lan.ipaddr")?, lan("network.lan.netmask")?);
+        let started = Instant::now();
+        match adopt::adopt(&target, lan_ip, lan_mask) {
+            Ok(session) => {
+                crate::netlog!("[relay] took over the previous agent's connection in {} ms", started.elapsed().as_millis());
+                Some(session)
+            }
+            Err(e) => {
+                crate::netlog!("[relay] previous connection not taken over ({e}); rolling back and reconnecting");
+                None
             }
         }
     }
@@ -400,7 +537,7 @@ impl WifiRelay {
                 return;
             }
             if hotspot::owner_off("wlan2") {
-                let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).restore_generation == generation {
                     let error = resume::clear(root).err();
                     self.cancel_restore();
@@ -418,7 +555,7 @@ impl WifiRelay {
             });
             match found.and_then(|id| self.join(&id, "", target.ipv6, Origin::Restore(&target, generation))) {
                 Ok(()) => {
-                    eprintln!("[relay] restored after {} attempt(s)", attempt + 1);
+                    crate::netlog!("[relay] restored after {} attempt(s)", attempt + 1);
                     return self.finish_restore(generation, None);
                 }
                 Err(e) if e == RESTORE_CANCELLED => return self.finish_restore(generation, None),
@@ -427,7 +564,7 @@ impl WifiRelay {
                     break;
                 }
                 Err(e) => {
-                    eprintln!("[relay] restore attempt {} failed: {e}", attempt + 1);
+                    crate::netlog!("[relay] restore attempt {} failed: {e}", attempt + 1);
                     last = e;
                 }
             }
@@ -436,7 +573,7 @@ impl WifiRelay {
     }
 
     fn begin_restore(&self, root: &Path) -> Option<(resume::Resume, u64)> {
-        let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let target = resume::load(root)?;
         let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if i.session.is_some() || i.restore_generation != 0 { return None; }
@@ -484,34 +621,35 @@ impl WifiRelay {
     }
 
     fn scan_for_restore(&self, restore: Option<(&resume::Resume, u64)>) -> Result<(), String> {
-        let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _claim = self.begin()?;
+        let _lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((target, generation)) = restore {
             self.check_restore(Path::new(JOURNAL), target, generation)?;
         }
         let idle = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).session.is_none();
         let mut temporary = if idle { Some(self.prepare()?) } else { None };
-        // 标记失败的扫描尝试也可能占过空口，不能混入带宽比较窗口。
-        if let Some(width) = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).session.as_mut().and_then(|s| s.width.as_mut()) {
-            width.scanned();
-        }
         let result: Result<_, String> = (|| {
             let channels = scan::Channels::parse(&Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?);
             let plan = channels.plan();
             let mut ctrl = scan::Ctrl::attach(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT))?;
             let (table, took) = scan::run(&mut ctrl, &plan)?;
-            Ok((parse_bss_on_channels(&table, took.as_secs() + 1, &channels), neighbours(&table, took.as_secs() + 1)))
+            Ok(parse_bss_on_channels(&table, took.as_secs() + 1, &channels))
         })();
         if let Some(s) = &mut temporary {
-            cleanup(s, || Ok(()))?;
+            cleanup(s, || ())?;
         }
         let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (i.scans, i.neighbours) = result?;
+        i.scans = result?;
         i.error = None;
         self.publish(&i);
         Ok(())
     }
 
     fn prepare(&self) -> Result<Session, String> {
+        // A Wi-Fi reload the agent started is still reconfiguring the radio.
+        if crate::netfx::admission::held(crate::netfx::admission::VENDOR_WIFI_RELOAD) {
+            return Err("Wi-Fi is still applying its new settings; retry in a moment".into());
+        }
         self.recover()?;
         if Path::new(&format!("/sys/class/net/{IFACE}")).exists() {
             return Err("Relay interface already exists; do not take over another process's interface".into());
@@ -534,25 +672,21 @@ impl WifiRelay {
         })?;
         net::private_dir(Path::new(ROOT))?;
         let _ = fs::remove_file(Path::new(ROOT).join("lease.json"));
-        let mut session = Session {
-            wireless: Transaction::new(Path::new(JOURNAL).join("wireless.json")),
-            network: Transaction::new(Path::new(JOURNAL).join("network.json")),
-            dns: Transaction::new(Path::new(JOURNAL).join("dns.json")),
-            dns_error: None,
-            supplicant: None,
-            dhcp: None,
-            dhcp_session: None,
-            lease: None,
-            selected: None,
-            ipv6: ipv6::Upstream::new(),
-            width: None,
-            tuning: saved::Tuning::Off,
-            association: Association::default(),
-            offload: offload::Runtime::off(),
-            guard: crate::net_guard::Cursor::default(),
-            renewed: None,
-        };
+        let mut session = Session::new(Path::new(JOURNAL));
         let result = (|| {
+            // Protect INPUT and forwarding before the interface exists,
+            // including scan-only sessions (`uplink`). The journal undoes in
+            // reverse, so the interface is deleted before its guard goes.
+            for tool in ["iptables", "ip6tables"] {
+                if Cmd::new(tool, &["-w", "2", "-t", "filter", "-S", "U60_RELAY_IN"]).run().is_ok() {
+                    return Err("Relay firewall chains are already in use".into());
+                }
+            }
+            session.uplink.claim()?;
+            let mut guards = input_guards();
+            guards.extend(uplink::steps());
+            session.wireless.apply_network(guards)?;
+            session.uplink.guard()?;
             session
                 .wireless
                 .apply(Step::new(Cmd::new("iw", &["phy", phy, "interface", "add", IFACE, "type", "managed"]), Cmd::new("iw", &["dev", IFACE, "del"])))?;
@@ -565,19 +699,13 @@ impl WifiRelay {
             bytes[5] ^= 0x60;
             let mac = bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
             Cmd::new("ip", &["link", "set", "dev", IFACE, "address", &mac]).run()?;
-            fs::write(format!("/proc/sys/net/ipv6/conf/{IFACE}/disable_ipv6"), b"1").map_err(|_| "Cannot disable unconfigured upstream IPv6")?;
-            // Protect INPUT before the interface is raised, including scan-only sessions.
-            for tool in ["iptables", "ip6tables"] {
-                if Cmd::new(tool, &["-w", "2", "-t", "filter", "-S", "U60_RELAY_IN"]).run().is_ok() {
-                    return Err("Relay firewall chains are already in use".into());
-                }
-            }
-            session.wireless.apply_network(input_guards())?;
+            // Deleting the interface is the undo.
+            session.wireless.apply(Step::new(Cmd::new("sysctl", &["-w", &format!("net.ipv6.conf.{IFACE}.disable_ipv6=1")]), Cmd::new("true", &[])))?;
             Cmd::new("ip", &["link", "set", "dev", IFACE, "up"]).run()?;
             net::write_private(&Path::new(ROOT).join("wpa.conf"), format!("ctrl_interface={ROOT}/ctrl\nupdate_config=0\n").as_bytes())?;
             let mut cmd = Command::new("wpa_supplicant");
             cmd.args(["-D", "nl80211", "-i", IFACE, "-c", &format!("{ROOT}/wpa.conf"), "-qq"]);
-            session.supplicant = Some(net::owned_child(cmd)?);
+            session.supplicant = Some(Helper::Owned(net::owned_child(cmd)?));
             let ready = (0..30).any(|_| {
                 if wpa("ping", &[]).is_ok_and(|s| s.ends_with("PONG")) {
                     true
@@ -590,7 +718,7 @@ impl WifiRelay {
                 return Err("wpa_supplicant did not become ready".into());
             }
             // A PONG from another supplicant must not pass for ours.
-            if !session.supplicant.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None))) {
+            if !session.supplicant.as_mut().is_some_and(Helper::alive) {
                 return Err("wpa_supplicant exited; another process may own the relay interface".into());
             }
             let old = wpa("driver", &["GETROAMMODE"])?;
@@ -604,7 +732,7 @@ impl WifiRelay {
         Ok(session)
     }
 
-    fn connect_remembered(&self, id: &str, password: &str, confirmed: bool, ipv6: bool, remember: bool, tuning: Option<saved::Tuning>) -> Result<(), String> {
+    fn connect_remembered(&self, id: &str, password: &str, confirmed: bool, ipv6: bool, remember: bool) -> Result<(), String> {
         if !confirmed {
             return Err("Confirm hotspot interruption and possible cellular charges first".into());
         }
@@ -615,11 +743,12 @@ impl WifiRelay {
             selected_config(&i.scans, id, password)?;
         }
         let generation = self.cancel_restore();
-        self.join(id, password, ipv6, Origin::Owner { remember, generation, tuning })
+        self.join(id, password, ipv6, Origin::Owner { remember, generation })
     }
 
     fn join(&self, id: &str, password: &str, ipv6: bool, origin: Origin) -> Result<(), String> {
-        let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _claim = self.begin()?;
+        let _lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = Path::new(JOURNAL);
         match origin {
             Origin::Owner { .. } => {},
@@ -628,11 +757,6 @@ impl WifiRelay {
         let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if i.restore_generation != origin.generation() { return Err(RESTORE_CANCELLED.into()); }
         let (selected, password, network_config) = selected_config(&i.scans, id, password)?;
-        let tuning = match origin {
-            Origin::Owner { tuning: Some(mode), .. } => mode,
-            _ => saved::tuning(&selected)?,
-        };
-        let neighbours = i.neighbours.clone();
         // Country/driver restrictions may have changed since the last scan.
         let channels = scan::Channels::parse(&Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?);
         if !channels.contains(selected.frequency) {
@@ -651,12 +775,30 @@ impl WifiRelay {
             self.publish(&i);
             Err(e)
         };
+        // Between 5 GHz upstreams the station and hotspot are handed over
+        // (`handover`); otherwise the old session is torn down first.
+        let mut handed = None;
         if let Some(mut old) = old {
-            if let Err(e) = cleanup(&mut old, || self.uplink_changed()) {
-                return failed(e);
+            let five = |n: Option<&Network>| n.is_some_and(|n| n.frequency > 5000);
+            if five(old.selected.as_ref()) && five(Some(&selected)) {
+                // The same access point again: IPv6 (its client, addresses,
+                // routes, NAT66 and the LAN's RA) goes over as it is.
+                let same_bss = old.selected.as_ref().is_some_and(|n| n.bssid == selected.bssid);
+                let keep_ipv6 = ipv6 && same_bss && old.ipv6.configured();
+                match handover(&mut old, &channels, keep_ipv6, || self.uplink_changed()) {
+                    Ok(next) => handed = Some((next, keep_ipv6)),
+                    Err(e) => crate::netlog!("[relay] station not handed over ({e}); tearing the old connection down"),
+                }
+            }
+            if handed.is_none() {
+                if let Err(e) = cleanup(&mut old, || self.uplink_changed()) {
+                    return failed(e);
+                }
             }
         }
-        let mut session = match self.prepare() {
+        let kept = handed.is_some();
+        let ipv6_kept = handed.as_ref().is_some_and(|(_, ipv6)| *ipv6);
+        let mut session = match handed.map_or_else(|| self.prepare(), |(next, _)| Ok(next)) {
             Ok(session) => session,
             Err(e) => return failed(e),
         };
@@ -669,11 +811,18 @@ impl WifiRelay {
         };
         let result = (|| {
             check()?;
-            hotspot::prepare(&mut session.wireless, selected.frequency, &channels)?;
+            if !kept {
+                hotspot::prepare(&mut session.wireless, selected.frequency, &channels)?;
+            }
             net::write_private(&Path::new(ROOT).join("wpa.conf"), format!("ctrl_interface={ROOT}/ctrl\nupdate_config=0\n{network_config}").as_bytes())?;
             // Undo must detach STA before restoring the same-radio AP channel,
-            // including a crash between reconfigure and association completion.
-            session.wireless.apply(association_step())?;
+            // including a crash between reconfigure and association completion
+            // (a handed-over station has that undo already).
+            session.wireless.ensure(association_step())?;
+            if kept {
+                // `handover` disconnected it; a reconfigure alone keeps it so.
+                wpa("reconnect", &[]).and_then(expect_ok)?;
+            }
             let mut linked = false;
             for _ in 0..30 {
                 check()?;
@@ -686,23 +835,11 @@ impl WifiRelay {
             if !linked {
                 return Err("Wi-Fi association failed; check password and signal".into());
             }
+            // The driver keeps an earlier `chwidth` across associations.
             reset_width();
-            session.tuning = tuning;
-            session.width = Some(LinkWidth::new(&selected, &neighbours, tuning));
-            let callback = std::env::current_exe().map_err(|e| e.to_string())?;
-            #[cfg(test)]
-            let callback = std::env::var_os("U60_IPV6_QA_CALLBACK").map(std::path::PathBuf::from).unwrap_or(callback);
-            let mut cmd = Command::new("udhcpc");
-            let mut nonce = [0; 16];
-            getrandom::getrandom(&mut nonce).map_err(|_| "Cannot create DHCP session")?;
-            let nonce = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let (nonce, dhcp) = start_dhcp(None)?;
             session.dhcp_session = Some(nonce.clone());
-            cmd.args(["-f", "-i", IFACE, "-s"])
-                .arg(callback)
-                .args(["-t", "5", "-T", "3", "-A", "10"])
-                .env("U60_RELAY_DHCP", "1")
-                .env("U60_RELAY_DHCP_SESSION", &nonce);
-            session.dhcp = Some(net::owned_child(cmd)?);
+            session.dhcp = Some(dhcp);
             let mut lease = None;
             for _ in 0..25 {
                 check()?;
@@ -717,25 +854,17 @@ impl WifiRelay {
             let lan_mask: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.netmask"]).run()?.parse().map_err(|_| "Invalid LAN mask")?;
             let prefix = validate_lease(&lease, lan_ip, lan_mask)?;
             net::reserve("iptables", "filter", &["U60_RELAY_FWD"], "-4", TABLE, PREF)?;
-            if dns_nft::occupied("ip") {
-                return Err("Relay DNS table is already occupied".into());
-            }
-            if Cmd::new("ip6tables", &["-w", "2", "-t", "filter", "-S", "U60_RELAY_V6"]).run().is_ok() {
-                return Err("Relay IPv6 guard chain is already occupied".into());
-            }
-            if Cmd::new(
-                "ip6tables",
-                &["-w", "2", "-t", "filter", "-S", "U60_RELAY_OUT"],
-            )
-            .run()
-            .is_ok()
-            {
-                return Err("Relay IPv6 output guard chain is already occupied".into());
-            }
             if fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default().trim() != "1" {
                 return Err("Router IPv4 forwarding is disabled".into());
             }
-            session.network.apply_network(relay_plan(&lease, prefix, lan_ip, lan_mask))?;
+            // The tables grow (forwarding, DNS, the IPv6 baseline) after the
+            // legacy accepts and routes, before the policy rule moves traffic.
+            let mut plan = relay_plan(&lease, prefix, lan_ip, lan_mask);
+            let rule = plan.pop().expect("the policy rule is the plan's last step");
+            session.network.apply_network(plan)?;
+            session.uplink.update(|l| l.relay = Some(relay_layout(&lease, lan_ip, lan_mask)))?;
+            session.network.apply_network(vec![rule])?;
+            session.routed = true;
             let route = Cmd::new("ip", &["-4", "route", "get", "1.1.1.1"]).run()?;
             if !route.contains(&format!("dev {IFACE}")) {
                 return Err("Firmware policy routing did not select the Wi-Fi upstream".into());
@@ -743,16 +872,13 @@ impl WifiRelay {
             // CPU-path help and hardware forwarding are optional: the relay
             // works without them. Hardware mode first, then IPACM's WAN route.
             if let Err(e) = session.network.apply_network(steering::plan()) {
-                eprintln!("[relay] receive steering not applied: {e}");
+                crate::netlog!("[relay] receive steering not applied: {e}");
             }
-            session.offload = offload::Runtime::start(&mut session.network, offload::config());
-            if session.offload.route {
-                let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(lease.ip) & u32::from(lease.subnet)));
-                match session.network.apply_network(offload::route_plan(&lease.gateway.to_string(), &subnet)) {
-                    Ok(()) => session.offload.kick(),
-                    Err(e) => session.offload.no_route(e),
-                }
+            if power_save::auto_off(Path::new(JOURNAL)) {
+                let _ = session.power_save.set(&mut session.network, true);
             }
+            let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(lease.ip) & u32::from(lease.subnet)));
+            session.offload = offload::Runtime::start(&mut session.network, lease.gateway, subnet);
             let dns = lease.dns.first().copied().unwrap_or(lease.gateway).to_string();
             session.dns.apply(Step::new(
                 Cmd::new("@u60-relay-dns", &[&dns]),
@@ -763,7 +889,9 @@ impl WifiRelay {
             }
             // A new uplink must not reuse the previous network's clock check.
             let _ = crate::network_clock::recheck_wifi();
-            session.ipv6.start(ipv6)?;
+            if !ipv6_kept {
+                session.ipv6.start(ipv6)?;
+            }
             check()?;
             if hotspot::owner_off("wlan2") || (selected.frequency < 3000 && hotspot::owner_off("wlan0")) {
                 return Err("Hotspot was turned off while connecting relay".into());
@@ -792,7 +920,7 @@ impl WifiRelay {
         i.session = Some(session);
         i.error = None;
         if let Origin::Owner { remember, .. } = origin {
-            if let Err(e) = saved::remember(&selected, remember.then_some(password.as_str()), tuning) { i.error = Some(format!("Relay connected, but {e}")); }
+            if let Err(e) = saved::remember(&selected, remember.then_some(password.as_str())) { i.error = Some(format!("Relay connected, but {e}")); }
             // Only a credential the router keeps can be rejoined after a restart.
             let kept = selected.security == "open" || saved::password(&selected).ok().flatten().is_some_and(|p| p == password);
             if kept {
@@ -802,51 +930,16 @@ impl WifiRelay {
         self.publish(&i);
         self.wake.notify_all();
         // Restarting the core takes seconds: do it without the session lock.
-        // A save error above stays visible; otherwise the restart's error shows.
         drop(i);
-        if let Err(e) = self.uplink_changed() {
-            let mut i = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            i.error.get_or_insert(e);
-            self.publish(&i);
-        }
-        Ok(())
-    }
-
-    fn set_tuning(&self, id: &str, tuning: saved::Tuning, confirmed: bool) -> Result<(), String> {
-        if !confirmed { return Err("Confirm the possible Wi-Fi reconnection first".into()); }
-        let reconnect = {
-            let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let current = i.session.as_ref().and_then(|s| s.selected.as_ref().map(|n| (n.clone(), s.tuning, s.ipv6.status()["requested"].as_bool().unwrap_or(false))));
-            let reconnect = current.filter(|(n, mode, _)| saved::key(&n.ssid, n.security) == id && *mode != tuning);
-            if let Some((network, _, _)) = &reconnect {
-                if network.security != "open" && saved::password(network)?.is_none_or(|p| p.is_empty()) {
-                    return Err("Enter this Wi-Fi password in the connection form to change its bandwidth mode".into());
-                }
-                if !i.scans.iter().any(|n| n.id == network.id) { i.scans.push(network.clone()); }
-            }
-            saved::set_tuning(id, tuning)?;
-            reconnect.map(|(network, _, ipv6)| {
-                i.restore_generation = i.restore_generation.wrapping_add(1);
-                i.restoring = None;
-                self.publish(&i);
-                self.wake.notify_all();
-                (network.id, ipv6, i.restore_generation)
-            })
-        };
-        if let Some((id, ipv6, generation)) = reconnect {
-            self.join(&id, "", ipv6, Origin::Owner { remember: false, generation, tuning: Some(tuning) })?;
-        }
+        self.uplink_changed();
         Ok(())
     }
 
     pub fn disconnect(&self) -> Result<(), String> {
         // Cancel before waiting for an in-flight scan/join to release the lock.
         self.cancel_restore();
-        let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _claim = self.begin_teardown();
+        let _lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Off until the owner connects again, restarts included.
         let cleared = resume::clear(Path::new(JOURNAL));
         let session = {
@@ -855,7 +948,17 @@ impl WifiRelay {
             self.publish(&i);
             session
         };
-        let result = if let Some(mut s) = session { cleanup(&mut s, || self.uplink_changed()) } else { self.recover().and(self.uplink_changed()) };
+        let result = if let Some(mut s) = session {
+            cleanup(&mut s, || self.uplink_changed())
+        } else {
+            // Mihomo follows only routes a previous agent left and this removed.
+            let routed = routes_journaled(Path::new(JOURNAL));
+            let recovered = self.recover();
+            if routed && !routes_journaled(Path::new(JOURNAL)) {
+                self.uplink_changed();
+            }
+            recovered
+        };
         let result = result.and(cleared);
         let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         i.error = result.as_ref().err().cloned();
@@ -863,12 +966,69 @@ impl WifiRelay {
         result
     }
 
-    /// Owner action: install or remove the IPACM entry (`offload`).
-    fn set_offload(&self, install: bool) -> Result<(), String> {
-        let _lock = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Owner action (`power_save`): saved for later connections and applied
+    /// to the current one at once.
+    fn set_power_save(&self, auto_off: bool) -> Result<(), String> {
+        let _claim = self.begin()?;
+        let _lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        power_save::save(Path::new(JOURNAL), auto_off)?;
+        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = i.session.as_mut().map_or(Ok(()), |s| s.power_save.set(&mut s.network, auto_off));
+        self.publish(&i);
+        result.map_err(|e| format!("Setting saved. {e}"))
+    }
+
+    /// Owner action: install or remove the IPACM entry (`offload`). A
+    /// connected relay follows at once. The connection reset that went with
+    /// it, if the path changed (`sync_offload`).
+    fn set_offload(&self, install: bool) -> Result<Option<Value>, String> {
+        let _claim = self.begin()?;
+        let _lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reset = None;
+        if !install {
+            // IPACM re-reads its configuration when the file changes, and
+            // then ignores the relay's WAN going down (it kept offloading
+            // with the `main` route gone): release first, give it a moment.
+            reset = self.sync_offload(true)?;
+            std::thread::sleep(Duration::from_secs(1));
+        }
         let config = if install { offload::install()? } else { offload::remove()? };
-        eprintln!("[relay] hardware forwarding config={config:?}");
-        Ok(())
+        crate::netlog!("[relay] hardware forwarding config={config:?}");
+        Ok(self.sync_offload(false)?.or(reset))
+    }
+
+    /// Owner action: hardware forwarding on or off without a restart. Saved
+    /// for later connections; a connected relay follows at once.
+    fn set_offload_enabled(&self, on: bool) -> Result<Option<Value>, String> {
+        let _claim = self.begin()?;
+        let _lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        offload::set_enabled(on)?;
+        crate::netlog!("[relay] hardware forwarding switched {}", if on { "on" } else { "off" });
+        self.sync_offload(false)
+    }
+
+    /// Caller owns the network lock. A changed path resets LAN IPv4
+    /// connections, so established and offloaded flows move onto it. The
+    /// reset's actual outcome (`conntrack::Report::json`, or a failure that
+    /// stays pending for the watchdog's retry) when the path changed; the
+    /// console says only what happened.
+    fn sync_offload(&self, release_now: bool) -> Result<Option<Value>, String> {
+        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(s) = i.session.as_mut() else { return Ok(None) };
+        let changed_at = Instant::now();
+        let changed = s.offload.sync(&mut s.network, release_now);
+        self.publish(&i);
+        drop(i);
+        match changed {
+            Ok(true) => Ok(Some(
+                match crate::netfx::conntrack::reset_since("relay forwarding path changed", crate::netfx::conntrack::Scope::Lan { v4: true, v6: false }, changed_at) {
+                    Ok(report) => report.json(),
+                    Err(e) => crate::netfx::conntrack::failed_json(&e),
+                },
+            )),
+            Ok(false) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -932,6 +1092,37 @@ impl Association {
     }
 }
 
+/// What one 3 s observation of an active session decides (section 6.2):
+/// observing is the tick's, deciding is this, acting is the tick's again.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    /// Tear the session down, for this reason (in this order of precedence).
+    Teardown(&'static str),
+    /// Association lost within the grace: keep the path, extend nothing.
+    Hold,
+    /// Keep it, with the renewed resolvers to adopt, if any.
+    Keep(Option<Lease>),
+}
+
+fn decide(link: AssociationResult, helpers_alive: bool, change: LeaseChange, hotspot_off: bool) -> Decision {
+    if hotspot_off {
+        Decision::Teardown("hotspot_off")
+    } else if !helpers_alive {
+        Decision::Teardown("helper_exited")
+    } else if change == LeaseChange::Replaced {
+        Decision::Teardown("lease_changed")
+    } else if link == AssociationResult::Expired {
+        Decision::Teardown("association_timeout")
+    } else if link == AssociationResult::Recovering {
+        Decision::Hold
+    } else {
+        Decision::Keep(match change {
+            LeaseChange::Resolvers(next) => Some(next),
+            _ => None,
+        })
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum LeaseChange {
     Same,
@@ -982,7 +1173,7 @@ fn resolvers_acceptable(lease: &Lease) -> bool {
 #[derive(Clone, Copy)]
 enum Origin<'a> {
     /// A connect request; `remember` saves its password.
-    Owner { remember: bool, generation: u64, tuning: Option<saved::Tuning> },
+    Owner { remember: bool, generation: u64 },
     /// `restore`: only while this is still the network to restore.
     Restore(&'a resume::Resume, u64),
 }
@@ -1011,6 +1202,11 @@ fn radio_phy() -> Result<String, String> {
         .ok_or_else(|| "Cannot identify the active Wi-Fi PHY".into())
 }
 
+/// Whether a journal holds relay routes (IPv4 or IPv6) still to undo.
+fn routes_journaled(root: &Path) -> bool {
+    ["network.json", "ipv6-network.json"].iter().any(|name| root.join(name).exists())
+}
+
 fn recovery_pending(root: &Path) -> bool {
     [
         "network.json",
@@ -1024,30 +1220,48 @@ fn recovery_pending(root: &Path) -> bool {
     .any(|name| root.join(name).exists())
 }
 
-/// A relay helper on our interface with our private paths (`stop_strays`).
+/// Where a monitor of `offload` records its process id (`stop_strays`).
+pub(crate) fn pid_file(name: &str) -> std::path::PathBuf {
+    Path::new(ROOT).join(format!("{name}.pid"))
+}
+
+/// The monitors whose processes an agent recorded.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn stray(args: &[String]) -> bool {
+const MONITORS: [&str; 2] = ["relay-neigh", "relay-lan"];
+
+/// A relay helper on our interface with our private paths (`stop_strays`).
+/// The monitors' command lines are common, so only the recorded process (id
+/// and start time, this boot) is one: not an `iw event` run by hand, not a
+/// process that reused the id.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stray(args: &[String], process: offload::Record, recorded: &[offload::Record]) -> bool {
     let Some(program) = args.first().and_then(|a| a.rsplit('/').next()) else { return false };
     let after = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str());
     match program {
         "wpa_supplicant" => after("-i") == Some(IFACE) && after("-c").is_some_and(|c| [format!("{ROOT}/wpa.conf"), format!("{ROOT}/recover.conf")].iter().any(|p| p == c)),
         "odhcp6c" => args.last().map(String::as_str) == Some(IFACE) && after("-p") == Some(&format!("{ROOT}/odhcp6c.pid")),
         "udhcpc" => after("-i") == Some(IFACE),
+        // `offload`'s monitors: an orphan only exits at its next write.
+        "ip" => args[1..] == ["-4", "monitor", "neigh", "dev", IFACE] && recorded.contains(&process),
+        "iw" => args[1..] == ["event", "-t"] && recorded.contains(&process),
         _ => false,
     }
 }
 
 /// Relay helpers a previous agent left running. B31 runs wpa_supplicant in
-/// SELinux domain `wpad.subj` and odhcp6c in `odhcp6c.subj`, and the kernel
-/// clears the parent-death signal on any exec that changes domain (even in
-/// permissive mode), so both outlive the agent. The old supplicant keeps the
-/// control socket: a new one exits at once and every command reaches the old
-/// one; the old odhcp6c keeps calling the new binary. Only callers without a
-/// live session reach here, and our own children are never matched.
+/// SELinux domain `wpad.subj`, odhcp6c in `odhcp6c.subj`, ip in `ip.subj` and iw in `iw.subj`,
+/// and the kernel clears the parent-death signal on any exec that changes
+/// domain (even in permissive mode), so they outlive the agent. The old
+/// supplicant keeps the control socket: a new one exits at once and every
+/// command reaches the old one; the old odhcp6c keeps calling the new binary.
+/// Only callers without a live session reach here, and our own children are
+/// never matched. `spare`: the helpers an adopting agent keeps (`adopt`).
 #[cfg(target_os = "linux")]
-fn stop_strays() -> Result<(), String> {
+fn stop_strays(spare: &[offload::Record]) -> Result<(), String> {
     let me = std::process::id().to_string();
-    let strays: Vec<libc::pid_t> = fs::read_dir("/proc")
+    let boot = net::boot_id();
+    let recorded: Vec<offload::Record> = MONITORS.iter().filter_map(|name| offload::Record::parse(&fs::read_to_string(pid_file(name)).ok()?, &boot)).collect();
+    let strays: Vec<(libc::pid_t, u64)> = fs::read_dir("/proc")
         .map_err(|_| "Cannot list processes")?
         .flatten()
         .filter_map(|entry| {
@@ -1056,18 +1270,24 @@ fn stop_strays() -> Result<(), String> {
             let args: Vec<String> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
             let status = fs::read_to_string(entry.path().join("status")).ok()?;
             let parent = status.lines().find_map(|l| l.strip_prefix("PPid:")).map(str::trim);
-            (stray(&args) && parent != Some(me.as_str())).then_some(pid)
+            let process = offload::Record { pid: pid as u32, start: crate::netfx::exec::process_start(pid as u32)? };
+            (stray(&args, process, &recorded) && parent != Some(me.as_str()) && !spare.contains(&process)).then_some((pid, process.start))
         })
         .collect();
+    // Only a previous agent's records are left here: a live session has none.
+    for name in MONITORS {
+        let _ = fs::remove_file(pid_file(name));
+    }
     if strays.is_empty() {
         return Ok(());
     }
-    eprintln!("[relay] stopping {} helper(s) left by a previous agent", strays.len());
+    crate::netlog!("[relay] stopping {} helper(s) left by a previous agent", strays.len());
     // A zombie has an empty command line; its parent (init) reaps it.
-    let alive = |pid: &libc::pid_t| fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| !c.is_empty());
+    // Also the same process: a reused id is never signalled.
+    let alive = |(pid, start): &(libc::pid_t, u64)| fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| !c.is_empty()) && crate::netfx::exec::process_start(*pid as u32) == Some(*start);
     for (signal, wait) in [(libc::SIGTERM, 10), (libc::SIGKILL, 10)] {
-        for pid in strays.iter().filter(|p| alive(p)) {
-            // SAFETY: plain kill(2) on a pid matched just above.
+        for (pid, _) in strays.iter().filter(|p| alive(p)) {
+            // SAFETY: plain kill(2) on a process matched and re-identified just above.
             unsafe { libc::kill(*pid, signal) };
         }
         for _ in 0..wait {
@@ -1081,7 +1301,7 @@ fn stop_strays() -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn stop_strays() -> Result<(), String> {
+fn stop_strays(_spare: &[offload::Record]) -> Result<(), String> {
     Ok(())
 }
 
@@ -1093,6 +1313,11 @@ fn wpa_command(action: &str, args: &[&str]) -> Cmd {
 
 fn wpa(action: &str, args: &[&str]) -> Result<String, String> {
     wpa_command(action, args).run()
+}
+
+/// Whether hostapd runs `iface` (`ENABLED`).
+pub(crate) fn hotspot_enabled(iface: &str) -> bool {
+    ap(iface, "status", &[]).is_ok_and(|s| net::key(&s, "state") == Some("ENABLED"))
 }
 
 fn ap(iface: &str, action: &str, args: &[&str]) -> Result<String, String> {
@@ -1180,33 +1405,106 @@ pub(crate) fn restore_roam(mode: &str) -> Result<(), String> {
     restored
 }
 
-fn cleanup(s: &mut Session, uplink_changed: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+/// A switch between 5 GHz upstreams: the old session's hardware path, IPv6,
+/// routes, DNS, lease and association go, as in `cleanup`; its station,
+/// supplicant, guard and hotspot journal stay for the next session, and the
+/// hotspot only goes back to the non-DFS staging channel (`hotspot::restage`)
+/// instead of first returning to the owner's 160 MHz channel and its radar
+/// check (about 65 s on B31). `keep_ipv6` (the same access point again):
+/// IPv6 stays as it is and goes to the next session too; the station keeps
+/// its addresses and routes across the reassociation. `Err` leaves `old`
+/// for `cleanup` to finish.
+fn handover(old: &mut Session, channels: &scan::Channels, keep_ipv6: bool, uplink_changed: impl FnOnce()) -> Result<Session, String> {
+    if crate::netfx::admission::held(crate::netfx::admission::VENDOR_WIFI_RELOAD) {
+        return Err("Wi-Fi is still applying its new settings".into());
+    }
+    if !old.supplicant.as_mut().is_some_and(Helper::alive) {
+        return Err("the supplicant exited".into());
+    }
+    old.offload.stop();
+    if !keep_ipv6 {
+        old.ipv6.stop()?;
+    }
+    if let Err(e) = old.uplink.update(|l| l.relay = None) {
+        crate::netlog!("[relay] relay tables not narrowed before releasing routes (the journal removes them): {e}");
+    }
+    let routes = old.network.rollback();
+    let dns = old.dns.rollback();
+    if std::mem::take(&mut old.routed) {
+        uplink_changed();
+    }
+    routes.and(dns)?;
+    net::stop_child(&mut old.dhcp);
+    if let Some(path) = old.dhcp_session.take().and_then(|session| lease_file(Path::new(ROOT), &session)) {
+        let _ = fs::remove_file(path);
+    }
+    wpa("disconnect", &[]).and_then(expect_ok)?;
+    hotspot::restage(channels)?;
+    // From here the station and the hotspot journal are the next session's.
+    let mut next = Session::new(Path::new(JOURNAL));
+    next.wireless = std::mem::replace(&mut old.wireless, Transaction::new(Path::new(JOURNAL).join("wireless.json")));
+    next.uplink = old.uplink.clone();
+    next.ipv6 = if keep_ipv6 {
+        // `old` is dropped, never cleaned up, after a handover: its empty
+        // replacement never rolls back (and so removes) IPv6's journals.
+        std::mem::replace(&mut old.ipv6, ipv6::Upstream::new(next.uplink.clone()))
+    } else {
+        ipv6::Upstream::new(next.uplink.clone())
+    };
+    next.supplicant = old.supplicant.take();
+    crate::netlog!("[relay] station handed over to the next upstream{}; the hotspot waits on its staging channel", if keep_ipv6 { " with its IPv6" } else { "" });
+    Ok(next)
+}
+
+/// Tears the session down. `uplink_changed` runs only when the session had
+/// installed its routes: a failed connection or a scan changes no uplink.
+fn cleanup(s: &mut Session, uplink_changed: impl FnOnce()) -> Result<(), String> {
+    s.offload.stop();
     let ipv6 = s.ipv6.stop();
+    // Back to the guard before the routes go; the station is still up.
+    if let Err(e) = s.uplink.update(|l| l.relay = None) {
+        crate::netlog!("[relay] relay tables not narrowed before releasing routes (the journal removes them): {e}");
+    }
     let routes = s.network.rollback();
     let dns = s.dns.rollback();
     // Rebind the proxy as soon as routes/DNS are released, before hotspot CAC.
-    let uplink = uplink_changed();
+    if std::mem::take(&mut s.routed) {
+        uplink_changed();
+    }
     if let Err(e) = ipv6 {
         net::stop_child(&mut s.dhcp);
-        net::stop_child(&mut s.supplicant);
-        return routes.and(dns).and(uplink).and(Err(e));
+        stop_helper(&mut s.supplicant);
+        return routes.and(dns).and(Err(e));
     }
     net::stop_child(&mut s.dhcp);
     if s.supplicant.is_some() && wpa("disconnect", &[]).and_then(expect_ok).is_err() {
         // Without an acknowledged DISCONNECT it could reassociate between
         // the journal's link check and restoring the AP channel.
-        net::stop_child(&mut s.supplicant);
+        stop_helper(&mut s.supplicant);
     }
     let wireless = s.wireless.rollback();
-    net::stop_child(&mut s.supplicant);
+    if wireless.is_ok() {
+        s.uplink.forget();
+    }
+    stop_helper(&mut s.supplicant);
     if let Some(path) = s.dhcp_session.take().and_then(|session| lease_file(Path::new(ROOT), &session)) {
         let _ = fs::remove_file(path);
     }
     let _ = fs::remove_file(Path::new(ROOT).join("lease.json"));
     let _ = fs::remove_file(Path::new(ROOT).join("wpa.conf"));
-    routes.and(wireless).and(dns).and(uplink)
+    routes.and(wireless).and(dns)
 }
 
+/// The `wireless` plan's firewall steps (the upstream INPUT accepts), which
+/// `net_guard` re-checks; its radio steps cannot be re-applied.
+fn firewall_step(cmd: &Cmd) -> bool {
+    matches!(cmd.program.as_str(), "iptables" | "ip6tables")
+}
+
+/// What must pass the vendor's INPUT rejects from the upstream: established
+/// replies and DHCP offers (IPv6 hooks its own `U60_R6_IN` in here). The
+/// guard's drop is in `uplink`; these chains hold accepts only, so a rule
+/// re-added out of order can neither open nor close anything else.
 fn input_guards() -> Vec<Step> {
     let mut p = Vec::new();
     for tool in ["iptables", "ip6tables"] {
@@ -1215,28 +1513,36 @@ fn input_guards() -> Vec<Step> {
             p.push(net::rule(tool, "filter", "U60_RELAY_IN", &["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"], false));
             p.push(net::rule(tool, "filter", "U60_RELAY_IN", &["-p", "udp", "--sport", "67", "--dport", "68", "-j", "ACCEPT"], false));
         }
-        p.push(net::rule(tool, "filter", "U60_RELAY_IN", &["-j", "DROP"], false));
         p.push(net::rule(tool, "filter", "INPUT", &["-i", IFACE, "-j", "U60_RELAY_IN"], true));
     }
     p
 }
 
+/// The tables' part for installed routes: the resolver DNS goes to and the
+/// LAN it keeps.
+fn relay_layout(l: &Lease, lan: Ipv4Addr, mask: Ipv4Addr) -> uplink::Relay {
+    let lan = format!("{}/{}", Ipv4Addr::from(u32::from(lan) & u32::from(mask)), u32::from(mask).count_ones());
+    uplink::Relay { dns: l.dns.first().copied().unwrap_or(l.gateway), lan }
+}
+
+/// Addresses, routes, the legacy accepts, MASQUERADE and the portal RETURN;
+/// the policy rule is last (the caller loads the tables before it).
 fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) -> Vec<Step> {
     let address = format!("{}/{prefix}", l.ip);
     let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(l.ip) & u32::from(l.subnet)));
     let lan_net = format!("{}/{}", Ipv4Addr::from(u32::from(lan) & u32::from(mask)), u32::from(mask).count_ones());
     let gw = l.gateway.to_string();
-    let dns = l.dns.first().copied().unwrap_or(l.gateway);
     let mut p = vec![net::ip_step("-4", "addr", &[&address, "dev", IFACE])];
     p.push(net::ip_step("-4", "route", &[&subnet, "dev", IFACE, "scope", "link", "src", &l.ip.to_string(), "table", TABLE]));
     // Other RFC1918 subnets can host the hotel's portal/DNS. Only our own
     // management/tailnet/link-local routes fall through to the main tables.
-    for dest in ["100.64.0.0/10", "169.254.0.0/16", "224.0.0.0/4", &lan_net] {
+    for dest in crate::netfx::ids::LOCAL_ROUTES_V4.iter().copied().chain([lan_net.as_str()]) {
         if dest != subnet {
             p.push(net::ip_step("-4", "route", &["throw", dest, "table", TABLE]));
         }
     }
     p.push(net::ip_step("-4", "route", &["default", "via", &gw, "dev", IFACE, "table", TABLE]));
+    // Through the vendor's FORWARD rejects; `uplink` drops the rest first.
     p.extend(net::chain("iptables", "filter", "U60_RELAY_FWD"));
     p.push(net::rule("iptables", "filter", "U60_RELAY_FWD", &["-i", "br-lan", "-o", IFACE, "-j", "ACCEPT"], false));
     // TCP first, on its own: its counter is the hardware forwarding check
@@ -1247,48 +1553,16 @@ fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) -> Vec<Step
         args.extend(["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]);
         p.push(net::rule("iptables", "filter", "U60_RELAY_FWD", &args, false));
     }
-    for flag in ["-i", "-o"] {
-        p.push(net::rule("iptables", "filter", "U60_RELAY_FWD", &[flag, IFACE, "-j", "DROP"], false));
-    }
     p.push(net::rule("iptables", "filter", "FORWARD", &["-j", "U60_RELAY_FWD"], true));
     // Core/router UDP sockets may retain a previously selected SIM source.
-    // Translate only our owned Wi-Fi egress, not cellular or local traffic.
+    // Translate only our owned Wi-Fi egress, not cellular or local traffic
+    // (it stays in legacy until an nft MASQUERADE is shown to keep hardware
+    // forwarding, D11). It also covers router DNS that `uplink` redirects
+    // from a socket bound to a SIM source.
     p.push(net::rule("iptables", "nat", "POSTROUTING", &["-o", IFACE, "-j", "MASQUERADE"], true));
-    // DNS through the Wi-Fi resolver, local, LAN and tailnet lookups kept
-    // (`dns_nft`). The MASQUERADE above also covers router DNS that the
-    // output chain redirects from a socket bound to a SIM source.
-    p.push(dns_nft::v4(dns, &lan_net));
-    // Skip only the vendor's offline-portal chain, not the rest of NAT or any
-    // filter policy. Direct management and configured port forwards survive.
     for tool in ["iptables", "ip6tables"] {
         p.push(portal::web_bypass(tool));
     }
-    // Baseline guard stays active when optional IPv6 is absent or expires.
-    // Its owned Wi-Fi-only forward chain precedes this guard when configured.
-    p.extend(net::chain("ip6tables", "filter", "U60_RELAY_V6"));
-    p.push(net::rule("ip6tables", "filter", "U60_RELAY_V6", &["-o", "rmnet+", "-j", "REJECT"], false));
-    for dest in ["fc00::/7", "fe80::/10", "ff00::/8"] {
-        p.push(net::rule("ip6tables", "filter", "U60_RELAY_V6", &["-d", dest, "-j", "RETURN"], false));
-    }
-    p.push(net::rule("ip6tables", "filter", "U60_RELAY_V6", &["-j", "REJECT"], false));
-    p.push(net::rule("ip6tables", "filter", "FORWARD", &["-i", "br-lan", "-j", "U60_RELAY_V6"], true));
-    // Keep the broad cellular reject in an exclusive chain: the prejournaled
-    // undo of a step that never ran must not delete an identical vendor rule.
-    p.extend(net::chain("ip6tables", "filter", "U60_RELAY_OUT"));
-    p.push(net::rule(
-        "ip6tables",
-        "filter",
-        "U60_RELAY_OUT",
-        &["-o", "rmnet+", "-j", "REJECT"],
-        false,
-    ));
-    p.push(net::rule(
-        "ip6tables",
-        "filter",
-        "OUTPUT",
-        &["-j", "U60_RELAY_OUT"],
-        true,
-    ));
     // Installed last: no downstream traffic switches until NAT/guards exist.
     p.push(net::ip_step("-4", "rule", &["pref", PREF, "lookup", TABLE]));
     p
@@ -1369,14 +1643,6 @@ fn parse_bss_on_channels(text: &str, max_age: u64, channels: &scan::Channels) ->
     networks
 }
 
-/// Every fresh BSS, hidden ones included: what shares the air with a link.
-fn neighbours(text: &str, max_age: u64) -> Vec<(u32, i32)> {
-    let mut out = Vec::new();
-    fresh_bss(text, max_age, |_, frequency, signal, _, _| out.push((frequency, signal)));
-    out.truncate(256);
-    out
-}
-
 fn network(bssid: &str, frequency: u32, signal: i32, flags: &str, ssid: &str) -> Option<Network> {
     if bssid.len() != 17 || !bssid.split(':').all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit())) {
         return None;
@@ -1392,8 +1658,13 @@ fn network(bssid: &str, frequency: u32, signal: i32, flags: &str, ssid: &str) ->
     } else {
         "unsupported"
     };
-    let id = format!("{:x}", Sha256::digest(format!("{bssid}:{frequency}:{ssid}").as_bytes()))[..16].to_owned();
+    let id = network_id(bssid, frequency, &ssid);
     Some(Network { id, ssid, frequency, signal, security, supported: security != "unsupported" && channel(frequency).is_some(), bssid: bssid.into() })
+}
+
+/// A scanned network's id: stable for one BSS, channel and name.
+fn network_id(bssid: &str, frequency: u32, ssid: &str) -> String {
+    format!("{:x}", Sha256::digest(format!("{bssid}:{frequency}:{ssid}").as_bytes()))[..16].to_owned()
 }
 
 fn wpa_network(n: &Network, password: &str) -> Result<String, String> {
@@ -1469,6 +1740,26 @@ fn read_lease(session: &str) -> Result<Lease, String> {
     serde_json::from_slice(&fs::read(path).map_err(|_| "No DHCP lease")?).map_err(|_| "Invalid DHCP lease".into())
 }
 
+/// A DHCP client on a new session path (its lease file), asking for
+/// `request` when given: the session id and the client.
+fn start_dhcp(request: Option<Ipv4Addr>) -> Result<(String, Child), String> {
+    let callback = std::env::current_exe().map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    let callback = std::env::var_os("U60_IPV6_QA_CALLBACK").map(std::path::PathBuf::from).unwrap_or(callback);
+    let mut nonce = [0; 16];
+    getrandom::getrandom(&mut nonce).map_err(|_| "Cannot create DHCP session")?;
+    let nonce = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let mut cmd = Command::new("udhcpc");
+    cmd.args(["-f", "-i", IFACE, "-s"])
+        .arg(callback)
+        .args(["-t", "5", "-T", "3", "-A", "10"]);
+    if let Some(address) = request {
+        cmd.args(["-r", &address.to_string()]);
+    }
+    cmd.env("U60_RELAY_DHCP", "1").env("U60_RELAY_DHCP_SESSION", &nonce);
+    Ok((nonce, net::owned_child(cmd)?))
+}
+
 /// BusyBox udhcpc invokes the agent executable with bound/renew/deconfig.
 /// A per-connection path prevents late callback children corrupting a reconnect.
 pub fn dhcp_callback(event: &str) -> i32 {
@@ -1503,32 +1794,40 @@ pub fn status(state: &crate::handlers::AppState) -> (u16, Value) {
 }
 
 pub fn change(state: &crate::handlers::AppState, action: &str, body: &[u8]) -> (u16, Value) {
+    if action == "offload" {
+        // `reset`: what resetting existing LAN IPv4 connections onto the new
+        // path did (`conntrack::Report::json`), or null when it did not change.
+        let result = match serde_json::from_slice::<Value>(body).ok() {
+            Some(v) if v["install"].is_boolean() => state.wifi_relay.set_offload(v["install"] == true),
+            Some(v) if v["enabled"].is_boolean() => state.wifi_relay.set_offload_enabled(v["enabled"] == true),
+            _ => Err("Send install or enabled as a boolean".into()),
+        };
+        return match result {
+            Ok(reset) => {
+                let (code, mut reply) = status(state);
+                reply["data"]["reset"] = reset.unwrap_or(Value::Null);
+                (code, reply)
+            }
+            Err(e) => (503, json!({"ok":false,"error":e})),
+        };
+    }
     let result = match action {
         "scan" => state.wifi_relay.scan(),
         "disconnect" => state.wifi_relay.disconnect(),
         "clock" => state.wifi_relay.recheck_clock_with(crate::network_clock::recheck_wifi),
-        "offload" => serde_json::from_slice::<Value>(body)
+        "power-save" => serde_json::from_slice::<Value>(body)
             .ok()
-            .and_then(|v| v["install"].as_bool())
-            .ok_or_else(|| "install must be a boolean".to_owned())
-            .and_then(|install| state.wifi_relay.set_offload(install)),
-        "tuning" => serde_json::from_slice::<Value>(body).map_err(|_| "Invalid request".to_owned()).and_then(|v| {
-            let mode = saved::Tuning::parse(v["width_mode"].as_str().unwrap_or(""))?;
-            state.wifi_relay.set_tuning(v["id"].as_str().unwrap_or(""), mode, v["confirmed"].as_bool() == Some(true))
-        }),
+            .and_then(|v| v["auto_off"].as_bool())
+            .ok_or_else(|| "auto_off must be a boolean".to_owned())
+            .and_then(|auto_off| state.wifi_relay.set_power_save(auto_off)),
         "forget" => {
-            let _lock = state.wifi_relay.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _lock = state.wifi_relay.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             serde_json::from_slice::<Value>(body).map_err(|_| "Invalid request".to_owned())
                 .and_then(|v| saved::forget(v["id"].as_str().unwrap_or("")))
         }
         "connect" => match serde_json::from_slice::<Value>(body) {
-            Ok(v) => (|| {
-                let tuning = match v.get("width_mode").filter(|v| !v.is_null()) {
-                    None => None,
-                    Some(v) => Some(saved::Tuning::parse(v.as_str().unwrap_or(""))?),
-                };
-                state.wifi_relay.connect_remembered(v["network"].as_str().unwrap_or(""), v["password"].as_str().unwrap_or(""), v["confirmed"].as_bool() == Some(true), v["ipv6"].as_bool().unwrap_or(true), v["remember"].as_bool() == Some(true), tuning)
-            })(),
+            // A `width_mode` from an older page is ignored: width tuning was retired.
+            Ok(v) => state.wifi_relay.connect_remembered(v["network"].as_str().unwrap_or(""), v["password"].as_str().unwrap_or(""), v["confirmed"].as_bool() == Some(true), v["ipv6"].as_bool().unwrap_or(true), v["remember"].as_bool() == Some(true)),
             Err(_) => Err("Invalid relay request".into()),
         },
         _ => Err("Unknown relay action".into()),
@@ -1643,15 +1942,35 @@ mod tests {
 
 
     #[test]
+    fn the_upstream_input_guard_is_rechecked_but_radio_steps_are_not() {
+        let guard = input_guards();
+        assert!(guard.iter().all(|s| firewall_step(&s.apply) && s.apply.checkable()), "every guard step can be re-applied");
+        assert!(guard.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["-N", "U60_RELAY_IN"])));
+        for radio in [roam_step("0"), association_step()] {
+            assert!(!firewall_step(&radio.apply));
+        }
+    }
+
+    #[test]
     fn strays_are_only_relay_helpers_on_our_interface_and_paths() {
         let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let mine = offload::Record { pid: 42, start: 500 };
         for helper in [
             "wpa_supplicant -D nl80211 -i u60sta0 -c /tmp/zte-agent-relay/wpa.conf -qq",
             "/usr/sbin/wpa_supplicant -D nl80211 -i u60sta0 -c /tmp/zte-agent-relay/recover.conf -qq",
             "odhcp6c -N try -R -r 23 -s /data/zte-agent -p /tmp/zte-agent-relay/odhcp6c.pid u60sta0",
             "udhcpc -f -i u60sta0 -s /data/zte-agent -t 5 -T 3 -A 10",
+            "ip -4 monitor neigh dev u60sta0",
+            "iw event -t",
         ] {
-            assert!(stray(&args(helper)), "{helper}");
+            assert!(stray(&args(helper), mine, &[mine]), "{helper}");
+        }
+        // A monitor this agent did not record is someone else's, and so is a
+        // process that reused a recorded id (R2).
+        let reused = offload::Record { pid: 42, start: 777 };
+        for manual in ["ip -4 monitor neigh dev u60sta0", "iw event -t"] {
+            assert!(!stray(&args(manual), offload::Record { pid: 43, start: 500 }, &[mine]), "{manual}");
+            assert!(!stray(&args(manual), reused, &[mine]), "{manual} with a reused id");
         }
         for other in [
             // The firmware's own supplicants and clients, and look-alikes.
@@ -1661,10 +1980,16 @@ mod tests {
             "odhcp6c -p /tmp/zte-agent-relay/odhcp6c.pid wlan0",
             "udhcpc -f -i br-lan -s /usr/share/udhcpc/default.script",
             "sh -c udhcpc -i u60sta0",
+            "ip -4 monitor neigh dev wlan0",
+            "ip monitor neigh dev u60sta0",
+            "ip -4 monitor neigh",
+            "ip",
+            "iw event",
+            "iw dev wlan2 station dump",
             "/data/zte-agent",
             "",
         ] {
-            assert!(!stray(&args(other)), "{other}");
+            assert!(!stray(&args(other), mine, &[mine]), "{other}");
         }
     }
 
@@ -1700,12 +2025,12 @@ mod tests {
         assert_eq!(relay.recheck_clock_with(|| panic!("Must not probe while disconnected")).unwrap_err(), "Connect Wi-Fi relay before checking time");
         *relay.snapshot.lock().unwrap() = json!({"connected":true,"ssid":"W","address":"192.168.2.124"});
         let before = relay.snapshot.lock().unwrap().clone();
-        let network = relay.lock.lock().unwrap();
+        let network = relay.op.lock().unwrap();
         assert!(relay.recheck_clock_with(|| panic!("Must not race a network operation")).unwrap_err().contains("network operation"));
         drop(network);
         for result in [Err("Upstream unavailable".to_owned()), Ok(())] {
             assert_eq!(relay.recheck_clock_with(|| {
-                assert!(relay.lock.try_lock().is_err(), "Keep the current uplink stable");
+                assert!(relay.op.try_lock().is_err(), "Keep the current uplink stable");
                 assert!(relay.inner.try_lock().is_ok(), "Do not hold relay state during HTTPS");
                 clock.sync_with(true, |_| {
                     assert_eq!(relay.status_with_clock(&clock)["ssid"], "W", "Status reads stay responsive");
@@ -1756,9 +2081,9 @@ mod tests {
             i.restoring = Some("Working network".into());
             i.scans = parse_bss(&bss(&[("02:11:22:33:44:55", 5260, -49, 0, "[WPA2-PSK-CCMP][ESS]", "W_Game")]), 0);
         }
-        assert!(relay.connect_remembered("unknown", "", true, true, false, None).is_err());
+        assert!(relay.connect_remembered("unknown", "", true, true, false).is_err());
         let id = relay.inner.lock().unwrap().scans[0].id.clone();
-        assert!(relay.connect_remembered(&id, "short", true, true, false, None).is_err());
+        assert!(relay.connect_remembered(&id, "short", true, true, false).is_err());
         let i = relay.inner.lock().unwrap();
         assert_eq!(i.restore_generation, 0);
         assert_eq!(i.restoring.as_deref(), Some("Working network"));
@@ -1928,57 +2253,39 @@ mod tests {
         let l = Lease { ip: "10.0.0.2".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.0.0.1".parse().unwrap(), dns: vec![] };
         let p = relay_plan(&l, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
         for tool in ["iptables", "ip6tables"] {
-            let rule = p.iter().find(|s| s.apply.program == tool && s.apply.args.windows(2).any(|w| w == ["-I", "redirect_chain"])).expect("missing vendor offline-portal bypass");
-            assert!(rule.apply.args.windows(2).any(|w| w == ["-t", "nat"]));
-            assert_eq!(&rule.apply.args[6..], &["1", "-i", "br-lan", "-m", "comment", "--comment", "zte-agent-wifi-relay", "-j", "RETURN"]);
-            assert!(rule.undo.args.windows(2).any(|w| w == ["-D", "redirect_chain"]));
-            assert_eq!(&rule.apply.args[7..], &rule.undo.args[6..]);
+            let rule = p.iter().find(|s| s.apply.program == "@u60-relay-portal-return" && s.apply.args == [tool]).expect("missing vendor offline-portal bypass");
+            assert_eq!(rule.undo.program, tool);
+            assert_eq!(&rule.undo.args[..6], &["-w", "2", "-t", "nat", "-D", "redirect_chain"]);
+            assert_eq!(&rule.undo.args[6..], &["-i", "br-lan", "-m", "comment", "--comment", "zte-agent-wifi-relay", "-j", "RETURN"]);
         }
     }
 
+    /// v5: the denials are in the relay's tables; legacy holds accepts only
+    /// (the vendor's DROP/REJECT is what they pass), MASQUERADE (D11) and
+    /// the portal RETURN.
     #[test]
-    fn absent_upstream_ipv6_never_uses_cellular_even_for_ula() {
-        let l = Lease {
-            ip: "10.0.0.2".parse().unwrap(),
-            subnet: "255.255.255.0".parse().unwrap(),
-            gateway: "10.0.0.1".parse().unwrap(),
-            dns: vec![],
-        };
-        let plan = relay_plan(
-            &l,
-            24,
-            "192.168.0.1".parse().unwrap(),
-            "255.255.255.0".parse().unwrap(),
-        );
-        let jump = plan
-            .iter()
-            .find(|s| {
-                s.apply.program == "ip6tables"
-                    && s.apply.args.windows(2).any(|w| w == ["-I", "OUTPUT"])
-            })
-            .unwrap();
-        assert!(jump
-            .apply
-            .args
-            .ends_with(&["-j".into(), "U60_RELAY_OUT".into()]));
-        let guard = plan
-            .iter()
-            .find(|s| {
-                s.apply
-                    .args
-                    .windows(2)
-                    .any(|w| w == ["-A", "U60_RELAY_OUT"])
-            })
-            .unwrap();
-        assert!(guard.apply.args.ends_with(&[
-            "-o".into(),
-            "rmnet+".into(),
-            "-j".into(),
-            "REJECT".into()
-        ]));
-        assert!(!guard.apply.args.iter().any(|a| a == "!" || a == "-d"));
-        let forward = plan.iter().find(|s| s.apply.args.windows(2).any(|w| w == ["-A", "U60_RELAY_V6"])).unwrap();
-        assert!(forward.apply.args.ends_with(&["-o".into(), "rmnet+".into(), "-j".into(), "REJECT".into()]));
+    fn legacy_rules_only_accept_what_must_pass_the_vendors_rejects() {
+        let l = Lease { ip: "10.0.0.2".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.0.0.1".parse().unwrap(), dns: vec![] };
+        let plan = relay_plan(&l, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
+        let guards = input_guards();
+        let owned = |s: &&Step| matches!(s.apply.program.as_str(), "iptables" | "ip6tables") && s.apply.args.get(5).is_some_and(|c| c.starts_with("U60_"));
+        for step in plan.iter().chain(&guards).filter(owned) {
+            let target = step.apply.args.windows(2).find(|w| w[0] == "-j").map(|w| w[1].as_str());
+            assert!(matches!(target, None | Some("ACCEPT" | "U60_R6_IN")), "{:?}", step.apply);
+        }
+        for retired in crate::netfx::ids::RETIRED_RELAY_CHAINS {
+            assert!(!plan.iter().chain(&guards).any(|s| s.apply.args.iter().any(|a| a == retired)), "{retired}");
+        }
+        assert!(!plan.iter().any(|s| s.apply.program == "ip6tables" && s.apply.args.iter().any(|a| a == "REJECT" || a == "OUTPUT")));
+        // The TCP return accept stays first: its counter is the hardware
+        // forwarding check.
+        let forward: Vec<_> = plan.iter().filter(|s| s.apply.args.windows(2).any(|w| w == ["-A", "U60_RELAY_FWD"])).collect();
+        assert_eq!(forward.len(), 3);
+        assert!(forward[1].apply.args.windows(2).any(|w| w == ["-p", "tcp"]));
+        // Absent upstream IPv6 never uses cellular: the baseline's rejects.
+        let [_, ip6] = uplink::tables(&uplink::Layout { relay: Some(relay_layout(&l, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap())), ..Default::default() }, None).unwrap();
+        assert_eq!(uplink::tests::chain(&ip6, "output"), ["oifname \"rmnet*\" reject"]);
+        assert_eq!(uplink::tests::chain(&ip6, "forward")[0], "iifname \"br-lan\" oifname \"rmnet*\" reject");
     }
 
     #[test]
@@ -2011,6 +2318,36 @@ mod tests {
     }
 
     #[test]
+    fn an_observation_decides_teardown_hold_or_keep_in_order() {
+        use AssociationResult::*;
+        let lease = Lease { ip: "10.0.0.2".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.0.0.1".parse().unwrap(), dns: vec!["10.0.0.53".parse().unwrap()] };
+        assert_eq!(decide(Expired, false, LeaseChange::Replaced, true), Decision::Teardown("hotspot_off"), "the owner turning the hotspot off wins");
+        assert_eq!(decide(Expired, false, LeaseChange::Replaced, false), Decision::Teardown("helper_exited"));
+        assert_eq!(decide(Expired, true, LeaseChange::Replaced, false), Decision::Teardown("lease_changed"));
+        assert_eq!(decide(Expired, true, LeaseChange::Same, false), Decision::Teardown("association_timeout"));
+        assert_eq!(decide(Recovering, true, LeaseChange::Resolvers(lease.clone()), false), Decision::Hold, "nothing is adopted while the link is lost");
+        assert_eq!(decide(Ready, true, LeaseChange::Resolvers(lease.clone()), false), Decision::Keep(Some(lease)), "only the DNS changed: adopted in place");
+        assert_eq!(decide(Ready, true, LeaseChange::Same, false), Decision::Keep(None));
+    }
+
+    /// R4, M2: a scan, a join that failed before its routes and a second
+    /// disconnect leave Mihomo's uplink alone; a session that routed tells it once.
+    #[test]
+    fn only_a_session_that_installed_routes_tells_mihomo_its_uplink_changed() {
+        let dir = std::env::temp_dir().join(format!("u60-relay-routed-{}", std::process::id()));
+        let mut told = 0;
+        let mut scan = Session::new(&dir);
+        cleanup(&mut scan, || told += 1).unwrap();
+        assert_eq!(told, 0, "a scan or a join that failed before routing");
+        let mut routed = Session::new(&dir);
+        routed.routed = true;
+        cleanup(&mut routed, || told += 1).unwrap();
+        cleanup(&mut routed, || told += 1).unwrap();
+        assert_eq!(told, 1, "once, not again for a repeated teardown");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn failed_recovery_journals_keep_network_ownership() {
         let dir = std::env::temp_dir().join(format!("u60-relay-ownership-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -2031,7 +2368,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_dns_is_one_nft_step_for_the_wifi_resolver_and_the_lan_subnet() {
+    fn relay_dns_follows_the_wifi_resolver_and_keeps_the_lan_subnet() {
         let l = Lease {
             ip: "10.20.1.2".parse().unwrap(),
             subnet: "255.255.240.0".parse().unwrap(),
@@ -2039,17 +2376,15 @@ mod tests {
             dns: vec!["10.20.0.53".parse().unwrap()],
         };
         let p = relay_plan(&l, 20, "192.168.8.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
-        let dns: Vec<_> = p.iter().filter(|s| s.apply.program == "@u60-relay-nft").collect();
-        assert_eq!(dns.len(), 1);
-        assert_eq!(dns[0].apply.args, ["v4", "10.20.0.53", "192.168.8.0/24"]);
-        assert_eq!(dns[0].undo.args, ["remove", "ip"]);
+        let lan = ("192.168.8.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
+        assert_eq!(relay_layout(&l, lan.0, lan.1), uplink::Relay { dns: "10.20.0.53".parse().unwrap(), lan: "192.168.8.0/24".into() });
+        assert!(!p.iter().any(|s| s.apply.program == "@u60-relay-nft"), "DNS is in the relay's tables");
         assert!(!p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["--dport", "53"])), "no legacy DNS rules");
         // Router DNS redirected from a socket bound to a SIM source still
         // leaves with the relay's address.
         assert!(p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["-I", "POSTROUTING"])
             && s.apply.args.ends_with(&["-o".into(), IFACE.into(), "-j".into(), "MASQUERADE".into()])));
-        let gateway_only = relay_plan(&Lease { dns: vec![], ..l }, 20, "192.168.8.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
-        assert!(gateway_only.iter().any(|s| s.apply.program == "@u60-relay-nft" && s.apply.args[1] == "10.20.0.1"));
+        assert_eq!(relay_layout(&Lease { dns: vec![], ..l }, lan.0, lan.1).dns, "10.20.0.1".parse::<Ipv4Addr>().unwrap());
     }
 
     fn lease_with(dns: &[&str]) -> Lease {

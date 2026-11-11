@@ -5,17 +5,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{IFACE, JOURNAL, PREF, ROOT, TABLE};
+use super::{offload, stop_helper, Helper, IFACE, JOURNAL, PREF, ROOT, TABLE};
 use crate::boottime::{BootClock, Clock};
 use crate::net_tools::{self as net, Cmd, Step, Transaction};
 
-pub(super) const TAILNET: &str = "fd7a:115c:a1e0::/48";
+pub(super) const TAILNET: &str = crate::netfx::ids::TAILNET_V6;
 // A client may keep a previously advertised address after the vendor removes
 // it from br-lan. Keep only a bounded, session-owned return route, not the old
 // vendor address/configuration. Never carry this observation across reboot.
@@ -297,10 +297,12 @@ fn lease_file(session: &str) -> Option<PathBuf> {
 }
 
 pub struct Upstream {
-    client: Option<Child>,
+    client: Option<Helper>,
     session: Option<String>,
     setup: Transaction,
     network: Transaction,
+    /// The relay's tables: discovery opens the upstream, a lease adds NAT66.
+    uplink: super::uplink::Shared,
     installed: Option<Lease>,
     path: Option<Lease>,
     phase: &'static str,
@@ -321,12 +323,13 @@ pub fn off_status() -> Value {
 }
 
 impl Upstream {
-    pub fn new() -> Self {
+    pub fn new(uplink: super::uplink::Shared) -> Self {
         Self {
             client: None,
             session: None,
             setup: Transaction::new(Path::new(JOURNAL).join("ipv6-setup.json")),
             network: Transaction::new(Path::new(JOURNAL).join("ipv6-network.json")),
+            uplink,
             installed: None,
             path: None,
             phase: "off",
@@ -358,6 +361,12 @@ impl Upstream {
         self.revision
     }
 
+    /// Configured on a usable lease with its client running: kept across a
+    /// reassociation to the same access point (`super::handover`).
+    pub fn configured(&mut self) -> bool {
+        self.phase == "configured" && self.installed.is_some() && self.client.as_mut().is_some_and(Helper::alive)
+    }
+
     pub fn start(&mut self, requested: bool) -> Result<(), String> {
         self.requested = requested;
         if !requested {
@@ -367,6 +376,8 @@ impl Upstream {
             capabilities()?;
             net::reserve("ip6tables", "filter", &["U60_R6_IN"], "-6", TABLE, PREF)?;
             self.setup.apply_network(setup_plan())?;
+            // Open the upstream for discovery before the client asks.
+            self.uplink.update(|l| l.discovery = true)?;
             let mut nonce = [0u8; 16];
             getrandom::getrandom(&mut nonce).map_err(|_| "Cannot create IPv6 relay session")?;
             let session = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -384,23 +395,43 @@ impl Upstream {
                 .args(["-p", &format!("{ROOT}/odhcp6c.pid"), IFACE])
                 .env("U60_RELAY_DHCP6", "1")
                 .env("U60_RELAY_DHCP6_SESSION", session);
-            self.client = Some(net::owned_child(cmd)?);
+            self.client = Some(Helper::Owned(net::owned_child(cmd)?));
             self.phase = "detecting";
             Ok(())
         })();
         if let Err(e) = attempt {
-            net::stop_child(&mut self.client);
+            stop_helper(&mut self.client);
             self.setup.rollback()?;
+            self.close();
             self.phase = "unsupported";
             self.error = Some(e);
         }
         Ok(())
     }
 
+    /// Takes NAT66 out of the relay's tables after its routes and RA went.
+    /// A failed load stays the target (`net_guard` retries) and does not stop
+    /// the withdrawal: without the routes nothing uses it.
+    fn withdraw(&mut self) -> Result<(), String> {
+        self.network.rollback()?;
+        if let Err(e) = self.uplink.update(|l| l.nat66 = None) {
+            crate::netlog!("[relay] IPv6 NAT not yet removed from the relay tables: {e}");
+        }
+        Ok(())
+    }
+
+    /// Closes the upstream to IPv6 again.
+    fn close(&mut self) {
+        if let Err(e) = self.uplink.update(|l| { l.nat66 = None; l.discovery = false; }) {
+            crate::netlog!("[relay] upstream IPv6 not yet closed in the relay tables: {e}");
+        }
+    }
+
     /// `net_guard`: re-applies the firewall and nft rules another writer
-    /// removed from both IPv6 plans (NAT66, forwarding, DNS). Addresses,
-    /// routes and the policy rule stay with `check_owned`, which also checks
-    /// for conflicts, waits for DAD and uses the current lease lifetimes.
+    /// removed from both IPv6 plans (the legacy accepts; the relay checks
+    /// its tables). Addresses, routes and the policy rule stay with
+    /// `check_owned`, which also checks for conflicts, waits for DAD and uses
+    /// the current lease lifetimes.
     pub fn reconcile(&mut self) -> net::Reconciled {
         let firewall = |cmd: &Cmd| cmd.program != "ip";
         let mut result = self.setup.reconcile_only(firewall);
@@ -416,7 +447,7 @@ impl Upstream {
         if let Err(error) = self.tick_inner() {
             // Only an unsafe, failed undo may propagate to the relay owner.
             // Ordinary RA/lease errors withdraw IPv6, not working IPv4.
-            self.network.rollback()?;
+            self.withdraw()?;
             self.installed = None;
             self.path = None;
             self.lan_prefix = None;
@@ -435,7 +466,7 @@ impl Upstream {
         if self.client.is_none() {
             return Ok(());
         }
-        if !matches!(self.client.as_mut().unwrap().try_wait(), Ok(None)) {
+        if !self.client.as_mut().unwrap().alive() {
             self.stop()?;
             self.phase = "error";
             self.error = Some("IPv6 discovery stopped; IPv4 relay remains active".into());
@@ -451,7 +482,7 @@ impl Upstream {
             .filter(Lease::ready);
         if live.is_none() {
             if self.installed.is_some() {
-                self.network.rollback()?;
+                self.withdraw()?;
                 self.installed = None;
                 self.path = None;
                 self.lan_prefix = None;
@@ -520,7 +551,7 @@ impl Upstream {
             // A delayed watchdog may find the old finite address/route already
             // expired. Rebuild only IPv6; this is not an IPv4 relay failure.
         }
-        self.network.rollback()?;
+        self.withdraw()?;
         self.installed = None;
         self.path = None;
         self.lan_prefix = None;
@@ -537,7 +568,7 @@ impl Upstream {
                 self.unreadable = 0;
             }
             Err(e) => {
-                self.network.rollback()?;
+                self.withdraw()?;
                 self.path = None;
                 self.phase = "error";
                 self.error = Some(e);
@@ -572,7 +603,7 @@ impl Upstream {
             }
             Err(Fault::Unreadable(e)) if self.unreadable + 1 < UNREADABLE_TICKS => {
                 self.unreadable += 1;
-                eprintln!(
+                crate::netlog!(
                     "[relay-ipv6] owned path check unavailable ({}/{UNREADABLE_TICKS}); path kept",
                     self.unreadable
                 );
@@ -678,20 +709,7 @@ impl Upstream {
     }
 
     fn configure(&mut self, lease: &Lease, mtu: u32) -> Result<String, String> {
-        net::reserve(
-            "ip6tables",
-            "filter",
-            &["U60_R6_FWD", "U60_R6_OUT"],
-            "-6",
-            TABLE,
-            PREF,
-        )?;
-        if Cmd::new("ip6tables", &["-w", "2", "-t", "nat", "-S", "U60_R6_NAT"]).run().is_ok() {
-            return Err("IPv6 relay chains are already in use".into());
-        }
-        if super::dns_nft::occupied("ip6") {
-            return Err("IPv6 relay DNS table is already in use".into());
-        }
+        net::reserve("ip6tables", "filter", &["U60_R6_FWD"], "-6", TABLE, PREF)?;
         let lan = Cmd::new("ip", &["-j", "-6", "addr", "show", "dev", "br-lan"]).run()?;
         let (lan_prefixes, linklocal) = lan_state(&lan)?;
         let ula = stable_ula()?;
@@ -741,7 +759,13 @@ impl Upstream {
         }
         let local = Cmd::new("ip", &["-j", "-6", "addr", "show"]).run()?;
         let dns_lease = safe_dns_lease(lease, &sources, &local)?;
-        self.network.apply_network(network_plan(&dns_lease, &ula, &sources))?;
+        // NAT66, its forwarding and DNS join the relay's tables before the
+        // policy rule moves LAN traffic.
+        let mut plan = network_plan(&dns_lease, &ula, &sources);
+        let rule = plan.pop().expect("the policy rule is the plan's last step");
+        self.network.apply_network(plan)?;
+        self.uplink.update(|l| l.nat66 = Some(super::uplink::Nat66 { sources: sources.clone(), dns: upstream_dns(&dns_lease) }))?;
+        self.network.apply_network(vec![rule])?;
         let route = Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"]).run()?;
         if !route.contains(&format!("dev {IFACE}")) {
             return Err("IPv6 routing did not select Wi-Fi".into());
@@ -752,9 +776,10 @@ impl Upstream {
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
-        net::stop_child(&mut self.client);
+        stop_helper(&mut self.client);
         self.network.rollback()?;
         self.setup.rollback()?;
+        self.close();
         if self.installed.is_some() {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -773,6 +798,105 @@ impl Upstream {
         let _ = fs::remove_file(Path::new(ROOT).join("odhcp6c.pid"));
         Ok(())
     }
+}
+
+impl Upstream {
+    /// The previous agent's IPv6, taken over with its relay session after an
+    /// agent restart (`super::adopt`): its client keeps running and the
+    /// addresses, routes, NAT66 and RA stay. The journals are taken over and
+    /// the plans re-taken from the lease, the relay ULA and the LAN as they
+    /// are now (`Transaction::adopt`: nothing that holds runs again), so
+    /// `reconcile` and the ticks keep them from here on. `Err` before the
+    /// journals are loaded changes nothing; after, the caller stops the
+    /// client and rolls IPv6 back from its journals (`recover`).
+    pub fn adopt(&mut self, client: offload::Record, session: &str) -> Result<(), String> {
+        let path = lease_file(session).ok_or("Invalid IPv6 session")?;
+        let bytes = fs::read(path).map_err(|_| "No IPv6 lease")?;
+        let lease: Lease = serde_json::from_slice(&bytes).map_err(|_| "Invalid IPv6 lease")?;
+        let live = lease.remaining(now());
+        if !live.ready() {
+            return Err("the IPv6 lease is not usable".into());
+        }
+        let ula = stable_ula()?;
+        let lan = Cmd::new("ip", &["-j", "-6", "addr", "show", "dev", "br-lan"]).run()?;
+        let (_, linklocal) = lan_state(&lan)?;
+        let mut observed = BTreeMap::new();
+        observe_lan(&mut observed, &lan, Some(&ula), now())?;
+        let lan_sources: Vec<String> = observed.keys().cloned().collect();
+        let mut sources = lan_sources.clone();
+        if !sources.contains(&ula) {
+            sources.push(ula.clone());
+        }
+        let local = Cmd::new("ip", &["-j", "-6", "addr", "show"]).run()?;
+        let dns_lease = safe_dns_lease(&live, &sources, &local)?;
+        let mtu = ra::advertised_mtu(live.mtu, ra::lan_mtu()?)?;
+        let setup = Transaction::load(&Path::new(JOURNAL).join("ipv6-setup.json"))?;
+        let network = Transaction::load(&Path::new(JOURNAL).join("ipv6-network.json"))?;
+        // The tables first: the relay's adoption declared them without NAT66.
+        self.uplink.update(|l| {
+            l.discovery = true;
+            l.nat66 = Some(super::uplink::Nat66 { sources: sources.clone(), dns: upstream_dns(&dns_lease) });
+        })?;
+        (self.setup, self.network) = (setup, network);
+        self.client = Some(Helper::Adopted(client));
+        self.session = Some(session.to_owned());
+        for step in setup_plan() {
+            self.setup.adopt(step)?;
+        }
+        for step in network_plan(&dns_lease, &ula, &sources) {
+            self.network.adopt(step)?;
+        }
+        self.network.adopt(ra_step(&ula, linklocal, mtu))?;
+        self.requested = true;
+        self.installed = Some(lease);
+        self.path = Some(live);
+        self.lan_prefix = Some(ula);
+        self.lan_observed = observed;
+        self.lan_sources = lan_sources;
+        self.ra_mtu = Some(mtu);
+        self.phase = "configured";
+        self.error = None;
+        self.maintained = Some(Instant::now());
+        self.unreadable = 0;
+        Ok(())
+    }
+
+    /// Only the client (an adoption that did not finish).
+    pub fn stop_client(&mut self) {
+        stop_helper(&mut self.client);
+    }
+}
+
+/// The previous agent's IPv6 client, still running, and its session (the
+/// lease file it writes): `None` unless exactly one is found.
+pub fn running_client() -> Option<(offload::Record, String)> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else { continue };
+        let args: Vec<String> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        if !session_client(&args) {
+            continue;
+        }
+        let environ = fs::read(entry.path().join("environ")).unwrap_or_default();
+        let session = environ
+            .split(|&b| b == 0)
+            .find_map(|v| v.strip_prefix(b"U60_RELAY_DHCP6_SESSION="))
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .filter(|s| lease_file(s).is_some());
+        if let (Some(start), Some(session)) = (crate::netfx::exec::process_start(pid), session) {
+            found.push((offload::Record { pid, start }, session));
+        }
+    }
+    (found.len() == 1).then(|| found.remove(0))
+}
+
+/// The relay's IPv6 client, as `start` runs it.
+fn session_client(args: &[String]) -> bool {
+    let after = |flag: &str| args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str());
+    args.first().and_then(|a| a.rsplit('/').next()) == Some("odhcp6c")
+        && args.last().map(String::as_str) == Some(IFACE)
+        && after("-p") == Some(&format!("{ROOT}/odhcp6c.pid"))
 }
 
 pub fn recover() -> Result<(), String> {
@@ -801,9 +925,9 @@ pub fn recover() -> Result<(), String> {
 
 fn capabilities() -> Result<(), String> {
     // odhcp6c's help exits 1 even on OpenWrt. Its owned spawn below is the
-    // executable check, and any failure rolls back the journaled setup.
+    // executable check, and any failure rolls back the journaled setup. The
+    // NAT66 masquerade is nftables (`uplink`): loading the tables checks it.
     Cmd::new("ip6tables", &["-w", "2", "-t", "nat", "-S"]).run()?;
-    Cmd::new("ip6tables", &["-t", "nat", "-j", "MASQUERADE", "--help"]).run()?;
     if fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding")
         .unwrap_or_default()
         .trim()
@@ -843,7 +967,8 @@ fn setup_plan() -> Vec<Step> {
             Cmd::new("true", &[]),
         ));
     }
-    // The existing scan INPUT guard stays closed except for this owned subchain.
+    // Through the vendor's INPUT reject; the relay's tables open the same
+    // traffic (`uplink`, discovery) and drop the rest first.
     plan.extend(net::chain("ip6tables", "filter", "U60_R6_IN"));
     plan.push(net::rule(
         "ip6tables",
@@ -892,13 +1017,6 @@ fn setup_plan() -> Vec<Step> {
         &[
             "-p", "udp", "--sport", "547", "--dport", "546", "-j", "ACCEPT",
         ],
-        false,
-    ));
-    plan.push(net::rule(
-        "ip6tables",
-        "filter",
-        "U60_R6_IN",
-        &["-j", "DROP"],
         false,
     ));
     plan.push(net::rule(
@@ -1256,7 +1374,7 @@ fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
         "route",
         &["fe80::/64", "dev", IFACE, "table", TABLE],
     ));
-    let destinations: Vec<&str> = vec![TAILNET, "fe80::/10", "ff00::/8"];
+    let destinations: Vec<&str> = vec![TAILNET, crate::netfx::ids::LINK_LOCAL_V6, crate::netfx::ids::MULTICAST_V6];
     for source in sources {
         p.push(Step::new(
             lan_route(source, "add"),
@@ -1305,40 +1423,9 @@ fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
             ],
         ),
     ));
-    p.extend(net::chain("ip6tables", "nat", "U60_R6_NAT"));
-    // Cover core/router sockets retaining an old cellular source, as well as
-    // existing cellular LAN addresses that clients have not deprecated yet.
-    p.push(net::rule(
-        "ip6tables",
-        "nat",
-        "U60_R6_NAT",
-        &["-j", "MASQUERADE"],
-        false,
-    ));
-    p.push(net::rule(
-        "ip6tables",
-        "nat",
-        "POSTROUTING",
-        &["-o", IFACE, "-j", "U60_R6_NAT"],
-        true,
-    ));
-    // Keep broad rejects inside an exclusive chain so prejournaled undo
-    // cannot delete an identical vendor rule that predates this transaction.
-    p.extend(net::chain("ip6tables", "filter", "U60_R6_OUT"));
-    p.push(net::rule(
-        "ip6tables",
-        "filter",
-        "U60_R6_OUT",
-        &["-o", "rmnet+", "-j", "REJECT"],
-        false,
-    ));
-    p.push(net::rule(
-        "ip6tables",
-        "filter",
-        "OUTPUT",
-        &["-j", "U60_R6_OUT"],
-        true,
-    ));
+    // The masquerade, the denials and DNS are in the relay's tables
+    // (`uplink`, NAT66); legacy keeps what must pass the vendor's FORWARD
+    // rejects.
     p.extend(net::chain("ip6tables", "filter", "U60_R6_FWD"));
     for source in sources {
         p.push(net::rule(
@@ -1367,15 +1454,6 @@ fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
         ],
         false,
     ));
-    for flag in ["-i", "-o"] {
-        p.push(net::rule(
-            "ip6tables",
-            "filter",
-            "U60_R6_FWD",
-            &[flag, IFACE, "-j", "DROP"],
-            false,
-        ));
-    }
     p.push(net::rule(
         "ip6tables",
         "filter",
@@ -1383,10 +1461,6 @@ fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
         &["-j", "U60_R6_FWD"],
         true,
     ));
-    // External client DNS through local dnsmasq (Mihomo still wins); router
-    // DNS through the Wi-Fi RDNSS instead of the SIM-only resolver, or
-    // rejected without one so IPv4 DNS is used (`dns_nft`).
-    p.push(super::dns_nft::v6(upstream_dns(l), sources));
     p.push(net::ip_step("-6", "rule", &["pref", PREF, "lookup", TABLE]));
     p
 }
@@ -1463,6 +1537,16 @@ fn maintain_ra() -> Result<(), Fault> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_the_relays_own_ipv6_client_is_taken_over() {
+        let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let ours = format!("odhcp6c -N try -R -r 23 -s /data/zte-agent -p {ROOT}/odhcp6c.pid {IFACE}");
+        assert!(session_client(&args(&ours)));
+        assert!(session_client(&args(&ours.replacen("odhcp6c", "/usr/sbin/odhcp6c", 1))));
+        assert!(!session_client(&args(&ours.replace(&format!(" {IFACE}"), " rmnet_data0"))));
+        assert!(!session_client(&args("odhcp6c -s /lib/netifd/dhcpv6.script -p /var/run/odhcp6c.pid u60sta0")), "the firmware's own client");
+    }
+
     fn lease() -> Lease {
         parse_lease(
             |k| {
@@ -1512,38 +1596,32 @@ mod tests {
             true,
         );
         assert!(!plan.iter().any(|step| step.undo == vendor.undo));
-        assert!(plan
-            .iter()
-            .any(|s| s.apply.args.windows(2).any(|a| a == ["-N", "U60_R6_OUT"])));
-        let plan = network_plan(
-            &lease(),
-            "fd12:3456:789a::/64",
-            &["fd12:3456:789a::/64".into()],
-        );
+        // The cellular OUTPUT reject is the relay baseline's one rule in its
+        // tables, not a second legacy chain here.
+        assert!(!plan.iter().any(|s| s.apply.args.iter().any(|a| a == "OUTPUT" || a == "REJECT" || a == "DROP" || a == "MASQUERADE")));
+        assert_eq!(plan.last().unwrap().apply.args, ["-6", "rule", "add", "pref", PREF, "lookup", TABLE], "the policy rule is last");
         assert!(
             net::foreign_identity(&plan).is_empty(),
             "{:?}",
             net::foreign_identity(&plan)
         );
         assert!(net::foreign_identity(&setup_plan()).is_empty());
+        assert!(!setup_plan().iter().any(|s| s.apply.args.iter().any(|a| a == "DROP")), "the drop is in the tables");
     }
 
     #[test]
     fn router_dns_follows_the_upstream_resolver_or_is_rejected_without_one() {
         let mut linklocal = lease();
         linklocal.dns = vec!["fe80::53".parse().unwrap()];
-        for (l, upstream) in [(lease(), upstream_dns(&lease()).unwrap().to_string()), (linklocal, "none".into())] {
-            let plan = network_plan(&l, "fd12:3456:789a::/64", &["fd12:3456:789a::/64".into()]);
-            let dns: Vec<_> = plan.iter().filter(|s| s.apply.program == "@u60-relay-nft").collect();
-            assert_eq!(dns.len(), 1);
-            assert_eq!(dns[0].apply.args, ["v6".to_owned(), upstream, "fd12:3456:789a::/64".into()]);
-            assert_eq!(dns[0].undo.args, ["remove", "ip6"]);
-        }
+        assert!(upstream_dns(&lease()).is_some());
+        assert_eq!(upstream_dns(&linklocal), None, "a link-local resolver is not used: the tables reject router DNS instead");
+        let plan = network_plan(&lease(), "fd12:3456:789a::/64", &["fd12:3456:789a::/64".into()]);
+        assert!(!plan.iter().any(|s| s.apply.program == "@u60-relay-nft"), "DNS is in the relay's tables");
     }
 
     #[test]
     fn unreadable_checks_keep_the_path_for_a_few_ticks_but_conflicts_withdraw_it() {
-        let mut upstream = Upstream::new();
+        let mut upstream = Upstream::new(super::super::uplink::tests::shared("unreadable").0);
         for _ in 1..UNREADABLE_TICKS {
             assert!(upstream
                 .tolerate(Err(Fault::Unreadable("busy".into())))
@@ -1845,12 +1923,10 @@ mod tests {
             &["fd12:3456:789a::/64".into()],
         );
         assert!(!p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["--dport", "53"])), "no legacy DNS rules");
-        assert_eq!(p.iter().filter(|s| s.apply.program == "@u60-relay-nft").count(), 1);
-        let snat = p
-            .iter()
-            .find(|s| s.apply.args.windows(2).any(|w| w == ["-I", "POSTROUTING"]))
-            .unwrap();
-        assert!(snat.apply.args.windows(2).any(|w| w == ["-o", IFACE]));
+        assert!(!p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["-I", "POSTROUTING"])), "NAT66 is in nftables");
+        let layout = super::super::uplink::Layout { nat66: Some(super::super::uplink::Nat66 { sources: vec!["fd12:3456:789a::/64".into()], dns: upstream_dns(&lease()) }), ..Default::default() };
+        let [_, ip6] = super::super::uplink::tables(&layout, None).unwrap();
+        assert_eq!(super::super::uplink::tests::chain(&ip6, "nat66"), [format!("oifname \"{IFACE}\" masquerade")], "only the relay's upstream");
         assert!(p.iter().any(|s| s
             .apply
             .args
@@ -1866,25 +1942,20 @@ mod tests {
 
     #[test]
     fn upstream_private_dns_is_not_mistaken_for_local_management() {
-        let p = network_plan(
-            &lease(),
-            "fd12:3456:789a::/64",
-            &["fd12:3456:789a::/64".into()],
-        );
+        let tables = |l: &Lease| {
+            let nat66 = super::super::uplink::Nat66 { sources: vec!["fd12:3456:789a::/64".into()], dns: upstream_dns(l) };
+            let [_, ip6] = super::super::uplink::tables(&super::super::uplink::Layout { nat66: Some(nat66), ..Default::default() }, None).unwrap();
+            super::super::uplink::tests::chain(&ip6, "dns_router")
+        };
         // Only the LAN's own prefixes stay local, not all of fc00::/7 (the
-        // ruleset adds ::1, the tailnet and link-local: `dns_nft`).
-        let dns = p.iter().find(|s| s.apply.program == "@u60-relay-nft").unwrap();
-        assert_eq!(&dns.apply.args[2..], ["fd12:3456:789a::/64"]);
-        assert_ne!(dns.apply.args[1], "none");
+        // ruleset adds ::1, the tailnet and link-local: `uplink`).
+        let with = tables(&lease());
+        assert_eq!(with[1], "ip6 daddr { ::1/128, fd7a:115c:a1e0::/48, fe80::/10, fd12:3456:789a::/64 } return");
+        assert!(with[2].contains("dnat to"));
         let mut no_dns = lease();
         no_dns.dns.clear();
-        let p = network_plan(
-            &no_dns,
-            "fd12:3456:789a::/64",
-            &["fd12:3456:789a::/64".into()],
-        );
-        let dns = p.iter().find(|s| s.apply.program == "@u60-relay-nft").unwrap();
-        assert_eq!(dns.apply.args[1], "none", "router DNS is rejected so IPv4 DNS is used");
+        assert_eq!(tables(&no_dns)[2], "reject", "router DNS is rejected so IPv4 DNS is used");
+        let p = network_plan(&no_dns, "fd12:3456:789a::/64", &["fd12:3456:789a::/64".into()]);
         assert!(!p
             .iter()
             .any(|s| s.apply.args.iter().any(|a| a == "fc00::/7")));
@@ -2031,6 +2102,54 @@ mod tests {
             &[source.into(), "2001:db8:2::/64".into()],
         );
         net::write_private(Path::new(&path),&serde_json::to_vec_pretty(&json!({"setup":setup_plan(),"network":network,"network_ula_dns":network_ula_dns,"ipv4":ipv4,"mihomo":crate::mihomo::proxy_plan_with(|_| Ok("0".into())).unwrap()})).unwrap()).unwrap();
+    }
+
+    /// v5 isolated acceptance (`zte-agent/tests/relay-firewall-qa`): the
+    /// relay's table batches per layout as `Shared` loads them, the legacy
+    /// restore transactions `Transaction::apply_network` runs, the portal
+    /// RETURN moves and this version's journals (boot `BOOT`).
+    #[test]
+    #[ignore = "writes files for the isolated relay firewall QA; set U60_RELAY_QA"]
+    fn export_relay_firewall_for_isolated_linux_acceptance() {
+        use super::super::uplink::{self, Layout, Nat66, Relay};
+        let dir = PathBuf::from(std::env::var("U60_RELAY_QA").expect("U60_RELAY_QA"));
+        fs::create_dir_all(&dir).unwrap();
+        let relay = Relay { dns: "10.20.0.1".parse().unwrap(), lan: "192.168.0.0/24".into() };
+        let nat66 = |dns: Option<&str>| Nat66 { sources: vec!["fd12:3456:789a::/64".into()], dns: dns.map(|d| d.parse().unwrap()) };
+        let layouts = [
+            ("guard", Layout::default()),
+            ("discovery", Layout { discovery: true, ..Layout::default() }),
+            ("relay", Layout { relay: Some(relay.clone()), ..Layout::default() }),
+            ("full", Layout { relay: Some(relay.clone()), discovery: true, nat66: Some(nat66(Some("2001:db8:20::1"))) }),
+            ("full-nodns", Layout { relay: Some(relay.clone()), discovery: true, nat66: Some(nat66(None)) }),
+        ];
+        for (generation, (name, layout)) in layouts.iter().enumerate() {
+            let (marker, text) = crate::netfx::effect::batch("relay", uplink::TABLE, generation as u64 + 1, uplink::tables(layout, None).unwrap()).unwrap();
+            fs::write(dir.join(format!("{name}.nft")), text).unwrap();
+            fs::write(dir.join(format!("{name}.marker")), marker).unwrap();
+        }
+        let [ip, ip6] = uplink::tables(&layouts[3].1, None).unwrap();
+        let (_, broken) = crate::netfx::effect::batch("relay", uplink::TABLE, 99, [ip, ip6.replace("masquerade", "masquerade to nowhere")]).unwrap();
+        fs::write(dir.join("broken.nft"), broken).unwrap();
+        let v4 = super::super::Lease { ip: "10.20.0.7".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.20.0.1".parse().unwrap(), dns: vec!["10.20.0.1".parse().unwrap()] };
+        let lan: (std::net::Ipv4Addr, std::net::Ipv4Addr) = ("192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
+        let mut wireless = vec![Step::new(Cmd::new("sysctl", &["-w", "net.ipv6.conf.u60sta0.disable_ipv6=1"]), Cmd::new("true", &[]))];
+        wireless.extend(super::super::input_guards());
+        wireless.extend(uplink::steps());
+        let network = super::super::relay_plan(&v4, 24, lan.0, lan.1);
+        let ula = "fd12:3456:789a::/64";
+        let v6 = network_plan(&lease(), ula, &[ula.into()]);
+        let mut restore = Vec::new();
+        for (name, plan) in [("wireless", &wireless), ("network", &network), ("ipv6-setup", &setup_plan()), ("ipv6-network", &v6)] {
+            for (program, input) in net::firewall::inputs(plan) {
+                restore.push(json!({"plan": name, "program": program, "input": input}));
+            }
+            let undo: Vec<&Cmd> = plan.iter().map(|s| &s.undo).collect();
+            fs::write(dir.join(format!("{name}.json")), serde_json::to_vec_pretty(&json!({"boot": "BOOT", "undo": undo})).unwrap()).unwrap();
+        }
+        fs::write(dir.join("restore.json"), serde_json::to_vec_pretty(&restore).unwrap()).unwrap();
+        let moves = json!({"late": super::super::portal::moves(super::super::portal::Place::Late), "absent": super::super::portal::moves(super::super::portal::Place::Absent)});
+        fs::write(dir.join("portal.json"), moves.to_string()).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -2236,7 +2355,9 @@ mod tests {
             .run()
             .unwrap();
 
-        let mut upstream = Upstream::new();
+        let uplink = super::super::uplink::Shared::new(PathBuf::from("/tmp/u60-ipv6-qa-uplink.nft"));
+        uplink.guard().unwrap();
+        let mut upstream = Upstream::new(uplink);
         upstream.start(false).unwrap();
         assert_eq!(upstream.status()["state"], "off");
         upstream.start(true).unwrap();
@@ -2394,8 +2515,8 @@ mod tests {
         let mut remove = rule;
         remove[4] = "-D";
         Cmd::new("ip6tables", &remove).run().unwrap();
-        upstream.rules_checked = None;
-        upstream.tick().unwrap();
+        // The repair now comes from the `net_guard` reconcile, not the tick.
+        assert!(upstream.reconcile().failed.is_empty());
         Cmd::new("ip6tables", &rule).run().unwrap();
         assert_eq!(
             fs::read(Path::new(JOURNAL).join("ipv6-network.json")).unwrap(),
@@ -2607,7 +2728,7 @@ mod tests {
             upstream.status()
         );
         let revision = upstream.revision();
-        let child = upstream.client.as_mut().unwrap();
+        let Some(Helper::Owned(child)) = upstream.client.as_mut() else { panic!("the client this test started") };
         child.kill().unwrap();
         child.wait().unwrap();
         upstream.tick().unwrap();

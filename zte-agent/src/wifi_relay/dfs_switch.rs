@@ -74,16 +74,16 @@ pub(super) fn allow() {
             break;
         }
         if started.elapsed() >= WAIT {
-            eprintln!("[relay] {SCRIPT} has not reached its sleep after {} s; turning the DFS channel switch on anyway", WAIT.as_secs());
+            crate::netlog!("[relay] {SCRIPT} has not reached its sleep after {} s; turning the DFS channel switch on anyway", WAIT.as_secs());
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     match Cmd::new("iwpriv", &["wlan2", "disableDfsCS", "0"]).run() {
         // Only the firmware's window is worth a line; other joins stay quiet.
-        Ok(_) if vendor => eprintln!("[relay] DFS channel switch turned on for wlan2 inside {SCRIPT}'s window (waited {:.1} s)", started.elapsed().as_secs_f32()),
+        Ok(_) if vendor => crate::netlog!("[relay] DFS channel switch turned on for wlan2 inside {SCRIPT}'s window (waited {:.1} s)", started.elapsed().as_secs_f32()),
         Ok(_) => {}
-        Err(e) => eprintln!("[relay] cannot turn the DFS channel switch on for wlan2: {e}"),
+        Err(e) => crate::netlog!("[relay] cannot turn the DFS channel switch on for wlan2: {e}"),
     }
 }
 

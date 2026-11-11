@@ -18,7 +18,9 @@
 //!
 //! The mobile side is every interface named `rmnet*`: Qualcomm's cellular
 //! data interfaces (`rmnet_data0` carries the data call, `rmnet_ipa0` the
-//! hardware path; probe evidence of 2026-09-11 and 2026-09-14). The PEER is
+//! hardware path; probe evidence of 2026-09-11 and 2026-09-14); and the Wi-Fi
+//! relay's upstream `u60sta*` (a hotel network is as foreign as the carrier's;
+//! its firewall guard already refuses it, this is the second line). The PEER is
 //! checked, not the address it reached: a port forward or DMZ to the router
 //! reaches its LAN address from the internet. TCP needs the replies to reach
 //! the peer, and they leave through the interface whose subnet holds it
@@ -56,8 +58,8 @@ use crate::boottime::{BootClock, BootInstant, Clock};
 /// The opt-out: `1` serves the mobile side too.
 pub const ENV: &str = "ZTE_AGENT_ALLOW_MOBILE";
 
-/// Interface names on the mobile-data side.
-const MOBILE: [&str; 1] = ["rmnet"];
+/// Interface names on the mobile-data side, and the relay's upstream Wi-Fi.
+const MOBILE: [&str; 2] = ["rmnet", "u60sta"];
 
 /// The table is read again at the first connection that needs it after this
 /// long (so a subnet that went away is served at most this long).
@@ -570,6 +572,15 @@ mod tests {
         assert!(!admits(&wide, v6("2001:db8:5::99", 0)) && admits(&wide, v6("2001:db8:6::99", 0)));
     }
 
+    /// D1: a host on the relay's upstream network (a hotel's) is refused;
+    /// the router's own relay address and the LAN are served.
+    #[test]
+    fn the_relay_upstream_is_refused_like_the_carrier() {
+        let t = vec![ifa("lo", "127.0.0.1", 8, 0), ifa("br-lan", "192.168.0.1", 24, 0), ifa("u60sta0", "192.168.2.124", 24, 0)];
+        assert!(!admits(&t, v4("192.168.2.1")));
+        assert!(admits(&t, v4("192.168.2.124")) && admits(&t, v4("192.168.0.23")));
+    }
+
     #[test]
     fn prefixes() {
         let host = ifa("tun9", "192.0.2.103", 32, 0);
@@ -581,6 +592,7 @@ mod tests {
         assert!(contains(&ifa("x1", "10.0.0.1", 8, 0), "10.200.3.4".parse().unwrap()));
         assert!(!contains(&ifa("x2", "fd00::1", 64, 0), "192.168.0.1".parse().unwrap()));
         assert!(mobile_side("rmnet_data0") && mobile_side("rmnet_ipa0") && !mobile_side("br-lan") && !mobile_side("usb0") && !mobile_side("wlan0"));
+        assert!(mobile_side("u60sta0"), "the relay's upstream network is foreign too");
     }
 
     /// Exactly `1` turns the check off; anything else is ignored, and said.

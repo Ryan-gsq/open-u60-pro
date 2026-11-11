@@ -63,6 +63,51 @@ fn probe(address: SocketAddr, tcp: bool, name: &str, expected: Ipv4Addr) -> std:
     Ok(matches_answer(&query, &answer[..size], expected))
 }
 
+/// The core's IPv4 answer for `name` on its DNS listener (UDP): `Ok(None)`
+/// for no address (NXDOMAIN, an empty answer, a server failure), `Err` when
+/// it does not answer at all.
+pub(super) fn first_address(name: &str, port: u16) -> Result<Option<Ipv4Addr>, String> {
+    let query = query(name);
+    let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    socket.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+    socket.connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).map_err(|e| e.to_string())?;
+    socket.send(&query).map_err(|e| e.to_string())?;
+    let mut answer = [0; 2048];
+    let size = socket.recv(&mut answer).map_err(|_| "Mihomo's DNS did not answer".to_owned())?;
+    Ok(answer_address(&query, &answer[..size]))
+}
+
+/// The first A record of an answer to `query`, skipping other records.
+fn answer_address(query: &[u8], answer: &[u8]) -> Option<Ipv4Addr> {
+    if answer.len() < query.len() || answer[..2] != query[..2] || answer[2] & 0x80 == 0 || answer[3] & 0x0f != 0 {
+        return None;
+    }
+    let count = u16::from_be_bytes([answer[6], answer[7]]);
+    let mut pos = query.len();
+    for _ in 0..count {
+        // The owner name: labels, or a compression pointer.
+        loop {
+            let length = *answer.get(pos)?;
+            if length & 0xc0 == 0xc0 {
+                pos += 2;
+                break;
+            }
+            pos += 1 + usize::from(length);
+            if length == 0 {
+                break;
+            }
+        }
+        let header = answer.get(pos..pos + 10)?;
+        let (kind, size) = (u16::from_be_bytes([header[0], header[1]]), usize::from(u16::from_be_bytes([header[8], header[9]])));
+        let data = answer.get(pos + 10..pos + 10 + size)?;
+        if kind == 1 && size == 4 {
+            return Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]));
+        }
+        pos += 10 + size;
+    }
+    None
+}
+
 fn matches_answer(query: &[u8], answer: &[u8], expected: Ipv4Addr) -> bool {
     if answer.len() < query.len()
         || answer[..2] != query[..2]
@@ -107,6 +152,24 @@ mod tests {
         assert!(available(tcp.local_addr().unwrap().port()).is_err());
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
         assert!(available(udp.local_addr().unwrap().port()).is_err());
+    }
+
+    #[test]
+    fn the_first_address_skips_a_cname_and_an_error_has_none() {
+        let query = query("x.example");
+        let mut answer = query.clone();
+        answer[2] |= 0x80;
+        answer[7] = 2;
+        answer.extend_from_slice(&[0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 12]);
+        answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 198, 18, 0, 7]);
+        assert_eq!(answer_address(&query, &answer), Some(Ipv4Addr::new(198, 18, 0, 7)));
+        let mut nxdomain = query.clone();
+        nxdomain[2] |= 0x80;
+        nxdomain[3] |= 3;
+        assert_eq!(answer_address(&query, &nxdomain), None);
+        for size in 0..answer.len() {
+            let _ = answer_address(&query, &answer[..size]);
+        }
     }
 
     #[test]
