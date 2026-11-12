@@ -2,7 +2,7 @@
 # Run on U60 over USB: adb shell sh /tmp/check-relay-internet.sh
 # Every HTTP/ICMP probe binds to the relay, so cellular cannot hide a failure.
 set -u
-iface=u60sta0
+iface=ath20
 gateway=$(ip -4 route show table 60631 | awk '$1 == "default" && $2 == "via" { print $3; exit }')
 [ -n "$gateway" ] || { echo 'FAIL: no relay default gateway'; exit 1; }
 failed=0

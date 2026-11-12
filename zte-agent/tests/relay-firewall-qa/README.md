@@ -6,7 +6,7 @@ the exact batches the agent loads, exported from the production generators
 (`uplink::tables` through `NftTables`' batch, the legacy restore
 transactions of `Transaction::apply_network`, the portal RETURN moves and
 this version's journals), on four network namespaces (`client` on `br-lan`,
-`upstream` on `u60sta0`, `cell` on `rmnet_data0`, `router` between them).
+`upstream` on `ath20`, `cell` on `rmnet_data0`, `router` between them).
 **Never run this on the U60, a host or a shared container**: it creates
 namespaces, replaces the container's `iptables*` with the legacy build and
 writes `/data/zte-agent-relay`. Use a disposable Docker VM.

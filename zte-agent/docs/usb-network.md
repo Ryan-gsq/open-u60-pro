@@ -49,6 +49,13 @@ agent 用 inotify 监听这个脚本的 `IN_OPEN` 和 `IN_CLOSE_NOWRITE`（每�
 USB（包括 ADB）会一直断着，直到 agent 再次启动（启动时立即修复，不等 60 秒）或者重启路由器
 （重启后 configfs 里没有 `c.2`）。只在线一直插着、ZTE 又恰好重建时才会遇到。
 
+## 开发 Mac 的上网路径（2026-11-12）
+
+Mac 选中配置 2 后，macOS 把 USB 服务 “ZTE Mobile Broadband” 排在 Wi-Fi 之前，Mac 的默认路由就经过路由器。
+于是中继断开会切断 Mac 的外网，跑在这台 Mac 上的 agent 会话也随之断开。在路由器上把 `ecm0` 关掉不会让
+macOS 切到 Wi-Fi（2026-11-12：默认路由经 `en16` 走路由器，`en0` 仍连着 Wi-Fi；`ip link set ecm0 down` 7 秒后
+`en16` 仍是活动的、默认路由仍走它、外网不通，`ip link set ecm0 up` 后恢复；`measurements/observations-2026-11-12.md`）。测试中继断开前，先给 Mac 一条不经过路由器的外网路径。
+
 ## 修改配置时暂停 adbd
 
 configfs 只允许在 gadget 解绑时增删配置和链接。可解绑后，`adbd` 的 FunctionFS 会收到 unbind，

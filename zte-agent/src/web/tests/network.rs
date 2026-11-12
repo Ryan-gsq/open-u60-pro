@@ -1010,24 +1010,30 @@ fn conflicting_device_setters_refuse_during_network_transactions() {
 }
 
 #[tokio::test]
-async fn hardware_forwarding_and_the_direct_bypass_post_their_own_handlers() {
+async fn the_relay_page_says_whether_ipacm_lists_the_station_and_the_direct_bypass_posts_its_handler() {
     let c = ctx(Some(PW));
     let cookie = format!("zte_ui_session={}", login(&c, 226, 1).await);
-    for (config, connected, hardware, install) in [("not_installed", false, false, true), ("overwritten", false, false, true), ("loaded", true, true, false), ("reboot_required", true, false, false)] {
+    let unlisted = "This firmware's IPA configuration does not list the relay interface (ath20)";
+    for (config, connected, route, shown) in [
+        ("listed", false, false, "Lists the relay interface"),
+        ("listed", true, true, "Lists the relay interface"),
+        ("not_listed", true, false, "Does not list the relay interface; the relay forwards on the CPU"),
+        ("unavailable", false, false, "Unavailable on this firmware"),
+    ] {
         let _d = device::set(&c.app, device::Device {
-            gets: vec![("/api/wifi-relay/status", Ok(json!({"connected":connected,"offload":{"config":config,"hardware":hardware,"reason":(!hardware).then_some("Hardware forwarding is installed; restart the router to load it")}})))],
+            gets: vec![("/api/wifi-relay/status", Ok(json!({"connected":connected,"offload":{"config":config,"enabled":true,"state":if route { "routed" } else { "off" },"route":route,"reason":(!route).then_some(unlisted)}})))],
             ..Default::default()
         });
         let relay = get_with(&c, network::RELAY, peer(226, 2), &cookie).await;
         relay.assert_secure_html(200);
         let text = relay.text();
-        assert_eq!(text.matches(&format!("action=\"{}\"", network::OFFLOAD)).count(), 1);
-        assert!(text.contains(if install { "Install hardware forwarding" } else { "Remove hardware forwarding" }));
-        assert_eq!(text.contains("Hardware (IPA)"), connected && hardware);
+        assert!(text.contains(shown), "{shown}");
+        assert_eq!(text.matches("action=\"/ui/relay/offload").count(), 1, "the switch is the only control");
+        assert_eq!(text.matches(&format!("action=\"{}\"", network::OFFLOAD_SWITCH)).count(), 1);
+        assert_eq!(text.contains(unlisted), connected && !route, "the reason, for a connection");
+        assert_eq!(text.contains("Hardware (IPA) in the Balanced (极速模式) working mode"), connected && route);
         assert!(text.contains("skip the router's firewall rules, speed limits, Smart QoS and parental control"));
-        let body = format!("csrf={}&once={}&install={}", relay.input("csrf"), relay.input("once"), if install { 1 } else { 0 });
-        post(&c, network::OFFLOAD, peer(226, 2), &cookie, &body).await.assert_see_other(network::RELAY);
-        assert_eq!(device::calls(&c.app).last().unwrap(), &("/api/wifi-relay/offload".into(), json!({"install":install})));
+        assert!(text.contains("Whether IPA is active is decided by the router's own settings, which this page never changes: the Balanced (极速模式) working mode turns acceleration on"));
     }
     let _d = devices(&c, true);
     let core = get_with(&c, network::MIHOMO, peer(226, 2), &cookie).await;
@@ -1044,7 +1050,7 @@ async fn the_hardware_forwarding_switch_shows_the_owner_setting_and_flips_it() {
     let cookie = format!("zte_ui_session={}", login(&c, 253, 1).await);
     for enabled in [true, false] {
         let _d = device::set(&c.app, device::Device {
-            gets: vec![("/api/wifi-relay/status", Ok(json!({"connected":true,"offload":{"config":"loaded","enabled":enabled,"hardware":enabled,"reason":(!enabled).then_some("Hardware forwarding is turned off")}})))],
+            gets: vec![("/api/wifi-relay/status", Ok(json!({"connected":true,"offload":{"config":"listed","enabled":enabled,"state":if enabled { "routed" } else { "off" },"route":enabled,"reason":(!enabled).then_some("Hardware forwarding is turned off")}})))],
             ..Default::default()
         });
         let relay = get_with(&c, network::RELAY, peer(253, 2), &cookie).await;
@@ -1054,6 +1060,7 @@ async fn the_hardware_forwarding_switch_shows_the_owner_setting_and_flips_it() {
         assert!(text.contains(&format!("aria-checked=\"{enabled}\" aria-labelledby=\"offload-heading\"")));
         assert_eq!(text.contains("Hardware forwarding is turned off"), !enabled);
         assert_eq!(text.contains("Hardware (IPA)"), enabled);
+        assert_eq!(text.contains("<span>CPU</span>"), !enabled);
         let body = format!("csrf={}&once={}&enabled={}", relay.input("csrf"), relay.input("once"), if enabled { 0 } else { 1 });
         post(&c, network::OFFLOAD_SWITCH, peer(253, 2), &cookie, &body).await.assert_see_other(network::RELAY);
         assert_eq!(device::calls(&c.app).last().unwrap(), &("/api/wifi-relay/offload".into(), json!({"enabled":!enabled})));

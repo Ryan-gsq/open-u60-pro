@@ -1,7 +1,7 @@
 //! Upstream hosts that IPACM puts ahead of the gateway
 //! (`zte-agent/docs/relay-hw-offload.md`, section 8).
 //!
-//! In STA mode IPACM makes every IPv4 neighbour of `u60sta0` a WAN client and
+//! In STA mode IPACM makes every IPv4 neighbour of the station a WAN client and
 //! gives it a rule in `WANRTBLv4` that matches the relay's own address as
 //! source, in front of the gateway's. Offloaded uplink, NATed to that address,
 //! then goes to that host's MAC: once IPA takes a connection over, its ACKs
@@ -12,8 +12,8 @@
 //! client's MAC shows up at another IPv4 address. So every other MAC is
 //! announced once at `SPARE` and then put back at its own address, where IPACM
 //! still knows it as an upstream host (connections to it stay on the CPU).
-//! Neither step, later sightings nor a SW→HW switch bring the rule back (B31,
-//! 2026-11-09). IPACM drops its clients when `u60sta0` goes away, so a MAC is
+//! Neither step, later sightings nor a change of IPACM's mode bring the rule back (B31,
+//! 2026-11-09). IPACM drops its clients when the station goes away, so a MAC is
 //! retired once per relay session.
 
 use std::collections::HashSet;
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn only_entries_with_a_link_layer_address_on_the_relay_count() {
         assert_eq!(parse("192.168.2.250 lladdr 02:00:5E:00:00:99 REACHABLE "), Some(seen("192.168.2.250", "02:00:5e:00:00:99")));
-        assert_eq!(parse("192.168.2.9 dev u60sta0 lladdr e6:3e:70:62:48:a4 STALE"), Some(seen("192.168.2.9", HOST)));
+        assert_eq!(parse("192.168.2.9 dev ath20 lladdr e6:3e:70:62:48:a4 STALE"), Some(seen("192.168.2.9", HOST)));
         for line in [
             "Deleted 192.168.2.250 lladdr 02:00:5e:00:00:99 REACHABLE",
             "192.0.2.1 FAILED ",
@@ -203,10 +203,10 @@ mod tests {
         assert_eq!(
             steps,
             [
-                format!("ip -4 neigh replace 192.0.2.1 lladdr {HOST} nud reachable dev u60sta0"),
-                "ip -4 neigh del 192.0.2.1 dev u60sta0".to_owned(),
-                format!("ip -4 neigh replace 192.168.2.77 lladdr {HOST} nud stale dev u60sta0"),
-                format!("ip -4 neigh replace 192.168.2.77 lladdr {HOST} nud reachable dev u60sta0"),
+                format!("ip -4 neigh replace 192.0.2.1 lladdr {HOST} nud reachable dev ath20"),
+                "ip -4 neigh del 192.0.2.1 dev ath20".to_owned(),
+                format!("ip -4 neigh replace 192.168.2.77 lladdr {HOST} nud stale dev ath20"),
+                format!("ip -4 neigh replace 192.168.2.77 lladdr {HOST} nud reachable dev ath20"),
             ]
         );
         assert!(SPARE.is_documentation() && !SPARE.is_link_local());

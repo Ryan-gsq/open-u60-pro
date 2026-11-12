@@ -294,19 +294,32 @@ impl Chain {
     }
 }
 
-/// The LAN IPv4 connections a change from `old` to `new` must reset (D10,
-/// `relay-mihomo-architecture.md` section 4.5): what `old` let skip the core
-/// and `new` does not. A chain that is not plain destinations up to its last
+/// `lost_from` one chain.
+#[cfg(test)]
+pub(super) fn lost(old: &Chain, new: &Chain) -> crate::netfx::conntrack::Scope {
+    lost_from(std::slice::from_ref(old), new)
+}
+
+/// The LAN IPv4 connections a change from `olds` to `new` must reset (D10,
+/// `relay-mihomo-architecture.md` section 4.5): what any of `olds` let skip
+/// the core and `new` does not. `olds` are every table connections may have
+/// skipped the core by since the last reset: one the kernel was confirmed to
+/// hold, or one a failed load left as the target (a reconcile may have
+/// loaded it since). A chain that is not plain destinations up to its last
 /// return makes it every LAN IPv4 connection (`old`) or all of what `old`
 /// let through (`new`); more than 64 ranges also reset the whole LAN.
 /// Nothing when nothing lost the bypass: re-compiling the same table resets
 /// nothing.
-pub(super) fn lost(old: &Chain, new: &Chain) -> crate::netfx::conntrack::Scope {
+pub(super) fn lost_from(olds: &[Chain], new: &Chain) -> crate::netfx::conntrack::Scope {
     use crate::netfx::conntrack::Scope;
-    if old.returns == 0 {
+    let mut before = Vec::new();
+    for old in olds.iter().filter(|old| old.returns > 0) {
+        let Some(bypass) = old.bypass() else { return Scope::Lan { v4: true, v6: false } };
+        before = ranges::union(&before, &bypass);
+    }
+    if before.is_empty() {
         return Scope::Destinations(Vec::new());
     }
-    let Some(before) = old.bypass() else { return Scope::Lan { v4: true, v6: false } };
     let after = new.bypass().unwrap_or_default();
     let lost = ranges::to_cidrs(&ranges::subtract(&before, &after));
     if lost.len() > Scope::MAX_RANGES {
@@ -745,6 +758,14 @@ impl Routes {
         let mut sets: Vec<(String, u64)> = self.providers.iter().filter(|(_, p)| p.kind == "http" && p.interval > 0).map(|(name, p)| (name.clone(), p.interval)).collect();
         sets.sort();
         sets
+    }
+
+    /// Whether a refresh of rule set `name` can change the kernel plan: a
+    /// `domain` set never enters it (fake-ip decides, and what a refreshed
+    /// set holds is fake in the DNS filter whatever it is), so its refresh
+    /// needs no tightening and no table. An unknown set may.
+    pub(super) fn reaches_kernel(&self, name: &str) -> bool {
+        self.providers.get(name).is_none_or(|p| p.behavior != "domain")
     }
 
     /// Rule mode: the rules in the core's order, as kernel conditions. A rule
@@ -1433,7 +1454,23 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         assert_eq!(lost(&many, &Chain::default()), Scope::Lan { v4: true, v6: false }, "more than 64 ranges");
         assert_eq!(ranges::to_cidrs(&[(0, u32::MAX)]).iter().map(ToString::to_string).collect::<Vec<_>>(), ["0.0.0.0/0"]);
         assert_eq!(ranges::to_cidrs(&[(u32::from(Ipv4Addr::new(10, 0, 0, 1)), u32::from(Ipv4Addr::new(10, 0, 0, 6)))]).iter().map(ToString::to_string).collect::<Vec<_>>(), ["10.0.0.1/32", "10.0.0.2/31", "10.0.0.4/31", "10.0.0.6/32"]);
+        // Finding 1: a table that failed to load may still be loaded by a
+        // reconcile, so what it lets through counts as well.
+        let other = plan(&["IP-CIDR,8.8.8.0/24,DIRECT", "MATCH,P"]);
+        assert_eq!(dests(lost_from(&[fewer.clone(), other.clone()], &fewer)), ["8.8.8.0/24"]);
+        assert!(dests(lost_from(&[Chain::default(), other.clone()], &other)).is_empty());
+        assert!(dests(lost_from(&[], &other)).is_empty());
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Finding 6: a `domain` set's refresh cannot change the kernel plan.
+    #[test]
+    fn only_sets_the_kernel_reads_need_a_table_when_refreshed() {
+        let config: serde_yaml_ng::Value = serde_yaml_ng::from_str("rule-providers:\n  names: {type: http, behavior: domain, url: 'https://example.invalid/a', interval: 3600}\n  cidrs: {type: http, behavior: ipcidr, url: 'https://example.invalid/b', interval: 3600}\n  rules: {type: http, behavior: classical, url: 'https://example.invalid/c', interval: 3600}\nrules: ['RULE-SET,names,DIRECT', 'MATCH,DIRECT']").unwrap();
+        let routes = Routes::from(&config);
+        assert_eq!(routes.refresh().len(), 3);
+        assert!(!routes.reaches_kernel("names"));
+        assert!(routes.reaches_kernel("cidrs") && routes.reaches_kernel("rules") && routes.reaches_kernel("unknown"));
     }
 
     /// v3: a reload is proven by an answer that must differ.

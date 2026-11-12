@@ -3,13 +3,22 @@
 //! LAN web traffic also skips the vendor's offline redirect (`redirect_chain`,
 //! both families) through a RETURN that must sit before every vendor rule
 //! there: a present rule (`-C`) behind a DNAT proves nothing.
+//!
+//! A session journals both in its `dns` transaction (`dns.json`, next to the
+//! resolver line), and a handover between 5 GHz upstreams moves them to the
+//! next session as they are (`wifi_relay::handover`). Released there and
+//! applied again with the next lease, the switch read 1 for a few seconds;
+//! the fw3 reload netifd runs after the agent's own IPv6 setup fell into
+//! that gap, `firewall_redirect.sh` appended its port-80 DNAT while no
+//! RETURN was there, and the DNAT stayed until the next reload (B31,
+//! 2026-11-12).
 
 use crate::net_tools::{Cmd, Step};
 
 const KEY: &str = "zwrt_redirect.redirect.switch";
 const PACKAGE: &str = "zwrt_redirect";
 const CHAIN: &str = "redirect_chain";
-const COMMENT: &str = "zte-agent-wifi-relay";
+const COMMENT: &str = crate::netfx::ids::RELAY_COMMENT;
 /// The RETURN, as given to iptables.
 const BYPASS: [&str; 7] = ["-i", "br-lan", "-m", "comment", "--comment", COMMENT, "-j"];
 
@@ -30,6 +39,14 @@ fn bypass() -> Vec<&'static str> {
 pub(super) fn web_bypass(tool: &str) -> Step {
     let rule = crate::net_tools::rule(tool, "nat", CHAIN, &bypass(), true);
     Step::new(Cmd::new("@u60-relay-portal-return", &[tool]), rule.undo)
+}
+
+/// The RETURN for both families, as the session's `dns` transaction
+/// journals it (with the switch, so a handover keeps both). The undo is the
+/// `-D` the previous build journaled in `network.json`: either build
+/// recovers the other's journal.
+pub(super) fn web_bypasses() -> Vec<Step> {
+    ["iptables", "ip6tables"].into_iter().map(web_bypass).collect()
 }
 
 /// Where the RETURN is in a `-S redirect_chain` listing.
@@ -88,9 +105,10 @@ pub(super) fn moves(at: Place) -> Option<String> {
     }
 }
 
-/// Whether the RETURN is in place: present and ahead of every vendor rule.
-pub(crate) fn return_first(args: &[String]) -> Result<bool, String> {
-    Ok(place(&listing(tool(args)?)?) == Place::First)
+/// Whether the RETURN is in place in a `-t nat -S` listing (the whole table,
+/// as a guard check reads it once): present and ahead of every vendor rule.
+pub(crate) fn return_first(listing: &str) -> bool {
+    place(listing) == Place::First
 }
 
 fn plan_with(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Option<Step>, String> {
@@ -163,6 +181,84 @@ fn command_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_tools::bench::{self, Bench};
+    use crate::net_tools::{Pass, Transaction};
+
+    /// What the vendor's `firewall_redirect.sh` appended during a fw3 reload
+    /// while our switch delta was released for a reconnect (B31,
+    /// 2026-11-12): it stayed until the next reload.
+    const VENDOR_DNAT: &str = "-A redirect_chain ! -d 192.168.0.1/32 -p tcp -m tcp --dport 80 -m limit --limit 20/sec --limit-burst 40 -j DNAT --to-destination 192.168.0.1";
+    const OURS: &str = "-A redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN";
+
+    #[test]
+    fn a_return_behind_the_vendors_dnat_is_late_and_a_guard_check_moves_it() {
+        let listed = bench::router("iptables", "nat");
+        assert!(return_first(&listed), "as the router listed it");
+        let late = listed.replace(OURS, &format!("{VENDOR_DNAT}\n{OURS}"));
+        assert_eq!(place(&late), Place::Late);
+        assert!(!return_first(&late));
+        assert_eq!(place(&listed.replace(OURS, &format!("{OURS}\n{VENDOR_DNAT}"))), Place::First);
+        assert_eq!(place(&listed.replace(OURS, VENDOR_DNAT)), Place::Absent, "flushed by the reload");
+        let mut tx = Transaction::new(std::path::PathBuf::from("/nonexistent/dns.json"));
+        tx.assume(web_bypasses());
+        let mut device = Bench::router();
+        device.list(Cmd::new("iptables", &["-w", "2", "-t", "nat", "-S"]), Ok(late));
+        let result = tx.reconcile_with(|_| true, &mut device);
+        assert_eq!(device.applied, [web_bypass("iptables").apply], "the IPv6 RETURN is first");
+        assert!(result.restored.len() == 1 && result.failed.is_empty(), "{result:?}");
+    }
+
+    /// The relay connected on 5 GHz with IPv6, as the router listed it: the
+    /// five transactions the guard checks, built by the relay's own plans
+    /// (IPv6's as `bench` mirrors them). Nothing is missing, so nothing is
+    /// re-applied and no `-C` runs; every command is one process.
+    #[test]
+    fn a_guard_check_of_the_connected_relay_reads_each_listing_once() {
+        let lease = super::super::Lease { ip: "192.168.2.124".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "192.168.2.1".parse().unwrap(), dns: vec![] };
+        let path = |name: &str| std::path::Path::new("/nonexistent").join(name);
+        let mut wireless = Transaction::new(path("wireless.json"));
+        wireless.assume(super::super::input_guards());
+        let mut network = Transaction::new(path("network.json"));
+        network.assume(super::super::relay_plan(&lease, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap()));
+        network.assume(super::super::offload::route_plan("192.168.2.1", "192.168.2.0/24"));
+        let mut dns = Transaction::new(path("dns.json"));
+        dns.assume(web_bypasses());
+        let ipv6 = bench::relay_ipv6_firewall();
+        let mut setup = Transaction::new(path("ipv6-setup.json"));
+        setup.assume(ipv6[..11].to_vec());
+        let mut upstream = Transaction::new(path("ipv6-network.json"));
+        upstream.assume(ipv6[11..].to_vec());
+        let firewall = |cmd: &Cmd| cmd.program != "ip";
+        let mut check = |device: &mut Bench| {
+            let mut result = wireless.reconcile_with(super::super::firewall_step, device);
+            result.extend(network.reconcile_with(|_| true, device));
+            result.extend(dns.reconcile_with(|_| true, device));
+            result.extend(setup.reconcile_with(firewall, device));
+            result.extend(upstream.reconcile_with(firewall, device));
+            assert!(result.restored.is_empty() && result.failed.is_empty(), "{result:?}");
+        };
+        // As the tick runs it today: each transaction reads for itself.
+        let mut device = Bench::router();
+        check(&mut device);
+        assert_eq!(device.ran.len(), 11, "{:?}", device.ran);
+        // In one pass (the tick opens it around the five).
+        let mut device = Bench::router();
+        {
+            let _pass = Pass::open();
+            check(&mut device);
+        }
+        let mut ran: Vec<String> = device.ran.iter().map(|c| format!("{} {}", c.program, c.args.join(" "))).collect();
+        ran.sort();
+        assert_eq!(ran, [
+            "ip -4 route show table all",
+            "ip -4 rule show",
+            "ip -o -4 addr show",
+            "ip6tables -w 2 -t filter -S",
+            "ip6tables -w 2 -t nat -S",
+            "iptables -w 2 -t filter -S",
+            "iptables -w 2 -t nat -S",
+        ]);
+    }
 
     struct Firmware {
         persisted: String,
@@ -222,6 +318,33 @@ mod tests {
         fn action(&mut self, action: &str) -> Result<(), String> {
             command_with(&[action.into()], &mut |cmd| self.run(cmd))
         }
+
+        fn restarts(&self) -> usize {
+            self.calls.iter().filter(|c| c.program == "/etc/init.d/dnsmasq").count()
+        }
+    }
+
+    /// A handover keeps the step and its delta (`wifi_relay::handover`): the
+    /// next session's plan finds the switch at 0 and takes nothing, so a
+    /// vendor reload in between (`firewall_redirect.sh` reads the switch with
+    /// `uci -q get`) never sees 1, and dnsmasq restarts only when the relay
+    /// connects and when it is torn down, including after a failed join.
+    #[test]
+    fn a_held_switch_is_not_taken_again_and_dnsmasq_restarts_only_at_connect_and_teardown() {
+        let mut fw = Firmware::new();
+        let step = plan_with(&mut |cmd| fw.run(cmd)).unwrap().unwrap();
+        fw.action("disable").unwrap();
+        assert_eq!(fw.restarts(), 1);
+        for _reconnect in 0..2 {
+            assert_eq!(current(&mut |cmd| fw.run(cmd)).unwrap(), "0", "what a reload in the gap reads");
+            let calls = fw.calls.len();
+            assert!(plan_with(&mut |cmd| fw.run(cmd)).unwrap().is_none(), "held, not taken again");
+            assert!(fw.calls[calls..].iter().all(|c| c.program == "uci" && c.args[..2] == ["-q", "get"]), "{:?}", &fw.calls[calls..]);
+            assert!(!fw.serving_redirect);
+        }
+        assert_eq!(fw.restarts(), 1, "nothing restarted across the handovers");
+        command_with(&step.undo.args, &mut |cmd| fw.run(cmd)).unwrap();
+        assert_eq!((fw.restarts(), fw.serving_redirect, fw.delta.as_deref()), (2, true, None));
     }
 
     #[test]

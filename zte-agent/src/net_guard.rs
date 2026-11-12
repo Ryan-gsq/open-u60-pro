@@ -1,7 +1,7 @@
 //! One trigger for keeping the agent's network changes in place against
 //! ZTE's own (owner decision 63, `zte-agent/docs/relay-hw-offload.md`).
 //! ZTE rewrites legacy iptables, sysctls and routes from many paths: firewall
-//! reloads (`fw3`), Wi-Fi/QoS/speed-limit/IPA scripts and WAN events. Each
+//! reloads (`fw3`), Wi-Fi/QoS/speed-limit scripts and WAN events. Each
 //! owner (relay, Mihomo) keeps its changes in a `Transaction`, which can
 //! re-check and re-apply them (`Transaction::reconcile`); this module only
 //! decides when: shortly after a ZTE script runs (inotify `IN_OPEN`, every
@@ -13,16 +13,14 @@
 //! `RECHECK` after a check that had to restore something; and for `SAMPLE`
 //! after each trigger, every `SAMPLE_EVERY`, only the kernel settings owners
 //! hold (`hold`) are read and written back if changed, under the holder's
-//! registration, so a released setting is never written again. Opens of a
-//! script the agent runs itself (`own_run`) count once per run; other
-//! scripts and events in that window still count.
+//! registration, so a released setting is never written again.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Firmware events after which ZTE may rewrite rules, routes or sysctls.
-pub const EVENTS: &[&str] = &["zwrt_wlan", "zwrt_router.msg", "zwrt_smart_mng.msg", "network.interface"];
+pub const EVENTS: &[&str] = &["zwrt_wlan", "zwrt_router.msg", "network.interface"];
 /// Scripts and tools that rewrite them.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WATCHED: &[&str] = &[
@@ -42,8 +40,6 @@ const WATCHED: &[&str] = &[
     "/sbin/mwan_speedlimit.sh",
     "/sbin/speedlimit.sh",
     "/sbin/qos_set.sh",
-    "/sbin/smart_set_qos_policy.sh",
-    "/sbin/ipacm_switch.sh",
     "/sbin/router_common.sh",
     "/etc/hotplug.d/iface/15-mwan3",
 ];
@@ -195,44 +191,6 @@ fn sampler() {
     }
 }
 
-/// A script the agent itself runs: its opens during `own_run` count as one
-/// trigger, since another opener cannot be told apart.
-struct Own {
-    path: &'static str,
-    until: Option<Instant>,
-    counted: bool,
-}
-
-static OWN: Mutex<Vec<Own>> = Mutex::new(Vec::new());
-/// Opens that arrive just after the run returns are still its own.
-const OWN_GRACE: Duration = Duration::from_secs(1);
-
-/// Runs `f`, which runs the watched script `path`.
-pub fn own_run<T>(path: &'static str, f: impl FnOnce() -> T) -> T {
-    OWN.lock().unwrap_or_else(PoisonError::into_inner).push(Own { path, until: None, counted: false });
-    let result = f();
-    let mut own = OWN.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(run) = own.iter_mut().rev().find(|o| o.path == path && o.until.is_none()) {
-        run.until = Some(Instant::now() + OWN_GRACE);
-    }
-    result
-}
-
-/// Whether an open of `path` is a trigger.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn counts(path: &str) -> bool {
-    let mut own = OWN.lock().unwrap_or_else(PoisonError::into_inner);
-    own.retain(|o| o.until.is_none_or(|at| Instant::now() < at));
-    match own.iter_mut().find(|o| o.path == path) {
-        Some(run) if run.counted => false,
-        Some(run) => {
-            run.counted = true;
-            true
-        }
-        None => true,
-    }
-}
-
 /// Logs what an owner's reconcile re-applied, so ZTE's rewrites stay visible,
 /// and what it could not (once until that changes; the owner shows it).
 pub fn report(owner: &str, result: crate::net_tools::Reconciled) -> Result<(), String> {
@@ -274,42 +232,23 @@ fn watch() {
         return crate::netlog!("[guard] inotify unavailable; relying on events and the fallback check");
     }
     let mut watched = 0;
-    let mut paths: Vec<(i32, &'static str)> = Vec::new();
     for path in WATCHED {
         let Ok(c) = CString::new(*path) else { continue };
-        let wd = unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_OPEN) };
-        if wd >= 0 {
+        if unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_OPEN) } >= 0 {
             watched += 1;
-            paths.push((wd, path));
         }
     }
     crate::netlog!("[guard] watching {watched} ZTE scripts");
-    let mut buffer = [0u64; 512];
-    let header = std::mem::size_of::<libc::inotify_event>();
+    let mut buffer = [0u8; 4096];
     loop {
-        let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), std::mem::size_of_val(&buffer)) };
+        let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
         if n < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             return crate::netlog!("[guard] inotify read failed; relying on events and the fallback check");
         }
-        // Watches on files carry no name: each event is its header alone.
-        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), n as usize) };
-        let mut at = 0;
-        let (mut trigger, mut parsed) = (false, false);
-        while at + header <= bytes.len() {
-            // SAFETY: a whole event header lies at `at` in what the kernel wrote.
-            let event = unsafe { std::ptr::read_unaligned(bytes[at..].as_ptr().cast::<libc::inotify_event>()) };
-            let path = paths.iter().find(|(wd, _)| *wd == event.wd).map(|(_, p)| *p);
-            trigger |= path.is_none_or(counts);
-            parsed = true;
-            at += header + event.len as usize;
-        }
-        // Unreadable events keep one check.
-        if trigger || !parsed {
-            poke();
-        }
+        poke();
     }
 }
 
@@ -364,18 +303,5 @@ mod tests {
         hold(owner, "brnf-test", "0");
         release(owner, None);
         assert!(sample(read, write).is_empty());
-    }
-
-    #[test]
-    fn the_agents_own_script_run_counts_once_and_others_still_count() {
-        const PATH: &str = "/sbin/test-own-switch.sh";
-        own_run(PATH, || {
-            assert!(counts(PATH), "its first open: the source cannot be told");
-            assert!(!counts(PATH), "later opens of the same run");
-            assert!(counts("/sbin/fw3"), "another script in the window");
-        });
-        assert!(!counts(PATH), "within the grace after the run");
-        OWN.lock().unwrap().iter_mut().filter(|o| o.path == PATH).for_each(|o| o.until = Some(Instant::now()));
-        assert!(counts(PATH), "after the window");
     }
 }

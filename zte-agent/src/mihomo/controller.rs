@@ -16,7 +16,16 @@
 //! nothing skips the core, `to_core` drops what no core takes); `Backoff`
 //! (D3 after a confirmed core failure: interception withdrawn, fake-ip fails
 //! fast, retries at 5, 15, 30, 60 s then every 5 min); `CleanupPending` (a
-//! release failed: the journal and ownership stay).
+//! release failed: the journal and ownership stay; a D3 withdrawal that
+//! failed is retried on the same timers, since until it works the old
+//! tables keep LAN DNS on a core that is gone).
+//!
+//! What the kernel may hold is kept as `NftTables` keeps it: the table last
+//! confirmed and the ones declared since that did not confirm, since a
+//! `reconcile` loads the last of them later (and a failed load may have
+//! committed). Narrowing before a change and the connections a change
+//! resets follow everything the kernel may hold (I4), and the status
+//! follows what a reconcile loaded (I7).
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -209,9 +218,14 @@ pub(super) trait Port: Send + 'static {
     fn recover(&mut self) -> Result<(), String>;
     /// Whether starting is refused for now (an install is in progress).
     fn busy(&mut self) -> Option<String>;
-    fn prepare(&mut self, source: &Source) -> Result<Prepared, String>;
+    /// Writes and validates the configuration. `serving`: a core keeps
+    /// serving meanwhile, so a validation runs in the background (one Go
+    /// execution slot, lower priority).
+    fn prepare(&mut self, source: &Source, serving: bool) -> Result<Prepared, String>;
     /// Ports the core binds are free (checked before each spawn).
     fn ports_free(&mut self) -> Result<(), String>;
+    /// Effects are held (a start re-applies them rather than claiming them).
+    fn owns(&mut self) -> bool;
     fn engage(&mut self, how: Engage) -> Result<(), String>;
     /// Loads a table shape; `Err` when it is not confirmed.
     fn tables(&mut self, shape: Shape) -> Result<(), String>;
@@ -239,9 +253,10 @@ pub(super) trait Port: Send + 'static {
     /// sets and listeners are there, and `probe` answers as the new filter
     /// says (fake or not).
     fn verify_reload(&mut self, prepared: &Prepared, probe: Option<&(String, bool)>, before: &Selected) -> Result<(), String>;
-    fn uplink(&mut self) -> Uplink;
+    /// The egress now; `upstream`: also which access point the relay is on.
+    fn uplink(&mut self, upstream: bool) -> Uplink;
     /// Re-applies what another writer removed (`net_guard` decides when).
-    fn reconcile(&mut self) -> Result<(), String>;
+    fn reconcile(&mut self) -> Guarded;
     /// Whether the owner wants Mihomo on after a restart.
     fn wanted(&mut self) -> bool;
     fn set_wanted(&mut self, on: bool) -> Result<(), String>;
@@ -249,6 +264,14 @@ pub(super) trait Port: Send + 'static {
     fn sources_changed(&mut self) -> bool;
     fn guard_due(&mut self) -> bool;
     fn retry_reset(&mut self);
+}
+
+/// What a `net_guard` check found.
+pub(super) struct Guarded {
+    pub result: Result<(), String>,
+    /// The tables' target is what the kernel holds now (a target that had
+    /// not loaded may have been loaded by this check).
+    pub confirmed: bool,
 }
 
 /// Delays and windows; tests shorten them.
@@ -281,17 +304,32 @@ impl Default for Timings {
     }
 }
 
+/// A table declared that the kernel was not read to hold.
+struct Pending {
+    bypass: Bypass,
+    chain: Chain,
+    /// Declared to narrow the bypass before a change that then did not
+    /// happen: once loaded, the plan is followed again.
+    narrowing: bool,
+}
+
 /// The running core and what the kernel was set up for.
 struct Run {
     core: Box<dyn CoreHandle>,
     prepared: Prepared,
     mode: Mode,
     selected: Selected,
-    /// What the kernel holds (`Chain::default()` while nothing is bypassed).
-    chain: Chain,
-    /// The widest chain connections may still use: what was bypassed since
-    /// the last reset (a tightening narrows `chain`, not this).
-    bypassed: Chain,
+    /// What the kernel was last read to hold (`Chain::default()` while
+    /// nothing is bypassed), and what that bypasses.
+    kernel: (Bypass, Chain),
+    /// Tables declared since that did not confirm, oldest first.
+    pending: Vec<Pending>,
+    /// Every chain connections may have skipped the core by since the last
+    /// reset, confirmed or pending (a tightening narrows `kernel`, not this).
+    bypassed: Vec<Chain>,
+    /// The bypass was narrowed for a change, and what the core runs since
+    /// has not been read back yet.
+    unfollowed: bool,
     uplink: Uplink,
     /// The egress has IPv6 now (the last observation).
     ipv6: bool,
@@ -303,6 +341,64 @@ struct Run {
     followed: Instant,
     /// Rule sets the controller refreshes: name, interval, next due.
     refresh: Vec<(String, Duration, Instant)>,
+}
+
+impl Run {
+    /// The kernel may let traffic skip the core: the confirmed table does,
+    /// or one a reconcile may still load.
+    fn may_return(&self) -> bool {
+        self.kernel.1.returns > 0 || self.pending.iter().any(|p| p.chain.returns > 0)
+    }
+
+    /// The table the kernel holds or a reconcile will load.
+    fn target(&self) -> &Chain {
+        self.pending.last().map_or(&self.kernel.1, |p| &p.chain)
+    }
+
+    fn declared(&mut self, bypass: Bypass, chain: Chain, narrowing: bool, confirmed: bool) {
+        if chain.returns > 0 && !self.bypassed.contains(&chain) {
+            self.bypassed.push(chain.clone());
+        }
+        if confirmed {
+            self.kernel = (bypass, chain);
+            self.pending.clear();
+        } else {
+            self.pending.push(Pending { bypass, chain, narrowing });
+        }
+    }
+
+    /// After a reset: from now on connections can skip the core only by
+    /// what the kernel may still hold.
+    fn reset_done(&mut self) {
+        let mut bypassed: Vec<Chain> = Vec::new();
+        for chain in std::iter::once(&self.kernel.1).chain(self.pending.iter().map(|p| &p.chain)) {
+            if chain.returns > 0 && !bypassed.contains(chain) {
+                bypassed.push(chain.clone());
+            }
+        }
+        self.bypassed = bypassed;
+    }
+
+    /// A reconcile confirmed the target: the last table declared is what
+    /// the kernel holds. `Some(narrowing)` when one was pending.
+    fn loaded(&mut self) -> Option<bool> {
+        let last = self.pending.pop()?;
+        self.pending.clear();
+        self.kernel = (last.bypass, last.chain);
+        Some(last.narrowing)
+    }
+}
+
+/// Why a planned restart runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Restart {
+    /// The selected profile changed: the old core serves until the new
+    /// configuration is ready, and keeps serving if it is not.
+    Profile,
+    /// The egress moved: the old core's connections are stranded.
+    Egress,
+    /// A hot reload was not confirmed.
+    Reload,
 }
 
 pub(super) struct Controller<P: Port> {
@@ -327,6 +423,12 @@ pub(super) struct Controller<P: Port> {
     v6_restarted: Option<Instant>,
     egress_restarted: Option<Instant>,
     last_reset: Value,
+    /// Why the core went direct, while its interception is still being
+    /// withdrawn (CleanupPending, retried on the D2 timers).
+    cause: Option<String>,
+    /// The egress when the core went direct (D3): a new IPv4 egress since
+    /// is worth a retry at once.
+    seen: Uplink,
 }
 
 /// Why a wait ended early.
@@ -358,6 +460,21 @@ impl<P: Port> Controller<P> {
             v6_restarted: None,
             egress_restarted: None,
             last_reset: Value::Null,
+            cause: None,
+            seen: Uplink::default(),
+        }
+    }
+
+    /// Runs the controller; a panic on its thread calls `end` (finding 8).
+    /// The core dies with this thread (its parent-death signal follows the
+    /// thread that forked it), while the tables, LAN DNS redirected to it
+    /// and a `running` snapshot would stay, in an agent `zte-agent guard`
+    /// still sees alive. `end` takes the agent down, so the guard starts it
+    /// again and the new agent adopts this boot's tables.
+    pub fn supervised(self, end: impl FnOnce(String)) {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run())) {
+            let what = panic.downcast_ref::<&str>().map(|s| (*s).to_owned()).or_else(|| panic.downcast_ref::<String>().cloned());
+            end(what.unwrap_or_else(|| "a panic".into()));
         }
     }
 
@@ -431,8 +548,8 @@ impl<P: Port> Controller<P> {
             }
             Message::Config { reply } => {
                 let result = match self.phase {
-                    Phase::Running => self.restart("the profile changed", true),
-                    Phase::Backoff => self.start(Engage::FromBackoff, false),
+                    Phase::Running => self.restart("the profile changed", Restart::Profile),
+                    Phase::Backoff => self.start(false),
                     _ => Ok(()),
                 };
                 self.publish();
@@ -491,22 +608,27 @@ impl<P: Port> Controller<P> {
             Phase::Running | Phase::Starting | Phase::Restarting | Phase::Reloading => {
                 if owner {
                     self.port.set_wanted(true)?;
+                } else {
+                    crate::netlog!("[mihomo] restore: already {}", self.phase.name());
                 }
                 return Ok(());
             }
+            // The boot restore runs once the router and the relay are back
+            // (section 5.2): what failed before is worth trying now, not at
+            // the next D2 step (up to 5 min away).
+            Phase::Backoff if !owner => return self.retry(Some("the boot restore")),
+            Phase::CleanupPending if !owner && self.cause.is_some() => return self.retry(Some("the boot restore")),
             Phase::CleanupPending => return Err(self.error.clone().unwrap_or_else(|| "Mihomo's previous network changes are not cleaned up; turn it off to retry".into())),
-            Phase::Backoff if !owner => return Ok(()),
             Phase::Off | Phase::Backoff => {}
         }
         if !owner && !self.port.wanted() {
             return Ok(());
         }
-        let from = if self.phase == Phase::Backoff { Engage::FromBackoff } else { Engage::Fresh };
         if owner {
             self.failures = 0;
             self.exits.clear();
         }
-        let result = self.start(from, owner);
+        let result = self.start(owner);
         match (&result, owner) {
             (Ok(()), true) => {
                 if let Err(e) = self.port.set_wanted(true) {
@@ -540,6 +662,8 @@ impl<P: Port> Controller<P> {
             run.core.stop();
         }
         self.retry_at = None;
+        // Releasing everything also ends a D3 withdrawal still pending.
+        self.cause = None;
         match self.port.release_all() {
             Ok(()) => {
                 self.phase = Phase::Off;
@@ -558,16 +682,21 @@ impl<P: Port> Controller<P> {
         }
     }
 
-    /// A start from Off or Backoff (`how`). A failed start the owner asked
-    /// for releases what it took and stays off (the owner sees the error);
-    /// a boot restore or a retry falls back to D3 and retries.
-    fn start(&mut self, how: Engage, owner: bool) -> Result<(), String> {
+    /// A start from Off or Backoff. Effects still held (D3 keeps the
+    /// journal) are re-applied; with none held (a start that failed before
+    /// it claimed any, an adoption that failed) they are claimed afresh.
+    /// A failed start the owner asked for releases what it took and stays
+    /// off (the owner sees the error); a boot restore or a retry falls back
+    /// to D3 and retries.
+    fn start(&mut self, owner: bool) -> Result<(), String> {
+        let from_backoff = self.phase == Phase::Backoff;
         if let Some(busy) = self.port.busy() {
             if !owner {
                 self.fail(busy.clone());
             }
             return Err(busy);
         }
+        let how = if self.port.owns() { Engage::FromBackoff } else { Engage::Fresh };
         self.retry_at = None;
         self.phase = Phase::Starting;
         self.reason = None;
@@ -586,8 +715,11 @@ impl<P: Port> Controller<P> {
             Ok(()) => {
                 self.error = None;
                 // Connections that went direct before keep their path until reset.
-                let scope = Scope::Lan { v4: true, v6: how == Engage::FromBackoff };
+                let scope = Scope::Lan { v4: true, v6: from_backoff };
                 self.reset("Mihomo started", scope, Instant::now());
+                if let Some(run) = self.run.as_mut() {
+                    run.reset_done();
+                }
             }
             Err(e) if owner => {
                 let _ = self.stop_all();
@@ -603,7 +735,12 @@ impl<P: Port> Controller<P> {
     /// Prepares, spawns and verifies a core, then loads the plan its
     /// read-back mode and choices give. The tables already hold or guard.
     fn launch(&mut self, source: Source, restart: bool) -> Result<(), String> {
-        let prepared = self.port.prepare(&source)?;
+        let prepared = self.port.prepare(&source, false)?;
+        self.launch_prepared(prepared, restart)
+    }
+
+    /// `launch` with a configuration already prepared and validated.
+    fn launch_prepared(&mut self, prepared: Prepared, restart: bool) -> Result<(), String> {
         self.port.ports_free()?;
         self.generation += 1;
         let generation = self.generation;
@@ -643,14 +780,17 @@ impl<P: Port> Controller<P> {
             let every = Duration::from_secs(every);
             (name, every, now + every.min(Duration::from_secs(3600)) + Duration::from_secs(10 * i as u64))
         }).collect();
-        let uplink = self.port.uplink();
-        let mut run = Run {
+        let uplink = self.port.uplink(true);
+        self.run = Some(Run {
             core,
             prepared: prepared.clone(),
             mode,
             selected,
-            chain: Chain::default(),
-            bypassed: Chain::default(),
+            // The tables hold: nothing skips the core yet.
+            kernel: (Bypass::None("The kernel plan is being loaded".into()), Chain::default()),
+            pending: Vec::new(),
+            bypassed: Vec::new(),
+            unfollowed: false,
             ipv6: uplink.paths[1].is_some(),
             uplink,
             stranding: None,
@@ -659,20 +799,13 @@ impl<P: Port> Controller<P> {
             audited: now,
             followed: now,
             refresh,
-        };
-        match self.port.tables(Shape::Full(&chain)) {
-            Ok(()) => {
-                run.bypassed = chain.clone();
-                run.chain = chain;
-                self.set_bypass(bypass);
-            }
-            Err(e) => {
-                // Stays held (nothing skips the core) until a reconcile loads it.
-                self.set_bypass(Bypass::None(format!("The kernel plan is not confirmed yet: {e}")));
-                self.error = Some(e);
-            }
+        });
+        if let Err(e) = self.load(Shape::Full(&chain), bypass, false) {
+            // Stays held (nothing skips the core) until a reconcile loads
+            // it; `guard` then takes it as the kernel's.
+            self.set_bypass(Bypass::None(format!("The kernel plan is not confirmed yet: {e}")));
+            self.error = Some(e);
         }
-        self.run = Some(run);
         self.previous = Some(prepared);
         self.phase = Phase::Running;
         self.reason = None;
@@ -707,23 +840,42 @@ impl<P: Port> Controller<P> {
         }
     }
 
-    /// A planned restart: tighten (hold), stop the old core, start the new
-    /// one, load its plan. `config`: the profile changed, so a failure falls
-    /// back to the configuration that ran before.
-    fn restart(&mut self, reason: &str, config: bool) -> Result<(), String> {
+    /// A planned restart (finding 4). The new configuration is prepared and
+    /// validated while the old core still serves (`mihomo -t` took about
+    /// 1.7 s, a clock check up to 16 s, all of it behind a hold table with
+    /// no core); only then is the bypass tightened (hold), the old core
+    /// stopped and the new one started (I4). A profile that does not
+    /// validate leaves the old core serving; one that validates but does not
+    /// start falls back to the configuration that ran before.
+    fn restart(&mut self, reason: &str, why: Restart) -> Result<(), String> {
         crate::netlog!("[mihomo] restarting: {reason}");
+        let Some(run) = self.run.as_ref() else { return Ok(()) };
+        let source = Source::Selected { local: run.prepared.local.clone(), runtime: Some(run.prepared.runtime.clone()) };
+        let prepared = match self.port.prepare(&source, why == Restart::Profile) {
+            Ok(prepared) => prepared,
+            Err(e) if why == Restart::Profile => {
+                crate::netlog!("[mihomo] the new profile was not started ({e}); the running one keeps serving");
+                let error = format!("{e}; the running profile keeps serving");
+                self.error = Some(error.clone());
+                return Err(error);
+            }
+            Err(e) => {
+                let error = format!("The planned restart failed: {e}");
+                self.fail(error.clone());
+                return Err(error);
+            }
+        };
         // Interception stays and nothing may skip the core before the old
         // one stops (section 5.2).
-        self.port.tables(Shape::Hold).map_err(|e| format!("Mihomo was not restarted: {e}"))?;
+        self.load(Shape::Hold, Bypass::None(format!("Restarting: {reason}")), true).map_err(|e| format!("Mihomo was not restarted: {e}"))?;
         let Some(old) = self.run.take() else { return Ok(()) };
-        self.set_bypass(Bypass::None(format!("Restarting: {reason}")));
         self.phase = Phase::Restarting;
         self.reason = Some(reason.into());
         self.publish();
+        let held = Instant::now();
         old.core.stop();
-        let runtime = Some(old.prepared.runtime.clone());
-        let mut result = self.launch(Source::Selected { local: old.prepared.local.clone(), runtime }, true);
-        if let (Err(e), true) = (&result, config) {
+        let mut result = self.launch_prepared(prepared, true);
+        if let (Err(e), Restart::Profile) = (&result, why) {
             crate::netlog!("[mihomo] the new profile did not start ({e}); starting the previous one");
             let fallback = self.launch(Source::Previous(Box::new(old.prepared.clone())), true);
             result = match fallback {
@@ -731,14 +883,19 @@ impl<P: Port> Controller<P> {
                 Err(again) => Err(format!("{e}; the previous profile did not start either: {again}")),
             };
             if self.phase == Phase::Running {
+                crate::netlog!("[mihomo] the restart held traffic for {} ms", held.elapsed().as_millis());
                 self.error = result.as_ref().err().cloned();
                 return result;
             }
         }
         match &result {
             Ok(()) => {
-                let lost = routing::lost(&old.bypassed, &self.run.as_ref().map(|r| r.chain.clone()).unwrap_or_default());
+                crate::netlog!("[mihomo] the restart held traffic for {} ms", held.elapsed().as_millis());
+                let lost = routing::lost_from(&old.bypassed, self.run.as_ref().map_or(&Chain::default(), Run::target));
                 self.reset("Mihomo restarted", lost, Instant::now());
+                if let Some(run) = self.run.as_mut() {
+                    run.reset_done();
+                }
             }
             Err(e) => self.fail(format!("The planned restart failed: {e}")),
         }
@@ -752,16 +909,13 @@ impl<P: Port> Controller<P> {
     fn reload(&mut self, reason: &str) -> Result<(), String> {
         let Some(run) = self.run.as_ref() else { return Ok(()) };
         let (previous, before) = (run.prepared.clone(), run.selected.clone());
-        let next = self.port.prepare(&Source::Reload(Box::new(previous.clone())))?;
+        let next = self.port.prepare(&Source::Reload(Box::new(previous.clone())), true)?;
         if next.dns == previous.dns {
             // DNS stays: only what skips the core changes.
             return self.follow(reason, &[], |_| {});
         }
-        if run.chain.returns > 0 {
-            self.port.tables(Shape::Hold).map_err(|e| format!("Nothing was changed: the bypass could not be narrowed first ({e})"))?;
-            if let Some(run) = self.run.as_mut() {
-                run.chain = Chain::default();
-            }
+        if self.run.as_ref().is_some_and(Run::may_return) {
+            self.load(Shape::Hold, Bypass::None(format!("Reloading: {reason}")), true).map_err(|e| format!("Nothing was changed: the bypass could not be narrowed first ({e})"))?;
         }
         crate::netlog!("[mihomo] reloading: {reason}");
         self.set_bypass(Bypass::None(format!("Reloading: {reason}")));
@@ -783,7 +937,7 @@ impl<P: Port> Controller<P> {
                 self.previous = Some(next);
                 self.follow(reason, &[], |_| {})
             }
-            Err(e) => self.restart(&format!("the reload was not confirmed ({e})"), false),
+            Err(e) => self.restart(&format!("the reload was not confirmed ({e})"), Restart::Reload),
         }
     }
 
@@ -791,26 +945,93 @@ impl<P: Port> Controller<P> {
     /// traffic goes direct while fake-ip fails fast; retries follow D2.
     fn fail(&mut self, error: String) {
         crate::netlog!("[mihomo] direct until the core is back: {error}");
-        if let Some(run) = self.run.take() {
-            run.core.stop();
-        }
-        if let Err(e) = self.port.direct() {
-            self.phase = Phase::CleanupPending;
-            self.error = Some(format!("{error}; and its network changes could not be released: {e}"));
-            return;
-        }
+        self.seen = match self.run.take() {
+            Some(run) => {
+                run.core.stop();
+                run.uplink
+            }
+            None => self.port.uplink(true),
+        };
         let now = Instant::now();
         self.exits.push_back(now);
         while self.exits.front().is_some_and(|at| now.duration_since(*at) > self.timings.quick) {
             self.exits.pop_front();
         }
         self.failures += 1;
+        self.retry_at = Some(now + self.step());
+        self.cause = Some(error);
+        self.withdraw();
+    }
+
+    /// The D2 wait before the next retry.
+    fn step(&self) -> Duration {
         let last = self.timings.retries.len() - 1;
-        let step = if self.exits.len() >= 3 { last } else { (self.failures as usize - 1).min(last) };
-        self.retry_at = Some(now + self.timings.retries[step]);
-        self.phase = Phase::Backoff;
-        self.error = Some(error);
-        self.set_bypass(Bypass::None("Mihomo is not running; LAN traffic goes direct".into()));
+        self.timings.retries[if self.exits.len() >= 3 { last } else { (self.failures.max(1) as usize - 1).min(last) }]
+    }
+
+    /// D3's withdrawal: Backoff once it is done. Until then the old tables
+    /// may still send LAN traffic and DNS to a core that is gone, so the
+    /// state is CleanupPending (not "direct") and the withdrawal is tried
+    /// again on the D2 timers (finding 3). With effects held, interception
+    /// gives way to the fake-ip reject (`Port::direct`); with none held,
+    /// whatever a previous agent left is rolled back (`Port::recover`): an
+    /// adoption that failed before it took them leaves that agent's tables,
+    /// LAN DNS redirected to a core that died with it (finding 2).
+    fn withdraw(&mut self) {
+        let Some(cause) = self.cause.clone() else { return };
+        let withdrawn = if self.port.owns() { self.port.direct() } else { self.port.recover() };
+        match withdrawn {
+            Ok(()) => {
+                self.cause = None;
+                self.phase = Phase::Backoff;
+                self.error = Some(cause);
+                self.set_bypass(Bypass::None("Mihomo is not running; LAN traffic goes direct".into()));
+            }
+            Err(e) => {
+                crate::netlog!("[mihomo] the interception could not be withdrawn yet: {e}");
+                self.phase = Phase::CleanupPending;
+                self.error = Some(format!("{cause}; its interception could not be withdrawn yet, so LAN traffic may still be sent to it ({e}); retrying"));
+                self.set_bypass(Bypass::None("Mihomo is not running and its interception is still in place".into()));
+            }
+        }
+    }
+
+    /// D2's retry (`why`: what made it come early): the withdrawal if it is
+    /// still pending, then a start; off if the owner no longer wants it.
+    fn retry(&mut self, why: Option<&str>) -> Result<(), String> {
+        if !self.port.wanted() {
+            return self.stop_all();
+        }
+        match why {
+            Some(why) => crate::netlog!("[mihomo] retrying now ({why}) after {} failure(s)", self.failures),
+            None => crate::netlog!("[mihomo] retrying after {} failure(s)", self.failures),
+        }
+        if self.cause.is_some() {
+            self.withdraw();
+            if self.cause.is_some() {
+                self.retry_at = Some(Instant::now() + self.step());
+                return Err(self.error.clone().unwrap_or_default());
+            }
+        }
+        self.start(false)
+    }
+
+    /// Loads `shape` and records it either way: a table that did not
+    /// confirm stays `NftTables`' target, which a reconcile may load later.
+    /// `narrowing`: before a change.
+    fn load(&mut self, shape: Shape, bypass: Bypass, narrowing: bool) -> Result<(), String> {
+        let chain = match &shape {
+            Shape::Full(chain) => (*chain).clone(),
+            _ => Chain::default(),
+        };
+        let loaded = self.port.tables(shape);
+        if let Some(run) = self.run.as_mut() {
+            run.declared(bypass, chain, narrowing, loaded.is_ok());
+            run.unfollowed |= narrowing && loaded.is_ok();
+            let shown = run.kernel.0.clone();
+            self.set_bypass(shown);
+        }
+        loaded
     }
 
     fn exited(&mut self, generation: u64, how: String) {
@@ -822,13 +1043,20 @@ impl<P: Port> Controller<P> {
     }
 
     /// A routing write (section 5.4): tighten, write, read back, load the
-    /// new plan, reset what lost DIRECT.
+    /// new plan, reset what lost DIRECT. Refreshing a rule set the kernel
+    /// never reads (`domain`) changes no plan and no DNS answer (a refreshed
+    /// set's names are fake-ip): it goes to the core as it is, with no table
+    /// loaded around it (finding 6: two 112 KB loads per refresh before).
     fn write(&mut self, write: &Write) -> Answered {
-        let secret = self.run.as_ref().map(|r| r.prepared.secret.clone()).ok_or("Mihomo is off")?;
+        let run = self.run.as_ref().ok_or("Mihomo is off")?;
+        let secret = run.prepared.secret.clone();
         let unsettled: Vec<String> = match write.segments.as_slice() {
             [providers, rules, name] if providers == "providers" && rules == "rules" => vec![name.clone()],
             _ => Vec::new(),
         };
+        if unsettled.first().is_some_and(|name| !run.prepared.routes.reaches_kernel(name)) {
+            return self.port.write(&secret, write);
+        }
         let mut answer = None;
         self.follow("a routing change", &unsettled, |port| {
             answer = Some(port.write(&secret, write));
@@ -838,51 +1066,54 @@ impl<P: Port> Controller<P> {
 
     /// Tightens before `change`, then follows what the core reports. With
     /// `unsettled` rule sets, only they are treated as unknown meanwhile;
-    /// otherwise nothing skips the core during the change.
+    /// otherwise nothing skips the core during the change. Whether to
+    /// tighten is decided by everything the kernel may hold, a table still
+    /// pending included (I4).
     fn follow(&mut self, why: &str, unsettled: &[String], change: impl FnOnce(&mut P)) -> Result<(), String> {
         let Some(run) = self.run.as_ref() else { return Err("Mihomo is off".into()) };
-        let (old, routes, mode, selected, secret) = (run.bypassed.clone(), run.prepared.routes.clone(), run.mode, run.selected.clone(), run.prepared.secret.clone());
-        if run.chain.returns > 0 {
-            let tightened = if unsettled.is_empty() {
-                self.port.tables(Shape::Hold)
+        if run.may_return() {
+            let narrowed = if unsettled.is_empty() {
+                self.load(Shape::Hold, Bypass::None(format!("Following {why}")), true)
             } else {
-                let (_, tight) = self.port.plan(&routes, mode, &selected, unsettled);
-                self.port.tables(Shape::Full(&tight))
+                let (routes, mode, selected) = (run.prepared.routes.clone(), run.mode, run.selected.clone());
+                let (bypass, tight) = self.port.plan(&routes, mode, &selected, unsettled);
+                self.load(Shape::Full(&tight), bypass, true)
             };
-            tightened.map_err(|e| format!("Nothing was changed: the bypass could not be narrowed first ({e})"))?;
-            if let Some(run) = self.run.as_mut() {
-                run.chain = Chain::default();
-            }
-            self.set_bypass(Bypass::None(format!("Following {why}")));
+            narrowed.map_err(|e| format!("Nothing was changed: the bypass could not be narrowed first ({e})"))?;
         }
         change(&mut self.port);
+        self.widen(why);
+        Ok(())
+    }
+
+    /// Reads back what the core runs and loads the plan that gives,
+    /// resetting what lost DIRECT since the last reset. Until the core
+    /// answers, the bypass stays narrowed and the next tick asks again.
+    fn widen(&mut self, why: &str) {
+        let Some(secret) = self.run.as_ref().map(|r| r.prepared.secret.clone()) else { return };
         let Some((mode, selected, runtime)) = self.port.read_back(&secret) else {
-            self.error = Some(format!("Mihomo did not report its state after {why}; the bypass stays off until it does"));
-            return Ok(());
+            self.error = Some(format!("Mihomo did not report its state after {why}; the bypass stays narrowed until it does"));
+            return;
         };
+        let Some(run) = self.run.as_mut() else { return };
+        let routes = run.prepared.routes.clone();
         let (bypass, chain) = self.port.plan(&routes, mode, &selected, &[]);
-        let lost = routing::lost(&old, &chain);
-        let changed = Instant::now();
-        self.reset("Mihomo routing changed", lost, changed);
-        let loaded = self.port.tables(Shape::Full(&chain));
+        let lost = self.run.as_ref().map(|run| routing::lost_from(&run.bypassed, &chain)).unwrap_or(Scope::Destinations(Vec::new()));
+        self.reset("Mihomo routing changed", lost, Instant::now());
         if let Some(run) = self.run.as_mut() {
+            run.reset_done();
             run.mode = mode;
             run.selected = selected;
             run.prepared.runtime = runtime;
             run.followed = Instant::now();
-            if loaded.is_ok() {
-                run.bypassed = chain.clone();
-                run.chain = chain;
-            }
+            run.unfollowed = false;
         }
-        match loaded {
-            Ok(()) => self.set_bypass(bypass),
-            Err(e) => {
+        if let Err(e) = self.load(Shape::Full(&chain), bypass, false) {
+            if self.run.as_ref().is_some_and(|r| r.kernel.1.returns == 0) {
                 self.set_bypass(Bypass::None(format!("The new kernel plan is not confirmed yet: {e}")));
-                self.error = Some(e);
             }
+            self.error = Some(e);
         }
-        Ok(())
     }
 
     fn reset(&mut self, reason: &'static str, scope: Scope, changed: Instant) {
@@ -894,18 +1125,34 @@ impl<P: Port> Controller<P> {
 
     /// The relay changed its routes.
     /// `net_guard`'s check when it is due: another writer may have removed
-    /// interception, routes or kernel settings.
+    /// interception, routes or kernel settings. A table that had not loaded
+    /// may load here: what the controller believes and shows follows it,
+    /// and a narrowing that was loaded for a change that never happened is
+    /// widened again once the core is read back.
     fn guard(&mut self) {
-        if self.port.guard_due() {
-            if let Err(e) = self.port.reconcile() {
-                self.error = Some(e);
-            }
+        if !self.port.guard_due() {
+            return;
+        }
+        let checked = self.port.reconcile();
+        if let Err(e) = checked.result {
+            self.error = Some(e);
+        }
+        let Some(run) = self.run.as_mut().filter(|_| checked.confirmed) else { return };
+        let Some(narrowing) = run.loaded() else { return };
+        crate::netlog!("[mihomo] a table that had not loaded is in the kernel now (bypass {})", run.kernel.0.label());
+        let shown = run.kernel.0.clone();
+        self.set_bypass(shown);
+        if narrowing {
+            self.widen("a narrowed table that loaded late");
         }
     }
 
     fn egress(&mut self) {
-        let observed = self.port.uplink();
-        let Some(run) = self.run.as_mut() else { return };
+        let observed = self.port.uplink(true);
+        let Some(run) = self.run.as_mut() else {
+            self.egress_while_direct(observed);
+            return;
+        };
         run.ipv6 = observed.paths[1].is_some();
         match egress::change(&run.uplink, &observed) {
             Change::None => crate::netlog!("[mihomo] duplicate uplink notification; core kept running"),
@@ -924,23 +1171,35 @@ impl<P: Port> Controller<P> {
                 }
             }
             Change::V4 => {
-                if let Err(e) = self.restart("the egress changed", false) {
+                if let Err(e) = self.restart("the egress changed", Restart::Egress) {
                     crate::netlog!("[mihomo] did not follow the egress change: {e}");
                 }
             }
         }
     }
 
+    /// In D3 (or while its withdrawal is pending), an IPv4 egress that is
+    /// new since the core went direct (the relay came up after the boot
+    /// restore failed without it, or moved) retries at once instead of at
+    /// the next D2 step.
+    fn egress_while_direct(&mut self, observed: Uplink) {
+        if self.phase != Phase::Backoff && self.cause.is_none() {
+            return;
+        }
+        let change = egress::change(&self.seen, &observed);
+        if matches!(change, Change::Adopt | Change::V6 | Change::V4) {
+            self.seen.adopt(&observed);
+        }
+        if change == Change::V4 {
+            let _ = self.retry(Some("a new IPv4 egress"));
+        }
+    }
+
     fn tick(&mut self) {
         self.port.retry_reset();
         match self.phase {
-            Phase::Backoff if self.retry_at.is_some_and(|at| Instant::now() >= at) => {
-                if self.port.wanted() {
-                    crate::netlog!("[mihomo] retrying after {} failure(s)", self.failures);
-                    let _ = self.start(Engage::FromBackoff, false);
-                } else {
-                    let _ = self.stop_all();
-                }
+            Phase::Backoff | Phase::CleanupPending if (self.phase == Phase::Backoff || self.cause.is_some()) && self.retry_at.is_some_and(|at| Instant::now() >= at) => {
+                let _ = self.retry(None);
                 self.publish();
                 return;
             }
@@ -953,24 +1212,29 @@ impl<P: Port> Controller<P> {
             self.exits.clear();
         }
         self.guard();
+        // A narrowing whose follow did not read the core back yet.
+        if self.run.as_ref().is_some_and(|r| r.unfollowed) {
+            self.widen("an earlier change");
+        }
         // An IPv6-only egress change that held.
         let v6 = self.run.as_ref().and_then(|r| r.v6.clone());
         if let Some((seen, since)) = v6 {
-            let observed = self.port.uplink();
+            let observed = self.port.uplink(true);
             if observed != seen {
                 if let Some(run) = self.run.as_mut() {
                     run.v6 = (egress::change(&run.uplink, &observed) == Change::V6).then(|| (observed, now));
                 }
             } else if egress::v6_due(since, self.v6_restarted) <= now {
                 self.v6_restarted = Some(now);
-                let _ = self.restart("the IPv6 egress changed", false);
+                let _ = self.restart("the IPv6 egress changed", Restart::Egress);
                 self.publish();
                 return;
             }
         }
-        // Outside the relay: only an egress that strands connections.
+        // Outside the relay: only an egress that strands connections. The
+        // relay announces its own routes, so this needs no `iw`.
         if self.run.as_ref().is_some_and(|r| now.duration_since(r.audited) >= self.timings.audit || r.stranding.is_some()) {
-            let observed = self.port.uplink();
+            let observed = self.port.uplink(false);
             let last = self.egress_restarted;
             let restart = self.run.as_mut().is_some_and(|run| {
                 run.audited = now;
@@ -979,7 +1243,7 @@ impl<P: Port> Controller<P> {
             });
             if restart {
                 self.egress_restarted = Some(now);
-                let _ = self.restart("the egress left the core's interface or source address", false);
+                let _ = self.restart("the egress left the core's interface or source address", Restart::Egress);
                 self.publish();
                 return;
             }

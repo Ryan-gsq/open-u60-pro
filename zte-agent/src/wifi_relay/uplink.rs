@@ -6,7 +6,7 @@
 //! only these chains: the vendor's rules still apply after them.
 //!
 //! What the tables hold follows the session (`Layout`):
-//! - always, from before `u60sta0` is raised (a scan too) until the station
+//! - always, from before the station is raised (a scan too) until the station
 //!   is gone: the upstream INPUT guard and a drop of all forwarding through
 //!   the upstream;
 //! - `relay` (routes installed): the forwarding returns, the relay DNS, and
@@ -391,10 +391,10 @@ pub mod tests {
     #[test]
     fn a_guard_alone_closes_the_upstream_in_both_families() {
         let [ip, ip6] = tables(&Layout::default(), None).unwrap();
-        assert_eq!(chain(&ip, "input"), ["iifname \"u60sta0\" ct state established,related return", "iifname \"u60sta0\" udp sport 67 udp dport 68 return", "iifname \"u60sta0\" drop"]);
-        assert_eq!(chain(&ip, "forward"), ["iifname \"u60sta0\" drop", "oifname \"u60sta0\" drop"], "nothing is forwarded through the upstream before routes");
-        assert_eq!(chain(&ip6, "input"), ["iifname \"u60sta0\" drop"], "IPv6 stays closed until discovery starts");
-        assert_eq!(chain(&ip6, "forward"), ["iifname \"u60sta0\" drop", "oifname \"u60sta0\" drop"]);
+        assert_eq!(chain(&ip, "input"), ["iifname \"ath20\" ct state established,related return", "iifname \"ath20\" udp sport 67 udp dport 68 return", "iifname \"ath20\" drop"]);
+        assert_eq!(chain(&ip, "forward"), ["iifname \"ath20\" drop", "oifname \"ath20\" drop"], "nothing is forwarded through the upstream before routes");
+        assert_eq!(chain(&ip6, "input"), ["iifname \"ath20\" drop"], "IPv6 stays closed until discovery starts");
+        assert_eq!(chain(&ip6, "forward"), ["iifname \"ath20\" drop", "oifname \"ath20\" drop"]);
         for text in [&ip, &ip6] {
             assert!(text.contains("type filter hook input priority filter - 1; policy accept;"));
             assert!(!text.contains("dns_") && !text.contains("chain output") && !text.contains("masquerade"));
@@ -412,16 +412,16 @@ pub mod tests {
         assert!(input[2].contains("{ nd-neighbor-solicit, nd-neighbor-advert } ip6 hoplimit 255 return"));
         assert!(input[3].contains("destination-unreachable, packet-too-big, time-exceeded, parameter-problem"));
         assert!(input[4].ends_with("udp sport 547 udp dport 546 return"));
-        assert_eq!(input.last().unwrap(), "iifname \"u60sta0\" drop");
+        assert_eq!(input.last().unwrap(), "iifname \"ath20\" drop");
     }
 
     #[test]
     fn forwarding_returns_come_before_the_relays_drops() {
         let [ip, _] = tables(&Layout { relay: Some(relay()), ..Layout::default() }, None).unwrap();
         let forward = chain(&ip, "forward");
-        assert_eq!(forward[0], "iifname \"br-lan\" oifname \"u60sta0\" return");
-        assert_eq!(forward[1], "iifname \"u60sta0\" oifname \"br-lan\" ct state established,related return");
-        assert!(at(&forward, "iifname \"u60sta0\" drop") > 1 && at(&forward, "oifname \"u60sta0\" drop") > 1);
+        assert_eq!(forward[0], "iifname \"br-lan\" oifname \"ath20\" return");
+        assert_eq!(forward[1], "iifname \"ath20\" oifname \"br-lan\" ct state established,related return");
+        assert!(at(&forward, "iifname \"ath20\" drop") > 1 && at(&forward, "oifname \"ath20\" drop") > 1);
         assert_eq!(chain(&ip, "input").len(), 3, "routes add nothing to the upstream INPUT guard");
     }
 
@@ -432,13 +432,13 @@ pub mod tests {
         assert_eq!(forward[0], "iifname \"br-lan\" oifname \"rmnet*\" reject", "before the NAT66 and the local exceptions");
         let out = at(&forward, "ip6 saddr { fd12:3456:789a::/64, 2001:db8:5::/64 } return");
         let back = at(&forward, "oifname \"br-lan\" ct state established,related return");
-        let drop = at(&forward, "iifname \"u60sta0\" drop");
+        let drop = at(&forward, "iifname \"ath20\" drop");
         let local = at(&forward, "ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } return");
         assert!(0 < out && out < back && back < drop && drop < local && local < forward.len() - 1);
         assert_eq!(forward.last().unwrap(), "iifname \"br-lan\" reject");
         assert_eq!(ip6.matches("oifname \"rmnet*\" reject").count(), 2, "one forward, one output reject");
         assert_eq!(chain(&ip6, "output"), ["oifname \"rmnet*\" reject"]);
-        assert_eq!(chain(&ip6, "nat66"), ["oifname \"u60sta0\" masquerade"]);
+        assert_eq!(chain(&ip6, "nat66"), ["oifname \"ath20\" masquerade"]);
         assert!(ip6.contains("type nat hook postrouting priority srcnat - 1; policy accept;"));
         // Without NAT66 the baseline still rejects cellular and keeps the
         // upstream closed.
@@ -517,7 +517,7 @@ pub mod tests {
         assert!(kernel.table("ip").is_none() && uplink.layout().is_none(), "nothing before the guard");
         uplink.claim().unwrap();
         uplink.guard().unwrap();
-        assert!(kernel.table("ip").unwrap().contains("iifname \"u60sta0\" drop") && kernel.table("ip6").is_some());
+        assert!(kernel.table("ip").unwrap().contains("iifname \"ath20\" drop") && kernel.table("ip6").is_some());
         uplink.update(|l| l.relay = Some(relay())).unwrap();
         uplink.update(|l| l.discovery = true).unwrap();
         uplink.update(|l| l.nat66 = Some(nat66(None))).unwrap();

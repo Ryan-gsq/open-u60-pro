@@ -48,28 +48,6 @@ pub static DISCONNECT: Action = Action {
     once: true,
 };
 
-/// Installs or removes the IPACM entry for hardware forwarding.
-pub static OFFLOAD: Action = Action {
-    path: network::OFFLOAD,
-    screen: &RELAY,
-    fields: &[Field { name: "install", kind: Kind::Choice(&["0", "1"]) }],
-    confirm: &[],
-    confirm_at: None,
-    unchanged: None,
-    reads: &[],
-    call: (Method::Post, "/api/wifi-relay/offload"),
-    body: |v, _| Some(json!({"install": v.get("install") == "1"})),
-    after: After::Flash(|v, data| (Some(true), if v.get("install") != "1" {
-        "Hardware forwarding removed. The relay forwards on the CPU now; restart the router to unload it fully."
-    } else if data["offload"]["config"] == "loaded" {
-        "Hardware forwarding installed. The router had already loaded it, so it applies at once."
-    } else {
-        "Hardware forwarding installed. Restart the router to load it; the relay then reconnects by itself if a restart choice is saved."
-    }.into())),
-    again: None,
-    once: true,
-};
-
 /// Turns hardware forwarding on or off without a restart (a connected relay
 /// follows at once).
 pub static OFFLOAD_SWITCH: Action = Action {
@@ -85,7 +63,7 @@ pub static OFFLOAD_SWITCH: Action = Action {
     after: After::Flash(|v, data| {
         let (ok, note) = reset_note(&data["reset"]);
         (ok, format!("{}{note}", if v.get("enabled") == "1" {
-            "Hardware forwarding on. A connected relay uses it at once."
+            "Hardware forwarding on. A connected relay uses it at once while the router's working mode is Balanced (极速模式)."
         } else {
             "Hardware forwarding off. The relay forwards on the CPU."
         }))

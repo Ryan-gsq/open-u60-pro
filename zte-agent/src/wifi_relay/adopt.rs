@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use super::{
     decode_ssid, input_guards, lease_change, lease_file, net, network_id, offload, power_save, read_lease, relay_layout,
     relay_plan, resolvers_acceptable, resume, start_dhcp, steering, uplink, validate_lease, wpa, Cmd, Helper, Lease,
-    LeaseChange, Network, Session, Step, Transaction, IFACE, JOURNAL, ROOT,
+    LeaseChange, Network, Session, Transaction, IFACE, JOURNAL, ROOT,
 };
 
 /// How long the new DHCP client may take to renew the address.
@@ -104,8 +104,12 @@ fn take_over(session: &mut Session, installed: &Lease, prefix: u32, lan_ip: Ipv4
         }
     }
     session.dns = Transaction::load(&root.join("dns.json"))?;
-    let resolver = installed.dns.first().copied().unwrap_or(installed.gateway).to_string();
-    session.dns.adopt(Step::new(Cmd::new("@u60-relay-dns", &[&resolver]), Cmd::new("@u60-relay-dns", &[])))?;
+    // The previous build journaled the RETURN in `network.json`; either
+    // journal's `-D` undoes it.
+    for step in super::portal::web_bypasses() {
+        session.dns.adopt(step)?;
+    }
+    session.dns.adopt(super::resolver(installed))?;
     // The previous tables keep working until here; IPv6 adds its part next.
     session.uplink.adopt(relay_layout(installed, lan_ip, lan_mask))
 }
@@ -270,7 +274,7 @@ mod tests {
         assert!(session_supplicant(&args(&format!("/usr/sbin/wpa_supplicant -D nl80211 -i {IFACE} -c {ROOT}/wpa.conf -qq"))));
         assert!(!session_supplicant(&args(&format!("wpa_supplicant -D nl80211 -i {IFACE} -c {ROOT}/recover.conf -qq"))));
         assert!(!session_supplicant(&args(&format!("wpa_supplicant -D nl80211 -i wlan0 -c {ROOT}/wpa.conf"))));
-        assert!(!session_supplicant(&args("hostapd -i u60sta0 -c /tmp/zte-agent-relay/wpa.conf")));
+        assert!(!session_supplicant(&args("hostapd -i ath20 -c /tmp/zte-agent-relay/wpa.conf")));
     }
 
     #[test]

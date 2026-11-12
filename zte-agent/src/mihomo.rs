@@ -86,10 +86,12 @@ pub struct Mihomo {
     profile_revision: Mutex<u64>,
     library_revision: AtomicU64,
     status_cache: Mutex<Option<(profiles::LibraryStamp, Value)>>,
-    /// Fingerprint (secret masked) of the last configuration that passed
-    /// `mihomo -t` and then started; an identical restart skips the check.
-    /// Kept in `VALIDATED` for this boot, so a restarted agent reuses it.
-    validated_config: Mutex<Option<String>>,
+    /// Fingerprints (secret and egress interface masked) of the last
+    /// configurations that passed `mihomo -t`, newest first; a start with
+    /// one of them skips the check (a relay/cellular switch, a fallback to
+    /// the previous profile). Kept in `VALIDATED` for this boot, so a
+    /// restarted agent reuses them.
+    validated_config: Mutex<Vec<String>>,
     digests: geodata::Digests,
     subscription_dns: Mutex<Vec<std::net::Ipv4Addr>>,
     passes: dashboard::Passes,
@@ -214,14 +216,23 @@ impl Mihomo {
 
     /// Starts the controller and tells it the agent started (it adopts this
     /// boot's interception when the owner wants Mihomo on, else rolls back
-    /// what a previous process left). `local` is the management name.
+    /// what a previous process left). `local` is the management name. A
+    /// fresh start waits for `restore`, which `main` calls once the vendor
+    /// boot sync released and the relay's journals were rolled back
+    /// (section 5.2): started earlier, it ran without an uplink and
+    /// restarted when the relay came up, or used up its first retries. A
+    /// panic on the controller's thread ends the agent (`supervised`).
     pub fn start(self: &Arc<Self>, local: String) {
         let (tx, rx) = mpsc::channel();
-        let port = DevicePort::new(Arc::clone(self), local.clone());
+        let port = DevicePort::new(Arc::clone(self), local);
         let controller = controller::Controller::new(port, rx, tx.clone(), Arc::clone(&self.shared), controller::Timings::default());
-        crate::system::spawn_named("mihomo", move || controller.run());
+        crate::system::spawn_named("mihomo", move || {
+            controller.supervised(|why| {
+                crate::netlog!("[mihomo] the controller thread panicked ({why}); ending the agent so that its guard starts it again and it adopts the interception");
+                std::process::abort();
+            });
+        });
         let _ = tx.send(Message::Boot);
-        let _ = tx.send(Message::Enable { local, owner: false, reply: None });
         let guard = std::sync::Mutex::new(tx.clone());
         crate::net_guard::on_settled(move || {
             let _ = guard.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(Message::Guard);
@@ -262,8 +273,8 @@ impl Mihomo {
         *self
             .validated_config
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        remember_validation(&self.root, None);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Vec::new();
+        remember_validation(&self.root, &[]);
         net::private_dir(&self.root)?;
         let core = self.download(CORE_URL, CORE_SHA, 32 * 1024 * 1024)?;
         let mut binary = Vec::new();
@@ -348,13 +359,10 @@ impl Mihomo {
         ))
     }
 
-    fn check(&self, name: &str) -> Result<(), String> {
-        self.check_with(name, false)
-    }
-
     /// `background` keeps a validation that runs beside a live core (profile
-    /// refresh) from competing with forwarding: one Go execution slot, a soft memory
-    /// limit for the Go runtime, and a lower scheduling priority.
+    /// refresh, a profile change before the restart) from competing with
+    /// forwarding: one Go execution slot, a soft memory limit for the Go
+    /// runtime, and a lower scheduling priority.
     fn check_with(&self, name: &str, background: bool) -> Result<(), String> {
         let mut c = Command::new(self.root.join("mihomo"));
         c.env("SKIP_SYSTEM_IPV6_CHECK", "true");
@@ -417,14 +425,18 @@ impl Mihomo {
     /// After the agent starts: turn Mihomo on again if the owner left it on
     /// (an update, a crash or a reboot), retrying (D2) while that holds.
     /// Call after the relay's recovery, or the core would bind to a stale
-    /// relay route.
+    /// relay route. In D3 it retries at once rather than at the next step.
     pub fn restore(&self, local_name: &str) {
         if !self.wants_restore() {
             return;
         }
-        match self.command(|reply| Message::Enable { local: local_name.into(), owner: false, reply: Some(reply) }) {
-            Ok(()) => crate::netlog!("[mihomo] restored"),
-            Err(e) => crate::netlog!("[mihomo] restore failed: {e}; retrying"),
+        let result = self.command(|reply| Message::Enable { local: local_name.into(), owner: false, reply: Some(reply) });
+        let s = self.snapshot();
+        let retry = s.retry_at.map_or_else(|| "no retry is scheduled".to_owned(), |at| format!("next retry in {} s", at.saturating_duration_since(Instant::now()).as_secs()));
+        match (result, s.phase) {
+            (Ok(()), Phase::Running) => crate::netlog!("[mihomo] restore: running generation={}", s.generation),
+            (Ok(()), phase) => crate::netlog!("[mihomo] restore: {} ({retry})", phase.name()),
+            (Err(e), phase) => crate::netlog!("[mihomo] restore did not start the core: {e}; state={} ({retry})", phase.name()),
         }
     }
 
@@ -543,7 +555,7 @@ impl controller::Port for DevicePort {
         self.m.operation.try_lock().is_err().then(|| "A Mihomo operation is in progress".into())
     }
 
-    fn prepare(&mut self, source: &Source) -> Result<Prepared, String> {
+    fn prepare(&mut self, source: &Source, serving: bool) -> Result<Prepared, String> {
         let m = &self.m;
         let prepared = match source {
             Source::Previous(previous) => (**previous).clone(),
@@ -587,10 +599,7 @@ impl controller::Port for DevicePort {
                 // A user may have disabled cellular data while Wi-Fi is offline. Keep
                 // the core available without creating a route or enabling the modem.
                 if Cmd::new("ip", &["-4", "route", "get", "1.1.1.1"]).run().is_ok_and(|route| route.contains(&format!("dev {}", ids::RELAY_IFACE))) {
-                    if let Err(error) = crate::network_clock::sync_wifi() {
-                        // A captive portal must not tear down working IPv4 relay.
-                        crate::netlog!("[clock] {error}");
-                    }
+                    check_clock();
                     config.as_mapping_mut().unwrap().insert(Yaml::from("interface-name"), Yaml::from(ids::RELAY_IFACE));
                 }
                 // Always written, so a first start and a restart with the same
@@ -606,16 +615,20 @@ impl controller::Port for DevicePort {
         };
         net::write_private(&m.root.join("config.yaml"), prepared.config.as_bytes())?;
         let fingerprint = m.validation_fingerprint(&prepared.config, &prepared.secret);
-        let reused = fingerprint.is_some() && *m.validated_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner) == fingerprint;
+        let reused = fingerprint.as_ref().is_some_and(|key| m.validated_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(key));
         if reused {
             crate::netlog!("[mihomo] validation reused");
         } else {
-            m.check("config.yaml")?;
+            m.check_with("config.yaml", serving)?;
             // Only dependencies that stayed the same across the check passed it.
             let after = m.validation_fingerprint(&prepared.config, &prepared.secret);
-            let validated = fingerprint.filter(|key| after.as_ref() == Some(key));
-            remember_validation(&m.root, validated.as_deref());
-            *m.validated_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = validated;
+            if let Some(key) = fingerprint.filter(|key| after.as_ref() == Some(key)) {
+                let mut validated = m.validated_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                validated.retain(|k| *k != key);
+                validated.insert(0, key);
+                validated.truncate(VALIDATIONS_KEPT);
+                remember_validation(&m.root, &validated);
+            }
         }
         if self.lan.is_none() {
             self.lan = Some(lan_address()?);
@@ -632,6 +645,10 @@ impl controller::Port for DevicePort {
             return Err("Mihomo's transparent proxy port is occupied".into());
         }
         Ok(())
+    }
+
+    fn owns(&mut self) -> bool {
+        self.effects.is_some()
     }
 
     fn engage(&mut self, how: Engage) -> Result<(), String> {
@@ -809,20 +826,21 @@ impl controller::Port for DevicePort {
         Ok(())
     }
 
-    fn uplink(&mut self) -> egress::Uplink {
-        egress::Uplink::observe()
+    fn uplink(&mut self, upstream: bool) -> egress::Uplink {
+        egress::Uplink::observe(upstream)
     }
 
-    fn reconcile(&mut self) -> Result<(), String> {
-        let Some(effects) = self.effects.as_mut() else { return Ok(()) };
+    fn reconcile(&mut self) -> controller::Guarded {
+        let Some(effects) = self.effects.as_mut() else { return controller::Guarded { result: Ok(()), confirmed: false } };
         let mut result = effects.tx.reconcile();
         match effects.tables.reconcile(&mut effect::Device) {
             Ok(true) => result.restored.push("nftables tables".into()),
             Ok(false) => {}
             Err(e) => result.failed.push(e),
         }
+        let confirmed = effects.tables.confirmed();
         self.guard.after(&result);
-        crate::net_guard::report("mihomo", result)
+        controller::Guarded { result: crate::net_guard::report("mihomo", result), confirmed }
     }
 
     fn wanted(&mut self) -> bool {
@@ -907,30 +925,65 @@ fn tables_step() -> Step {
     Step::new(Cmd::new("@u60-mihomo-nft", &["tables"]), Cmd::new("@u60-mihomo-nft", &["remove"]))
 }
 
-/// Identifies a configuration by content with the per-start secret masked.
-/// The last validation's fingerprint (hashes and file identities, nothing
-/// secret), for this boot only.
-const VALIDATED: &str = "validated";
+/// Checks UTC over the relay (`network_clock::sync_wifi`: TLS nodes need a
+/// trusted clock with cellular off) on a thread of its own, one at a time.
+/// A start never waits for it: a failing check took 4–16 s, inside a planned
+/// restart's or an adoption's blackout. The agent restored its lower bound
+/// at start; a check that passed is reused for 300 s.
+fn check_clock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static CHECKING: AtomicBool = AtomicBool::new(false);
+    if CHECKING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = crate::system::try_spawn_named("mihomo-clock", || {
+        if let Err(error) = crate::network_clock::sync_wifi() {
+            // A captive portal must not tear down working IPv4 relay.
+            crate::netlog!("[clock] {error}");
+        }
+        CHECKING.store(false, Ordering::SeqCst);
+    });
+    if spawned.is_err() {
+        CHECKING.store(false, Ordering::SeqCst);
+    }
+}
 
-fn remember_validation(root: &Path, fingerprint: Option<&str>) {
+/// The validations' fingerprints (hashes and file identities, nothing
+/// secret), newest first, for this boot only. An older agent reads one
+/// fingerprint here: several never match it, so it validates again.
+const VALIDATED: &str = "validated";
+/// The relay's and cellular's configurations, and a previous profile.
+const VALIDATIONS_KEPT: usize = 4;
+
+fn remember_validation(root: &Path, fingerprints: &[String]) {
     let path = root.join(VALIDATED);
-    let _ = match fingerprint {
-        Some(key) => net::write_private(&path, format!("{} {key}", net::boot_id()).as_bytes()),
-        None => fs::remove_file(path).map_err(|e| e.to_string()),
+    let _ = if fingerprints.is_empty() {
+        fs::remove_file(path).map_err(|e| e.to_string())
+    } else {
+        net::write_private(&path, format!("{} {}", net::boot_id(), fingerprints.join(" ")).as_bytes())
     };
 }
 
-fn remembered_validation(root: &Path) -> Option<String> {
-    let text = fs::read_to_string(root.join(VALIDATED)).ok()?;
-    let (boot, key) = text.split_once(' ')?;
-    (!boot.is_empty() && boot == net::boot_id()).then(|| key.to_owned())
+fn remembered_validation(root: &Path) -> Vec<String> {
+    let text = fs::read_to_string(root.join(VALIDATED)).unwrap_or_default();
+    let mut words = text.split_whitespace();
+    match words.next() {
+        Some(boot) if boot == net::boot_id() => words.map(str::to_owned).take(VALIDATIONS_KEPT).collect(),
+        _ => Vec::new(),
+    }
 }
 
+/// Identifies a configuration by content with the per-start secret masked
+/// and the egress interface (`interface-name`, top level) left out: `mihomo
+/// -t` does not bind it, so a relay/cellular switch alone reuses a passed
+/// validation (section 5.6).
 fn config_fingerprint(config: &str, secret: &str) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(config.replace(secret, "<secret>").as_bytes())
-    )
+    let mut digest = Sha256::new();
+    for line in config.replace(secret, "<secret>").lines().filter(|line| !line.starts_with("interface-name:")) {
+        digest.update(line.as_bytes());
+        digest.update(b"\n");
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn valid_runtime(runtime: &Value) -> bool {
@@ -1403,14 +1456,15 @@ mod tests {
     fn a_validation_is_remembered_for_this_boot_only() {
         let dir = std::env::temp_dir().join(format!("u60-validated-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        remember_validation(&dir, Some("abc:1:2"));
+        remember_validation(&dir, &["abc:1:2".to_owned(), "def:3:4".to_owned()]);
         let boot = net::boot_id();
-        assert_eq!(remembered_validation(&dir), (!boot.is_empty()).then(|| "abc:1:2".to_owned()), "no boot id (not Linux): never reused");
+        let expected: Vec<String> = if boot.is_empty() { Vec::new() } else { vec!["abc:1:2".into(), "def:3:4".into()] };
+        assert_eq!(remembered_validation(&dir), expected, "no boot id (not Linux): never reused");
         fs::write(dir.join(VALIDATED), "another-boot abc:1:2").unwrap();
-        assert_eq!(remembered_validation(&dir), None, "another boot's validation is not reused");
-        remember_validation(&dir, None);
+        assert!(remembered_validation(&dir).is_empty(), "another boot's validation is not reused");
+        remember_validation(&dir, &[]);
         assert!(!dir.join(VALIDATED).exists());
-        assert_eq!(Mihomo::at(dir.clone(), Arc::new(Mutex::new(()))).validated_config.lock().unwrap().as_deref(), None);
+        assert!(Mihomo::at(dir.clone(), Arc::new(Mutex::new(()))).validated_config.lock().unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1698,10 +1752,10 @@ mod tests {
             runtime: json!({"mode": "rule", "log-level": "info"}),
             routes: routing::Routes::default(),
             dns: Vec::new(),
-            config: "interface-name: u60sta0\nrule-providers:\n  Web: {type: http, behavior: ipcidr, url: 'https://x', path: ./w.yaml}\n".into(),
+            config: "interface-name: ath20\nrule-providers:\n  Web: {type: http, behavior: ipcidr, url: 'https://x', path: ./w.yaml}\n".into(),
         };
         let before: routing::Selected = [("G".to_owned(), "DIRECT".to_owned())].into();
-        let configs = json!({"mode": "rule", "interface-name": "u60sta0"});
+        let configs = json!({"mode": "rule", "interface-name": "ath20"});
         let proxies = |now: &str| json!({"proxies": {"G": {"type": "Selector", "now": now}}});
         let providers = json!({"providers": {"Web": {"ruleCount": 3}}});
         assert!(reload_findings(&prepared, Some(&configs), Some(&proxies("DIRECT")), Some(&providers), &before).is_ok());
@@ -1709,7 +1763,7 @@ mod tests {
         assert!(fell.contains("COMPATIBLE"), "{fell}");
         assert!(reload_findings(&prepared, Some(&configs), Some(&proxies("P")), Some(&providers), &before).is_err(), "a choice not restored");
         assert!(reload_findings(&prepared, Some(&configs), Some(&proxies("DIRECT")), Some(&json!({"providers": {}})), &before).unwrap_err().contains("Web"));
-        assert!(reload_findings(&prepared, Some(&json!({"mode": "global", "interface-name": "u60sta0"})), Some(&proxies("DIRECT")), Some(&providers), &before).is_err());
+        assert!(reload_findings(&prepared, Some(&json!({"mode": "global", "interface-name": "ath20"})), Some(&proxies("DIRECT")), Some(&providers), &before).is_err());
         assert!(reload_findings(&prepared, Some(&json!({"mode": "rule"})), Some(&proxies("DIRECT")), Some(&providers), &before).unwrap_err().contains("interface"));
         assert!(reload_findings(&prepared, None, Some(&proxies("DIRECT")), Some(&providers), &before).is_err(), "no answer is no proof");
     }
@@ -1728,13 +1782,16 @@ mod tests {
     }
 
     #[test]
-    fn a_config_fingerprint_ignores_only_the_per_start_secret() {
+    fn a_config_fingerprint_ignores_only_the_per_start_secret_and_the_egress_interface() {
         let config = |secret: &str, interface: &str| {
-            format!("secret: {secret}\nlisteners: [{{password: {secret}}}]\ninterface-name: {interface}\n")
+            format!("secret: {secret}\nlisteners: [{{password: {secret}}}]\ninterface-name: {interface}\nproxies:\n- name: a\n  interface-name: {interface}\n")
         };
-        let a = config_fingerprint(&config("aaaa", "u60sta0"), "aaaa");
-        assert_eq!(a, config_fingerprint(&config("bbbb", "u60sta0"), "bbbb"));
-        assert_ne!(a, config_fingerprint(&config("aaaa", "rmnet0"), "aaaa"));
+        let a = config_fingerprint(&config("aaaa", "ath20"), "aaaa");
+        assert_eq!(a, config_fingerprint(&config("bbbb", "ath20"), "bbbb"));
+        let top = |interface: &str| format!("secret: s\n{interface}mode: rule\n");
+        assert_eq!(config_fingerprint(&top(""), "s"), config_fingerprint(&top("interface-name: ath20\n"), "s"), "relay or cellular: the same validation");
+        assert_ne!(a, config_fingerprint(&config("aaaa", "rmnet0"), "aaaa"), "anything nested still counts");
+        assert_ne!(config_fingerprint(&top(""), "s"), config_fingerprint("secret: s\nmode: global\n", "s"));
     }
 
     #[test]
@@ -2085,7 +2142,7 @@ hosts: {interface-name: 192.0.2.1}
                 if matches!(request, "cell" | "offline" | "stalled") {
                     None
                 } else {
-                    Some("u60sta0")
+                    Some("ath20")
                 }
             );
             assert_eq!(

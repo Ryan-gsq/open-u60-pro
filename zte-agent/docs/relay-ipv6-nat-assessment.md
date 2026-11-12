@@ -1,5 +1,7 @@
 # Wi-Fi relay IPv6 / NAT66 assessment
 
+> 2026-11-12 note: the station named `u60sta0` here is `ath20` since 2026-11-12.
+
 Date: 2026-10-25. Scope: design and primary-source research, not an implemented
 feature or hardware acceptance. No router settings or production code changed.
 

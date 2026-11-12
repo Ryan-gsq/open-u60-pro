@@ -185,12 +185,12 @@ def topology():
     for ns in ("client", "router", "upstream", "cell"):
         sh("ip", "netns", "add", ns)
         sh("ip", "link", "set", "lo", "up", ns=ns)
-    for router_side, peer, peer_ns in (("br-lan", "c0", "client"), ("u60sta0", "u0", "upstream"), ("rmnet_data0", "m0", "cell")):
+    for router_side, peer, peer_ns in (("br-lan", "c0", "client"), ("ath20", "u0", "upstream"), ("rmnet_data0", "m0", "cell")):
         sh("ip", "link", "add", router_side, "netns", "router", "type", "veth", "peer", "name", peer, "netns", peer_ns)
     addresses = (
         ("client", "c0", ["192.168.0.23/24", "fd12:3456:789a::23/64", "fd99::23/64"]),
         ("router", "br-lan", ["192.168.0.1/24", "fd12:3456:789a::1/64", "fd99::1/64"]),
-        ("router", "u60sta0", ["10.20.0.7/24", "2001:db8:20::7/64"]),
+        ("router", "ath20", ["10.20.0.7/24", "2001:db8:20::7/64"]),
         ("upstream", "u0", ["10.20.0.1/24", "2001:db8:20::1/64"]),
         ("router", "rmnet_data0", ["100.100.0.2/24", "2001:db8:c::2/64"]),
         ("cell", "m0", ["100.100.0.1/24", "2001:db8:c::1/64"]),
@@ -203,8 +203,8 @@ def topology():
     routes = (
         ("client", ["default", "via", "192.168.0.1"]),
         ("client", ["-6", "default", "via", "fd12:3456:789a::1"]),
-        ("router", ["default", "via", "10.20.0.1", "dev", "u60sta0"]),
-        ("router", ["-6", "default", "via", "2001:db8:20::1", "dev", "u60sta0"]),
+        ("router", ["default", "via", "10.20.0.1", "dev", "ath20"]),
+        ("router", ["-6", "default", "via", "2001:db8:20::1", "dev", "ath20"]),
         ("router", ["-6", "2001:db8:99::/64", "via", "2001:db8:c::1", "dev", "rmnet_data0"]),
         ("upstream", ["192.168.0.0/24", "via", "10.20.0.7"]),
         ("upstream", ["-6", "fd12:3456:789a::/64", "via", "2001:db8:20::7"]),
@@ -261,7 +261,7 @@ def restore_inputs():
     network = next(r for r in inputs if r["plan"] == "network")
     again = sh(network["program"], "--noflush", "--wait", "2", ns="router", check=False, stdin=network["input"])
     rules = [l for l in sh("iptables", "-w", "2", "-S", "U60_RELAY_FWD", ns="router").stdout.splitlines() if l.startswith("-A ")]
-    report("an existing chain of that name is neither taken over nor flushed", again.returncode != 0 and len(rules) == 3, again.stderr.strip())
+    report("an existing chain of that name is neither taken over nor flushed", again.returncode != 0 and len(rules) == 2, again.stderr.strip())
 
 
 def data_plane():
@@ -375,7 +375,7 @@ def boot_id():
 
 def engage():
     """Everything this version applies for a relay with NAT66, and its journals."""
-    for ns, link, cidr in (("router", "u60sta0", "10.20.0.7/24"), ("router", "br-lan", "fd12:3456:789a::1/64")):
+    for ns, link, cidr in (("router", "ath20", "10.20.0.7/24"), ("router", "br-lan", "fd12:3456:789a::1/64")):
         sh("ip", "addr", "replace", cidr, "dev", link, ns=ns)
     load("full")
     with open(f"{DATA}/restore.json") as f:
@@ -388,7 +388,7 @@ def engage():
         if sh(tool, "-w", "2", "-t", "nat", "-C", *rule, ns="router", check=False).returncode != 0:
             sh(tool, "-w", "2", "-t", "nat", "-I", rule[0], "1", *rule[1:], ns="router")
     os.makedirs(JOURNAL, exist_ok=True)
-    for name in ("wireless", "network", "ipv6-setup", "ipv6-network"):
+    for name in ("wireless", "network", "dns", "ipv6-setup", "ipv6-network"):
         with open(f"{DATA}/{name}.json") as f:
             journal = json.load(f)
         journal["boot"] = boot_id()
@@ -401,8 +401,8 @@ def clean():
     legacy = "".join(sh(tool, "-w", "2", "-t", table, "-S", ns="router").stdout for tool in ("iptables", "ip6tables") for table in ("filter", "nat"))
     chains = "U60_" not in legacy
     portal_gone = "zte-agent-wifi-relay" not in legacy
-    masquerade = "-o u60sta0 -j MASQUERADE" not in legacy
-    journals = not any(os.path.exists(f"{JOURNAL}/{name}.json") for name in ("wireless", "network", "ipv6-setup", "ipv6-network"))
+    masquerade = "-o ath20 -m comment --comment zte-agent-wifi-relay -j MASQUERADE" not in legacy
+    journals = not any(os.path.exists(f"{JOURNAL}/{name}.json") for name in ("wireless", "network", "dns", "ipv6-setup", "ipv6-network"))
     return tables, chains, portal_gone, masquerade, journals
 
 

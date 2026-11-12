@@ -1,0 +1,268 @@
+### ip6tables -t filter
+-P INPUT DROP
+-P FORWARD DROP
+-P OUTPUT ACCEPT
+-N MINIUPNPD
+-N U60_R6_FWD
+-N U60_R6_IN
+-N U60_RELAY_IN
+-N client_access_network
+-N domainname_filter
+-N forward_lan_accept
+-N forward_lan_isolate
+-N forward_special_protocol
+-N forwarding_lan_rule
+-N forwarding_phantap_rule
+-N forwarding_rule
+-N forwarding_swip_rule
+-N forwarding_wan_rule
+-N input_lan_rule
+-N input_phantap_rule
+-N input_rule
+-N input_swip_rule
+-N input_wan_rule
+-N ipset_web_filter
+-N output_lan_rule
+-N output_phantap_rule
+-N output_rule
+-N output_swip_rule
+-N output_wan_rule
+-N pctrl_timelimit
+-N redirect_chain
+-N reject
+-N second_auth_redirect_chain
+-N syn_flood
+-N sys_fw_filter
+-N zone_lan_dest_ACCEPT
+-N zone_lan_forward
+-N zone_lan_input
+-N zone_lan_output
+-N zone_lan_src_ACCEPT
+-N zone_phantap_dest_ACCEPT
+-N zone_phantap_forward
+-N zone_phantap_input
+-N zone_phantap_output
+-N zone_phantap_src_DROP
+-N zone_swip_dest_ACCEPT
+-N zone_swip_forward
+-N zone_swip_input
+-N zone_swip_output
+-N zone_swip_src_ACCEPT
+-N zone_wan_dest_ACCEPT
+-N zone_wan_dest_REJECT
+-N zone_wan_forward
+-N zone_wan_input
+-N zone_wan_output
+-N zone_wan_src_REJECT
+-A INPUT -i ath20 -j U60_RELAY_IN
+-A INPUT -i lo -m comment --comment "!fw3" -j ACCEPT
+-A INPUT -m comment --comment "!fw3: Custom input rule chain" -j input_rule
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "!fw3" -j ACCEPT
+-A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m comment --comment "!fw3" -j syn_flood
+-A INPUT -i br-lan -m comment --comment "!fw3" -j zone_lan_input
+-A INPUT -i mhi_swip0 -m comment --comment "!fw3" -j zone_swip_input
+-A INPUT -i br-phantap -m comment --comment "!fw3" -j zone_phantap_input
+-A INPUT -m comment --comment "!fw3" -j reject
+-A FORWARD -j second_auth_redirect_chain
+-A FORWARD -j U60_R6_FWD
+-A FORWARD -m comment --comment "!fw3: Custom forwarding rule chain" -j forwarding_rule
+-A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "!fw3" -j ACCEPT
+-A FORWARD -i br-lan -m comment --comment "!fw3" -j zone_lan_forward
+-A FORWARD -i mhi_swip0 -m comment --comment "!fw3" -j zone_swip_forward
+-A FORWARD -i br-phantap -m comment --comment "!fw3" -j zone_phantap_forward
+-A FORWARD -m comment --comment "!fw3" -j reject
+-A OUTPUT -o lo -m comment --comment "!fw3" -j ACCEPT
+-A OUTPUT -m comment --comment "!fw3: Custom output rule chain" -j output_rule
+-A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "!fw3" -j ACCEPT
+-A OUTPUT -o br-lan -m comment --comment "!fw3" -j zone_lan_output
+-A OUTPUT -o mhi_swip0 -m comment --comment "!fw3" -j zone_swip_output
+-A OUTPUT -o br-phantap -m comment --comment "!fw3" -j zone_phantap_output
+-A U60_R6_FWD -s fd1b:f7f5:d006::/64 -i br-lan -o ath20 -j ACCEPT
+-A U60_R6_FWD -i ath20 -o br-lan -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A U60_R6_IN -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A U60_R6_IN -s fe80::/10 -p ipv6-icmp -m icmp6 --icmpv6-type 134 -m hl --hl-eq 255 -j ACCEPT
+-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 135 -m hl --hl-eq 255 -j ACCEPT
+-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT
+-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 1 -j ACCEPT
+-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 2 -j ACCEPT
+-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 3 -j ACCEPT
+-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 4 -j ACCEPT
+-A U60_R6_IN -p udp -m udp --sport 547 --dport 546 -j ACCEPT
+-A U60_RELAY_IN -j U60_R6_IN
+-A forwarding_lan_rule -j forward_lan_accept
+-A forwarding_lan_rule -j forward_lan_isolate
+-A forwarding_rule -j forward_special_protocol
+-A forwarding_rule -j client_access_network
+-A forwarding_rule -j domainname_filter
+-A forwarding_rule -j ipset_web_filter
+-A forwarding_rule -j pctrl_timelimit
+-A input_rule -j sys_fw_filter
+-A input_rule -j domainname_filter
+-A ipset_web_filter -i br-lan -p tcp -m set --match-set domainfilter_v6_lan dst -m multiport --dports 80,443 -j DROP
+-A ipset_web_filter -i br-lan2 -p tcp -m set --match-set domainfilter_v6_lan2 dst -m multiport --dports 80,443 -j DROP
+-A ipset_web_filter -i br-lan3 -p tcp -m set --match-set domainfilter_v6_lan3 dst -m multiport --dports 80,443 -j DROP
+-A ipset_web_filter -i br-lan4 -p tcp -m set --match-set domainfilter_v6_lan4 dst -m multiport --dports 80,443 -j DROP
+-A reject -p tcp -m comment --comment "!fw3" -j REJECT --reject-with tcp-reset
+-A reject -m comment --comment "!fw3" -j REJECT --reject-with icmp6-port-unreachable
+-A syn_flood -m limit --limit 25/sec --limit-burst 50 -m comment --comment "!fw3" -j RETURN
+-A syn_flood -m comment --comment "!fw3" -j DROP
+-A zone_lan_dest_ACCEPT -o br-lan -m comment --comment "!fw3" -j ACCEPT
+-A zone_lan_forward -m comment --comment "!fw3: Custom lan forwarding rule chain" -j forwarding_lan_rule
+-A zone_lan_forward -m comment --comment "!fw3: Zone lan to wan forwarding policy" -j zone_wan_dest_ACCEPT
+-A zone_lan_forward -m comment --comment "!fw3" -j zone_lan_dest_ACCEPT
+-A zone_lan_input -m comment --comment "!fw3: Custom lan input rule chain" -j input_lan_rule
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 129 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 1 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 2 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 3 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 4/0 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 4/1 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 133 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 135 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 134 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m comment --comment "!fw3: Allow-ICMPv6-Input-lan" -j ACCEPT
+-A zone_lan_input -p udp -m udp --dport 1900 -m comment --comment "!fw3: Allow-upnp-ipv6" -j ACCEPT
+-A zone_lan_input -m comment --comment "!fw3" -j zone_lan_src_ACCEPT
+-A zone_lan_output -m comment --comment "!fw3: Custom lan output rule chain" -j output_lan_rule
+-A zone_lan_output -m comment --comment "!fw3" -j zone_lan_dest_ACCEPT
+-A zone_lan_src_ACCEPT -i br-lan -m conntrack --ctstate NEW,UNTRACKED -m comment --comment "!fw3" -j ACCEPT
+-A zone_phantap_dest_ACCEPT -o br-phantap -m comment --comment "!fw3" -j ACCEPT
+-A zone_phantap_forward -m comment --comment "!fw3: Custom phantap forwarding rule chain" -j forwarding_phantap_rule
+-A zone_phantap_forward -m comment --comment "!fw3" -j zone_phantap_dest_ACCEPT
+-A zone_phantap_input -m comment --comment "!fw3: Custom phantap input rule chain" -j input_phantap_rule
+-A zone_phantap_input -m comment --comment "!fw3" -j zone_phantap_src_DROP
+-A zone_phantap_output -m comment --comment "!fw3: Custom phantap output rule chain" -j output_phantap_rule
+-A zone_phantap_output -m comment --comment "!fw3" -j zone_phantap_dest_ACCEPT
+-A zone_phantap_src_DROP -i br-phantap -m comment --comment "!fw3" -j DROP
+-A zone_swip_dest_ACCEPT -o mhi_swip0 -m comment --comment "!fw3" -j ACCEPT
+-A zone_swip_forward -m comment --comment "!fw3: Custom swip forwarding rule chain" -j forwarding_swip_rule
+-A zone_swip_forward -m comment --comment "!fw3" -j zone_swip_dest_ACCEPT
+-A zone_swip_input -m comment --comment "!fw3: Custom swip input rule chain" -j input_swip_rule
+-A zone_swip_input -m comment --comment "!fw3" -j zone_swip_src_ACCEPT
+-A zone_swip_output -m comment --comment "!fw3: Custom swip output rule chain" -j output_swip_rule
+-A zone_swip_output -m comment --comment "!fw3" -j zone_swip_dest_ACCEPT
+-A zone_swip_src_ACCEPT -i mhi_swip0 -m conntrack --ctstate NEW,UNTRACKED -m comment --comment "!fw3" -j ACCEPT
+-A zone_wan_forward -m comment --comment "!fw3: Custom wan forwarding rule chain" -j forwarding_wan_rule
+-A zone_wan_forward -p gre -m comment --comment "!fw3: Allow-IP6-GRE" -j zone_lan_dest_ACCEPT
+-A zone_wan_forward -m comment --comment "!fw3" -j zone_wan_dest_REJECT
+-A zone_wan_input -m comment --comment "!fw3: Custom wan input rule chain" -j input_wan_rule
+-A zone_wan_input -p udp -m udp --dport 546:547 -m comment --comment "!fw3: Allow-DHCPv6" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 129 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 1 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 2 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 3 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 4/0 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 4/1 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 133 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 135 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 134 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m comment --comment "!fw3: Allow-ICMPv6-Input" -j ACCEPT
+-A zone_wan_input -m comment --comment "!fw3" -j zone_wan_src_REJECT
+-A zone_wan_output -m comment --comment "!fw3: Custom wan output rule chain" -j output_wan_rule
+-A zone_wan_output -m comment --comment "!fw3" -j zone_wan_dest_ACCEPT
+### ip6tables -t nat
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P OUTPUT ACCEPT
+-P POSTROUTING ACCEPT
+-N redirect_chain
+-N remote_manager
+-N second_auth_redirect_chain
+-A PREROUTING -j second_auth_redirect_chain
+-A PREROUTING -j redirect_chain
+-A PREROUTING -j remote_manager
+-A redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN
+### ip6tables -t mangle
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+-P POSTROUTING ACCEPT
+-N guest_access_restrict
+-N main_access_restrict
+-N portmirror_postrouting
+-N portmirror_prerouting
+-N qcom_qos_filter_POSTROUTING
+-N qcom_qos_reset_POSTROUTING
+-N remote_mark
+-N second_auth_redirect_chain
+-N smart_mng
+-N smart_mng_app_filter
+-N smart_mng_cutoff
+-N smart_mng_defective_filter
+-N smart_mng_domain_filter
+-N smart_mng_time_ctl
+-N smart_mng_times_ctl
+-N smart_qos_policy
+-N tcp_mss
+-N wifi_multissid_isolate
+-A PREROUTING -j portmirror_prerouting
+-A PREROUTING -j tcp_mss
+-A PREROUTING -j second_auth_redirect_chain
+-A PREROUTING -j remote_mark
+-A PREROUTING -j smart_mng
+-A PREROUTING -j guest_access_restrict
+-A PREROUTING -j main_access_restrict
+-A POSTROUTING -j portmirror_postrouting
+-A POSTROUTING -j tcp_mss
+-A POSTROUTING -j qcom_qos_reset_POSTROUTING
+-A POSTROUTING -j qcom_qos_filter_POSTROUTING
+-A POSTROUTING -j smart_qos_policy
+-A POSTROUTING -j wifi_multissid_isolate
+-A smart_mng -j smart_mng_cutoff
+-A smart_mng -j smart_mng_app_filter
+-A smart_mng -j smart_mng_domain_filter
+-A smart_mng -j smart_mng_time_ctl
+-A smart_mng -j smart_mng_times_ctl
+-A smart_mng -j smart_mng_defective_filter
+-A wifi_multissid_isolate -m physdev --physdev-in wlan0 --physdev-out wlan1 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan1 --physdev-out wlan0 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan0 --physdev-out wlan3 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan3 --physdev-out wlan0 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan2 --physdev-out wlan1 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan2 --physdev-out wlan3 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan1 --physdev-out wlan2 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan3 --physdev-out wlan2 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in mld0 --physdev-out wlan1 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan1 --physdev-out mld0 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in mld0 --physdev-out wlan3 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan3 --physdev-out mld0 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in mld0 --physdev-out mld1 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in mld1 --physdev-out mld0 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan0 --physdev-out mld1 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in mld1 --physdev-out wlan0 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in wlan2 --physdev-out mld1 -j DROP
+-A wifi_multissid_isolate -m physdev --physdev-in mld1 --physdev-out wlan2 -j DROP
+### ip6tables -t raw
+-P PREROUTING ACCEPT
+-P OUTPUT ACCEPT
+-N zone_lan_helper
+-N zone_phantap_helper
+-N zone_swip_helper
+-A PREROUTING -i br-lan -m comment --comment "!fw3: lan CT helper assignment" -j zone_lan_helper
+-A PREROUTING -i mhi_swip0 -m comment --comment "!fw3: swip CT helper assignment" -j zone_swip_helper
+-A PREROUTING -i br-phantap -m comment --comment "!fw3: phantap CT helper assignment" -j zone_phantap_helper
+-A zone_lan_helper -p udp -m comment --comment "!fw3: Amanda backup and archiving proto" -m udp --dport 10080 -j CT --helper amanda
+-A zone_lan_helper -p tcp -m comment --comment "!fw3: FTP passive connection tracking" -m tcp --dport 21 -j CT --helper ftp
+-A zone_lan_helper -p udp -m comment --comment "!fw3: RAS proto tracking" -m udp --dport 1719 -j CT --helper RAS
+-A zone_lan_helper -p tcp -m comment --comment "!fw3: Q.931 proto tracking" -m tcp --dport 1720 -j CT --helper Q.931
+-A zone_lan_helper -p tcp -m comment --comment "!fw3: SANE scanner connection tracking" -m tcp --dport 6566 -j CT --helper sane
+-A zone_lan_helper -p tcp -m comment --comment "!fw3: SIP VoIP connection tracking" -m tcp --dport 5060 -j CT --helper sip
+-A zone_lan_helper -p udp -m comment --comment "!fw3: SIP VoIP connection tracking" -m udp --dport 5060 -j CT --helper sip
+-A zone_lan_helper -p udp -m comment --comment "!fw3: TFTP connection tracking" -m udp --dport 69 -j CT --helper tftp
+-A zone_phantap_helper -p udp -m comment --comment "!fw3: Amanda backup and archiving proto" -m udp --dport 10080 -j CT --helper amanda
+-A zone_phantap_helper -p tcp -m comment --comment "!fw3: FTP passive connection tracking" -m tcp --dport 21 -j CT --helper ftp
+-A zone_phantap_helper -p udp -m comment --comment "!fw3: RAS proto tracking" -m udp --dport 1719 -j CT --helper RAS
+-A zone_phantap_helper -p tcp -m comment --comment "!fw3: Q.931 proto tracking" -m tcp --dport 1720 -j CT --helper Q.931
+-A zone_phantap_helper -p tcp -m comment --comment "!fw3: SANE scanner connection tracking" -m tcp --dport 6566 -j CT --helper sane
+-A zone_phantap_helper -p tcp -m comment --comment "!fw3: SIP VoIP connection tracking" -m tcp --dport 5060 -j CT --helper sip
+-A zone_phantap_helper -p udp -m comment --comment "!fw3: SIP VoIP connection tracking" -m udp --dport 5060 -j CT --helper sip
+-A zone_phantap_helper -p udp -m comment --comment "!fw3: TFTP connection tracking" -m udp --dport 69 -j CT --helper tftp
+-A zone_swip_helper -p udp -m comment --comment "!fw3: Amanda backup and archiving proto" -m udp --dport 10080 -j CT --helper amanda
+-A zone_swip_helper -p tcp -m comment --comment "!fw3: FTP passive connection tracking" -m tcp --dport 21 -j CT --helper ftp
+-A zone_swip_helper -p udp -m comment --comment "!fw3: RAS proto tracking" -m udp --dport 1719 -j CT --helper RAS
+-A zone_swip_helper -p tcp -m comment --comment "!fw3: Q.931 proto tracking" -m tcp --dport 1720 -j CT --helper Q.931
+-A zone_swip_helper -p tcp -m comment --comment "!fw3: SANE scanner connection tracking" -m tcp --dport 6566 -j CT --helper sane
+-A zone_swip_helper -p tcp -m comment --comment "!fw3: SIP VoIP connection tracking" -m tcp --dport 5060 -j CT --helper sip
+-A zone_swip_helper -p udp -m comment --comment "!fw3: SIP VoIP connection tracking" -m udp --dport 5060 -j CT --helper sip
+-A zone_swip_helper -p udp -m comment --comment "!fw3: TFTP connection tracking" -m udp --dport 69 -j CT --helper tftp

@@ -1,5 +1,7 @@
 # DFS upstream acceptance — 2026-11-03
 
+> 2026-11-12 note: the station named `u60sta0` here is `ath20` since 2026-11-12.
+
 Device: U60 Pro B31, CN self-managed PHY. Upstream: `W_Game`, WPA2,
 5260 MHz (channel 52), approximately −46…−49 dBm. All management and probes
 used authorized USB ADB; the development Mac stayed on its own Internet link.

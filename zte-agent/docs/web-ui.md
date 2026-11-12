@@ -506,7 +506,8 @@ The per-network bandwidth choice (Keep negotiated bandwidth / Auto tuning,
 2026-11-03) is retired: `/ui/relay` has no bandwidth selector or Apply forms,
 `POST /ui/relay/tuning` and `POST /api/wifi-relay/tuning` are gone, and status
 no longer carries `width_mode`, `width` or `width_state`. The relay always
-keeps the negotiated width (it still resets it once after each association).
+keeps the negotiated width (the reset it made after each association was
+removed on 2026-11-12; nothing in the agent runs `iwpriv … chwidth`).
 `POST /api/wifi-relay/connect` ignores a `width_mode` an older page may still
 send. Saved records with `width_mode` (including `auto`) load unchanged and
 lose the field at their next write; remembering a network now stores only its

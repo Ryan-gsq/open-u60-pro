@@ -8,6 +8,7 @@ use std::sync::mpsc;
 struct FakeCore {
     generation: u64,
     alive: Arc<AtomicBool>,
+    world: Arc<Mutex<World>>,
 }
 
 impl CoreHandle for FakeCore {
@@ -19,6 +20,7 @@ impl CoreHandle for FakeCore {
     }
     fn stop(&self) -> bool {
         self.alive.store(false, Ordering::SeqCst);
+        self.world.lock().unwrap().events.push(format!("stop {}", self.generation));
         true
     }
 }
@@ -28,22 +30,42 @@ struct World {
     events: Vec<String>,
     wanted: bool,
     adoptable: bool,
+    /// Effects are held (`Port::owns`).
     owned: bool,
     steps: bool,
+    /// What the kernel holds.
     tables: Option<String>,
+    /// What `NftTables` would load on a reconcile (the last declared).
+    target: Option<String>,
+    /// A previous agent's journal and tables are still in the kernel.
+    leftover: bool,
     spawned: Vec<u64>,
     /// Errors for the next `prepare` calls (`None`: succeed).
     prepare: VecDeque<Option<String>>,
+    /// Errors for the next table loads, whatever their shape.
     tables_fail: VecDeque<String>,
+    /// Errors for the next loads of shapes starting with this name.
+    shape_fail: Vec<(String, String)>,
+    /// Errors for the next D3 withdrawals and rollbacks.
+    direct_fail: VecDeque<String>,
+    adopt_fail: Option<String>,
     release_fail: Option<String>,
     unready: bool,
+    /// Cores that never become ready, by spawn order (then ready).
+    unready_spawns: VecDeque<bool>,
+    unready_now: bool,
     resets: Vec<Scope>,
     selected_direct: bool,
     writes: Vec<String>,
     uplink: Uplink,
     busy: Option<String>,
+    guard_due: bool,
+    /// Panic in the next `engage` (a defect on the controller's thread).
+    panic: bool,
     /// Changes the DNS filter a `prepare` gives (the bypass setting).
     dns: u32,
+    /// The configuration a `prepare` gives routes for (none: empty).
+    config: Option<&'static str>,
     reload: Option<Result<u16, String>>,
     verify: Option<String>,
 }
@@ -74,30 +96,64 @@ impl Port for FakePort {
     }
     fn recover(&mut self) -> Result<(), String> {
         self.log("recover");
+        let mut w = self.world();
+        if let Some(error) = w.direct_fail.pop_front() {
+            return Err(error);
+        }
+        w.leftover = false;
+        w.tables = None;
         Ok(())
     }
     fn busy(&mut self) -> Option<String> {
         self.world().busy.clone()
     }
-    fn prepare(&mut self, source: &Source) -> Result<Prepared, String> {
+    fn prepare(&mut self, source: &Source, serving: bool) -> Result<Prepared, String> {
         let previous = matches!(source, Source::Previous(_));
-        self.log(match source { Source::Previous(_) => "prepare previous", Source::Reload(_) => "prepare reload", _ => "prepare" });
+        self.log(match (source, serving) {
+            (Source::Previous(_), _) => "prepare previous",
+            (Source::Reload(_), _) => "prepare reload",
+            (_, true) => "prepare serving",
+            _ => "prepare",
+        });
         if let Some(Some(error)) = self.world().prepare.pop_front() {
             return Err(error);
         }
         let dns = vec![format!("filter {}", self.world().dns)];
-        Ok(Prepared { secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode": "rule"}), routes: routing::Routes::default(), dns, config: if previous { "previous".into() } else { "selected".into() } })
+        let routes = self.world().config.map_or_else(routing::Routes::default, |yaml| routing::Routes::from(&serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml).unwrap()));
+        Ok(Prepared { secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode": "rule"}), routes, dns, config: if previous { "previous".into() } else { "selected".into() } })
     }
     fn ports_free(&mut self) -> Result<(), String> {
         Ok(())
     }
+    fn owns(&mut self) -> bool {
+        self.world().owned
+    }
+    /// As `DevicePort`: a fresh start claims names nothing holds, a start
+    /// from D3 needs the effects it kept, an adoption takes the previous
+    /// agent's.
     fn engage(&mut self, how: Engage) -> Result<(), String> {
         self.log(format!("engage {how:?}"));
         let mut w = self.world();
+        if std::mem::take(&mut w.panic) {
+            drop(w);
+            panic!("a defect on the controller's thread");
+        }
+        match how {
+            Engage::Fresh if w.owned || w.leftover => return Err("Mihomo's nftables tables are left from before; turn Mihomo off to clean them up".into()),
+            Engage::FromBackoff if !w.owned => return Err("Mihomo owns nothing to start from".into()),
+            Engage::Adopt => {
+                if let Some(error) = w.adopt_fail.clone() {
+                    return Err(error);
+                }
+                w.leftover = false;
+            }
+            _ => {}
+        }
         w.owned = true;
         w.steps = true;
         Ok(())
     }
+    /// As `NftTables`: a load that fails stays the target.
     fn tables(&mut self, shape: Shape) -> Result<(), String> {
         let name = match shape {
             Shape::Guard => "guard".to_owned(),
@@ -107,8 +163,12 @@ impl Port for FakePort {
         };
         self.log(format!("tables {name}"));
         let mut w = self.world();
+        w.target = Some(name.clone());
         if let Some(error) = w.tables_fail.pop_front() {
             return Err(error);
+        }
+        if let Some(at) = w.shape_fail.iter().position(|(prefix, _)| name.starts_with(prefix.as_str())) {
+            return Err(w.shape_fail.remove(at).1);
         }
         w.tables = Some(name);
         Ok(())
@@ -119,8 +179,15 @@ impl Port for FakePort {
     fn direct(&mut self) -> Result<(), String> {
         self.log("direct");
         let mut w = self.world();
+        if let Some(error) = w.direct_fail.pop_front() {
+            if w.owned {
+                w.target = Some("reject".into());
+            }
+            return Err(error);
+        }
         if w.owned {
             w.tables = Some("reject".into());
+            w.target = w.tables.clone();
             w.steps = false;
         }
         Ok(())
@@ -134,15 +201,20 @@ impl Port for FakePort {
         w.owned = false;
         w.steps = false;
         w.tables = None;
+        w.target = None;
+        w.leftover = false;
         Ok(())
     }
     fn spawn(&mut self, generation: u64, _: &Prepared, _: Sender<Message>) -> Result<Box<dyn CoreHandle>, String> {
         self.log(format!("spawn {generation}"));
-        self.world().spawned.push(generation);
-        Ok(Box::new(FakeCore { generation, alive: Arc::new(AtomicBool::new(true)) }))
+        let mut w = self.world();
+        w.spawned.push(generation);
+        w.unready_now = w.unready_spawns.pop_front().unwrap_or(false);
+        Ok(Box::new(FakeCore { generation, alive: Arc::new(AtomicBool::new(true)), world: Arc::clone(&self.0) }))
     }
     fn ready(&mut self, _: &Prepared) -> bool {
-        !self.world().unready
+        let w = self.world();
+        !w.unready && !w.unready_now
     }
     fn verify_routing(&mut self) -> Result<(), String> {
         Ok(())
@@ -178,11 +250,17 @@ impl Port for FakePort {
     fn verify_reload(&mut self, _: &Prepared, _: Option<&(String, bool)>, _: &Selected) -> Result<(), String> {
         self.world().verify.clone().map_or(Ok(()), Err)
     }
-    fn uplink(&mut self) -> Uplink {
+    fn uplink(&mut self, _: bool) -> Uplink {
         self.world().uplink.clone()
     }
-    fn reconcile(&mut self) -> Result<(), String> {
-        Ok(())
+    /// As `NftTables::reconcile`: the target is loaded.
+    fn reconcile(&mut self) -> Guarded {
+        self.log("reconcile");
+        let mut w = self.world();
+        if w.owned && w.target != w.tables {
+            w.tables = w.target.clone();
+        }
+        Guarded { result: Ok(()), confirmed: w.owned && w.target == w.tables }
     }
     fn wanted(&mut self) -> bool {
         self.world().wanted
@@ -195,7 +273,7 @@ impl Port for FakePort {
         false
     }
     fn guard_due(&mut self) -> bool {
-        false
+        self.world().guard_due
     }
     fn retry_reset(&mut self) {}
 }
@@ -221,10 +299,14 @@ struct Harness {
 
 impl Harness {
     fn new(world: World) -> Self {
+        Self::with(world, timings())
+    }
+
+    fn with(world: World, timings: Timings) -> Self {
         let port = FakePort(Arc::new(Mutex::new(world)));
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Snapshot::default()));
-        let controller = Controller::new(port.clone(), rx, tx.clone(), Arc::clone(&shared), timings());
+        let controller = Controller::new(port.clone(), rx, tx.clone(), Arc::clone(&shared), timings);
         let thread = std::thread::spawn(move || controller.run());
         Self { port, tx, shared, thread: Some(thread) }
     }
@@ -302,7 +384,7 @@ fn an_old_cores_late_exit_cannot_touch_the_new_one() {
     h.enable(true).unwrap();
     // The relay brought up an uplink the core was started without: a
     // planned restart to generation 2.
-    h.port.world().uplink = Uplink::sample("u60sta0", 9, "192.0.2.2", None);
+    h.port.world().uplink = Uplink::sample("ath20", 9, "192.0.2.2", None);
     h.tx.send(Message::Egress).unwrap();
     let s = h.until("generation 2", |s| s.generation == 2 && s.phase == Phase::Running);
     let events = h.events();
@@ -320,17 +402,17 @@ fn an_old_cores_late_exit_cannot_touch_the_new_one() {
 /// IPv6 is added to it later. The core restarts once, for the new IPv4.
 #[test]
 fn a_relay_switch_restarts_the_core_once() {
-    let h = Harness::new(World { uplink: Uplink::sample("u60sta0", 9, "192.168.2.124", Some("2409:8a00::5")), ..World::default() });
+    let h = Harness::new(World { uplink: Uplink::sample("ath20", 9, "192.168.2.124", Some("2409:8a00::5")), ..World::default() });
     h.enable(true).unwrap();
     let settle = || std::thread::sleep(Duration::from_millis(80));
     h.port.world().uplink = Uplink::default();
     h.tx.send(Message::Egress).unwrap();
     settle();
     assert_eq!(h.snapshot().generation, 1, "no egress: nothing to restart onto");
-    h.port.world().uplink = Uplink::sample("u60sta0", 10, "192.168.2.124", None);
+    h.port.world().uplink = Uplink::sample("ath20", 10, "192.168.2.124", None);
     h.tx.send(Message::Egress).unwrap();
     h.until("generation 2", |s| s.generation == 2 && s.phase == Phase::Running);
-    h.port.world().uplink = Uplink::sample("u60sta0", 10, "192.168.2.124", Some("2409:8a00::5"));
+    h.port.world().uplink = Uplink::sample("ath20", 10, "192.168.2.124", Some("2409:8a00::5"));
     h.tx.send(Message::Egress).unwrap();
     settle();
     let s = h.snapshot();
@@ -462,14 +544,24 @@ fn a_write_is_refused_unless_running() {
 fn a_new_profile_that_fails_falls_back_to_the_previous_one_without_going_direct() {
     let h = Harness::new(World::default());
     h.enable(true).unwrap();
+    // It does not validate: the running core never stopped.
     h.port.world().prepare.push_back(Some("invalid profile".into()));
+    let before = h.events().len();
+    let error = h.call(|reply| Message::Config { reply }).unwrap_err();
+    assert!(error.contains("running profile keeps serving"), "{error}");
+    let s = h.snapshot();
+    assert_eq!((s.phase, s.generation), (Phase::Running, 1));
+    assert_eq!(h.events()[before..], ["prepare serving"], "nothing held, nothing stopped");
+    // It validates but does not start: the previous one starts again.
+    h.port.world().unready_spawns.push_back(true);
     let error = h.call(|reply| Message::Config { reply }).unwrap_err();
     assert!(error.contains("previous profile was started again"), "{error}");
     assert_eq!(h.snapshot().phase, Phase::Running);
     assert!(h.events().contains(&"prepare previous".to_owned()));
     assert!(!h.events().contains(&"direct".to_owned()));
     // Both fail: the planned restart failed finally, D3.
-    h.port.world().prepare.extend([Some("invalid profile".into()), Some("previous broke too".into())]);
+    h.port.world().unready_spawns.push_back(true);
+    h.port.world().prepare.extend([None, Some("previous broke too".into())]);
     assert!(h.call(|reply| Message::Config { reply }).is_err());
     h.until("backoff", |s| s.phase == Phase::Backoff);
 }
@@ -544,4 +636,231 @@ fn a_dns_filter_change_reloads_tightened_and_falls_back_to_a_restart() {
     let reloads = h.events().iter().filter(|e| e.starts_with("reload")).count();
     h.call(|reply| Message::Bypass { reply }).unwrap();
     assert_eq!(h.events().iter().filter(|e| e.starts_with("reload")).count(), reloads);
+}
+
+/// D2 with a first wait long enough that only an early retry can start it.
+fn slow_retries() -> Timings {
+    Timings { retries: vec![Duration::from_secs(30)], ..timings() }
+}
+
+/// Finding 2, first case: a boot restore that failed before it held
+/// anything (an install in progress) retries by claiming the effects
+/// afresh, and keeps its own error meanwhile.
+#[test]
+fn a_retry_from_backoff_starts_fresh_when_nothing_is_held() {
+    let h = Harness::new(World { wanted: true, busy: Some("A Mihomo operation is in progress".into()), ..World::default() });
+    assert!(h.enable(false).is_err());
+    h.until("backoff", |s| s.phase == Phase::Backoff);
+    assert!(!h.port.world().owned);
+    std::thread::sleep(Duration::from_millis(150));
+    let error = h.snapshot().error.unwrap();
+    assert!(error.contains("in progress"), "the original error, not a missing journal: {error}");
+    h.port.world().busy = None;
+    h.until("started", |s| s.phase == Phase::Running);
+    let events = h.events();
+    assert!(events.contains(&"engage Fresh".to_owned()) && !events.contains(&"engage FromBackoff".to_owned()), "{events:?}");
+    assert_eq!(h.port.world().tables.as_deref(), Some("full/0"));
+}
+
+/// Finding 2, second case: an adoption that fails before it took the
+/// previous agent's effects leaves that agent's tables (DNS redirected to a
+/// core that is gone). They are rolled back before the status says direct;
+/// a rollback that fails is CleanupPending and retried; the retry then
+/// claims the effects afresh.
+#[test]
+fn a_failed_adoption_rolls_the_old_tables_back_before_going_direct() {
+    let world = World { wanted: true, adoptable: true, leftover: true, tables: Some("full/1".into()), adopt_fail: Some("Network cleanup paused: rule busy".into()), ..World::default() };
+    let h = Harness::with(world, slow_retries());
+    h.tx.send(Message::Boot).unwrap();
+    let s = h.until("backoff", |s| s.phase == Phase::Backoff);
+    assert!(s.error.unwrap().contains("did not come back"));
+    {
+        let w = h.port.world();
+        assert!(!w.leftover && w.tables.is_none(), "the old tables are gone: LAN DNS works");
+    }
+    h.port.world().adopt_fail = None;
+    h.enable(false).unwrap();
+    assert_eq!(h.snapshot().phase, Phase::Running);
+    assert!(h.events().contains(&"engage Fresh".to_owned()));
+    // The rollback itself fails: not "direct" while the old tables stay.
+    let world = World { wanted: true, adoptable: true, leftover: true, tables: Some("full/1".into()), adopt_fail: Some("busy".into()), direct_fail: ["Network cleanup paused: rule busy".to_owned()].into(), ..World::default() };
+    let h = Harness::new(world);
+    h.tx.send(Message::Boot).unwrap();
+    let s = h.until("cleanup pending", |s| s.phase == Phase::CleanupPending);
+    assert!(s.error.unwrap().contains("could not be withdrawn"));
+    assert!(h.port.world().leftover);
+    h.port.world().adopt_fail = None;
+    h.until("rolled back and started", |s| s.phase == Phase::Running);
+    assert!(!h.port.world().leftover);
+}
+
+/// Finding 3: the fake-ip reject table that withdraws interception after a
+/// core exit does not load. The state says the cleanup is pending (not
+/// "direct") and the withdrawal is retried on the D2 timers until it works;
+/// then the core starts again.
+#[test]
+fn a_failed_withdrawal_is_retried_until_it_works() {
+    let h = Harness::new(World::default());
+    h.enable(true).unwrap();
+    h.port.world().direct_fail.extend(["nftables did not load generation 4: Device tool timed out".to_owned(), "generation 5 is not confirmed".to_owned()]);
+    h.tx.send(Message::Exited { generation: 1, how: "signal 9".into() }).unwrap();
+    let s = h.until("cleanup pending", |s| s.phase == Phase::CleanupPending);
+    let error = s.error.unwrap();
+    assert!(error.contains("signal 9") && error.contains("could not be withdrawn"), "{error}");
+    assert!(s.retry_at.is_some(), "retried on the D2 timers");
+    h.until("withdrawn and started again", |s| s.phase == Phase::Running && s.generation == 2);
+    let events = h.events();
+    assert_eq!(events.iter().filter(|e| *e == "direct").count(), 3, "{events:?}");
+    assert!(after(&events, "direct", "engage FromBackoff"));
+}
+
+/// Finding 1, first case: a plan that did not load may still be loaded by a
+/// reconcile, so the next switch tightens first and resets what it let
+/// through.
+#[test]
+fn a_plan_that_did_not_load_is_tightened_before_the_next_switch() {
+    let h = Harness::new(World::default());
+    h.enable(true).unwrap();
+    h.port.world().shape_fail.push(("full".into(), "generation 3 is not confirmed".into()));
+    h.write("G", "DIRECT").unwrap();
+    {
+        let w = h.port.world();
+        assert_eq!((w.tables.as_deref(), w.target.as_deref()), (Some("full/0"), Some("full/1")), "the plan is the target, not loaded");
+    }
+    h.port.world().resets.clear();
+    h.write("G", "P").unwrap();
+    let events = h.events();
+    assert_eq!(events.iter().rfind(|e| e.starts_with("write")).unwrap(), "write proxies/G with tables hold", "{events:?}");
+    let resets = h.port.world().resets.clone();
+    match resets.as_slice() {
+        [Scope::Destinations(lost)] => assert_eq!(lost.iter().map(ToString::to_string).collect::<Vec<_>>(), ["1.2.3.0/24"]),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Finding 1, the same once a reconcile loaded it: the status follows the
+/// kernel, and the next switch tightens first.
+#[test]
+fn a_plan_a_reconcile_loads_later_is_shown_and_tightened_before_the_next_switch() {
+    let h = Harness::new(World::default());
+    h.enable(true).unwrap();
+    h.port.world().shape_fail.push(("full".into(), "generation 3 is not confirmed".into()));
+    h.write("G", "DIRECT").unwrap();
+    assert_eq!(h.snapshot().bypass.unwrap().label(), "none");
+    h.port.world().guard_due = true;
+    h.tx.send(Message::Guard).unwrap();
+    h.until("the late table shown", |s| s.bypass.as_ref().is_some_and(|b| b.label() == "rules"));
+    h.port.world().guard_due = false;
+    assert_eq!(h.port.world().tables.as_deref(), Some("full/1"));
+    h.port.world().resets.clear();
+    h.write("G", "P").unwrap();
+    let events = h.events();
+    assert_eq!(events.iter().rfind(|e| e.starts_with("write")).unwrap(), "write proxies/G with tables hold", "{events:?}");
+    assert!(matches!(h.port.world().resets.as_slice(), [Scope::Destinations(lost)] if lost.len() == 1));
+}
+
+/// Finding 1, mirror case: a narrowing that did not load, which a reconcile
+/// loads later, turns the bypass off in the kernel. The status says so, and
+/// the plan the core still runs is loaded again once it is read back.
+#[test]
+fn a_narrowing_a_reconcile_loads_later_is_shown_and_widened_again() {
+    let h = Harness::new(World { selected_direct: true, ..World::default() });
+    h.enable(true).unwrap();
+    h.port.world().tables_fail.push_back("generation 3 is not confirmed".into());
+    assert!(h.write("G", "P").unwrap_err().contains("narrowed"));
+    assert_eq!(h.snapshot().bypass.unwrap().label(), "rules", "the kernel still holds the plan");
+    let writes = h.port.world().writes.len();
+    // The check loads the narrowing; loading the plan again fails once.
+    h.port.world().shape_fail.push(("full".into(), "generation 4 is not confirmed".into()));
+    h.port.world().guard_due = true;
+    h.tx.send(Message::Guard).unwrap();
+    h.until("the narrowing shown", |s| s.bypass.as_ref().is_some_and(|b| b.label() == "none"));
+    assert!(h.events().contains(&"tables hold".to_owned()));
+    // A later check loads the plan of the core, which never changed.
+    h.until("the plan back", |s| s.bypass.as_ref().is_some_and(|b| b.label() == "rules"));
+    h.port.world().guard_due = false;
+    assert_eq!(h.port.world().tables.as_deref(), Some("full/1"));
+    assert_eq!(h.port.world().writes.len(), writes, "nothing was written to the core");
+}
+
+/// Finding 5: the boot restore, sent once the router and the relay are
+/// back, retries a core in D3 at once instead of at its next step.
+#[test]
+fn a_boot_restore_in_backoff_retries_now() {
+    let h = Harness::with(World { wanted: true, busy: Some("A Mihomo operation is in progress".into()), ..World::default() }, slow_retries());
+    assert!(h.enable(false).is_err());
+    assert_eq!(h.snapshot().phase, Phase::Backoff);
+    h.port.world().busy = None;
+    h.enable(false).unwrap();
+    assert_eq!(h.snapshot().phase, Phase::Running, "not at the next step, 30 s later");
+}
+
+/// Finding 5: an IPv4 egress that appears in D3 retries at once; the same
+/// egress again does not.
+#[test]
+fn a_new_ipv4_egress_in_backoff_retries_now() {
+    let h = Harness::with(World { wanted: true, ..World::default() }, slow_retries());
+    h.port.world().prepare.push_back(Some("Mihomo validation timed out".into()));
+    assert!(h.enable(false).is_err());
+    assert_eq!(h.snapshot().phase, Phase::Backoff);
+    h.tx.send(Message::Egress).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(h.snapshot().phase, Phase::Backoff, "no new egress: the timer decides");
+    h.port.world().uplink = Uplink::sample("ath20", 9, "192.0.2.2", None);
+    h.tx.send(Message::Egress).unwrap();
+    h.until("started on the new egress", |s| s.phase == Phase::Running);
+}
+
+/// Finding 8: a panic on the controller's thread ends the agent (`end`)
+/// rather than leaving the tables, a dead core and a `running` snapshot.
+#[test]
+fn a_panic_on_the_controller_thread_ends_the_agent() {
+    let port = FakePort(Arc::new(Mutex::new(World { panic: true, ..World::default() })));
+    let (tx, rx) = mpsc::channel();
+    let controller = Controller::new(port, rx, tx.clone(), Arc::new(Mutex::new(Snapshot::default())), timings());
+    let (ended, why) = mpsc::channel();
+    let thread = std::thread::spawn(move || controller.supervised(move |what| ended.send(what).unwrap()));
+    tx.send(Message::Enable { local: String::new(), owner: true, reply: None }).unwrap();
+    assert!(why.recv_timeout(Duration::from_secs(5)).unwrap().contains("defect"));
+    thread.join().unwrap();
+}
+
+/// Finding 4: a planned restart prepares and validates while the old core
+/// serves (in the background for a profile change); the hold table goes in
+/// and the old core stops only then.
+#[test]
+fn a_planned_restart_prepares_before_it_holds_and_stops_the_old_core() {
+    let h = Harness::new(World::default());
+    h.enable(true).unwrap();
+    h.call(|reply| Message::Config { reply }).unwrap();
+    let events = h.events();
+    let at = |e: &str| events.iter().rposition(|x| x == e).unwrap_or_else(|| panic!("{e}: {events:?}"));
+    assert!(at("prepare serving") < at("tables hold") && at("tables hold") < at("stop 1") && at("stop 1") < at("spawn 2"), "{events:?}");
+    h.port.world().uplink = Uplink::sample("ath20", 9, "192.0.2.2", None);
+    h.tx.send(Message::Egress).unwrap();
+    h.until("generation 3", |s| s.generation == 3 && s.phase == Phase::Running);
+    let events = h.events();
+    let at = |e: &str| events.iter().rposition(|x| x == e).unwrap();
+    assert!(at("prepare") < at("tables hold") && at("tables hold") < at("stop 2"), "{events:?}");
+}
+
+/// Finding 6: refreshing a `domain` rule set changes no kernel plan, so no
+/// table is loaded around it; a set the kernel reads is still treated as
+/// unknown while it refreshes.
+#[test]
+fn a_domain_rule_set_refresh_loads_no_table() {
+    let config = "rule-providers:\n  names: {type: http, behavior: domain, url: 'https://example.invalid/a', interval: 3600}\n  cidrs: {type: http, behavior: ipcidr, url: 'https://example.invalid/b', interval: 3600}\nrules: ['MATCH,G']";
+    let h = Harness::new(World { selected_direct: true, config: Some(config), ..World::default() });
+    h.enable(true).unwrap();
+    let refresh = |name: &str| {
+        let (tx, rx) = mpsc::sync_channel(1);
+        h.tx.send(Message::Write { write: Write { method: "PUT", segments: vec!["providers".into(), "rules".into(), name.into()], body: json!({}) }, answer: Answer::Sync(tx) }).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()
+    };
+    let before = h.events().len();
+    refresh("names");
+    assert_eq!(h.events()[before..], ["write providers/rules/names with tables full/1"]);
+    let before = h.events().len();
+    refresh("cidrs");
+    assert_eq!(h.events()[before..], ["tables full/0", "write providers/rules/cidrs with tables full/0", "tables full/1"]);
 }

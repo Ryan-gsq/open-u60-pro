@@ -1,5 +1,7 @@
 # Wi-Fi 上游 STA 带宽自适应：一手算法研究与适用边界
 
+> 2026-11-12 注：研究记录。它服务的自动调优在 v6 删除，`wifi_relay/width.rs` 在 2026-11-12 删除，agent 不再改上游宽度。
+
 ## 0. 结论先行
 
 本研究只服务于 **U60 Pro 的 Wi-Fi 上游 STA 带宽约束自适应**，不提出热点 AP 的选信道、带宽、MCS 或重启操作。没有进行设备探测、实现修改或构建；外部检索仅使用通用算法、驱动、字段名称，没有发送仓库内容、SSID/BSSID 或设备输出。
@@ -19,7 +21,7 @@
 
 ### 1.1 本地输入与证据等级
 
-已阅读 [交接 README](../../review-handoff/README.md) 第 0、1.5、1.6、2.1、3、7 节，以及 [width.rs](../src/wifi_relay/width.rs)、[llstats.rs](../src/wifi_relay/llstats.rs)。本次读到的实现使用 radio `rx_time` 与本接口接收字节构造分数，`predict()` 使用扫描邻居与固定 RSSI 阈值；`Tuner` 有四个样本、15% 晋升门槛、从最宽开始复查等规则，`Controller` 有读回确认与试验超时。这里只把这些当作待评估设计，**不把源码注释中的原因归属当作已经证明的无线事实**。
+已阅读 [交接 README](../../review-handoff/README.md) 第 0、1.5、1.6、2.1、3、7 节，以及 `width.rs`（2026-11-12 已删除）、[llstats.rs](../src/wifi_relay/llstats.rs)。本次读到的实现使用 radio `rx_time` 与本接口接收字节构造分数，`predict()` 使用扫描邻居与固定 RSSI 阈值；`Tuner` 有四个样本、15% 晋升门槛、从最宽开始复查等规则，`Controller` 有读回确认与试验超时。这里只把这些当作待评估设计，**不把源码注释中的原因归属当作已经证明的无线事实**。
 
 下文区分三类证据：
 

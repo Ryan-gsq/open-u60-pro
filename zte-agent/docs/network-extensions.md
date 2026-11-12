@@ -291,13 +291,16 @@ database or subscription is embedded in the Rust binary.
   with the same order as any routing write: that set counts as unknown first
   (skipped where it sends DIRECT, the chain ends where it does not), then the
   content is read back and the new plan loaded. A manual refresh in Zashboard
-  goes the same way.
+  goes the same way. A `domain` rule set never enters the kernel chain (its
+  names are fake-ip whatever it holds), so its refresh goes straight to the
+  core, with no tightening and no table load.
 - Routing writes are ordered (`relay-mihomo-architecture.md` section 5.4): a
   mode or group change from the console, and `PATCH /configs`,
   `PUT /proxies/*` and `PUT /providers/rules/*` from Zashboard, go through the
   controller: while anything is bypassed, the kernel first stops bypassing
   (the hold table, confirmed by its generation marker; if it cannot be
-  confirmed the write is refused and nothing changes), then the core changes,
+  confirmed the write is refused and nothing changes; a table declared earlier
+  that did not confirm counts too, since a reconcile may load it later), then the core changes,
   its mode and choices are read back, LAN IPv4 connections to what lost DIRECT
   are reset (only those ranges when both chains are plain destinations, every
   LAN IPv4 connection otherwise or beyond 64 ranges; nothing when nothing lost
@@ -307,7 +310,12 @@ database or subscription is embedded in the Rust binary.
 - Controller (`mihomo/controller.rs`): one thread for owner commands, routing
   writes, egress changes, core exits, retries, `net_guard` repairs and rule-set
   refreshes; it never takes the relay's network lock, so an association or a
-  5 GHz CAC never delays an exit or a repair. Pages read its published snapshot:
+  5 GHz CAC never delays an exit or a repair. A panic on it is logged and
+  aborts the agent, so the guard below starts it again and the new agent
+  adopts the tables (left running, the core would die with the thread while
+  the tables kept LAN DNS on it). It tracks the table the kernel was last read
+  to hold and every table declared since that did not confirm; a table a
+  reconcile loads later becomes the published bypass. Pages read its published snapshot:
   `state` (`off`, `starting`, `running`, `restarting`, `backoff`,
   `cleanup_pending`), `generation`, `tables` (target and confirmed generation),
   `direct_fallback`, `failures`, `retry_in_s`. Each core process has one reaper
@@ -322,9 +330,13 @@ database or subscription is embedded in the Rust binary.
   before any DIRECT return (`socket transparent 1 socket wildcard 0`), so a
   switch to DIRECT does not cut it; a new SYN to a remote port 17894 is not taken
   for one.
-- Planned restart (egress change, profile change, a reload that was not proven): the hold
-  table first, then the old core stops, the new one starts behind the
-  interception; nothing goes direct meanwhile. A new profile that fails falls
+- Planned restart (egress change, profile change, a reload that was not proven): the new
+  configuration is prepared and validated while the old core still serves (at
+  background priority for a profile change), then the hold table goes in, the
+  old core stops and the new one starts behind the interception; nothing goes
+  direct meanwhile (`[mihomo] the restart held traffic for N ms`, 2.26 s for an
+  egress change on B31, 2026-11-12). A new profile that does not validate
+  leaves the old core serving; one that validates but does not start falls
   back to the configuration that ran before. An IPv4 egress change the relay
   announces restarts the core at once; an IPv6-only change must hold for 5 s and
   such restarts are at least 60 s apart; outside the relay the 15 s audit
@@ -334,7 +346,13 @@ database or subscription is embedded in the Rust binary.
   goes direct while fake-ip addresses fail fast (TCP reset, UDP port
   unreachable). Retries follow D2: 5, 15, 30, 60 s, then every 5 min; three
   failures within 60 s go to 5 min at once; 5 min running clears the count. The
-  owner turning it off cancels any retry. A start from D3 keeps the fake-ip
+  owner turning it off cancels any retry. The boot restore, or a new IPv4
+  egress (the relay came up), retries at once. A withdrawal that fails leaves
+  the state `cleanup_pending` (the old tables may still send LAN DNS to the
+  dead core) and is tried again on the same timers before the start. A retry
+  with no effects held (a start that failed before it claimed any, or a failed
+  adoption, which first rolls the previous agent's tables back) claims them
+  afresh. A start from D3 keeps the fake-ip
   reject (and the input guard) until the full table takes over, then resets LAN
   IPv4 and IPv6 connections that went direct. A start the owner asked for that
   fails releases what it took and stays off; a boot restore keeps retrying.
@@ -390,10 +408,12 @@ binding and IPv6. It disables subscription-provided listeners, TUN, iptables,
 NTP service, alternate controllers and server listeners; a subscription's
 `sniffer` section is kept as written (it cannot bind an interface or open a
 port). Configuration checks
-run `mihomo -t`; rejected YAML does not replace the selected profile. A restart whose
+run `mihomo -t`; rejected YAML does not replace the selected profile. A start whose
 generated configuration, referenced geodata contents and installed core identity
-match one that already passed and started (with the per-start secret masked)
-can skip the repeated check (logged as `validation reused`). Databases referenced
+match one of the last four that passed and started this boot (with the
+per-start secret masked and the top-level `interface-name` left out, so a
+relay/cellular switch alone reuses it) skips the repeated check (logged as
+`validation reused`; kept in `/data/zte-agent-mihomo/validated`). Databases referenced
 by rules, sub-rules, rule providers, DNS and the sniffer's `geosite:`/`geoip:`
 entries count; missing or unreadable dependencies disable reuse, and a
 dependency change during the check or startup prevents caching that result.
@@ -418,7 +438,8 @@ re-applied as journaled, never by flushing or taking
 over another writer's rules. The relay announces changes of
 its own path, and such an uplink change restarts the core. For any other egress
 (cellular) the watchdog compares the effective egress with the core's reference
-egress whenever addresses change and at each 15 s audit, and restarts only when
+egress whenever addresses change and at each 15 s audit (the route over
+rtnetlink and the addresses from `getifaddrs`; no `ip` or `iw` process), and restarts only when
 existing connections are stranded: a readable family moved to another interface
 (name or index) or lost a source address it had. Added addresses, gateway or
 preferred-source changes and a family that became available (IPv6, or IPv4
@@ -485,7 +506,12 @@ use the existing LAN HTTPS feature where appropriate.
 This is a fresh Rust implementation based on public device interfaces and the
 earlier B31 association observations, not a translation of enhanced's GPL code.
 
-- Creates only its own `u60sta0`; PHY is discovered from `wlan2/phy80211`.
+- Creates only its own station `ath20` (named `u60sta0` before 2026-11-12;
+  helpers and journals an older build left on that name are still found and
+  undone, `OLD_RELAY_IFACE`); PHY is discovered from `wlan2/phy80211`. B31's
+  stock IPACM configuration lists `ath20`, which is why the station has that
+  name (section Hardware forwarding); a `wlan*` name would stall the vendor's
+  Wi-Fi off, which waits for every such interface to disappear.
 - Requires 5 GHz main AP enabled and Guest WiFi disabled. The matching upstream
   band's main AP must also be enabled. Open/WPA2-Personal only, on 2.4 GHz
   and 5 GHz channels enabled by the PHY, including DFS. Scans and connects
@@ -511,21 +537,38 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   channel change was not confirmed", and each rollback to 160 MHz cost a 60 s
   CAC. The driver's own policy (`gWlanMccToSccSwitchMode=3`, force SCC
   without SAP restart) is left to move the AP to the STA's channel by CSA.
-- That CSA needs the driver's DFS channel switch, which B31 turns off for the
-  first 10 minutes of every 160 MHz 5 GHz start (`/sbin/zte_wifi_dfs_hdlr.sh`:
-  `iwpriv wlan2 disableDfsCS 1`, `sleep 599`, then `0`; the ini also loads
-  `gDisableDFSChSwitch=1`). Any 160 MHz AP here spans DFS (44/160 covers
+- That CSA needs the driver's DFS channel switch. B31 turns it off for the
+  first 10 minutes of every 160 MHz 5 GHz start on an auto channel
+  (`/sbin/zte_wifi_dfs_hdlr.sh`: `iwpriv wlan2 disableDfsCS 1`, `sleep 599`,
+  then `0`; the ini also loads `gDisableDFSChSwitch=1`). `disableDfsCS` sets
+  one driver-wide flag that the driver reads at the end of every channel
+  switch; while it is set, the switch restarts beaconing on the old channel.
+  Any 160 MHz AP here spans DFS (44/160 covers
   52-64), and a STA connect makes the driver CSA it to 44/80. In the window
   the driver ends that CSA without the channel change: the connect waits 10 s
   and fails, and every later connect gets `Channel switch in progress` until
   the hotspot restarts. This is why the relay did not come back after a reboot
-  with the upstream present. Before each association the agent waits (at most
-  10 s) until the script has passed its own `disableDfsCS 1`, then runs
-  `iwpriv wlan2 disableDfsCS 0` (owner decision 62, `wifi_relay/dfs_switch.rs`).
+  with the upstream present. Owner decision 62 (`wifi_relay/dfs_switch.rs`):
+  before each association the agent makes sure the vendor's own
+  `wireless.zte_mbb.dfs_channel_switch_disable=1` is set (a persistent
+  setting, owner approval 2026-11-12). With it the script leaves
+  `disableDfsCS` alone, and from the next driver load the Wi-Fi scripts load
+  `gDisableDFSChSwitch=0` (`qcacld32.sh`, `check_ini`). The agent commits the
+  key only when no other `wireless` change is pending (`uci commit wireless`
+  would make those permanent too); otherwise it sets it uncommitted, which
+  `uci get` already reads, and logs that the next join commits it. It then
+  still runs `iwpriv wlan2 disableDfsCS 0`, for a driver loaded before the key
+  was committed. A script that started before the key was set has already
+  read it and may still turn the flag off within its first second, after a
+  join turned it on. A reboot with the key committed (2026-11-12): the relay
+  was restored on the first attempt 70.9 s after boot, inside the vendor's
+  10-minute window (`measurements/b1-reboot2/agent-boot.log` in the probe
+  reports).
   The AP ends at 44/80 after the connect; a later hotspot restart brings it
   back to the configured 160 on the STA's channel, whatever the STA's width.
   Validated 2026-10-29 with the switch turned off by hand before an agent
-  restart (`2026-10-29-width-v2-acceptance.md`); a real reboot is not yet tested.
+  restart, on the earlier build that waited for the script instead of setting
+  the key (`2026-10-29-width-v2-acceptance.md`).
 - All 5 GHz upstreams share the same preparation (`wifi_relay/hotspot.rs`).
   A join to 5260 MHz while SAP runs 36/160 repeatedly failed before authentication:
   `hdd_validate_channel_and_bandwidth: BW 3 not possible in 2.4GHz band`,
@@ -534,7 +577,12 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   `chan_switch` to an enabled non-DFS 5 GHz channel at 20 MHz. Then associate;
   the driver follows the DFS STA (tested 52/160). Disconnect detaches STA first,
   restores the original SAP channel, and waits for CAC (about 60 s for 36/160).
-  No persistent wireless setting or radar detection is disabled. See
+  No radar detection is disabled; the only persistent wireless setting the
+  relay writes is the DFS switch key above. Report B (2026-11-11, from the
+  driver's `wlan_hdd_cm_connect`) found no ini or uci setting that replaces
+  this staging: before every STA join the driver itself moves an AP that
+  spans DFS, and with a DFS upstream it picks a 2.4 GHz target while keeping
+  160 MHz, which fails as above. See
   [2026-11-03 DFS acceptance](2026-11-03-dfs-acceptance.md) for test coverage.
 - Scans go over an attached wpa_supplicant control socket: all enabled 2.4 GHz
   channels in one request, then each enabled 5 GHz channel alone, each waiting
@@ -566,8 +614,9 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
 - Nonlocal LAN DNS is forwarded to the lease's upstream resolver before vendor
   DNS interception. DNS addressed to the router/own LAN/tailnet/link-local stays
   local, preserving dnsmasq's management-name answers. The router's ordinary
-  TCP/UDP DNS queries also use the hotel resolver; the relay's `-o u60sta0`
-  MASQUERADE covers a socket still bound to a SIM source. The rules live in
+  TCP/UDP DNS queries also use the hotel resolver; the relay's `-o ath20`
+  MASQUERADE (comment `zte-agent-wifi-relay`) covers a socket still bound to a
+  SIM source. The rules live in
   the agent's nftables table `ip u60_relay` (IPv6: `ip6 u60_relay`,
   `wifi_relay/uplink.rs`): a LAN chain at prerouting `dstnat - 1` and a router
   chain at output `-101` (the output hook takes no `dstnat` keyword), both just
@@ -581,8 +630,20 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   without committing UCI and restarts dnsmasq once (SIGHUP does not reload this
   vendor option). The existing DHCP service and management names remain in use.
   Owned, LAN-scoped `RETURN` rules bypass only the vendor `redirect_chain` in
-  IPv4/IPv6 NAT; other NAT/filter rules are not skipped. The relay watcher
-  repairs these rules if a vendor WAN event replaces the chain, and keeps each
+  IPv4/IPv6 NAT; other NAT/filter rules are not skipped. The switch delta and
+  both RETURNs are journaled in the session's `dns` transaction (`dns.json`,
+  `portal::web_bypasses`), so a handover between 5 GHz upstreams releases only
+  the resolver line and passes the suppression to the next session as it is
+  (`successor`; the new session re-takes it with `ensure`, an adoption after
+  an agent restart takes the RETURNs into `dns`). A build before 2026-11-12
+  kept the RETURNs in `network.json` and released the switch during a
+  handover; a fw3 reload in that gap let the vendor's port-80 DNAT in until
+  the next reload. Measured with the current build (2026-11-12,
+  `measurements/b2-portal/handover-sampler.log` in the probe reports): two
+  handovers, each followed by firewall reloads, kept the switch at 0, no vendor
+  rule appeared, dnsmasq was not restarted, and after each flush the chain was
+  empty for about 4 s before the RETURN was back first. The guard check
+  repairs these rules after a reload replaces the chain, and keeps each
   ahead of every vendor rule in it: a RETURN found behind one (a DNAT inserted
   first) is deleted and inserted first in one `iptables-restore` transaction,
   so it is never missing; `-C` alone proves nothing about the order. Mihomo on/off
@@ -609,11 +670,11 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   route. No learned default is added to the cellular main table. Each discovery
   session has a random private lease path, so delayed callbacks from a prior
   connection cannot overwrite or remove the new connection's lease.
-- IPv6 mode adds guarded NAT66 through `u60sta0`, including the LAN's existing
+- IPv6 mode adds guarded NAT66 through `ath20`, including the LAN's existing
   IPv6 prefixes so clients retaining a cellular address do not bypass NAT or
   lose the selected Wi-Fi exit. Router/core connections also use Wi-Fi and
   masquerade an old selected source if needed. The masquerade is an nft rule
-  (`ip6 u60_relay`, postrouting `srcnat - 1`, only `oifname u60sta0`; B31 has
+  (`ip6 u60_relay`, postrouting `srcnat - 1`, only `oifname ath20`; B31 has
   `CONFIG_NFT_MASQ=y`). Mihomo's marked rule (pref
   `18620`) precedes Relay's table, so LAN TCP/UDP interception still wins.
   LAN address/prefix changes are reconciled even when the upstream lease is
@@ -656,8 +717,13 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   Loss/expiry withdraws owned IPv6 forwarding; missing IPv6 does not stop an
   otherwise working IPv4 relay. Lifetime-only renewals update owned addresses
   and the route without tearing down NAT/RA. Changed addressing rebuilds the
-  owned IPv6 transaction. Each active tick checks owned addresses, routes,
-  policy rules and the runtime RA overlay; missing owned effects are repaired
+  owned IPv6 transaction. The owned addresses, routes, policy rules and the
+  runtime RA overlay of an unchanged path are checked on the tick after a
+  settled `net_guard` trigger, on the next tick after a failed read, before a
+  lifetime refresh, and otherwise every 15 s (`ipv6::CHECK_EVERY`): an object
+  removed by something that fires no vendor trigger is noticed within 15 s
+  (owner accepted, 2026-11-12; each check spawns four read-only tools under the
+  session lock). Missing owned effects are repaired
   without changing the upstream revision, including a route table emptied by
   another writer (it then no longer exists). A failed inspection read keeps the
   path for up to three ticks before IPv6 is withdrawn; a conflicting owned
@@ -722,14 +788,14 @@ a return only leaves these chains, and ZTE's rules still apply after them.
 
 | Part | When | Rules |
 | --- | --- | --- |
-| Guard | From before `u60sta0` is raised (a scan too) until the station is deleted | Upstream INPUT: established/related and DHCP 67→68 return, the rest dropped; IPv6 dropped. All forwarding from or to `u60sta0` dropped. |
+| Guard | From before `ath20` is raised (a scan too) until the station is deleted | Upstream INPUT: established/related and DHCP 67→68 return, the rest dropped; IPv6 dropped. All forwarding from or to `ath20` dropped. |
 | IPv6 discovery | IPv6 requested, before `odhcp6c` starts | Upstream IPv6 INPUT: established/related, RA (link-local source, hop limit 255), NS/NA (hop limit 255), ICMPv6 errors 1–4, DHCPv6 547→546; the rest dropped. |
-| Routes | From before the policy rule until the routes are released (the tables shrink back to the guard first) | IPv4 FORWARD: `br-lan → u60sta0` and established replies return before the drops. IPv6 FORWARD from `br-lan`: `rmnet*` rejected first, then `fc00::/7`, `fe80::/10`, `ff00::/8` return, the rest rejected. One IPv6 OUTPUT reject to `rmnet*`, covering IPv6 off, a lost lease and a withdrawn NAT66. IPv4 DNS chains. |
-| NAT66 | A valid IPv6 lease, from before its policy rule | Approved LAN sources to `u60sta0` and established replies return (ahead of the upstream drops); the masquerade; IPv6 DNS chains. |
+| Routes | From before the policy rule until the routes are released (the tables shrink back to the guard first) | IPv4 FORWARD: `br-lan → ath20` and established replies return before the drops. IPv6 FORWARD from `br-lan`: `rmnet*` rejected first, then `fc00::/7`, `fe80::/10`, `ff00::/8` return, the rest rejected. One IPv6 OUTPUT reject to `rmnet*`, covering IPv6 off, a lost lease and a withdrawn NAT66. IPv4 DNS chains. |
+| NAT66 | A valid IPv6 lease, from before its policy rule | Approved LAN sources to `ath20` and established replies return (ahead of the upstream drops); the masquerade; IPv6 DNS chains. |
 
 Legacy iptables keeps only what must pass ZTE's DROP/REJECT: `U60_RELAY_IN`
-(established replies, DHCP offers, IPv6's `U60_R6_IN`), `U60_RELAY_FWD` (with
-its own TCP reply rule, whose counter checks hardware forwarding),
+(established replies, DHCP offers, IPv6's `U60_R6_IN`), `U60_RELAY_FWD` (two
+rules: LAN to upstream, and established/related replies back),
 `U60_R6_FWD`, the portal `RETURN` and the IPv4 MASQUERADE (an nft masquerade
 must first be shown to keep IPA forwarding, D11). These chains hold accepts
 only, so a rule ZTE removed and the guard re-added at the end can neither open
@@ -738,6 +804,13 @@ nor close anything else. The former `U60_RELAY_V6`, `U60_RELAY_OUT`,
 name them and remain undoable. This version's tables are journaled once, in
 the wireless plan, as `@u60-relay-nft remove ip|ip6`, which the previous
 agent runs too (`tests/relay-firewall-qa`).
+
+An owned legacy rule is identified by its chain or target (`U60_*`) or by a
+`zte-agent*` comment, which every rule in a vendor chain without a jump to one
+carries (the portal RETURN, the MASQUERADE); `firewall::owned_rule`. The
+station's name is no identity, since the vendor's IPACM file lists `ath20`
+too; only the names older agents created (`ids::OLD_IFACES`: `u60sta0`,
+`u60mh0`) still count, for the rules their journals hold.
 
 The core's own plain DNS keeps its destination once the core marks its
 sockets with a bit verified free on the device (M13, `ids::CORE_OUT_MARK`,
@@ -751,9 +824,39 @@ and again 5 s after a check that had to restore something; once a minute
 otherwise. For 3 s after each trigger it reads the kernel settings an owner
 holds (`@u60-sysctl`, such as Mihomo's `bridge-nf-call-ip(6)tables=0`) every
 0.5 s and writes back one ZTE changed, only while that owner still holds it:
-an owner's release unregisters the setting before its undo runs. Opens of
-`ipacm_switch.sh` while the agent itself runs it count once; other scripts
-and events in that window still count.
+an owner's release unregisters the setting before its undo runs. The watched
+scripts and events are `net_guard::WATCHED` and `EVENTS`.
+
+A check reads each iptables table once (`-S`) and routes, rules and addresses
+once per family (`net_tools::Listings`; the relay's four transactions share
+one set through `net_tools::Pass`), and compares every owned step with them:
+a full relay check runs 7 `iptables`/`ip` processes where it ran 43. A rule
+missing from its predicted listed form gets its own `-C`; only a definite
+absence is re-applied: the chain is gone, or `-C` exits 1 with one of the two
+wordings B31's iptables 1.8.8 (legacy, both families) uses for a missing
+rule (`firewall::no_rule`): "Bad rule (does a matching rule exist in that
+chain?)" when the rule's target is ACCEPT or RETURN or its chain is missing,
+"No chain/target/match by that name." when it jumps to a user chain that
+exists (every hook into a `U60_*` chain) or targets MASQUERADE. A missing target chain exits 2 and proves
+nothing. The first batch-1 build knew only the first wording: after a reboot
+the vendor's firewall start had flushed the IPv6 INPUT hook, its undo read as
+"not checked", and every relay restore failed with "Network cleanup paused"
+until the fixed build was installed (2026-11-12, about 15 minutes without an
+uplink).
+A listing or tool failure is reported as "not checked" and left to the next
+check, so a rule that is there is never added twice. Undo removes every copy
+of an owned rule and empties an owned `U60_*` chain before deleting it; a
+vendor chain is never emptied.
+
+The firewall reload that follows a relay connect is the agent's own: IPv6's
+`ubus call network.interface.lan set_data` (`wifi_relay/ipv6/ra.rs`) makes
+netifd run the `iface` hotplug with `ACTION=ifupdate IFUPDATE_DATA=1`, and
+`/etc/hotplug.d/iface/20-firewall` runs `fw3 -q reload` (process chain
+captured 2026-11-12; two reloads 3.2 s apart when IPv6 was withdrawn). Every
+reload runs the vendor's `firewall_init.sh`, which sets
+`bridge-nf-call-ip(6)tables` to 1 (no vendor setting turns that off; it read
+1 for about 0.2-0.5 s per reload before the sampler set it back) and flushes
+`redirect_chain` (`relay-hw-offload.md`, section 5).
 
 ### Hotel authentication
 
@@ -801,17 +904,25 @@ and conflict refusals separately on a device.
 
 ### Hardware forwarding (IPA)
 
-Relayed IPv4 NAT is carried by the Qualcomm IPA once the owner installs the
-`u60sta0` IPACM entry and restarts the router (Relay page, `offload`). The
-owner's switch, and a removal or a reinstall in the same boot, apply to a
-connected relay at once (owner decision 64): releasing the path deletes the
-`main` default (IPACM loses its relay WAN) and restores the IPACM mode, then
-resets LAN IPv4 connections. While connected and switched on the relay adds a
-`main` default (metric 60631, with
-unreachable guards for the ranges its table throws) and keeps IPACM in
-hardware mode unless an owner speed limit, power saver or `ipa_disable`
-needs the CPU path; ZTE's Smart QoS (`Ai_mode`) switches it to software at
-boot and is overridden only while relaying. RPS and a 5000 backlog help the
+Relayed IPv4 NAT is carried by the Qualcomm IPA: B31's stock
+`/etc/data/ipa/IPACM_cfg.xml` lists `ath20` as a Wi-Fi interface (Category
+UNKNOWN, WlanMode full), and IPACM reads it once at boot. The agent only reads
+that file (`offload.config`: `listed`, `not_listed` or `unavailable`); it
+never writes it, and there is no install step or restart. Builds before
+2026-11-12 inserted a `u60sta0` entry instead (removed from the owner's router
+with that build's own remove action on 2026-11-12). The owner's switch
+(`/data/zte-agent-relay/ipacm/off`) applies to a connected relay at once
+(owner decision 64): releasing the path deletes the
+`main` default (IPACM loses its relay WAN), then resets LAN IPv4 connections.
+While connected and switched on the relay adds a `main` default (metric
+60631, with unreachable guards for the ranges its table throws). The agent
+never reads or switches IPACM's hardware/software mode (owner decision,
+2026-11-12): the router's working mode decides it. Balanced (`Nomal_mode`,
+极速模式) turns acceleration on; the other working modes, a vendor speed
+limit, power saver and `ipa_disable` turn it off, and `Ai_mode` (the factory
+default) and `Game_mode` switch it with traffic. The Relay page therefore
+says "Hardware (IPA) in the Balanced (极速模式) working mode; CPU in any
+other" while the route is in place, and confirms nothing. RPS and a 5000 backlog help the
 traffic that stays on the CPU. With Mihomo on, the optional DIRECT bypass lets
 IPv4 the core's mode and rules send DIRECT skip the core in the kernel, so it
 can be offloaded too. Offloaded connections skip iptables, tc and parental
@@ -820,8 +931,8 @@ control. Design, measurements and open items:
 
 ### Upstream Wi-Fi power save
 
-The driver turns 802.11 power save on for every new `u60sta0` (`iw dev
-u60sta0 get power_save`); it is unrelated to ZTE's power saver mode. With it
+The driver turns 802.11 power save on for every new station (`iw dev
+ath20 get power_save`); it is unrelated to ZTE's power saver mode. With it
 off, short single-connection tests through the relay went from 166-218 to
 244-250 Mbit/s (2026-11-08). By default each relay connection turns it off
 (owner decision 65, `wifi_relay/power_save.rs`): an `@u60-relay-power-save
@@ -850,7 +961,7 @@ during an agent crash is not promised. The kernel clears that signal when an
 exec changes the SELinux domain, which B31 does for `wpa_supplicant`
 (`wpad.subj`) and `odhcp6c` (`odhcp6c.subj`) even in permissive mode, so
 those two survive the agent (seen on every update). Relay recovery therefore
-first stops any `wpa_supplicant`, `odhcp6c` or `udhcpc` on `u60sta0` with the
+first stops any `wpa_supplicant`, `odhcp6c` or `udhcpc` on `ath20` (or on `u60sta0`, left by an older build) with the
 relay's private paths that is not its own child (SIGTERM, then SIGKILL after
 1 s); otherwise the old supplicant keeps the control socket, the new one
 exits, and every reconnect fails at association.
@@ -884,7 +995,7 @@ new agent can persist that choice.
 One `net-restore` thread does it at start. At boot it first waits for the
 vendor sync barrier (`zwrt_topsw_daemon.sync`, at most 3 minutes), as Wi-Fi and
 the firewall are still being brought up before it. Then it rolls back the
-relay's journals, so that Mihomo cannot bind to a stale `u60sta0` route,
+relay's journals, so that Mihomo cannot bind to a stale `ath20` route,
 tries Mihomo (up to 4 attempts with 50 s of retry waits, plus bounded start work)
 and finally rejoins the relay network: a
 scan, the same BSS if it is still there or else the strongest one with the
@@ -918,7 +1029,7 @@ first attempt, at the remembered 20 MHz. A cold reboot (`reboot` over ADB):
 agent running by 54 s of uptime with the boot barrier already released,
 Mihomo on at about 60 s, W associated at 69 s, both reported `autostart: true`
 and no error by 94 s; the router reached 223.5.5.5 and HTTP through
-`u60sta0`. Not yet tried: a 5 GHz upstream, an upstream that is down at boot.
+`u60sta0` (the station's name then). Not yet tried: a 5 GHz upstream, an upstream that is down at boot.
 
 Keep USB ADB available for initial testing. Stop the agent before emergency
 manual recovery, then run the agent binary's `network-recover` command over
@@ -944,7 +1055,7 @@ never URLs. Zashboard's bridge uses the pass cookie instead of a bearer token.
 | POST | `/api/wifi-relay/connect` | `{"network":"opaque scan id","password":"...","confirmed":true,"ipv6":true}`; omitted IPv6 defaults on |
 | POST | `/api/wifi-relay/disconnect` | Restore runtime hotspot/routes |
 | POST | `/api/wifi-relay/clock` | Explicit fresh HTTPS time check; requires an active relay, never reconnects it |
-| POST | `/api/wifi-relay/offload` | `{"install":true/false}`: add/remove the IPACM `u60sta0` entry (loaded after a restart, or at once if IPACM already loaded it this boot); `{"enabled":true/false}`: the runtime switch. A connected relay follows both at once; status `offload.config`, `offload.enabled` |
+| POST | `/api/wifi-relay/offload` | `{"enabled":true/false}`: the hardware forwarding switch; a connected relay follows at once; status `offload.config` (`listed`/`not_listed`/`unavailable`, read from IPACM's file), `offload.enabled`, `offload.state`, `offload.route` |
 | POST | `/api/wifi-relay/power-save` | `{"auto_off":true/false}`: turn the upstream Wi-Fi power save off at each connection (default) or keep the driver's; a connected relay follows at once; status `power_save.auto_off`, `power_save.off`, `power_save.error` |
 | GET | `/api/mihomo/profiles` | Profile library status, no URLs or YAML |
 | GET | `/api/mihomo/profiles/{id}` | Explicit private editor read (metadata and URL, never saved YAML) for one profile |
@@ -1067,8 +1178,10 @@ refresh. While a warning is present, **Recheck time** performs a fresh check
 with success/error feedback, without reconnecting Wi-Fi or restarting Clash.
 The check runs on the blocking Slow lane, serialized with network changes;
 status reads remain responsive. Each new relay connection also checks afresh.
-Core startup may reuse verified UTC for at most five minutes; a failed check
-invalidates that cache. No periodic background clock probes are added, and a
+A Mihomo core start on the relay starts that check on a thread of its own
+(`mihomo-clock`, one at a time) and does not wait for it: a failing check took
+4-16 s inside a planned restart's or an adoption's blackout. A passed check is
+reused for five minutes; a failed check invalidates that cache. No periodic background clock probes are added, and a
 restored local UTC floor alone never clears a failed-verification warning.
 
 Clock warning regression validation (2026-10-27): `cargo test -p zte-agent`
@@ -1090,6 +1203,8 @@ on-router diagnostic, since removed in favor of the scan API) found it
 fresh 3/3 in 3.04-3.07 s. ARM64 musl release: section Total 8,486,448 bytes,
 gzip -9 4,331,301 bytes, +16,720 and +7,371 bytes over the same tree without
 this change (both measured with the same tool).
+
+The dated records below (2026-10-27/28) name the station `u60sta0`, its name until 2026-11-12.
 
 Live 5 GHz relay acceptance (2026-10-27, agent `35743a58`, Mihomo off): the
 web scan listed the 5220 MHz upstream; connecting left `wlan2` alone and the
@@ -1134,7 +1249,7 @@ AP's rate to the STA rising from HE-MCS 1 to HE-MCS 9-11, 2 SS.
 
 ### 上游带宽自适应 V2（2026-10-28，阶段 A）
 
-> **已删除（v6，2026-11-10）。** 下面是自动调优的历史设计与实测记录。代码只保留每次关联后的一次宽度复位和热点需要的信道解析（`wifi_relay/width.rs`）；`width_watch.rs`、`llstats.rs`、`widths.json` 的读写、`/api/wifi-relay/tuning` 和页面选项都已删除，已保存的 `auto` 读作保持协商带宽。设备上旧的 `/data/zte-agent-relay/widths.json` 不再读写，回退到旧版 agent 时仍可用。
+> **已删除（v6，2026-11-10）。** 下面是自动调优的历史设计与实测记录。当时代码只保留每次关联后的一次宽度复位和热点需要的信道解析（`wifi_relay/width.rs`）；2026-11-12 起宽度复位也已删除，`width.rs` 不再存在，信道解析移到 `wifi_relay/hotspot.rs`，agent 中没有任何地方再运行 `iwpriv … chwidth`；`width_watch.rs`、`llstats.rs`、`widths.json` 的读写、`/api/wifi-relay/tuning` 和页面选项都已删除，已保存的 `auto` 读作保持协商带宽。设备上旧的 `/data/zte-agent-relay/widths.json` 不再读写，回退到旧版 agent 时仍可用。
 
 已按 `width-v2-final-handoff` 实施；阶段 A 最初只做代码和本地验证，随后已获授权部署。
 阶段 B 与方案 A 的后续状态见本节末尾及真机验收记录，不能把阶段 A 快照当作当前设备状态。

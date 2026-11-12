@@ -25,7 +25,15 @@ const LAN_GRACE: u64 = 7200;
 /// LAN ULA address (valid 180 s, preferred 90 s) and RA router lifetime
 /// (90 s) bound the interval; a short upstream lifetime refreshes every tick.
 const MAINTAIN_EVERY: Duration = Duration::from_secs(15);
+/// Without a settled `net_guard` trigger, the owned addresses, routes, policy
+/// rule and RA overlay of an unchanged path are checked this often: an object
+/// removed by something that fires no vendor trigger is noticed within it.
+/// Each check spawns four read-only tools (`ubus`, the address, route and
+/// rule listings) under the session lock; the owner traded promptness for
+/// fewer of them (2026-11-12).
+const CHECK_EVERY: Duration = Duration::from_secs(15);
 /// Consecutive ticks whose inspection reads fail before the path is withdrawn.
+/// A failed check is retried on the next tick, not `CHECK_EVERY` later.
 const UNREADABLE_TICKS: u8 = 3;
 mod ra;
 
@@ -100,6 +108,23 @@ fn lease_maintenance_due(
     live: &Lease,
 ) -> bool {
     installed != received || maintenance_due(last, now, live.shortest_lifetime())
+}
+
+/// Whether this tick checks the owned objects of an unchanged path: after a
+/// settled `net_guard` trigger (`guard`), while a failed read is retried,
+/// before a lifetime refresh (its `change` commands need the objects
+/// present), or `CHECK_EVERY` after the last check.
+fn check_due(
+    guard: bool,
+    unreadable: u8,
+    refresh: bool,
+    last: Option<Instant>,
+    now: Instant,
+) -> bool {
+    guard
+        || unreadable > 0
+        || refresh
+        || last.is_none_or(|at| now.saturating_duration_since(at) >= CHECK_EVERY)
 }
 
 fn usable(address: Ipv6Addr) -> bool {
@@ -314,6 +339,8 @@ pub struct Upstream {
     lan_observed: BTreeMap<String, u64>,
     lan_sources: Vec<String>,
     maintained: Option<Instant>,
+    /// The last `check_owned` of the current path (`CHECK_EVERY`).
+    checked: Option<Instant>,
     /// Consecutive ticks whose inspection reads failed (`Fault::Unreadable`).
     unreadable: u8,
 }
@@ -341,6 +368,7 @@ impl Upstream {
             lan_observed: BTreeMap::new(),
             lan_sources: Vec::new(),
             maintained: None,
+            checked: None,
             unreadable: 0,
         }
     }
@@ -439,12 +467,13 @@ impl Upstream {
         result
     }
 
-    pub fn tick(&mut self) -> Result<(), String> {
+    /// `guard`: the relay's `net_guard` cursor was due on this tick.
+    pub fn tick(&mut self, guard: bool) -> Result<(), String> {
         // Only effective upstream identity/availability belongs to the core.
         // Repairs and LAN exemptions must not redial all proxy transports.
         let before = self.path.as_ref().map(upstream_identity);
         let revision = self.revision;
-        if let Err(error) = self.tick_inner() {
+        if let Err(error) = self.tick_inner(guard) {
             // Only an unsafe, failed undo may propagate to the relay owner.
             // Ordinary RA/lease errors withdraw IPv6, not working IPv4.
             self.withdraw()?;
@@ -462,7 +491,7 @@ impl Upstream {
         Ok(())
     }
 
-    fn tick_inner(&mut self) -> Result<(), String> {
+    fn tick_inner(&mut self, guard: bool) -> Result<(), String> {
         if self.client.is_none() {
             return Ok(());
         }
@@ -505,16 +534,19 @@ impl Upstream {
             && sources == self.lan_sources
             && self.ra_mtu == Some(ra_mtu)
         {
-            // Checks stay prompt; only redundant lifetime writes are throttled.
-            let checked = self.check_owned(&live, &sources);
-            self.tolerate(checked)?;
-            if !lease_maintenance_due(
+            let refresh = lease_maintenance_due(
                 self.maintained,
                 Instant::now(),
                 self.installed.as_ref(),
                 lease.as_ref(),
                 &live,
-            ) {
+            );
+            if check_due(guard, self.unreadable, refresh, self.checked, Instant::now()) {
+                let checked = self.check_owned(&live, &sources);
+                self.checked = Some(Instant::now());
+                self.tolerate(checked)?;
+            }
+            if !refresh {
                 self.installed = lease;
                 self.path = Some(live);
                 return Ok(());
@@ -565,6 +597,7 @@ impl Upstream {
                 self.phase = "configured";
                 self.error = None;
                 self.maintained = Some(Instant::now());
+                self.checked = Some(Instant::now());
                 self.unreadable = 0;
             }
             Err(e) => {
@@ -577,7 +610,7 @@ impl Upstream {
         Ok(())
     }
 
-    /// Each active tick of an unchanged path: RA ownership, owned addresses,
+    /// An unchanged path when `check_due`: RA ownership, owned addresses,
     /// routes and policy rule, with conflict checks, DAD and current lease
     /// lifetimes (`net_guard` covers the firewall and nft rules). Missing
     /// objects are re-added with their existing undo records; none of this
@@ -789,6 +822,7 @@ impl Upstream {
         self.ra_mtu = None;
         self.phase = "off";
         self.maintained = None;
+        self.checked = None;
         self.unreadable = 0;
         self.lan_observed.clear();
         self.lan_sources.clear();
@@ -857,6 +891,8 @@ impl Upstream {
         self.phase = "configured";
         self.error = None;
         self.maintained = Some(Instant::now());
+        // Nothing has checked the taken-over objects yet: the first tick does.
+        self.checked = None;
         self.unreadable = 0;
         Ok(())
     }
@@ -1544,7 +1580,7 @@ mod tests {
         assert!(session_client(&args(&ours)));
         assert!(session_client(&args(&ours.replacen("odhcp6c", "/usr/sbin/odhcp6c", 1))));
         assert!(!session_client(&args(&ours.replace(&format!(" {IFACE}"), " rmnet_data0"))));
-        assert!(!session_client(&args("odhcp6c -s /lib/netifd/dhcpv6.script -p /var/run/odhcp6c.pid u60sta0")), "the firmware's own client");
+        assert!(!session_client(&args("odhcp6c -s /lib/netifd/dhcpv6.script -p /var/run/odhcp6c.pid ath20")), "the firmware's own client");
     }
 
     fn lease() -> Lease {
@@ -1737,6 +1773,22 @@ mod tests {
             !maintenance_due(Some(start + tick), start, 300),
             "a clock step back never forces it"
         );
+    }
+
+    #[test]
+    fn owned_objects_are_checked_on_a_trigger_a_retry_a_refresh_or_every_15_s() {
+        let start = Instant::now();
+        let tick = Duration::from_secs(3);
+        assert!(check_due(false, 0, false, None, start), "first tick of a path");
+        assert!(!check_due(false, 0, false, Some(start), start + tick), "a quiet tick spawns nothing");
+        assert!(!check_due(false, 0, false, Some(start), start + CHECK_EVERY - Duration::from_millis(1)));
+        assert!(check_due(false, 0, false, Some(start), start + CHECK_EVERY));
+        assert!(check_due(true, 0, false, Some(start), start + tick), "a settled vendor trigger");
+        assert!(check_due(false, 0, true, Some(start), start + tick), "a lifetime refresh needs the objects present");
+        // A failed read is retried on the next tick, so `UNREADABLE_TICKS`
+        // still withdraws after about 6 s of failures, not 30 s.
+        assert!(check_due(false, 1, false, Some(start), start + tick));
+        assert!(!check_due(false, 0, false, Some(start + tick), start), "a clock step back never forces it");
     }
 
     #[test]
@@ -2133,14 +2185,17 @@ mod tests {
         fs::write(dir.join("broken.nft"), broken).unwrap();
         let v4 = super::super::Lease { ip: "10.20.0.7".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.20.0.1".parse().unwrap(), dns: vec!["10.20.0.1".parse().unwrap()] };
         let lan: (std::net::Ipv4Addr, std::net::Ipv4Addr) = ("192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
-        let mut wireless = vec![Step::new(Cmd::new("sysctl", &["-w", "net.ipv6.conf.u60sta0.disable_ipv6=1"]), Cmd::new("true", &[]))];
+        let mut wireless = vec![Step::new(Cmd::new("sysctl", &["-w", "net.ipv6.conf.ath20.disable_ipv6=1"]), Cmd::new("true", &[]))];
         wireless.extend(super::super::input_guards());
         wireless.extend(uplink::steps());
         let network = super::super::relay_plan(&v4, 24, lan.0, lan.1);
+        // The portal RETURN, journaled with the switch in `dns.json`; the
+        // switch and resolver steps need UCI and the vendor's resolv.conf.
+        let dns = super::super::portal::web_bypasses();
         let ula = "fd12:3456:789a::/64";
         let v6 = network_plan(&lease(), ula, &[ula.into()]);
         let mut restore = Vec::new();
-        for (name, plan) in [("wireless", &wireless), ("network", &network), ("ipv6-setup", &setup_plan()), ("ipv6-network", &v6)] {
+        for (name, plan) in [("wireless", &wireless), ("network", &network), ("dns", &dns), ("ipv6-setup", &setup_plan()), ("ipv6-network", &v6)] {
             for (program, input) in net::firewall::inputs(plan) {
                 restore.push(json!({"plan": name, "program": program, "input": input}));
             }
@@ -2363,11 +2418,11 @@ mod tests {
         upstream.start(true).unwrap();
         assert_eq!(upstream.status()["state"], "detecting");
         assert!(upstream.client.is_some());
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(upstream.status()["state"], "no_upstream");
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(150));
-            upstream.tick().unwrap();
+            upstream.tick(true).unwrap();
             if upstream.status()["state"] == "configured" {
                 break;
             }
@@ -2384,11 +2439,11 @@ mod tests {
             Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"])
                 .run()
                 .unwrap()
-                .contains("dev u60sta0")
+                .contains("dev ath20")
         );
         for _ in 0..3 {
             std::thread::sleep(Duration::from_millis(200));
-            upstream.tick().unwrap();
+            upstream.tick(true).unwrap();
             assert_eq!(
                 upstream.status()["state"],
                 "configured",
@@ -2402,7 +2457,7 @@ mod tests {
         Cmd::new("ip", &["link", "set", "br-lan", "mtu", "1400"])
             .run()
             .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(
             upstream.status()["state"],
             "configured",
@@ -2414,7 +2469,7 @@ mod tests {
         Cmd::new("ip", &["link", "set", "br-lan", "mtu", "1500"])
             .run()
             .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(upstream.status()["lan_mtu"], 1500);
         assert_eq!(ra::data().unwrap()["ra_mtu"], 1500);
         Cmd::new(
@@ -2423,7 +2478,7 @@ mod tests {
         )
         .run()
         .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(
             upstream.status()["state"],
             "configured",
@@ -2459,7 +2514,7 @@ mod tests {
         )
         .run()
         .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert!(Cmd::new("ip", &["-6", "route", "get", "2001:db8:2::123"])
             .run()
             .unwrap()
@@ -2476,7 +2531,7 @@ mod tests {
         )
         .run()
         .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         let revision = upstream.revision();
         Cmd::new(
             "ip",
@@ -2492,7 +2547,7 @@ mod tests {
         )
         .run()
         .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(
             upstream.revision(),
             revision,
@@ -2529,12 +2584,12 @@ mod tests {
         )
         .run()
         .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(upstream.revision(), revision);
         Cmd::new("ip", &["-6", "rule", "del", "pref", PREF, "lookup", TABLE])
             .run()
             .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(
             net::plain_policy_rule("-6", PREF, TABLE).unwrap(),
             net::PolicyRule::Owned
@@ -2549,7 +2604,7 @@ mod tests {
         default_route(upstream.path.as_ref().unwrap(), "del")
             .run()
             .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(
             upstream.status()["state"],
             "configured",
@@ -2565,7 +2620,7 @@ mod tests {
             Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"])
                 .run()
                 .unwrap()
-                .contains("dev u60sta0")
+                .contains("dev ath20")
         );
         // Owned addresses, and a route table another writer emptied (which
         // then no longer exists), are restored in place as well.
@@ -2591,7 +2646,7 @@ mod tests {
         )
         .run()
         .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         let addresses = Cmd::new("ip", &["-6", "addr", "show"]).run().unwrap();
         assert!(
             addresses.contains(&format!("{owned}/128"))
@@ -2601,7 +2656,7 @@ mod tests {
         Cmd::new("ip", &["-6", "route", "flush", "table", TABLE])
             .run()
             .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(
             upstream.status()["state"],
             "configured",
@@ -2612,7 +2667,7 @@ mod tests {
             Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"])
                 .run()
                 .unwrap()
-                .contains("dev u60sta0")
+                .contains("dev ath20")
         );
         assert_eq!(
             upstream.revision(),
@@ -2660,7 +2715,7 @@ mod tests {
         assert_ne!(upstream.session.as_ref().unwrap(), &old_session);
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(150));
-            upstream.tick().unwrap();
+            upstream.tick(true).unwrap();
             if upstream.status()["state"] == "configured" {
                 break;
             }
@@ -2680,7 +2735,7 @@ mod tests {
                 .env("RA_ADDRESSES", "2001:db8:dead::2/64,600,1200")
                 .env("RA_ROUTES", "::/0,fe80::dead,600,512");
             net::run(callback, Duration::from_secs(5)).unwrap();
-            upstream.tick().unwrap();
+            upstream.tick(true).unwrap();
             assert_eq!(
                 upstream.status()["state"],
                 "configured",
@@ -2696,7 +2751,7 @@ mod tests {
             &serde_json::to_vec(&expired).unwrap(),
         )
         .unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(upstream.status()["state"], "no_upstream");
         assert_eq!(upstream.status()["nat66"], false);
         assert!(upstream.client.is_some());
@@ -2716,7 +2771,7 @@ mod tests {
         upstream.start(true).unwrap();
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(150));
-            upstream.tick().unwrap();
+            upstream.tick(true).unwrap();
             if upstream.status()["state"] == "configured" {
                 break;
             }
@@ -2731,7 +2786,7 @@ mod tests {
         let Some(Helper::Owned(child)) = upstream.client.as_mut() else { panic!("the client this test started") };
         child.kill().unwrap();
         child.wait().unwrap();
-        upstream.tick().unwrap();
+        upstream.tick(true).unwrap();
         assert_eq!(upstream.status()["state"], "error");
         assert!(!upstream.status()["nat66"].as_bool().unwrap());
         assert_ne!(
@@ -2747,7 +2802,7 @@ mod tests {
         upstream.start(true).unwrap();
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(150));
-            upstream.tick().unwrap();
+            upstream.tick(true).unwrap();
             if upstream.status()["state"] == "configured" {
                 break;
             }
@@ -2770,7 +2825,7 @@ mod tests {
         .run()
         .unwrap();
         upstream
-            .tick()
+            .tick(true)
             .expect("Safe IPv6 withdrawal must not tear down IPv4 relay");
         assert_eq!(upstream.status()["state"], "error");
         assert_eq!(upstream.status()["nat66"], false);
@@ -2788,7 +2843,7 @@ mod tests {
         .unwrap();
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(150));
-            upstream.tick().unwrap();
+            upstream.tick(true).unwrap();
             if upstream.status()["state"] == "configured" {
                 break;
             }
@@ -2806,7 +2861,7 @@ mod tests {
         upstream.start(true).unwrap();
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(150));
-            upstream.tick().unwrap();
+            upstream.tick(true).unwrap();
             if upstream.status()["state"] == "configured" {
                 break;
             }

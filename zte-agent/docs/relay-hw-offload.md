@@ -1,13 +1,15 @@
 # Wi-Fi 中继的 IPA 硬件转发（owner decision 63）
 
 2026-11-08。中继的 IPv4 NAT 转发主要交给高通 IPA 硬件（IPACM + WDI3）完成；
-CPU 转发路径保留，作为兜底，并加上 RPS/backlog 作辅助。代码：
-`wifi_relay/offload.rs`（配置、HW 模式、main 路由、硬件自检）、
+CPU 转发路径保留，作为兜底，并加上 RPS/backlog 作辅助。2026-11-12 起 agent 不再读、切换、审计或核验
+IPACM 的 HW/SW 模式，由路由器的工作模式决定（车主决定，见“谁决定 HW/SW 模式”）。代码：
+`wifi_relay/offload.rs`（读 IPACM 配置、main 路由、固件指纹）、
 `wifi_relay/offload/neighbours.rs`（删掉 IPACM 给上游其他设备的上行规则，第 8 节）、
 `wifi_relay/offload/clients.rs`（热点客户端换频段后补回 IPACM 的 LAN 路由，第 9 节）、`wifi_relay/steering.rs`
 （RPS/backlog）、`mihomo/routing.rs` 和 `mihomo/geoip.rs`（按 Mihomo 的模式和规则在内核绕过，
 第 4 节）、`net_guard.rs`（统一对齐 ZTE 的改动），以及 `wifi_relay/hotspot.rs` 的同主信道 CSA 修复。
-运行时开关和即时生效的安装/移除见第 3 节末（owner decision 64）。
+运行时开关见第 3 节（owner decision 64）。2026-11-12 起中继的站点接口叫 `ath20`：B31 的原厂 IPACM 配置本来就列着它，
+agent 不再改写那个文件，也没有安装步骤和安装后的重启（第 1 节）。在那之前接口叫 `u60sta0`，本文带日期的记录里仍用旧名。
 
 ## 为什么要做
 
@@ -26,106 +28,103 @@ br-lan 上的 HTB + fq_codel）都压在一个 A55 核上。Speedtest.cn 的云�
 
 ## 三个缺一不可的条件
 
-1. **开机前 IPACM 配置里已经有 `u60sta0`。** 格式照 wlanX 的条目写（Category
-   `UNKNOWN`、WlanMode `full`），插在 `wlan0` 条目之前。IPACM 只在启动时读一次接口表；
-   运行中重启 ipacm 不仅无效还有害（新起来的进程收不到驱动之前发过的 AP/STA 事件），
-   所以 agent 永远不会重启它。只改名成 `wlan1`（ZTE 留给访客热点/回程热点、
-   169.254.31.1 的名字），或者只切 HW 模式，都已实测无效。
+1. **IPACM 开机时读到的配置里列着站点接口。** 条目要是 Wi-Fi 的格式（Category `UNKNOWN`、
+   WlanMode `full`）。IPACM 只在启动时读一次接口表；运行中重启 ipacm 不仅无效还有害（新起来的进程
+   收不到驱动之前发过的 AP/STA 事件），所以 agent 永远不会重启它。B31 的原厂文件已经这样列着
+   `ath20`，所以站点就叫 `ath20`。不用 `wlan*` 这类名字：厂商关 Wi-Fi 时会等所有名字含 `wlan` 的接口
+   消失（`lib/wifi/zteqcawifi.sh`）。早先实测：只改名成 `wlan1`（ZTE 留给访客热点/回程热点、
+   169.254.31.1 的名字），或者只切 HW 模式，都无效。
 2. **main 表里有一条经过中继的默认路由。** IPACM 不看策略路由表：只放在 60631 表时，
    日志一直是 "Wan is not up, cache connections"；加上之后立刻 `TriggerWANUp()`，
    缓存的连接被写进硬件 NAT（AddPdn / AddEntry）。
 3. **IPACM 处于 HW 模式**（`/sbin/ipacm_switch.sh on`，发 SIGUSR2；`off` 发 SIGUSR1，
    并设置 `zwrt_router.tmp_router.close_ipa_acce=1`）。
+   这一条由厂商决定，agent 只负责前两条，见下一节。
 
 另外，流量不能被 Mihomo 的 nft 表 TPROXY 进核心（见第 4 节）：核心终结的连接
 不经过转发路径，IPA 无从卸载。
 驱动层的 STA 卸载本来就是开着的（`gIPAConfig=0x46d`；dmesg 中有
 `wlan_ipa_setup_iface mode:0` 和 offload enable=1），问题完全出在 IPACM 这一层。
 
-## ZTE 为什么关掉加速
+## 谁决定 HW/SW 模式
 
-开机约 38 秒时，dmesg 先后出现 `ipacm_switch: ipacm to SW` 和
-`sfe_switch: sfe to off`。调用链是：`zte_smart_manage` 按
-`zwrt_smart_mng.smart_qos.mode='Ai_mode'` 执行
-`/sbin/smart_set_qos_policy.sh Ai_mode`，它调用 `router_common.sh` 里的
-`accelate_modem_proc off`（X75 平台上会同时关 IPA 和 SFE），然后在 br-lan 上建立
-智能 QoS 的 HTB 1:10–1:40 和 fq_codel。也就是说，这是 ZTE 的默认智能 QoS 策略：
-它需要每个包都经过 CPU。
+agent 不读也不改 IPACM 的模式（车主决定，2026-11-12）：想要硬件转发时，车主自己把工作模式设成
+极速模式（Balanced）。厂商通过 `router_common.sh` 的 `accelate_modem_proc on|off` 切换（X75 平台上
+同时开关 IPA 和 SFE）：
 
-`zte_router` 里另外两处调用 off 的路径，这台机器都不满足：
+- **工作模式**（`zwrt_smart_mng.smart_qos.mode`，`/sbin/smart_set_qos_policy.sh`）：官方 Web UI 共 6 个。
+  `Nomal_mode`（原文拼写，页面上叫 Balanced / 极速模式）执行 `on`；`Ai_mode`（出厂默认）、`Live_mode`、
+  `Game_mode`、`Video_mode`、`Chat_mode` 执行 `off`，并在 br-lan 上建立智能 QoS 的 HTB 1:10–1:40 和
+  fq_codel，需要每个包都经过 CPU。
+- **随流量切换**：`Ai_mode` 和 `Game_mode` 下，`zte_smart_manage` 的 `[ai_qos]` 循环检测到应用流量时下发
+  当前模式（加速关），连续检测不到时下发 `stop`（加速开），所以 IPA 模式随流量反复变化；`Nomal_mode` 下
+  这个循环什么都不做。`Ai_mode` 下开机约 38 秒时 dmesg 先后出现 `ipacm_switch: ipacm to SW` 和
+  `sfe_switch: sfe to off`，就是这条路径。
+- **其他设置**：`speedlimit.sh` 的限速和省电模式也会关加速（这两种情况下 `smart_set_qos_policy.sh` 提前返回，
+  不按工作模式打开），ubus 上 "user set ipa disable"（`zwrt_router.other.ipa_disable`）同样调用 `off`。
+- `zte_router` 里还有 `x75_platform_init` 会调用 `off`，它要求 `dev_info == SDX75_switch` 并且
+  `opms_wan_mode == DHCP`，这台是 `PPP`，不满足。
 
-- `x75_platform_init` 要求 `dev_info == SDX75_switch` 并且 `opms_wan_mode == DHCP`，
-  这台是 `PPP`；
-- `ipa_disable == 1` 时也会调用 off，这台没有设置。
-
-用户在设置里的显式选择同样会关加速：`speedlimit.sh` 的限速、省电模式，以及 ubus 上
-"user set ipa disable"（`zwrt_router.other.ipa_disable`）。
+2026-11-11 只读查询时本机已是 `Nomal_mode`（谁改的未查明）；本文早先写的 `Ai_mode` 是那之前的状态。
 
 ## 实现
 
-### 1. 配置安装（需要重启）
+### 1. IPACM 配置：只读
 
-中继页"Hardware forwarding"面板，接口是 `POST /api/wifi-relay/offload`，
-请求体 `{"install":true|false}`：
+agent 只读 `/etc/data/ipa/IPACM_cfg.xml`，从不写它（`offload::config`）。状态接口的 `offload.config`：
 
-- 安装：把条目插到 `/etc/data/ipa/IPACM_cfg.xml` 的 `wlan0` 之前。`/etc` 是 overlay，
-  改动能跨重启保留。文件就地改写，保留属主、权限和 SELinux 标签。原文件备份到
-  `/data/zte-agent-relay/ipacm/IPACM_cfg.xml.orig`，`installed` 里记下安装时的
-  boot id。在 B31 的出厂文件（`a0f361c5…`）上，生成结果和实测用过的文件
-  （`4b90dd39…`）逐字节一致。
-- 状态：`not_installed` / `reboot_required`（本次开机才装的）/ `loaded`（重启之后，
-  手工加的条目比 ipacm 进程早，或者本次开机 IPACM 已经加载过它）/ `overwritten` / `unavailable`。
-  每次判定为 `loaded` 时，把 boot id 记到 `/tmp/zte-agent-relay/ipacm-loaded`：IPACM 把接口表
-  留在内存里直到重启，所以同一次开机里移除后再安装，状态直接是 `loaded`，立即生效。
-  QCMAP 恢复出厂时会用 `factory_IPACM_cfg.xml` 覆盖这个文件，这时状态显示
-  `overwritten`，提示重新安装。QCMAP 运行时也会改写这个文件（当前文件比出厂文件
-  大），所以卸载时只删掉我们那一块，不整份恢复旧文件。
-- 卸载：删掉条目和 `installed` 记录，**保留 `.orig` 备份**。当前的中继连接立刻改走 CPU
-  （见第 3 节末），下次重启后 IPACM 也会忘掉这个接口。OTA 切换 A/B 槽位后，overlay 的上层目录不同，
-  需要重新安装。
-- 手工备份：原厂文件 `IPACM_cfg.xml.orig`（`a0f361c5…`）、安装后的 `IPACM_cfg.xml`
-  （`4b90dd39…`）和 `restore-stock.sh` 现在只在开发机上，放在仓库旁边的 `../backups/ipacm/`。
-  设备上的 `/data/zte-agent-backup/ipacm/` 已于 2026-11-11 按车主要求删除；agent 状态目录里的
-  `/data/zte-agent-relay/ipacm/IPACM_cfg.xml.orig` 与原厂文件相同。agent 不在时，把这个目录推到
-  设备上运行脚本恢复原厂文件，然后重启整机。不要只重启 ipacm。
-- **写入方式（H5，v1 记录风险，v4 修复）**：原先是 `O_TRUNC` 就地改写，截断与写完之间 agent
-  被杀或掉电会留下半份或空的唯一生效配置。现在（`offload::rewrite`）先在同一文件系统写完整副本
-  （父目录 `/etc/data` 与 `/etc/data/ipa` 同属一个文件系统时放在父目录，IPACM 监视的目录只看到一次
-  rename；否则放在同目录），把原文件的属主、权限和 SELinux 标签（`security.selinux`）复制过去，fsync
-  后核对内容和这三项，再 `rename` 覆盖并 fsync 目录。崩溃时只会留下完整的旧文件或完整的新文件
-  （外加一个可删的副本）；任何一步失败都删掉副本、原文件不动。中断写入的故障试验已在本机副本上做过
-  （目录不可写时原文件完整、副本删除）；设备上的属主、权限、标签和下次开机加载待维护窗口核对。
+- `listed`：有一个 `<Iface>` 条目名为 `ath20`、Category `UNKNOWN`、WlanMode `full`。B31 的原厂文件
+  （sha256 `a0f361c5…`）就是这样；QCMAP 运行时改写这个文件、恢复出厂时用 `factory_IPACM_cfg.xml` 覆盖它，
+  都不会去掉这个条目。
+- `not_listed`：别的固件没有这个条目，IPACM 不理中继，中继走 CPU，页面写明原因。
+- `unavailable`：读不到文件。
 
-### 1a. 状态机、固件指纹和车主限制（v4，`offload::Runtime`）
+页面的 “IPA CONFIGURATION” 一行显示这个状态，没有安装或移除的控件；`POST /api/wifi-relay/offload` 只接受
+`{"enabled":true|false}`（第 3 节）。
 
-每个中继会话的硬件路径是一个显式状态（状态接口 `offload.state`），设备读写都经 `IpacmPort`
-（测试用假实现跑完整的转换和失败矩阵）：
+依据（2026-11-12）：站点改名 `ath20` 后，IPACM 把中继登记成 WAN，为真实 LAN 客户端添加了硬件 NAT 表项，
+205 MB 下载 141–183 Mbit/s，内核转发路径只有 168 个包（`measurements/exp2-ath20-*`）；最终版在新开机、
+原厂文件上 205 MB 只有 135 个包走内核，软中断 0.9%（`measurements/b2-reboot3/hw-throughput.txt`）。
+
+**以前的安装（2026-11-12 删除）**：之前的版本把 `u60sta0` 条目插进这个文件，需要重启整机才生效，并有备份、
+标记文件和“本次开机是否已加载”的记账。车主的路由器上，这个条目已在 2026-11-12 用旧版自己的移除操作删掉，
+文件又与原厂一致（`measurements/b2-final/disconnect-connect.log` 的 sha 前缀）。路由器上旧安装留下的备份
+`/data/zte-agent-relay/ipacm/IPACM_cfg.xml.orig`（核对过与正在用的文件相同）已在同一天按车主的要求删除。
+开发机上仓库旁边的 `../backups/ipacm/`（原厂文件、装过条目的文件和 `restore-stock.sh`）还在，agent 不读它。
+
+### 1a. 状态机和固件指纹（`offload::Runtime`）
+
+每个中继会话的硬件转发路径是一个显式状态（状态接口 `offload.state`），设备读写都经 `IpacmPort`
+（测试用假实现跑转换和失败矩阵）。agent 管的只有第 2 节的 main 路由和第 8、9 节的两个监视器：
 
 | 状态 | 进入与离开 |
 | --- | --- |
-| `off` | 没有请求或没有会话；配置未加载、开关关、会话结束都回到这里。 |
-| `engaging` | 先切 HW（记下原模式，日志里有撤销），再加 main 路由和 unreachable 守卫，然后 SW→HW 重新挂载、启动邻居和客户端监视器。任何一步失败都撤掉这次取得的部分（路由和模式），进 `software` 并写明原因，不会留下"软件"快照掩盖实际接管。 |
-| `hardware` | 每 15 s 审计：ZTE 改回 SW 就再切 HW（模式归本会话，不再记新日志）；车主限制（`ipa_disable`、省电模式、限速）出现就释放进 `software`；回程计数在有负载时 ≥1,500 包/s 就重新挂载，每会话最多 3 次。有负载且回程只有少量包才显示"已确认卸载"（`offload_confirmed`），空闲不算。 |
-| `software` | 车主限制、固件不符、路由或模式失败。限制解除且开关仍开时，审计会重新 `engaging`（重启以后不用重连中继）。 |
-| `releasing` | 先删 main 路由（IPACM 的中继 WAN 下线），再恢复本次接管的模式。撤销失败就停在这里（不报 `off`），剩余撤销项保留，下次再试。释放后有负载时用回程计数确认回到 CPU（`cpu_path: confirmed`），否则 `unverified`。 |
+| `off` | 不需要或做不到：没有会话、IPACM 配置没有列出 `ath20`、开关关、固件指纹不符、加路由失败（已加的部分先撤掉）。`reason` 写明原因。 |
+| `routed` | main 默认路由和 unreachable 守卫已加好，邻居和客户端监视器在运行。IPACM 是否真的卸载，取决于它当时的模式（上一节）。 |
+| `releasing` | 停监视器，删 main 路由（IPACM 的中继 WAN 下线）。撤销失败就停在这里（不报 `off`），剩余撤销项保留，下次再试；还要路由时，等撤完再重新加。 |
 
-**固件指纹**：邻居退役（第 8 节）、客户端 STALE（第 9 节）和 SW→HW 重新挂载都是对 B31 IPACM 行为的修补，
+状态接口 `offload` 的键：`state`、`route`（main 路由是否在位）、`reason`、`config`（第 1 节的配置状态）、
+`enabled`（运行时开关）、`ipv4_through_mihomo`（`none` / `rules` / `all`：Mihomo 拦截的公网 IPv4 无论 IPA
+怎样都走 CPU，规则绕过开着时只有内核放行的 DIRECT 部分例外）。
+
+**固件指纹**：邻居退役（第 8 节）和客户端 STALE（第 9 节）是对 B31 IPACM 行为的修补，
 只在 `zwrt_common_info.common_config.wa_inner_version` 为 `BD_CNMU5250V1.0.0B31` 且 `/usr/bin/ipacm` 的
-SHA-256 为 `95385816…5c11c0`（4,129,835 字节，2026-11-10 只读查询）时启用；不符时不进入硬件路径，页面写明原因，
+SHA-256 为 `95385816…5c11c0`（4,129,835 字节，2026-11-10 只读查询）时启用；不符时不加 main 路由，页面写明原因，
 中继走 CPU。
 
-只有路径真的变了（开、关、移除、限制出现或解除）才重置 LAN IPv4 连接。页面区分"HW 模式但未确认""有负载下确认卸载"
-和"公网 IPv4 由 Mihomo 处理"（Mihomo 拦截的公网 IPv4 无论 IPA 状态都走 CPU；规则绕过开着时只有 DIRECT 部分例外）。
+只有路径真的变了（开关打开或关上）才重置 LAN IPv4 连接。路由在位时，页面的 RELAY PATH 写
+“极速模式（Balanced）下走硬件（IPA），其他工作模式走 CPU”：agent 不读模式，也不核验卸载是否真的发生。
+要确认，看 `U60_RELAY_FWD` 的回程计数（几百个包是硬件，十几万是 CPU），或第 8、9 节的 debugfs。
 
 ### 2. main 表默认路由（中继连接时加，断开时删）
 
-只有配置状态是 `loaded` 时才加，并纳入中继的 network Transaction：
+只有配置状态是 `listed`、运行时开关开着、固件指纹相符时才加，并纳入中继的 network Transaction：
 
 ```text
 ip -4 route add unreachable 100.64.0.0/10  metric 60631 table main
 ip -4 route add unreachable 169.254.0.0/16 metric 60631 table main
 ip -4 route add unreachable 224.0.0.0/4    metric 60631 table main
-ip -4 route add default via <网关> dev u60sta0 metric 60631 table main
+ip -4 route add default via <网关> dev ath20 metric 60631 table main
 ```
 
 - **中继优先、蜂窝备用**：所有流量都先查 pref 18640 → 60631 表（中继），这一点不变。
@@ -142,49 +141,42 @@ ip -4 route add default via <网关> dev u60sta0 metric 60631 table main
 - 回滚：路由删除时会按 `dev` 过滤；如果接口已经消失，就当作已经删除
   （`net_tools::Cmd::undo`）。
 
-### 3. HW 模式
+### 3. 运行时开关（owner decision 64）
 
-中继连接时（配置已加载、并且没有用户限制）执行 `@u60-relay-ipa hw`。顺序和实测一致：
-先切 HW，再加 main 路由。之后每 15 秒检查一次：
+中继连接时（配置列着 `ath20`、开关开、指纹相符）加第 2 节的路由，再启动第 8、9 节的监视器。
+IPACM 的模式整机共用、归厂商（见“谁决定 HW/SW 模式”），中继连接、断开和这个开关都不碰它，
+所以中继开着时蜂窝备用路径也照工作模式走。
 
-- 如果 `close_ipa_acce` 又变回 1（智能 QoS 事件等），就再切回 HW 并记一条日志；
-- 如果检测到 `ipa_disable=1`、省电模式，或者 `total_limit_switch` /
-  `st_total_limit_switch` 开着，就不再强切，页面显示原因。
+**已知未处理**：早先的版本观察到，中继重连后偶尔模式是 HW、连接却全部留在 CPU 上
+（`U60_RELAY_FWD` 回程计数每秒十几万包），先切 SW 再切 HW 每次都能恢复（3/3），所以当时在加好
+main 路由后做一次 SW→HW，并按回程计数每会话最多再做 3 次。这一步随模式切换一起删了；现在出现这种情况，
+页面照样显示“极速模式下走硬件”，agent 不会发现。2026-11-12 没有任何重新挂载的几次下载都走了硬件：
+agent 恢复中继后、厂商处于硬件模式时 205 MB 只有 155 个包走内核（全走 CPU 约 141,700 个）；厂商从软件切回
+硬件后 103 MB 只有 72 个（约 70,900 个）（`measurements/observations-2026-11-12.md`）；最终版新开机后 205 MB
+只有 135 个（`measurements/b2-reboot3/hw-throughput.txt`）。这几次都不是重连之后。
 
-**硬件自检和重新挂载**（只看 TCP：`U60_RELAY_FWD` 里单独有一条 TCP 回程放行规则，自检读
-它的计数；UDP 不参与自检，虽然 11-09 实测 IPv4 QUIC 也会被卸载，见末节）：中继重连后，偶尔会出现模式显示 HW、但所有连接仍在 CPU 上
-转发的情况（`U60_RELAY_FWD` 回程计数每秒十几万包）；先切 SW 再切 HW 每次都能恢复（3/3）。
-所以：
+同一天下午在极速模式（`Nomal_mode`，`close_ipa_acce=0`）下专门测了重连之后（`measurements/b3-final/ipa-switch.log`，
+开发机经 USB 下载）：重连同一个 5 GHz 上游、5 GHz 换到 2.4 GHz、2.4 GHz 换回 5 GHz、车主断开再连接，每次连上后
+立刻测一次、60 秒后再测一次。8 次测量走内核的包数在 41–377 之间（全走 CPU 约 35,400–70,900 个），`dmesg` 里
+厂商的 HW/SW 切换行一直只有开机时的那一条 `ipacm to HW`。加上当天早些时候的 5→2.4→5 往返，共 6 次重连都没有
+出现。旧现象是偶发的，所以这只说明这 6 次没有出现，不能说明它不会再出现；要判断是否出现，下载时看
+`iptables -L U60_RELAY_FWD -nvx` 的回程计数：每 100 MB 涨几百个包是硬件，涨约 7 万个包是 CPU。
 
-- main 路由加好之后立刻做一次 SW→HW（`Runtime::kick`，日志
-  `re-arming IPACM for the new uplink`）；
-- 之后每次 15 秒检查时，如果模式是 HW，就比较回程计数的速率，≥1500 包/秒说明连接还在
-  CPU 上，再做一次 SW→HW（每次会话最多 3 次，间隔至少 60 秒）；
-- 页面的 `hardware` 只有在模式是 HW、并且没有发现这种情况时才是 true，`mode` 另外给出
-  IPACM 的模式。
-
-断开时的处理（这个开关是整机的，会连带影响蜂窝）：只有在本次会话把 SW 切成了 HW 时，
-才恢复成 SW，也就是 ZTE 智能 QoS 原来的选择；如果连接时已经是 HW，就保持不动。
-所以中继关闭时，蜂窝路径和原厂行为完全一样。中继连着时，备用蜂窝的流量也会走 HW，
-不经过智能 QoS。
-
-**运行时开关（owner decision 64）**：中继页"Hardware forwarding"标题旁的开关，接口是
+中继页"Hardware forwarding"标题旁的开关，接口是
 `POST /api/wifi-relay/offload` 加 `{"enabled":true|false}`，关掉时存成
 `/data/zte-agent-relay/ipacm/off`（重启和重连后仍然有效），状态里是 `offload.enabled`。
-关掉、移除配置时，当前连接立刻改走 CPU；打开、或者同一次开机里重新安装时，立刻恢复硬件转发。
-不需要重启路由器，也不重连中继：
+关掉时当前连接立刻改走 CPU，打开时立刻恢复硬件转发，不需要重启路由器，也不重连中继：
 
-- 关（`Runtime::release`）：停止邻居监听，然后用 `Transaction::release` 只撤掉这部分步骤，
-  按添加的反序：先删 main 默认路由和 unreachable 守卫（IPACM 失去中继 WAN），再恢复本次会话
-  切换前的 IPACM 模式（原来是 SW 就切回 SW）。其余中继步骤和日志都保留。
-- 开（`Runtime::sync`）：和连接时一样，先切 HW、加 main 路由，再 SW→HW 重新挂载、启动邻居监听。
+- 关（`Runtime::release`）：停止邻居和客户端监听，然后用 `Transaction::release` 只撤掉这部分步骤，
+  按添加的反序删 main 默认路由和 unreachable 守卫（IPACM 失去中继 WAN）。其余中继步骤和日志都保留。
+- 开（`Runtime::sync`）：和连接时一样，加 main 路由、启动监听。
 - 路径变了之后执行 `conntrack -D -f ipv4 -s <LAN 网段>`，让已建立和已卸载的连接按新路径重建，
   所以每次切换都会重置一次现有的 LAN IPv4 连接。页面按实际结果提示（删了几条、没有可删的、
   已被同一次变化之后开始的删除覆盖，或失败待重试），不再一律说“已重置”；见下面的 conntrack 重置。
 - 关掉时页面的原因是 "Hardware forwarding is turned off"。
-- 移除时先撤掉硬件路径、等 1 秒，再改写 `IPACM_cfg.xml`。IPACM 监视这个文件，文件一变就重读配置；
-  重读之后它不再理会中继 WAN 的下线：11-09 实测先改文件、再删 main 路由，WAN 规则和 PDN 都还在，
-  新连接照样被卸载（回程内核包 221–416）。只关开关（不改文件）则立即回到 CPU（约 20 万）。
+- 设备事实（11-09，当时还有安装/移除）：IPACM 监视 `IPACM_cfg.xml`，文件一变就重读配置，重读之后不再理会中继
+  WAN 的下线：先改文件、再删 main 路由，WAN 规则和 PDN 都还在，新连接照样被卸载（回程内核包 221–416）。
+  只关开关（不改文件）则立即回到 CPU（约 20 万）。所以不要在中继连着时改这个文件。
 
 ### 4. Mihomo 的 DIRECT 规则在内核绕过（`POST /api/mihomo/cn-direct`）
 
@@ -256,7 +248,8 @@ fake-ip：
 （`PUT /proxies/…`）、更新规则集（`PUT /providers/rules/…`）都经控制器排队：先装"保持"表（不绕过任何
 地址，由代次标记确认；确认不了就拒绝这次修改，核心不动），再改核心、读回模式和选择、只重置失去 DIRECT
 的 LAN IPv4 连接，最后装新链。`http` 规则集的定时刷新也由控制器做（托管配置删掉了它们的 `interval`），
-刷新期间只把这个规则集当作未知。每 60 秒控制器还会读一次核心的模式和选择，有差异按同样顺序跟随。
+刷新期间只把这个规则集当作未知；`domain` 行为的规则集（内核链从不读它）刷新时直接交给核心，不收紧也不换表。
+上次声明而没有确认的表也算在内：收紧与否、要重置哪些连接，都按内核可能持有的所有表算。每 60 秒控制器还会读一次核心的模式和选择，有差异按同样顺序跟随。
 这个开关会改 DNS 过滤表：先收紧，再对同一份配置热重载（`PUT /configs?force=false`），读回模式、出口接口、
 各组选择（没有退到 `COMPATIBLE`）、规则集和监听，并在 1053 上查一个答案必须改变的名字；确认后才放开新链，
 确认不了就改用保留拦截的计划内重启。
@@ -282,7 +275,7 @@ conntrack-tools 1.4.8 在“没有条目可删”和“操作失败”时都返�
 成功且覆盖全部范围的一次删除才能抵掉之后的请求。最近 8 次结果在两个状态接口的
 `connection_resets` 里（开机后秒数、原因、范围、结果）。目的是让已建立的连接和已经被卸载的
 连接按新的路径重建；IPACM 收到 DESTROY 事件会删掉对应的硬件表项。切换只重置失去 DIRECT 的范围
-（`routing::lost`，D10）：新旧两张链直到最后一个放行点都只按目的地址判断时，用"旧放行减新放行"按首个
+（`routing::lost_from`，D10；“旧”是上次重置以来内核可能持有过的每一张表）：新旧两张链直到最后一个放行点都只按目的地址判断时，用"旧放行减新放行"按首个
 命中计算（例如在原 DIRECT 段前加了代理规则，被它截走的那半段）；任一张链含端口、来源或协议条件
 （例如前面加了 `DST-PORT,443,代理`，原 DIRECT 段里的 443 硬件流也必须退出）时，旧链不纯就重置整个
 LAN IPv4，新链不纯就重置旧链放行的全部范围；超过 64 段也重置整个 LAN IPv4；没有失去放行的就什么都不删
@@ -295,31 +288,41 @@ Mihomo 的拦截本身（TPROXY、nft 表、`tcp_pacing_*_ratio`、brnf）见
 
 ### 5. 统一对齐 ZTE 的改动（`net_guard.rs`）
 
-ZTE 会从很多地方改写 legacy iptables、sysctl 和路由：fw3 重载、Wi-Fi/QoS/限速/IPA
+ZTE 会从很多地方改写 legacy iptables、sysctl 和路由：fw3 重载、防火墙/QoS/限速/访客隔离
 脚本、WAN 事件。以前每样东西各自有检查（例如 `redirect_chain` 每个 tick 查一次），
 现在统一成一处：
 
 - 中继（IPv4 的 network，加上 IPv6 的 setup/network 两个事务）和 Mihomo 都把自己的改动
   记在 `Transaction` 里。IPv6 只交给这里检查防火墙和 nft 规则（NAT66、转发、DNS）；地址、
-  路由和策略规则仍由 IPv6 每个 tick 的 `check_owned` 修复，因为它还要检查冲突（前缀被改、
+  路由、策略规则和 RA 由 IPv6 自己的 `check_owned` 修复，因为它还要检查冲突（前缀被改、
   DAD 失败、路由或优先级被别人占用会撤掉 IPv6）、等 DAD，并使用租约当前的生存时间
-  （`Transaction::reconcile_only`）。`apply`/`apply_network` 会把
-  能复查的步骤（iptables 的 `-N/-I/-A`、`ip route/rule/addr add`、`@u60-sysctl`、
-  `@u60-mihomo-nft`、`@u60-relay-steer`）连同撤销一起记进内存里的期望状态，
-  `remove`/`rollback` 时删掉。`Transaction::reconcile` 按原顺序逐条检查
-  （`iptables -C`/`-S`、`ip ... show`、读 sysctl、`nft list`），缺了就原样重做。
-- `net_guard` 只决定什么时候查：inotify 监视 20 个 ZTE 脚本的 `IN_OPEN`
+  （`Transaction::reconcile_only`）。`check_owned` 在中继 tick 里运行，但只在这几种时候：
+  `net_guard` 的触发已安静（与下面的检查同一拍）、上次读取失败后的重试、续写生存时间之前，
+  以及距上次检查满 15 秒（`ipv6::CHECK_EVERY`）。所以不发厂商触发的删除最晚约 15 秒才发现（车主 2026-11-12 接受）。
+  `apply`/`apply_network` 会把能复查的步骤（iptables 的 `-N/-I/-A`、`ip route/rule/addr add`、
+  `@u60-sysctl`、`@u60-mihomo-nft`、`@u60-relay-steer`、`@u60-relay-power-save`、
+  `@u60-relay-portal-return`）连同撤销一起记进内存里的期望状态，`remove`/`rollback` 时删掉。
+- 一次检查（`Transaction::reconcile`）先读列表、再逐条对照：每个 iptables 表只 `-S` 一次，路由、
+  策略规则、地址每族各列一次（`net_tools::Listings`）；中继的 tick 用 `net_tools::Pass` 让同一次检查的
+  四个事务共用这些列表。完整检查一次中继从 43 个 `iptables`/`ip` 进程降到 7 个。规则不在预测的
+  `-S` 形式里时才对它单独跑 `-C`（日志 `[net] listed in a form not predicted`）。只有确定不在的才重做：
+  链不存在，或 `-C` 以退出码 1 报不在（`firewall::no_rule`）。B31 的 iptables 1.8.8（legacy，两族）有两种措辞：
+  目标是 ACCEPT、RETURN 或链不存在时是 "Bad rule (does a matching rule exist in that chain?)"，跳到一条存在的用户链
+  （每个挂到 `U60_*` 链的钩子）或目标是 MASQUERADE 时是 "No chain/target/match by that name."；目标链不存在则退出 2（"Couldn't load
+  target"），不算答案。批次 1 的第一版只认第一种：开机后厂商的防火墙启动清掉了 IPv6 INPUT 钩子，它的撤销读成
+  “查不了”，之后每次中继恢复都以 "Network cleanup paused" 失败，直到装上修复版（2026-11-12，约 15 分钟没有上行）。
+  列表或工具本身失败算“查不了”，报出来，留给下一次检查。重做之后，这个列表在本次检查里重新读。
+- 撤销（`Cmd::undo` → `firewall::undo`）删掉自有规则的每一份副本，自有 `U60_*` 链先清空再删除；
+  厂商链从不清空，别人的同样规则只删一次。只有确定的“不在”才算已撤销，工具或锁失败时保留日志。
+- `net_guard` 只决定什么时候查：inotify 监视 18 个 ZTE 脚本的 `IN_OPEN`
   （`fw3`、`firewall_*.sh`、`module_firewall_*.sh`、`wifi_isolate_*`、`isolate_exclude.sh`、
-  `speedlimit.sh`、`mwan_speedlimit.sh`、`qos_set.sh`、`smart_set_qos_policy.sh`、
-  `ipacm_switch.sh`、`router_common.sh`、`15-mwan3` 等），订阅 ubus 事件
-  `zwrt_wlan`、`zwrt_router.msg`、`zwrt_smart_mng.msg`、`network.interface`；
+  `speedlimit.sh`、`mwan_speedlimit.sh`、`qos_set.sh`、`router_common.sh`、`15-mwan3` 等，
+  `net_guard::WATCHED`），订阅 ubus 事件 `zwrt_wlan`、`zwrt_router.msg`、`network.interface`；
   触发后安静 2 秒再查（到点直接唤醒中继和 Mihomo，不等它们下一个 tick）；某次检查真的补回了
   东西，5 秒后再查一次；没有触发时每 60 秒兜底一次。没有任何 owner 时什么都不跑。
   每次触发后的 3 秒内，每 0.5 秒只读一遍 owner 持有的 `@u60-sysctl`（如 Mihomo 的 brnf=0），
   被改了才写回，而且写之前在同一把锁里确认它仍被同一 owner、同一代次持有；owner 释放时先注销
-  再执行撤销，所以释放后的迟到采样不会把运行值写回去（`net_guard::hold/release`）。agent
-  自己运行 `ipacm_switch.sh` 期间（及之后 1 秒）对它的打开只算一次触发，其他脚本和 ubus
-  照常算。
+  再执行撤销，所以释放后的迟到采样不会把运行值写回去（`net_guard::hold/release`）。
 - 每次恢复都会记日志，写明重做了哪些命令：
   `[guard] relay: restored after another writer removed them: ...`。某一条查不了或重做失败时，
   其余的照常处理；失败写进日志（同样的失败只记一次）并显示在页面上。
@@ -330,7 +333,32 @@ ZTE 会从很多地方改写 legacy iptables、sysctl 和路由：fw3 重载、W
   的 Firewall layout）：上游防护、转发、IPv6 基线、NAT66 和中继 DNS 的拒绝/改写都在 nft；
   legacy 只留必须穿过 ZTE 拒绝的放行（`U60_RELAY_IN`、`U60_RELAY_FWD`、`U60_R6_IN`、
   `U60_R6_FWD`）、门户 RETURN 和 IPv4 MASQUERADE。
-- IPA 模式不在这里：它有自己的 15 秒检查（要考虑用户限制，见第 3 节）。
+
+**fw3 重载做了什么、谁触发的**（2026-11-12 查明）：每次 fw3 start/restart/reload 都运行 include
+`firewall_init.sh`，它调用的 `firewall_sys_fw.sh`（`:1104-1106`，无条件）和
+`wifi_isolate_and_second_ssid_access_control.sh`（`:125-130`，本机条件恒真）把 brnf 写成 1，调用的
+`firewall_redirect.sh` 清空两族的 `redirect_chain`。没有厂商设置能关掉 brnf 的写入。实测每次重载后
+brnf 读到 1 约 0.2–0.5 秒，才被上面的采样写回 0。中继连上之后那次重载是 agent 自己引起的：IPv6 的
+`ubus call network.interface.lan set_data`（`wifi_relay/ipv6/ra.rs`）让 netifd 以
+`ACTION=ifupdate IFUPDATE_DATA=1` 跑 `iface` hotplug，`/etc/hotplug.d/iface/20-firewall` 随即
+`fw3 -q reload`（进程链实测；撤 IPv6 时两次重载相隔 3.2 秒）。
+
+**离线门户的抑制**（`wifi_relay/portal.rs`）：`firewall_redirect.sh` 只在 `zwrt_redirect.redirect.switch` 为 1 时
+写端口 80 的 DNAT（本机去掉 agent 的改动后读到的是 1）。中继会话期间 agent 用一个易失的 uci 改动把它设成 0，
+另在两族 `redirect_chain` 的最前面放一条 RETURN（`@u60-relay-portal-return`，注释 `zte-agent-wifi-relay`）。
+三步都记在会话的 `dns` 事务（`dns.json`）里，和解析器那一行放在一起。5 GHz 之间的交接只释放解析器那一行，
+开关改动和两条 RETURN 原样交给新会话（`successor`），新会话用 `ensure` 重新登记；guard 的核对在同一拍里查
+`dns`；agent 重启接管时把两条 RETURN 接进 `dns`；断开时才全部撤掉。
+
+为什么这样做：之前的版本把 RETURN 记在 `network.json`，交接时连同开关改动一起释放、几秒后随新租约再设。
+2026-11-12 实测同一上游重连时，这几秒里正好有一次 fw3 重载（agent 自己的 IPv6 设置引起），厂商的 DNAT 写进去
+并一直留到下一次重载（5 分钟以上）；agent 的 RETURN 缺了 6.3 秒，其中 3.1 秒 DNAT 在位
+（`measurements/exp1-step1-ipv6-off.log`）。
+
+现在的实测（2026-11-12，`measurements/b2-portal/handover-sampler.log`）：同一上游两次交接重连（IPv6 先关后开），
+每次后面都有防火墙重载；开关始终读 0，`redirect_chain` 里从没出现厂商规则，dnsmasq 的两个主进程没有变；
+每次清空后链里约 4 秒是空的，然后 RETURN 回到第一条。之后 `network.json` 不再提 `redirect_chain`，`dns.json`
+里有两条撤销。RETURN 和“排在所有厂商规则之前”的维护仍保留：开关一旦读到 1，厂商的 DNAT 就会出现。
 
 实测到的 ZTE 改写（2026-11-08）：中继每次连上之后，ZTE 都会把
 `bridge-nf-call-ip(6)tables` 改回 1，并清空 nat 表的 `redirect_chain`（中继放在里面的
@@ -338,10 +366,11 @@ RETURN 会跟着消失）；`fw3 reload` 也会把 brnf 改回 1。三者都被�
 IPv6 的 `U60_R6_NAT`/`U60_R6_FWD` 跳转后 4 秒补回（当时的版本；v5 起 NAT66 在 nft 表里，
 新的恢复时间待设备复测）。门户 RETURN 现在还要排在 `redirect_chain` 里所有厂商规则之前：
 排在后面时用一个 restore 事务删掉再插到第一条，期间不会缺失。
+（2026-11-12 注：这里的“中继连上之后”就是上面 IPv6 `set_data` 引起的那次 fw3 重载。）
 
 ### 6. RPS 和 backlog（辅助）
 
-中继连接时，`u60sta0` 和 `wlan2` 所有接收队列的 `rps_cpus` 设为"没有处理过 Wi-Fi
+中继连接时，`ath20` 和 `wlan2` 所有接收队列的 `rps_cpus` 设为"没有处理过 Wi-Fi
 中断的 CPU"（从 `/proc/interrupts` 计算，B31 上是 `c`）；`netdev_max_backlog`
 不到 5000 的提到 5000。断开时恢复。这只影响仍然走 CPU 的流量：Mihomo 代理的连接、
 IPv6/NAT66、每条连接的头几个包，以及设备本机的流量。
@@ -368,7 +397,7 @@ IPv6/NAT66、每条连接的头几个包，以及设备本机的流量。
 能打开；走 Mihomo 的 IPv6 和国外连接正常；路由器本机下载正常；手动 `ipacm_switch.sh off`
 后立刻正常，agent 切回 HW 后又坏。
 
-原因：IPACM 在 STA 模式下，把 `u60sta0` 上每个带 MAC 的 IPv4 邻居都登记成 wan client。
+原因：IPACM 在 STA 模式下，把 `ath20` 上每个带 MAC 的 IPv4 邻居都登记成 wan client。
 上游另一台设备 ARP 过 U60 一次就够了。IPACM 为它建一个 `32_IEEE802_3_STA_v4_<n>` 头，
 并在 `WANRTBLv4` 最前面插一条按源地址匹配的规则：`src = 中继地址 → 这台设备的 MAC`。
 NAT 之后的上行包都命中这条规则，所以连接被 IPA 接管后，客户端的 ACK 被发给了那台设备，
@@ -376,15 +405,15 @@ NAT 之后的上行包都命中这条规则，所以连接被 IPA 接管后，�
 正常。邻居条目删除、SW→HW 切换、删掉再加回 main 默认路由，都不会动这条规则。
 
 修复（`wifi_relay/offload/neighbours.rs`）：实测发现，已登记设备的 MAC 以另一个 IPv4 地址
-出现时，IPACM 会删掉它的规则，并且不再重建。中继会话在 main 路由加好、`kick` 之后，
-起一个线程运行 `ip -4 monitor neigh dev u60sta0`，启动时先读一遍 `ip -4 neigh show dev u60sta0`。
+出现时，IPACM 会删掉它的规则，并且不再重建。中继会话在 main 路由加好之后，
+起一个线程运行 `ip -4 monitor neigh dev ath20`，启动时先读一遍 `ip -4 neigh show dev ath20`。
 每个不是网关的 MAC，每个会话处理一次：
 
 ```text
-ip -4 neigh replace 192.0.2.1 lladdr <MAC> nud reachable dev u60sta0   # IPACM 删掉它的规则
-ip -4 neigh del 192.0.2.1 dev u60sta0
-ip -4 neigh replace <原地址> lladdr <MAC> nud stale dev u60sta0
-ip -4 neigh replace <原地址> lladdr <MAC> nud reachable dev u60sta0
+ip -4 neigh replace 192.0.2.1 lladdr <MAC> nud reachable dev ath20   # IPACM 删掉它的规则
+ip -4 neigh del 192.0.2.1 dev ath20
+ip -4 neigh replace <原地址> lladdr <MAC> nud stale dev ath20
+ip -4 neigh replace <原地址> lladdr <MAC> nud reachable dev ath20
 ```
 
 - `192.0.2.1` 是 RFC 5737 的文档地址：不会是上游的真实设备，也不在链路上，内核不会经这条
@@ -409,7 +438,7 @@ ip -4 neigh replace <原地址> lladdr <MAC> nud reachable dev u60sta0
   每个新会话里，网关的规则都会重新插到最前面，所以残留规则平时不生效；只有同一会话里网关的
   MAC 以别的地址出现、IPACM 删掉网关规则时，它才会重新起作用。
 - agent 重启不会清空 IPACM 的 wan client；显式断开会清空它还在追踪的部分。连接仍有效时新
-  agent 接管它（`u60sta0` 不重建，IPACM 不重新挂载，只换监听进程）；接管不成立时才断开重连。
+  agent 接管它（`ath20` 不重建，只换监听进程）；接管不成立时才断开重连。
 - IPA 头表空间有限。登记的上游设备多了以后，新设备拿不到自己的头，IPACM 给它的规则挂上
   别的设备的头；按 MAC 修复同样能删掉这条规则。
 - 不处理 IPv6：IPv6 走 NAT66 或 Mihomo，不经过 IPA。
@@ -459,9 +488,9 @@ IP 也相同的客户端，这个事件会被直接跳过，没有副作用。
 - 触发：`iw event -t` 里热点接口（`wlan*`）的 `new station`。等 5 秒，让 IPACM 先按驱动事件登记客户端，
   客户端也先做完 DHCP 和 ARP，再处理这个 MAC 在 `br-lan` 上的 IPv4 条目：只有 REACHABLE 才设成 STALE；
   STALE、DELAY、PROBE 时内核会自己发下一个事件，不用管；没有条目时不建（`change` 不会新建条目）。
-- 监听启动时（中继会话里 main 路由加好、kick 之后）把 `br-lan` 上所有 REACHABLE 的客户端都处理一遍，
+- 监听启动时（中继会话里 main 路由加好之后）把 `br-lan` 上所有 REACHABLE 的客户端都处理一遍，
   因为中继连接的过程中它们可能已经换过频段。监听进程退出会重启。
-- 生命周期和第 8 节的上游邻居监听相同：只在硬件转发路径生效时运行，关掉硬件转发、移除配置或中继
+- 生命周期和第 8 节的上游邻居监听相同：只在硬件转发路径生效时运行，关掉硬件转发或中继
   cleanup 时停止。两者共用 `offload/monitor.rs`。只处理 IPv4，没有轮询。
 - `iw` 在 SELinux 域 `iw.subj` 里运行，exec 时父进程死亡信号会被清掉。agent 被杀时这个监听进程可能留下：
   它在下一次写管道时退出，下一个 agent 的 `stop_strays` 也会停掉它：只停记录里的那个进程
@@ -503,7 +532,7 @@ IP 也相同的客户端，这个事件会被直接跳过，没有副作用。
   理论上不受影响，但还没有验证。
 - **继续保留的兼容项**：5G 非 DFS 20 MHz 暂存、`disableDfsCS`、2.4G 的
   disable/set/enable、portal、DNS、udhcpc 续租、resume 和残留进程清理、NAT66、
-  60631 策略路由、关联后的一次宽度复位（带宽自动调优及 llstats 采样在 v6 删除）。
+  60631 策略路由（带宽自动调优及 llstats 采样在 v6 删除，关联后的一次宽度复位在 2026-11-12 删除）。
 - **不再需要做**：精简 iptables 链。卸载以后收益很小。
 - **brnf**：Mihomo 运行时 `bridge-nf-call-ip(6)tables=0`（TPROXY 在 bridge-netfilter
   路径上拿不到套接字），停止时恢复原值。期间 br-lan 内部的二层流量不再经过 iptables，
@@ -513,17 +542,22 @@ IP 也相同的客户端，这个事件会被直接跳过，没有副作用。
 
 已验证：上表中的 SW/HW 对比；整机冷启动后 agent 能自动恢复中继（两次，约 55–75 秒）；
 IPv4 UDP（QUIC）会被卸载、IPv6/NAT66 不会（2026-11-09，见末节）。
-部署后的复测结果见末尾一节。
+2.4 GHz 上游的硬件转发（2026-11-12，一次，开发机经 USB，见“最终版回归”）。部署后的复测结果见末尾一节。
 
 未验证：
 
 - 蜂窝在线时 main 表的实际表现，以及 IPACM 在两个 WAN 同时存在时选哪一个；
 - HW 模式对蜂窝路径的影响；
 - 长时间运行的稳定性；
-- 2.4G 上游；
+- Wi-Fi 客户端（不是经 USB 的开发机）在 2.4 GHz 上游下的速度；
 - RPS 加 HW 的组合效果。
 
 ## 部署后复测（2026-11-08，agent 本次实现）
+
+> 2026-11-12 注：这一节和后面各节（两个 2026-11-12 回归除外）是当时版本的记录：站点叫 `u60sta0`，IPACM 配置要安装、
+> 装后重启，状态有 `loaded`。那时 agent 自己切 HW、每 15 秒审计并按 TCP 回程计数重新挂载
+> （kick），状态里有 `hardware`/`offload_confirmed`，`U60_RELAY_FWD` 的回程放行分 TCP 和其余两条；这些都已删除
+> （回程现在只有一条），现在的行为见第 1a、3 节。测得的数字仍然有效。
 
 安装配置后重启整机：
 
@@ -662,3 +696,57 @@ HTTPS/TCP 作对照）。"内核份额"是 conntrack 回程字节 ÷ Mac 收到�
 - QUIC 测试源：国内镜像大多不支持 HTTP/3。nju、xjtu 的 QUIC 每条连接约 7 Mbit/s，切到 CPU 转发也一样，
   是服务器的上限。兰大超过 2 个并发会返回 429，所以 UDP 只测了 2 连接；它的单连接波动也大
   （IPv4 41–232，IPv6 39–197）。腾讯 `dldir1.qq.com` 的 GET 会被 302 调度到 HTTP 节点，用不了。
+
+## 批次 1 回归（2026-11-12，站点接口仍是 `u60sta0`）
+
+批次 1 的构建（模式交还厂商、核对读列表）在 B31 上的第一次回归。来源：开机一项是
+`measurements/b1-reboot2/agent-boot.log`，其余是会话里看着命令输出记下的 `measurements/observations-2026-11-12.md`。
+
+- 硬件转发：厂商处于硬件模式、agent 恢复中继之后，LAN 客户端经路由器的 USB 网络下载 205 MB，
+  151/157/167/159 Mbit/s，内核转发路径 +155 个包，软中断 1.0%。
+- 厂商切到软件（手工 `ipacm_switch.sh off`）：45 秒后 `close_ipa_acce` 仍是 1，agent 没有动 IPACM 的模式，
+  main 默认路由保留；103 MB 139/87 Mbit/s，内核路径 +72,042 个包，软中断 18.6%。`ipacm_switch.sh on` 之后
+  103 MB 168/153 Mbit/s，+72 个包，软中断 0.9%。
+- 没有厂商触发时的守护：手工删掉 IPv6 的 INPUT 跳转和 IPv4 的 DHCP 放行，34 秒后各补回一份（60 秒兜底）；
+  删掉 IPv6 的策略规则（pref 18640）后 2 秒补回。
+- 开机（DFS 键已提交）：中继在开机后 70.9 秒第一次尝试就恢复。
+
+## 最终版回归（2026-11-12，站点 `ath20`，没有安装步骤）
+
+- 同一次开机里从用 `u60sta0` 的构建更新过来：日志 "previous connection not taken over (the relay interface is gone)"，
+  停掉 2 个旧助手，第一次尝试就在 `ath20` 上恢复（`measurements/b2-final/agent.log`）。之后 iptables、ip6tables、
+  nft、链路、进程和日志里都没有 `u60sta0`（工程师的检查记录，没有原始文件）。
+- 硬件转发：新开机、原厂 IPACM 文件，205 MB，128/155/120/125 Mbit/s，内核转发路径 +135 个包（全走 CPU 约
+  141,715 个），软中断 0.9%，`close_ipa_acce=0`（`measurements/b2-reboot3/hw-throughput.txt`）。
+- 开机：`dmesg` 里没有厂商 DFS 脚本的 `disableDfsCS` 行，`dfs_channel_switch_disable=1`，驱动 ini
+  `gDisableDFSChSwitch=0`，站点和热点都在 52/160，IPACM 文件里 `u60sta0` 0 条、`ath20` 1 条，main 默认路由经
+  `ath20`，MASQUERADE 带注释（`measurements/b2-reboot3/observations.txt`）；中继开机后 72.9 秒第一次尝试就恢复
+  （`agent-boot.log`），状态 `offload.config` 为 `listed`、`state` 为 `routed`（`relay-status.json`）。
+- 车主断开再连接：中继的规则、表、策略路由和 main 默认路由都撤干净，热点回到 36/160，IPACM 文件的 sha 不变；
+  重新连接 5 秒返回（`measurements/b2-final/disconnect-connect.log`）。
+- agent 以 SIGABRT 结束：guard 重新拉起，992 ms 接管连接，Mihomo 在结束后约 6.5 秒运行
+  （`measurements/b2-final/agent-abort.log`）。
+- 已知注意：同一次开机里退回到改名之前的构建时，如果中继连着，旧版的清理会暂停（它的 RPS 撤销不认 `ath20`）；
+  先断开中继或重启再退回（工程师记录；旧版 `steering.rs` 只认 `u60sta0`）。
+
+换频段往返（同一天，构建 `acc6a3f6…`：在上面的构建上只多了 `join` 失败路径的重启选择修复；不重启部署，
+新 agent 1037 ms 接管连接。`measurements/b3-final/band-switch.log`，速度都是开发机经 USB 下载）：
+
+- 从 5 GHz 上游用错密码连 2.4 GHz 上游：100 秒后返回 "Wi-Fi association failed; check password and signal"
+  （其中拆除原来的 5 GHz 会话约 65 秒）。之后 legacy 规则 0 条、没有中继的 nft 表、没有站点接口和助手进程、
+  没有日志文件、策略规则 0 条，已保存的 3 个网络不变；重启选择按设计已清除（车主发起的连接成功后才写回）。
+- 用已保存的密码连 2.4 GHz 上游：7 秒返回，再过 5 秒开发机能上网。站点 40 MHz，2.4 GHz 热点跟到同一信道
+  20 MHz，IPv6 `configured`，Mihomo 因出口变化重启，断流 2.3 秒。
+- 在 2.4 GHz 上游上保持约 4.5 分钟：开始 103 MB、47/47 Mbit/s，结束 103 MB、42/59 Mbit/s；内核转发路径
+  +103 / +90 个包（全走 CPU 约 70,857 个），软中断约 1%。宽度一直读 40 MHz：没有宽度复位，速度也没有塌陷。
+- 切回 5 GHz 上游：10 秒返回，再过 5 秒能上网，IPv6 约 30 秒内 `configured`。154 MB，160/160/185 Mbit/s，
+  内核转发路径 +108 个包（全走 CPU 约 106,286 个），软中断 1.1%。IPACM 文件的 sha 全程不变。
+- 隔离 Linux 验收（`tests/relay-firewall-qa`，这个构建加上 4155f03 构建的旧 agent）：36 项全部通过
+  （`measurements/b3-final/docker-qa.log`）。它的日志不含 RPS 步骤，所以上面“已知注意”的情况不在它的范围内。
+
+**关机充电模式下的重启选择（修复已合入，只有单元测试）**：低电量关机后进入关机充电模式时，厂商把
+`wireless.zte_mbb.wifi_onoff` 设成 0，而车主的开关 `wifi_onoff_by_user` 仍是 1（`measurements/observations-2026-11-12.md`，
+08:50；之前的版本因此清掉了 `resume.json`）。现在 `hotspot::off_by_owner` 读 `wifi_onoff_by_user`（没有这个键的固件
+才看 `wifi_onoff`）以及射频和 SSID 的 `disabled`：tick 和连接失败的清理只在热点是车主自己关的时候清除
+`resume.json`，开机恢复在 Wi-Fi 被固件关着时跳过这次尝试并保留选择。已验证的只有针对配置文本的单元测试；路由器上
+没有复现，因为那需要再一次低电量关机。

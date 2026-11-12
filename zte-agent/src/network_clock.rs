@@ -116,7 +116,7 @@ fn sync(last: &mut Option<(u64, Instant)>) -> Result<(), String> {
         .no_proxy()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
-        .interface("u60sta0")
+        .interface(crate::netfx::ids::RELAY_IFACE)
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(8))
         .pool_max_idle_per_host(0)

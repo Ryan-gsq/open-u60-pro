@@ -19,13 +19,14 @@
 //! The mobile side is every interface named `rmnet*`: Qualcomm's cellular
 //! data interfaces (`rmnet_data0` carries the data call, `rmnet_ipa0` the
 //! hardware path; probe evidence of 2026-09-11 and 2026-09-14); and the Wi-Fi
-//! relay's upstream `u60sta*` (a hotel network is as foreign as the carrier's;
-//! its firewall guard already refuses it, this is the second line). The PEER is
-//! checked, not the address it reached: a port forward or DMZ to the router
-//! reaches its LAN address from the internet. TCP needs the replies to reach
-//! the peer, and they leave through the interface whose subnet holds it
-//! most specifically, so a client on the mobile side cannot complete a
-//! connection as a LAN one (policy routes the table does not show aside).
+//! relay's station interface (`ids::RELAY_IFACE`; a hotel network is as
+//! foreign as the carrier's; its firewall guard already refuses it, this is
+//! the second line). The PEER is checked, not the address it reached: a port
+//! forward or DMZ to the router reaches its LAN address from the internet.
+//! TCP needs the replies to reach the peer, and they leave through the
+//! interface whose subnet holds it most specifically, so a client on the
+//! mobile side cannot complete a connection as a LAN one (policy routes the
+//! table does not show aside).
 //!
 //! The interface table comes from `getifaddrs`: two netlink dumps, which on
 //! the router's kernel wait for its rtnl lock (held for a while by, say, a
@@ -58,8 +59,11 @@ use crate::boottime::{BootClock, BootInstant, Clock};
 /// The opt-out: `1` serves the mobile side too.
 pub const ENV: &str = "ZTE_AGENT_ALLOW_MOBILE";
 
-/// Interface names on the mobile-data side, and the relay's upstream Wi-Fi.
-const MOBILE: [&str; 2] = ["rmnet", "u60sta"];
+/// Interface name prefix on the mobile-data side.
+const MOBILE: &str = "rmnet";
+/// The relay's upstream Wi-Fi, by its exact name: other `ath*` names are
+/// the vendor's.
+const RELAY: &str = crate::netfx::ids::RELAY_IFACE;
 
 /// The table is read again at the first connection that needs it after this
 /// long (so a subnet that went away is served at most this long).
@@ -122,7 +126,7 @@ pub fn interfaces() -> std::io::Result<Vec<IfAddr>> {
 
 /// An interface on the mobile-data side.
 pub fn mobile_side(name: &str) -> bool {
-    MOBILE.iter().any(|p| name.starts_with(p))
+    name.starts_with(MOBILE) || name == RELAY
 }
 
 fn link_local(ip: IpAddr) -> bool {
@@ -576,7 +580,7 @@ mod tests {
     /// the router's own relay address and the LAN are served.
     #[test]
     fn the_relay_upstream_is_refused_like_the_carrier() {
-        let t = vec![ifa("lo", "127.0.0.1", 8, 0), ifa("br-lan", "192.168.0.1", 24, 0), ifa("u60sta0", "192.168.2.124", 24, 0)];
+        let t = vec![ifa("lo", "127.0.0.1", 8, 0), ifa("br-lan", "192.168.0.1", 24, 0), ifa(RELAY, "192.168.2.124", 24, 0)];
         assert!(!admits(&t, v4("192.168.2.1")));
         assert!(admits(&t, v4("192.168.2.124")) && admits(&t, v4("192.168.0.23")));
     }
@@ -592,7 +596,8 @@ mod tests {
         assert!(contains(&ifa("x1", "10.0.0.1", 8, 0), "10.200.3.4".parse().unwrap()));
         assert!(!contains(&ifa("x2", "fd00::1", 64, 0), "192.168.0.1".parse().unwrap()));
         assert!(mobile_side("rmnet_data0") && mobile_side("rmnet_ipa0") && !mobile_side("br-lan") && !mobile_side("usb0") && !mobile_side("wlan0"));
-        assert!(mobile_side("u60sta0"), "the relay's upstream network is foreign too");
+        assert!(mobile_side(RELAY), "the relay's upstream network is foreign too");
+        assert!(!mobile_side("ath2") && !mobile_side("ath200") && !mobile_side("ath21"), "only the relay's own name");
     }
 
     /// Exactly `1` turns the check off; anything else is ignored, and said.

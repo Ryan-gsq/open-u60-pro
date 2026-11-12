@@ -44,9 +44,9 @@ def lifecycle():
         ip("-6", "addr", "add", address, "dev", iface)
     ip("-6", "route", "add", "default", "via", "fe80::999", "dev", "rmnet_data0")
     ip("netns", "add", "upstream")
-    ip("link", "add", "u60sta0", "type", "veth", "peer", "name", "ap0")
+    ip("link", "add", "ath20", "type", "veth", "peer", "name", "ap0")
     ip("link", "set", "ap0", "netns", "upstream")
-    ip("link", "set", "u60sta0", "up")
+    ip("link", "set", "ath20", "up")
     for args in [
         ("link", "set", "ap0", "up"), ("link", "set", "lo", "up"),
         ("-6", "addr", "add", "fe80::1/64", "dev", "ap0"),
@@ -54,10 +54,10 @@ def lifecycle():
     ]:
         ns("upstream", "ip", *args)
     run("sysctl", "-w", "net.ipv6.conf.all.forwarding=1")
-    run("sysctl", "-w", "net.ipv6.conf.u60sta0.accept_ra=0", "net.ipv6.conf.u60sta0.autoconf=0")
+    run("sysctl", "-w", "net.ipv6.conf.ath20.accept_ra=0", "net.ipv6.conf.ath20.autoconf=0")
     ow("ip6tables", "-N", "U60_RELAY_IN")
     ow("ip6tables", "-A", "U60_RELAY_IN", "-j", "DROP")
-    ow("ip6tables", "-I", "INPUT", "-i", "u60sta0", "-j", "U60_RELAY_IN")
+    ow("ip6tables", "-I", "INPUT", "-i", "ath20", "-j", "U60_RELAY_IN")
     for key, value in [("ra", "server"), ("dhcpv6", "server"), ("ndp", "relay")]:
         ow("uci", "set", f"dhcp.lan.{key}={value}")
     ow("uci", "commit", "dhcp")

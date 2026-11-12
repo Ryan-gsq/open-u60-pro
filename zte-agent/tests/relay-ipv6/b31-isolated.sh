@@ -48,7 +48,7 @@ cp "$QA/agent-tests" "$ROOT/agent-tests"
 cp "$QA/device-peer" "$ROOT/device-peer"
 cp "$QA/plan.json" "$ROOT/plan.json"
 for n in "$R" "$L" "$W" "$C"; do ip netns add "$n"; ip -n "$n" link set lo up; done
-for pair in "br-lan lan0 $L" "u60sta0 wan0 $W" "rmnet_data0 cell0 $C"; do
+for pair in "br-lan lan0 $L" "ath20 wan0 $W" "rmnet_data0 cell0 $C"; do
     set -- $pair
     if [ "$1" = br-lan ]; then
         ip -n "$R" link add br-lan type bridge
@@ -96,7 +96,7 @@ for tool in iptables ip6tables; do
     ip netns exec "$R" "$tool" -N U60_RELAY_IN
     if [ "$tool" = iptables ]; then ip netns exec "$R" "$tool" -A U60_RELAY_IN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; fi
     ip netns exec "$R" "$tool" -A U60_RELAY_IN -j DROP
-    ip netns exec "$R" "$tool" -I INPUT -i u60sta0 -j U60_RELAY_IN
+    ip netns exec "$R" "$tool" -I INPUT -i ath20 -j U60_RELAY_IN
 done
 sleep 3
 ip netns exec "$L" "$QA/device-peer" persistent "$QA/state" > "$QA/persistent.log" 2>&1 &

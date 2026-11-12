@@ -1,5 +1,7 @@
 # Network integration review
 
+> 2026-11-12 note: the relay station named `u60sta0` in this review is `ath20` since 2026-11-12.
+
 ## Review follow-up (2026-10-28, local changes)
 
 This increment is not deployed. Earlier physical-device results below do not

@@ -100,7 +100,7 @@ mod tests {
         assert_eq!(joined("wlan2: new station 3a:01:42:84:11:82").as_deref(), Some(MAC));
         for line in [
             "1794236994.101543: wlan2: del station 3a:01:42:84:11:82",
-            "1794236990.409515: u60sta0: new station c0:a4:76:b1:f0:e3",
+            "1794236990.409515: ath20: new station c0:a4:76:b1:f0:e3",
             "1794236994.356731: wlan0 (phy #0): vendor event 001374:101",
             "wlan2: new station 3a:01:42:84:11",
             "",

@@ -95,7 +95,8 @@ IPv6 内核绕过，IPv6 全部交给 Mihomo，代码简单一些。
    `bridge-nf-call-ip(6)tables` = 0。都是 Transaction 里的 `@u60-sysctl` 步骤，停止时恢复
    启动前读到的值。
 3. ZTE 在中继连上后、fw3 重载后会把 brnf 改回 1，由 `net_guard` 自动改回 0
-   （`zte-agent/docs/relay-hw-offload.md` 第 5 节）。
+   （`zte-agent/docs/relay-hw-offload.md` 第 5 节）。2026-11-12 注：中继连上后的那次也是 fw3 重载，
+   由 agent 自己的 IPv6 `set_data` 引起（同一节）。
 4. 没有用 REDIRECT：它只能处理 TCP，UDP 还得留一个 TUN，代码更复杂。
 
 部署后的实测（Mac 绑定 en0，tuna 镜像，15 秒）：IPv6 和 IPv4 经过 Mihomo 单连接

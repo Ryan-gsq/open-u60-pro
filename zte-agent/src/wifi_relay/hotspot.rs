@@ -2,7 +2,7 @@
 //! 2.4 GHz uses disable/set/enable (CSA cannot restore HT40 on B31);
 //! 5 GHz always stages at non-DFS 20 MHz, then lets the driver follow STA.
 //! Every changed runtime setting has a journaled undo. Owner OFF wins.
-use super::{ap, dfs_switch, net, scan::Channels, width, Cmd, Step, Transaction, HOSTAPD};
+use super::{ap, dfs_switch, net, scan::Channels, Cmd, Step, Transaction, HOSTAPD};
 use std::{
     fs,
     path::Path,
@@ -20,7 +20,7 @@ pub(super) fn prepare(
     dfs_switch::allow();
     let before = Cmd::new("iw", &["dev", "wlan2", "info"]).run()?;
     let (frequency, bandwidth, center) =
-        width::parse_channel(&before).ok_or("Cannot snapshot hotspot channel")?;
+        parse_channel(&before).ok_or("Cannot snapshot hotspot channel")?;
     let staging = staging(channels, frequency, bandwidth).ok_or("No enabled non-DFS hotspot staging channel")?;
     tx.apply(Step::new(
         command(staging, 20, staging),
@@ -38,7 +38,7 @@ pub(super) fn prepare(
 pub(super) fn restage(channels: &Channels) -> Result<(), String> {
     dfs_switch::allow();
     let before = Cmd::new("iw", &["dev", "wlan2", "info"]).run()?;
-    let (frequency, bandwidth, _) = width::parse_channel(&before).ok_or("Cannot read the hotspot channel")?;
+    let (frequency, bandwidth, _) = parse_channel(&before).ok_or("Cannot read the hotspot channel")?;
     let staging = staging(channels, frequency, bandwidth).ok_or("No enabled non-DFS hotspot staging channel")?;
     command(staging, 20, staging).run().map(|_| ())
 }
@@ -52,22 +52,55 @@ fn staging(channels: &Channels, frequency: u32, bandwidth: u32) -> Option<u32> {
         .or_else(|| channels.staging_5ghz_avoiding(frequency))
 }
 
+/// `(primary MHz, width MHz, center1 MHz)` from `iw dev <if> info`.
+fn parse_channel(info: &str) -> Option<(u32, u32, u32)> {
+    let line = info.lines().map(str::trim).find(|l| l.starts_with("channel "))?;
+    let number = |key: &str| line.split_once(key)?.1.trim_start().split(|c: char| !c.is_ascii_digit()).next()?.parse().ok();
+    Some((number("(")?, number("width:")?, number("center1:")?))
+}
+
 /// File reads only: the three-second relay watcher must not spawn extra UCI
 /// processes. Missing configuration is unknown, not proof of an owner OFF.
 pub(super) fn owner_off(iface: &str) -> bool {
     fs::read_to_string("/etc/config/wireless").is_ok_and(|text| configured_off(&text, iface))
 }
 
-fn configured_off(text: &str, iface: &str) -> bool {
-    let option = |section, key| crate::wifi_watchdog::config_option(text, section, key);
-    let (radio, ssid) = if iface == "wlan0" {
+/// Whether the hotspot is off by the owner's own choice, which cancels the
+/// relay's restart choice, and not only off for now. The vendor keeps the
+/// owner's Wi-Fi switch in `zte_mbb.wifi_onoff_by_user` (its boot and scan
+/// scripts read that one) and the present state in `wifi_onoff`, which it
+/// also sets to 0 where the owner turned nothing off: in power-off charging
+/// mode after a low-battery shutdown, where it does not start Wi-Fi (B31,
+/// 2026-11-12: the restart choice was cleared for it). A firmware without
+/// the owner's key leaves only `wifi_onoff` to tell.
+pub(super) fn off_by_owner(iface: &str) -> bool {
+    fs::read_to_string("/etc/config/wireless").is_ok_and(|text| configured_off_by_owner(&text, iface))
+}
+
+fn sections(iface: &str) -> (&'static str, &'static str) {
+    if iface == "wlan0" {
         ("wifi0", "main_2g")
     } else {
         ("wifi1", "main_5g")
-    };
+    }
+}
+
+fn configured_off(text: &str, iface: &str) -> bool {
+    let option = |section, key| crate::wifi_watchdog::config_option(text, section, key);
+    let (radio, ssid) = sections(iface);
     option("zte_mbb", "wifi_onoff").as_deref() == Some("0")
         || option(radio, "disabled").as_deref() == Some("1")
         || option(ssid, "disabled").as_deref() == Some("1")
+}
+
+fn configured_off_by_owner(text: &str, iface: &str) -> bool {
+    let option = |section, key| crate::wifi_watchdog::config_option(text, section, key);
+    let (radio, ssid) = sections(iface);
+    let switched_off = match option("zte_mbb", "wifi_onoff_by_user") {
+        Some(by_user) => by_user == "0",
+        None => option("zte_mbb", "wifi_onoff").as_deref() == Some("0"),
+    };
+    switched_off || option(radio, "disabled").as_deref() == Some("1") || option(ssid, "disabled").as_deref() == Some("1")
 }
 
 /// All hotspot undos (including journals from older releases) share this
@@ -254,7 +287,7 @@ fn switch_with(
     let status = Cmd::new("hostapd_cli", &["-p", HOSTAPD, "-i", "wlan2", "status"]);
     let target = (*frequency, *bandwidth, *center);
     let current = run(&info)?;
-    let now = width::parse_channel(&current);
+    let now = parse_channel(&current);
     if now != Some(target) {
         if crate::net_tools::key(&run(&status)?, "state") != Some("ENABLED") {
             return Err("Wait for the hotspot radar check before connecting relay".into());
@@ -268,7 +301,7 @@ fn switch_with(
             }
             loop {
                 if crate::net_tools::key(&run(&status)?, "state") == Some("ENABLED")
-                    && width::parse_channel(&run(&info)?) == Some((via, 20, via))
+                    && parse_channel(&run(&info)?) == Some((via, 20, via))
                 {
                     break;
                 }
@@ -286,7 +319,7 @@ fn switch_with(
     // completion before removing the journal; never skip radar checks.
     while elapsed() < Duration::from_secs(80) {
         if crate::net_tools::key(&run(&status)?, "state") == Some("ENABLED")
-            && width::parse_channel(&run(&info)?) == Some(target)
+            && parse_channel(&run(&info)?) == Some(target)
         {
             return Ok(());
         }
@@ -311,6 +344,13 @@ mod tests {
     }
 
     #[test]
+    fn channel_lines_parse() {
+        assert_eq!(parse_channel("Interface ath20\n\tchannel 44 (5220 MHz), width: 160 MHz, center1: 5250 MHz\n"), Some((5220, 160, 5250)));
+        assert_eq!(parse_channel("channel 6 (2437 MHz), width: 20 MHz, center1: 2437 MHz"), Some((2437, 20, 2437)));
+        assert_eq!(parse_channel("Interface ath20\n\ttype managed\n"), None);
+    }
+
+    #[test]
     fn external_off_wins_over_runtime_restore() {
         for text in [
             "config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n",
@@ -331,6 +371,25 @@ mod tests {
             "config wifi-device 'wifi0'\n option disabled '1'\n",
             "wlan0"
         ));
+    }
+
+    #[test]
+    fn wifi_the_firmware_keeps_off_is_not_the_owners_off() {
+        // Power-off charging mode on B31: the state is 0, the owner's switch still 1.
+        let charging = "config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '1'\n";
+        assert!(configured_off(charging, "wlan2"), "the hotspot is off");
+        assert!(!configured_off_by_owner(charging, "wlan2"), "but the restart choice stays");
+        for text in [
+            "config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '0'\n",
+            "config zte_mbb 'zte_mbb'\n option wifi_onoff '1'\n option wifi_onoff_by_user '0'\n",
+            "config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n",
+            "config wifi-device 'wifi1'\n option disabled '1'\n",
+            "config zte_mbb 'zte_mbb'\n option wifi_onoff_by_user '1'\nconfig wifi-iface 'main_5g'\n option disabled '1'\n",
+        ] {
+            assert!(configured_off_by_owner(text, "wlan2"), "{text}");
+        }
+        assert!(!configured_off_by_owner("", "wlan2"), "unknown config is not owner OFF");
+        assert!(!configured_off_by_owner("config zte_mbb 'zte_mbb'\n option wifi_onoff '1'\n option wifi_onoff_by_user '1'\n", "wlan2"));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # 2026-10-29 上游带宽 V2 真机验收
 
+> 2026-11-12 注：文中的站点接口 `u60sta0` 在 2026-11-12 改名为 `ath20`。
+
 本文件按时间追加。下文最初的 G1 失败与 Observe 结束状态是历史快照；之后所有者已判定
 G1 通过，完成阶段 B，并选择方案 A 进行有限 Auto 验证。最新进展见文末，不能把一次
 短时下载测试当作完整阶段 C 或弱信号、热点客户端混合业务验收。
@@ -178,6 +180,10 @@ STA 160→80（读回 80、中心 5210）→160，每约 1 s 一次快照，共 
 改 STA 宽度都不会移动热点。
 
 ### P0 修复（`wifi_relay/dfs_switch.rs`）
+
+> 2026-11-12 注：这是当时的版本。现在 `dfs_switch::allow()` 不再扫描 `/proc` 等厂商脚本，也没有 10 s 等待：
+> 它持久设置厂商键 `wireless.zte_mbb.dfs_channel_switch_disable=1`（让脚本不再关掉开关），再照旧 `disableDfsCS 0`
+> （[network-extensions.md](network-extensions.md)）。同样，下文的宽度复位和 `width.rs` 都已删除。
 
 - `join()` 在关联（`association_step`）之前调用 `dfs_switch::allow()`：若 `/sbin/zte_wifi_dfs_hdlr.sh`
   在运行、但还没进入它的长 sleep（即可能还要执行 `disableDfsCS 1`），最多等 10 s；随后执行

@@ -254,7 +254,7 @@ fn main() {
 
 /// Bring back the relay and Mihomo the owner left on (an update, a crash or
 /// a reboot). The relay's journals are rolled back first: Mihomo started on
-/// a stale relay route would bind to `u60sta0`.
+/// a stale relay route would bind to the relay's station interface.
 fn restore_network(state: &Arc<AppState>) {
     if !state.wifi_relay.wants_restore() && !state.mihomo.wants_restore() {
         return;

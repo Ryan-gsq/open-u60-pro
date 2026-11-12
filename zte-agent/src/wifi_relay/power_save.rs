@@ -1,6 +1,6 @@
 //! Wi-Fi power save of the relay's upstream link (owner decision 65). The
-//! driver turns it on for every new `u60sta0`: the U60 dozes between beacons
-//! and the upstream AP holds its frames meanwhile. With it off, short
+//! driver turns it on for every new station interface: the U60 dozes between
+//! beacons and the upstream AP holds its frames meanwhile. With it off, short
 //! single-connection tests through the relay went from 166-218 to 244-250
 //! Mbit/s (2026-11-08, `zte-agent/docs/relay-hw-offload.md`). Each relay
 //! connection turns it off unless the owner keeps the driver's default. A
@@ -40,17 +40,18 @@ pub(super) fn save(root: &Path, auto_off: bool) -> Result<(), String> {
 /// journal must stay undoable by the agent it may roll back to, which does
 /// not know this step (`relay-mihomo-architecture.md` section 4.2).
 fn step() -> Step {
-    Step::new(Cmd::new(PROGRAM, &["off"]), restore())
+    Step::new(Cmd::new(PROGRAM, &["off"]), restore(IFACE))
 }
 
-fn restore() -> Cmd {
-    Cmd::new("iw", &["dev", IFACE, "set", "power_save", "on"])
+fn restore(station: &str) -> Cmd {
+    Cmd::new("iw", &["dev", station, "set", "power_save", "on"])
 }
 
 /// Whether `cmd` is this step's undo, which never pauses a cleanup: the
-/// interface is deleted right after, or is already gone.
+/// interface is deleted right after, or is already gone. An older agent's
+/// journal names the station it used.
 pub(crate) fn is_restore(cmd: &Cmd) -> bool {
-    *cmd == restore()
+    super::STATIONS.iter().any(|station| *cmd == restore(station))
 }
 
 /// This connection: whether the step is applied, or why it failed.

@@ -4,10 +4,24 @@
 //! are listed only to be checked (the code spells them out in rules).
 #![allow(dead_code)]
 
-/// The relay's station interface.
-pub const RELAY_IFACE: &str = "u60sta0";
+/// The relay's station interface. IPACM forwards only interfaces its
+/// configuration lists, read once at boot; B31's factory file lists `ath20`
+/// as a Wi-Fi interface (Category UNKNOWN, WlanMode full), so the relay is
+/// offloaded without changing that file (2026-11-12). No name with `wlan`:
+/// the vendor's Wi-Fi off waits for every such interface to disappear.
+pub const RELAY_IFACE: &str = "ath20";
+/// The relay's station interface before it took a name IPACM lists, still
+/// named by the journals and helpers of the builds that used it.
+pub const OLD_RELAY_IFACE: &str = "u60sta0";
 /// The core's former TUN device, still named by old recovery journals.
 pub const OLD_CORE_IFACE: &str = "u60mh0";
+/// Interfaces only older agents created: a rule matching one of them is the
+/// agent's (`net_tools::firewall::owned_rule`).
+pub const OLD_IFACES: [&str; 2] = [OLD_RELAY_IFACE, OLD_CORE_IFACE];
+/// The comment on the relay's legacy rules in chains it does not own and
+/// without a jump to one (the portal RETURN, the IPv4 MASQUERADE): their
+/// identity, since the station's name is one the vendor's files also list.
+pub const RELAY_COMMENT: &str = "zte-agent-wifi-relay";
 
 /// Route tables: Mihomo's local delivery of marked packets, the relay (IPv4
 /// and IPv6).
@@ -96,7 +110,9 @@ mod tests {
     fn no_name_or_number_is_used_twice() {
         distinct("route table", &[MIHOMO_TABLE, RELAY_TABLE]);
         distinct("policy priority", &[MIHOMO_PREF, RELAY_PREF]);
-        distinct("interface", &[RELAY_IFACE, OLD_CORE_IFACE]);
+        distinct("interface", &[RELAY_IFACE, OLD_RELAY_IFACE, OLD_CORE_IFACE]);
+        assert!(!RELAY_IFACE.contains("wlan"), "the vendor's Wi-Fi off waits for every wlan interface");
+        assert!(RELAY_COMMENT.starts_with("zte-agent"), "the comment identity `owned_rule` reads");
         distinct("nft table", &[MIHOMO_NFT, RELAY_NFT]);
         let chains: Vec<&str> = RELAY_CHAINS.iter().chain(&RETIRED_RELAY_CHAINS).chain(&OTHER_CHAINS).copied().collect();
         distinct("legacy chain", &chains);

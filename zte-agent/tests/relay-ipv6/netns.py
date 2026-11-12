@@ -33,7 +33,7 @@ def ns(name, *args, check=True):
 def command(command):
     if command["program"] == "@u60-relay-ipv6-dad":
         for _ in range(40):
-            info = json.loads(ip("-j", "-6", "addr", "show", "dev", "u60sta0"))[0]["addr_info"]
+            info = json.loads(ip("-j", "-6", "addr", "show", "dev", "ath20"))[0]["addr_info"]
             ready = {a["local"] for a in info if not a.get("tentative") and not a.get("dadfailed")}
             if set(command["args"]) <= ready:
                 return
@@ -120,7 +120,7 @@ def acceptance(plan_path):
         plan = json.load(file)
     for name in ["lan", "wan", "cell"]:
         ip("netns", "add", name)
-    for iface, peer, name in [("br-lan", "lan0", "lan"), ("u60sta0", "wan0", "wan"), ("rmnet_data0", "cell0", "cell")]:
+    for iface, peer, name in [("br-lan", "lan0", "lan"), ("ath20", "wan0", "wan"), ("rmnet_data0", "cell0", "cell")]:
         ip("link", "add", iface, "type", "veth", "peer", "name", peer)
         ip("link", "set", peer, "netns", name)
         ip("link", "set", iface, "up")
@@ -146,7 +146,7 @@ def acceptance(plan_path):
         run(tool, "-t", "nat", "-N", "redirect_chain")
         run(tool, "-N", "U60_RELAY_IN")
         run(tool, "-A", "U60_RELAY_IN", "-j", "DROP")
-        run(tool, "-I", "INPUT", "-i", "u60sta0", "-j", "U60_RELAY_IN")
+        run(tool, "-I", "INPUT", "-i", "ath20", "-j", "U60_RELAY_IN")
     before = ip("-6", "route", "show", "table", "main")
     applied, network, mihomo = [], [], []
     server = None

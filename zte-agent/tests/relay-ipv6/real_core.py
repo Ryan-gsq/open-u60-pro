@@ -112,7 +112,7 @@ def acceptance():
         ip("netns", "add", name)
     for tool in ["iptables", "ip6tables"]:
         run(tool, "-t", "nat", "-N", "redirect_chain")
-    for iface, peer, name in [("br-lan", "lan0", "lan"), ("u60sta0", "wan0", "wan"), ("rmnet_data0", "cell0", "cell")]:
+    for iface, peer, name in [("br-lan", "lan0", "lan"), ("ath20", "wan0", "wan"), ("rmnet_data0", "cell0", "cell")]:
         if iface == "br-lan":
             ip("link", "add", iface, "type", "bridge")
             ip("link", "add", "lanport", "type", "veth", "peer", "name", peer)
@@ -155,7 +155,7 @@ def acceptance():
         if tool == "iptables":
             run(tool, "-A", "U60_RELAY_IN", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
         run(tool, "-A", "U60_RELAY_IN", "-j", "DROP")
-        run(tool, "-I", "INPUT", "-i", "u60sta0", "-j", "U60_RELAY_IN")
+        run(tool, "-I", "INPUT", "-i", "ath20", "-j", "U60_RELAY_IN")
     time.sleep(2)
     processes, v4, v6, setup = [], [], [], []
     try:

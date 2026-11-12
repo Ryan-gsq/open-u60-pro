@@ -32,7 +32,6 @@ pub const CONNECT: &str = "/ui/relay/connect";
 pub const DISCONNECT: &str = "/ui/relay/disconnect";
 pub const CLOCK: &str = "/ui/relay/clock";
 pub const FORGET: &str = "/ui/relay/forget";
-pub const OFFLOAD: &str = "/ui/relay/offload";
 pub const OFFLOAD_SWITCH: &str = "/ui/relay/offload-switch";
 pub const POWER_SAVE: &str = "/ui/relay/power-save";
 
@@ -372,8 +371,6 @@ fn power_save_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Ma
 
 fn offload_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Markup {
     let offload = &s["offload"];
-    let config = offload["config"].as_str().unwrap_or("unavailable");
-    let installed = matches!(config, "loaded" | "reboot_required");
     let enabled = offload["enabled"].as_bool() != Some(false);
     html! {
         section.relay-panel aria-labelledby="offload-heading" {
@@ -386,14 +383,12 @@ fn offload_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Marku
                 }
                 button.sw type="submit" role="switch" aria-checked=(if enabled { "true" } else { "false" }) aria-labelledby="offload-heading" {}
             }
-            p.relay-copy { "Qualcomm IPA carries relayed IPv4 NAT traffic without the CPU. Offloaded connections skip the router's firewall rules, speed limits, Smart QoS and parental control. IPv6/NAT66 and traffic through Mihomo stay on the CPU. While relaying, the router's Smart QoS choice of CPU forwarding is overridden and restored when the relay ends or hardware forwarding is turned off; an owner speed limit or power saver mode keeps the CPU path. A change of path resets existing LAN IPv4 connections once." }
+            p.relay-copy { "Qualcomm IPA carries relayed IPv4 NAT traffic without the CPU. Offloaded connections skip the router's firewall rules, speed limits, Smart QoS and parental control. IPv6/NAT66 and traffic through Mihomo stay on the CPU. Whether IPA is active is decided by the router's own settings, which this page never changes: the Balanced (极速模式) working mode turns acceleration on; any other working mode, a router speed limit or power saver mode keeps relayed traffic on the CPU. A change of path resets existing LAN IPv4 connections once." }
             div.relay-address {
-                span { "CONFIGURATION" }
-                span { (match config {
-                    "loaded" => "Installed and loaded",
-                    "reboot_required" => "Installed; restart the router to load it",
-                    "not_installed" => "Not installed",
-                    "overwritten" => "Removed by a router reset; install again",
+                span { "IPA CONFIGURATION" }
+                span { (match offload["config"].as_str() {
+                    Some("listed") => "Lists the relay interface",
+                    Some("not_listed") => "Does not list the relay interface; the relay forwards on the CPU",
                     _ => "Unavailable on this firmware",
                 }) }
             }
@@ -410,26 +405,16 @@ fn offload_panel(pd: &PageData, s: &serde_json::Value, connected: bool) -> Marku
                 }
                 @if let Some(reason) = offload["reason"].as_str() { p.relay-copy { (reason) } }
             }
-            @if config != "unavailable" {
-                form method="post" action=(OFFLOAD) {
-                    (pd.csrf()) (once_field(&pd.once()))
-                    input type="hidden" name="install" value=(if installed { "0" } else { "1" });
-                    p.relay-copy { (if installed { "Removing moves the current relay connection to the CPU at once; the IPA service forgets the interface at the next restart." } else { "Adds the relay interface to the IPA configuration (a backup is kept). Takes effect at once if the router already loaded it since its last restart, otherwise after a restart." }) }
-                    p.actions { button.relay-btn.relay-secondary type="submit" { (if installed { "Remove hardware forwarding" } else { "Install hardware forwarding" }) } }
-                }
-            }
         }
     }
 }
 
-/// The relay's IPv4 path: hardware mode alone is not offloading; it is
-/// confirmed once relayed traffic under load stays off the CPU.
+/// The relay's IPv4 path: with the `main` route in place, the router's
+/// working mode decides whether IPA carries it.
 fn relay_path(offload: &serde_json::Value) -> &'static str {
-    match (offload["state"].as_str(), offload["hardware"].as_bool(), offload["offload_confirmed"].as_bool()) {
-        (_, Some(true), Some(true)) => "Hardware (IPA), confirmed under load",
-        (_, Some(true), _) => "Hardware (IPA) mode; offloading not yet confirmed under load",
-        (Some("releasing"), _, _) => "Leaving hardware forwarding",
-        (Some("engaging"), _, _) => "Engaging hardware forwarding",
+    match (offload["route"].as_bool(), offload["state"].as_str()) {
+        (Some(true), _) => "Hardware (IPA) in the Balanced (极速模式) working mode; CPU in any other",
+        (_, Some("releasing")) => "Leaving hardware forwarding",
         _ => "CPU",
     }
 }

@@ -1,4 +1,5 @@
-//! Upstream scans over wpa_supplicant's control socket.
+//! Upstream scans, and the relay tick's status query, over wpa_supplicant's
+//! control socket.
 //!
 //! The B31 WLAN driver (qcacld 5.2.1.110D) removes from every multi-channel
 //! STA scan the 5 GHz channels that share a MAC with an AP it counts as DFS
@@ -18,6 +19,11 @@ use std::time::{Duration, Instant};
 
 /// `BSS` fields: id, bssid, freq, level, age, flags, ssid and the entry delimiter.
 const BSS_MASK: u32 = 0x1 | 0x2 | 0x4 | 0x80 | 0x200 | 0x800 | 0x1000 | 0x20000;
+/// How long a scan's control requests wait for their reply.
+const ANSWER: Duration = Duration::from_secs(3);
+/// The tick holds the relay's operation lock while it asks; a supplicant
+/// that does not answer within this counts as unreachable.
+const STATUS_WAIT: Duration = Duration::from_secs(2);
 
 /// One read of the PHY's enabled frequencies drives scanning, selection and
 /// hotspot preparation. DFS is a property of the radio, not a relay blacklist.
@@ -129,28 +135,45 @@ fn table(s: &mut impl Supplicant) -> Result<String, String> {
     Ok(out)
 }
 
-/// An attached control-socket client. Unlike `wpa_cli` it receives the
+/// A control-socket client. Attached, unlike `wpa_cli`, it receives the
 /// supplicant's events, so a scan waits for its completion, not a sleep.
 pub(super) struct Ctrl {
     socket: UnixDatagram,
     local: PathBuf,
+    attached: bool,
+    answer: Duration,
     events: VecDeque<String>,
     buf: Vec<u8>,
+}
+
+/// The supplicant's `STATUS` reply, the text `wpa_cli status` prints,
+/// without a process. `Err` when it cannot be reached or does not answer
+/// within `STATUS_WAIT`, where `wpa_cli` failed.
+pub(super) fn status(server: &Path, dir: &Path) -> Result<String, String> {
+    Ctrl::open(server, dir, STATUS_WAIT)?.request("STATUS")
 }
 
 impl Ctrl {
     /// `server` is the supplicant's socket; the client socket lives in `dir`.
     pub(super) fn attach(server: &Path, dir: &Path) -> Result<Self, String> {
-        crate::httpd::gate::debug_assert_may_block();
-        let mut nonce = [0u8; 8];
-        getrandom::getrandom(&mut nonce).map_err(|_| "Cannot open Wi-Fi control")?;
-        let local = dir.join(format!("scan-{}", nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()));
-        let socket = UnixDatagram::bind(&local).map_err(|_| "Cannot open Wi-Fi control")?;
-        let mut ctrl = Self { socket, local, events: VecDeque::new(), buf: vec![0; 16 * 1024] };
-        ctrl.socket.connect(server).map_err(|_| "Wi-Fi control is unavailable")?;
+        let mut ctrl = Self::open(server, dir, ANSWER)?;
+        ctrl.attached = true;
         if ctrl.request("ATTACH")? != "OK" {
             return Err("Wi-Fi control refused event delivery".into());
         }
+        Ok(ctrl)
+    }
+
+    /// A client without events, as `wpa_cli` opens one for a single command;
+    /// each request waits at most `answer` for its reply.
+    fn open(server: &Path, dir: &Path, answer: Duration) -> Result<Self, String> {
+        crate::httpd::gate::debug_assert_may_block();
+        let mut nonce = [0u8; 8];
+        getrandom::getrandom(&mut nonce).map_err(|_| "Cannot open Wi-Fi control")?;
+        let local = dir.join(format!("ctrl-{}", nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+        let socket = UnixDatagram::bind(&local).map_err(|_| "Cannot open Wi-Fi control")?;
+        let ctrl = Self { socket, local, attached: false, answer, events: VecDeque::new(), buf: vec![0; 16 * 1024] };
+        ctrl.socket.connect(server).map_err(|_| "Wi-Fi control is unavailable")?;
         Ok(ctrl)
     }
 
@@ -173,7 +196,7 @@ impl Supplicant for Ctrl {
         // Events from before this command cannot be its scan's completion.
         self.events.clear();
         self.socket.send(command.as_bytes()).map_err(|_| "Wi-Fi control failed")?;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + self.answer;
         while let Some(message) = self.recv(deadline)? {
             if message.starts_with('<') {
                 self.events.push_back(message);
@@ -203,7 +226,9 @@ impl Supplicant for Ctrl {
 
 impl Drop for Ctrl {
     fn drop(&mut self) {
-        let _ = self.socket.send(b"DETACH");
+        if self.attached {
+            let _ = self.socket.send(b"DETACH");
+        }
         let _ = std::fs::remove_file(&self.local);
     }
 }
@@ -326,5 +351,44 @@ mod tests {
             }
         }
         assert_eq!(run(&mut Refusing, &Channels::parse(CHANNELS).plan()).unwrap_err(), "Wi-Fi scan was refused");
+    }
+
+    fn socket_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("u60-ctrl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn status_is_one_plain_request_like_wpa_cli() {
+        let dir = socket_dir("status");
+        let server = UnixDatagram::bind(dir.join("ath20")).unwrap();
+        let supplicant = std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            server.send_to(b"bssid=02:00:00:00:00:01\nwpa_state=COMPLETED\n", from.as_pathname().unwrap()).unwrap();
+            // A client that never attached has nothing to detach.
+            server.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            (request, server.recv(&mut buf).ok())
+        });
+        let reply = status(&dir.join("ath20"), &dir).unwrap();
+        assert_eq!(crate::net_tools::key(&reply, "wpa_state"), Some("COMPLETED"));
+        assert_eq!(supplicant.join().unwrap(), ("STATUS".to_owned(), None));
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| e.file_name() == "ath20"), "the client socket is removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreachable_or_silent_supplicants_fail_the_status_within_its_bound() {
+        let dir = socket_dir("silent");
+        assert!(status(&dir.join("ath20"), &dir).is_err(), "no supplicant socket");
+        let _silent = UnixDatagram::bind(dir.join("ath20")).unwrap();
+        let started = Instant::now();
+        assert_eq!(status(&dir.join("ath20"), &dir).unwrap_err(), "Wi-Fi control did not answer");
+        let waited = started.elapsed();
+        assert!(waited >= STATUS_WAIT && waited < STATUS_WAIT + Duration::from_secs(1), "{waited:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
