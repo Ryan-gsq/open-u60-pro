@@ -160,10 +160,11 @@ struct State {
     last: Option<Done>,
     /// A request whose deletion failed: tried again by `retry`.
     pending: Option<Pending>,
-    history: VecDeque<Value>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { last: None, pending: None, history: VecDeque::new() });
+static STATE: Mutex<State> = Mutex::new(State { last: None, pending: None });
+// Resets take STATE then RESULTS; readers take only RESULTS, never STATE.
+static RESULTS: Mutex<VecDeque<Value>> = Mutex::new(VecDeque::new());
 /// Results kept for the status pages.
 const HISTORY: usize = 8;
 
@@ -181,11 +182,18 @@ pub fn retry() -> Option<Result<Report, String>> {
 
 /// The latest results, newest first (time since boot, reason, scope, outcome).
 pub fn history() -> Value {
-    Value::Array(lock().history.iter().rev().cloned().collect())
+    Value::Array(RESULTS.lock().unwrap_or_else(PoisonError::into_inner).iter().rev().cloned().collect())
 }
 
 fn lock() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) fn while_reset_locked(check: impl FnOnce()) {
+    let _serial = tests::SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let _reset = lock();
+    check();
 }
 
 trait Tables {
@@ -238,11 +246,12 @@ fn lan_prefixes(text: &str) -> Vec<String> {
     prefixes
 }
 
-fn record(state: &mut State, reason: &str, scope: &Scope, outcome: &str) {
-    if state.history.len() == HISTORY {
-        state.history.pop_front();
+fn record(reason: &str, scope: &Scope, outcome: &str) {
+    let mut history = RESULTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if history.len() == HISTORY {
+        history.pop_front();
     }
-    state.history.push_back(json!({"at": super::uptime(), "reason": reason, "scope": scope.describe(), "outcome": outcome}));
+    history.push_back(json!({"at": super::uptime(), "reason": reason, "scope": scope.describe(), "outcome": outcome}));
 }
 
 fn reset_with(reason: &'static str, scope: Scope, changed: Instant, tables: &mut impl Tables) -> Result<Report, String> {
@@ -253,7 +262,7 @@ fn reset_with(reason: &'static str, scope: Scope, changed: Instant, tables: &mut
     let mut state = lock();
     if state.last.as_ref().is_some_and(|done| done.started >= changed && done.scope.covers(&scope)) {
         crate::netlog!("[net] conntrack reset for {reason} settled by one that started after the change");
-        record(&mut state, reason, &scope, "merged");
+        record(reason, &scope, "merged");
         return Ok(Report { scope, merged: true, deleted: 0 });
     }
     // A pending failed request joins this one: one deletion settles both.
@@ -310,13 +319,13 @@ fn run(state: &mut State, reason: &'static str, scope: Scope, changed: Instant, 
     }
     if failures.is_empty() {
         crate::netlog!("[net] conntrack reset {} for {reason}: {deleted} deleted", scope.describe());
-        record(state, reason, &scope, &format!("{deleted} deleted"));
+        record(reason, &scope, &format!("{deleted} deleted"));
         state.last = Some(Done { started, scope: scope.clone() });
         return Ok(Report { scope, merged: false, deleted });
     }
     let error = format!("{deleted} deleted, then failed: {}", failures.join("; "));
     crate::netlog!("[net] conntrack reset {} for {reason}: {error}; will retry", scope.describe());
-    record(state, reason, &scope, &format!("failed ({error})"));
+    record(reason, &scope, &format!("failed ({error})"));
     state.pending = Some(Pending { reason, scope, changed });
     Err(format!("Existing connections were not all reset ({error}); retrying"))
 }
@@ -346,11 +355,12 @@ mod tests {
     }
 
     /// The tests share `STATE`.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    pub(super) static SERIAL: Mutex<()> = Mutex::new(());
 
     fn fresh() -> std::sync::MutexGuard<'static, ()> {
         let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        *lock() = State { last: None, pending: None, history: VecDeque::new() };
+        *lock() = State { last: None, pending: None };
+        RESULTS.lock().unwrap_or_else(PoisonError::into_inner).clear();
         serial
     }
 
@@ -442,5 +452,17 @@ mod tests {
         let text = r#"[{"ifname":"br-lan","addr_info":[{"family":"inet6","local":"fd1b:f7f5:d006::1","prefixlen":64,"scope":"global"},{"family":"inet6","local":"fe80::1","prefixlen":64,"scope":"link"},{"family":"inet6","local":"2409:8a3c::5","prefixlen":64,"scope":"global"}]}]"#;
         assert_eq!(lan_prefixes(text), ["2409:8a3c::/64", "fd1b:f7f5:d006::/64"]);
         assert!(lan_prefixes("not json").is_empty());
+    }
+
+    #[test]
+    fn history_and_relay_status_do_not_wait_for_a_reset_or_tick() {
+        let relay = std::sync::Arc::new(crate::wifi_relay::WifiRelay::new(std::sync::Arc::new(Mutex::new(()))));
+        let (send, receive) = std::sync::mpsc::channel();
+        while_reset_locked(|| {
+            let worker = std::thread::spawn(move || send.send((history(), relay.status())).unwrap());
+            let result = receive.recv_timeout(Duration::from_millis(200));
+            assert!(result.is_ok(), "a reset must not block either memory snapshot");
+            worker.join().unwrap();
+        });
     }
 }

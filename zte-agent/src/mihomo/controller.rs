@@ -76,7 +76,7 @@ pub(super) enum Message {
     /// The DIRECT bypass setting changed (the flag file is written).
     Bypass { reply: Reply },
     /// The selected profile changed while running.
-    Config { reply: Reply },
+    Config { refresh: bool, reply: Reply },
     Write { write: Write, answer: Answer },
     /// The relay changed its routes.
     Egress,
@@ -176,6 +176,9 @@ pub(super) struct Prepared {
     pub runtime: Value,
     pub routes: routing::Routes,
     pub dns: Vec<String>,
+    pub bypass: bool,
+    pub notice: Option<String>,
+    pub source: String,
     /// The managed configuration's text, kept to fall back to.
     pub config: String,
 }
@@ -190,6 +193,7 @@ pub(super) enum Source {
     /// The running configuration again, with the DNS filter the settings
     /// give now: same secret, mode, log level, egress interface and ports.
     Reload(Box<Prepared>),
+    Refresh(Box<Prepared>),
 }
 
 /// How effects are taken when a start begins.
@@ -242,7 +246,7 @@ pub(super) trait Port: Send + 'static {
     /// The running core's mode, choices and runtime settings.
     fn read_back(&mut self, secret: &str) -> Option<(Mode, Selected, Value)>;
     /// The kernel plan for these choices, with `unsettled` rule sets unknown.
-    fn plan(&mut self, routes: &routing::Routes, mode: Mode, selected: &Selected, unsettled: &[String]) -> (Bypass, Chain);
+    fn plan(&mut self, routes: &routing::Routes, bypass: bool, mode: Mode, selected: &Selected, unsettled: &[String]) -> (Bypass, Chain);
     fn reset(&mut self, reason: &'static str, scope: Scope, changed: Instant) -> Result<Report, String>;
     fn write(&mut self, secret: &str, write: &Write) -> Answered;
     /// `PUT /configs?force=false` with the whole managed configuration: the
@@ -397,8 +401,6 @@ enum Restart {
     Profile,
     /// The egress moved: the old core's connections are stranded.
     Egress,
-    /// A hot reload was not confirmed.
-    Reload,
 }
 
 pub(super) struct Controller<P: Port> {
@@ -418,8 +420,6 @@ pub(super) struct Controller<P: Port> {
     local: String,
     reason: Option<String>,
     backlog: VecDeque<Message>,
-    /// The last configuration that ran, to fall back to.
-    previous: Option<Prepared>,
     v6_restarted: Option<Instant>,
     egress_restarted: Option<Instant>,
     last_reset: Value,
@@ -456,7 +456,6 @@ impl<P: Port> Controller<P> {
             local: String::new(),
             reason: None,
             backlog: VecDeque::new(),
-            previous: None,
             v6_restarted: None,
             egress_restarted: None,
             last_reset: Value::Null,
@@ -510,10 +509,10 @@ impl<P: Port> Controller<P> {
         snapshot.tables = tables;
         snapshot.generation = self.generation;
         snapshot.core_pid = self.run.as_ref().map(|r| r.core.pid());
-        snapshot.notice = self.run.as_ref().filter(|r| !r.ipv6).and_then(|r| {
+        snapshot.notice = self.run.as_ref().and_then(|r| r.prepared.notice.clone()).or_else(|| self.run.as_ref().filter(|r| !r.ipv6).and_then(|r| {
             let nodes = r.prepared.routes.v6_only_in_use(r.mode, &r.selected);
             (!nodes.is_empty()).then(|| format!("{} only has an IPv6 server address and the uplink has no IPv6, so connections through it fail. Turn on IPv6 for the relay or choose another node.", nodes.join(", ")))
-        });
+        }));
         snapshot.last_reset.clone_from(&self.last_reset);
         if self.phase == Phase::Off {
             snapshot.bypass = None;
@@ -546,10 +545,12 @@ impl<P: Port> Controller<P> {
                 self.publish();
                 let _ = reply.send(result);
             }
-            Message::Config { reply } => {
+            Message::Config { refresh, reply } => {
                 let result = match self.phase {
+                    Phase::Running if refresh => self.refresh(),
                     Phase::Running => self.restart("the profile changed", Restart::Profile),
                     Phase::Backoff => self.start(false),
+                    _ if refresh => self.port.prepare(&Source::Selected { local: self.local.clone(), runtime: None }, false).map(|_| ()),
                     _ => Ok(()),
                 };
                 self.publish();
@@ -774,7 +775,7 @@ impl<P: Port> Controller<P> {
         };
         let mut prepared = prepared;
         prepared.runtime = runtime;
-        let (bypass, chain) = self.port.plan(&prepared.routes, mode, &selected, &[]);
+        let (bypass, chain) = self.port.plan(&prepared.routes, prepared.bypass, mode, &selected, &[]);
         let now = Instant::now();
         let refresh = prepared.routes.refresh().into_iter().enumerate().map(|(i, (name, every))| {
             let every = Duration::from_secs(every);
@@ -806,7 +807,6 @@ impl<P: Port> Controller<P> {
             self.set_bypass(Bypass::None(format!("The kernel plan is not confirmed yet: {e}")));
             self.error = Some(e);
         }
-        self.previous = Some(prepared);
         self.phase = Phase::Running;
         self.reason = None;
         self.publish();
@@ -865,9 +865,15 @@ impl<P: Port> Controller<P> {
                 return Err(error);
             }
         };
+        self.restart_prepared(reason, why, prepared)
+    }
+
+    fn restart_prepared(&mut self, reason: &str, why: Restart, prepared: Prepared) -> Result<(), String> {
         // Interception stays and nothing may skip the core before the old
         // one stops (section 5.2).
-        self.load(Shape::Hold, Bypass::None(format!("Restarting: {reason}")), true).map_err(|e| format!("Mihomo was not restarted: {e}"))?;
+        if self.phase != Phase::Reloading {
+            self.load(Shape::Hold, Bypass::None(format!("Restarting: {reason}")), true).map_err(|e| format!("Mihomo was not restarted: {e}"))?;
+        }
         let Some(old) = self.run.take() else { return Ok(()) };
         self.phase = Phase::Restarting;
         self.reason = Some(reason.into());
@@ -908,12 +914,37 @@ impl<P: Port> Controller<P> {
     /// otherwise a planned restart behind the interception takes over.
     fn reload(&mut self, reason: &str) -> Result<(), String> {
         let Some(run) = self.run.as_ref() else { return Ok(()) };
-        let (previous, before) = (run.prepared.clone(), run.selected.clone());
+        let previous = run.prepared.clone();
         let next = self.port.prepare(&Source::Reload(Box::new(previous.clone())), true)?;
-        if next.dns == previous.dns {
-            // DNS stays: only what skips the core changes.
-            return self.follow(reason, &[], |_| {});
+        if next.config == previous.config {
+            if self.run.as_ref().is_some_and(Run::may_return) {
+                self.load(Shape::Hold, Bypass::None(format!("Following {reason}")), true)?;
+            }
+            if let Some(run) = self.run.as_mut() {
+                run.prepared = next.clone();
+            }
+            self.widen(reason);
+            return Ok(());
         }
+        self.reload_prepared(reason, next)
+    }
+
+    fn refresh(&mut self) -> Result<(), String> {
+        let Some(run) = self.run.as_ref() else { return Ok(()) };
+        if !self.port.ready(&run.prepared) {
+            return self.restart("the profile changed while the core was unhealthy", Restart::Profile);
+        }
+        let previous = run.prepared.clone();
+        let next = self.port.prepare(&Source::Refresh(Box::new(previous.clone())), true)?;
+        if super::reload::needs_restart(&previous.config, &next.config) {
+            return self.restart_prepared("the profile changed startup settings", Restart::Profile, next);
+        }
+        self.reload_prepared("the selected subscription refreshed", next)
+    }
+
+    fn reload_prepared(&mut self, reason: &str, next: Prepared) -> Result<(), String> {
+        let Some(run) = self.run.as_ref() else { return Ok(()) };
+        let (previous, before) = (run.prepared.clone(), run.selected.clone());
         if self.run.as_ref().is_some_and(Run::may_return) {
             self.load(Shape::Hold, Bypass::None(format!("Reloading: {reason}")), true).map_err(|e| format!("Nothing was changed: the bypass could not be narrowed first ({e})"))?;
         }
@@ -925,19 +956,28 @@ impl<P: Port> Controller<P> {
         let started = Instant::now();
         let answered = self.port.reload(&next.secret, &next.config);
         let probe = routing::reload_probe(&previous.dns, &next.dns);
-        let verified = self.port.verify_reload(&next, probe.as_ref(), &before);
+        let verified = match &answered {
+            Ok(status) if !(200..300).contains(status) => Err("Mihomo rejected the reload".into()),
+            Err(_) if next.source != previous.source => Err("the subscription reload result is unknown".into()),
+            _ => self.port.verify_reload(&next, probe.as_ref(), &before),
+        };
         crate::netlog!("[mihomo] reload answered={answered:?} verified={:?} elapsed_ms={}", verified.as_ref().err(), started.elapsed().as_millis());
-        self.phase = Phase::Running;
-        self.reason = None;
         match verified {
             Ok(()) => {
                 if let Some(run) = self.run.as_mut() {
                     run.prepared = next.clone();
+                    let now = Instant::now();
+                    run.refresh = next.routes.refresh().into_iter().map(|(name, every)| {
+                        let every = Duration::from_secs(every);
+                        (name, every, now + every)
+                    }).collect();
                 }
-                self.previous = Some(next);
-                self.follow(reason, &[], |_| {})
+                self.phase = Phase::Running;
+                self.reason = None;
+                self.widen(reason);
+                Ok(())
             }
-            Err(e) => self.restart(&format!("the reload was not confirmed ({e})"), Restart::Reload),
+            Err(e) => self.restart_prepared(&format!("the reload was not confirmed ({e})"), Restart::Profile, next),
         }
     }
 
@@ -1075,8 +1115,8 @@ impl<P: Port> Controller<P> {
             let narrowed = if unsettled.is_empty() {
                 self.load(Shape::Hold, Bypass::None(format!("Following {why}")), true)
             } else {
-                let (routes, mode, selected) = (run.prepared.routes.clone(), run.mode, run.selected.clone());
-                let (bypass, tight) = self.port.plan(&routes, mode, &selected, unsettled);
+                let (routes, enabled, mode, selected) = (run.prepared.routes.clone(), run.prepared.bypass, run.mode, run.selected.clone());
+                let (bypass, tight) = self.port.plan(&routes, enabled, mode, &selected, unsettled);
                 self.load(Shape::Full(&tight), bypass, true)
             };
             narrowed.map_err(|e| format!("Nothing was changed: the bypass could not be narrowed first ({e})"))?;
@@ -1097,7 +1137,7 @@ impl<P: Port> Controller<P> {
         };
         let Some(run) = self.run.as_mut() else { return };
         let routes = run.prepared.routes.clone();
-        let (bypass, chain) = self.port.plan(&routes, mode, &selected, &[]);
+        let (bypass, chain) = self.port.plan(&routes, run.prepared.bypass, mode, &selected, &[]);
         let lost = self.run.as_ref().map(|run| routing::lost_from(&run.bypassed, &chain)).unwrap_or(Scope::Destinations(Vec::new()));
         self.reset("Mihomo routing changed", lost, Instant::now());
         if let Some(run) = self.run.as_mut() {

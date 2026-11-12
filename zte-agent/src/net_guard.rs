@@ -21,27 +21,21 @@ use std::time::{Duration, Instant};
 
 /// Firmware events after which ZTE may rewrite rules, routes or sysctls.
 pub const EVENTS: &[&str] = &["zwrt_wlan", "zwrt_router.msg", "network.interface"];
-/// Scripts and tools that rewrite them.
+/// The scripts and tools that write what an owner holds (B31, read from
+/// the vendor's scripts, 2026-11-11): `fw3` (a restart or flush removes
+/// every legacy rule; every reload runs the next two and the isolation
+/// script), the two that set `bridge-nf-call-ip(6)tables` to 1 from other
+/// paths as well, the speed-limit script that sets it for IPv4, and the two
+/// that flush nat `redirect_chain`. The rest of what a reload runs only
+/// touches the vendor's own chains, so watching it only added checks.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WATCHED: &[&str] = &[
     "/sbin/fw3",
-    "/etc/init.d/firewall",
-    "/sbin/firewall_init.sh",
     "/sbin/firewall_sys_fw.sh",
-    "/sbin/module_firewall_init.sh",
-    "/sbin/module_firewall_sys.sh",
     "/sbin/firewall_redirect.sh",
-    "/sbin/firewall_portmapping.sh",
-    "/sbin/firewall_porttrigger.sh",
     "/sbin/firewall_multi_wan_redirect.sh",
-    "/sbin/firewall_multi_wan_second_redirect.sh",
     "/sbin/wifi_isolate_and_second_ssid_access_control.sh",
-    "/sbin/isolate_exclude.sh",
     "/sbin/mwan_speedlimit.sh",
-    "/sbin/speedlimit.sh",
-    "/sbin/qos_set.sh",
-    "/sbin/router_common.sh",
-    "/etc/hotplug.d/iface/15-mwan3",
 ];
 /// A script runs for a while: check once it has been quiet this long.
 const SETTLE: Duration = Duration::from_secs(2);

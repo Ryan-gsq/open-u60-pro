@@ -2,6 +2,22 @@
 
 This design describes the retired interface. It is no longer served in production. `/` and `/ui/` now open the responsive console; see [the current guide](responsive-console.md). Shared certificate/security helpers and renderer regression fixtures remain internal.
 
+2026-11-12 note for the current Relay page (`src/web/pages/network.rs`,
+`src/web/tabs/relay.rs`): the text below remains an archive. The served page now
+uses memory-only relay status and shows `Scanning…`, `Connecting…`, `Recovering…`
+or `Disconnecting… (the hotspot is returning to its channel, up to about 80 s)`.
+Disconnect remains available during an operation. An accepted cancellation says
+"Disconnect requested" while phase is `disconnecting`; "Relay disconnected" is
+reserved for completed cleanup. `recovery_required` is only shown with journals
+left after work stops (`idle`/`recovery_pending`, no pending disconnect).
+The relay's admission/operation wait is at most 3 s, then HTTP 409 with the phase;
+other operation failures remain 503, separately from the HTTP gate. Connect's
+selection check counts in the same 3 s. A Disconnect
+with no operation in progress performs cleanup synchronously, including CAC.
+The display limit comes from the hotspot restoration deadline; router response
+measurements and untested paths are recorded in
+[implementation batch 4](relay-mihomo-implementation.md#batch-4).
+
 # Web UI: `/ui/`
 
 ## Experimental Web-Only Network Extensions

@@ -261,20 +261,6 @@ impl NftTables {
         self.load(nft).map(|_| true)
     }
 
-    /// Deletes both tables (a missing one is fine) and forgets the target.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn remove(&mut self, nft: &mut (impl Nft + ?Sized)) -> Result<(), String> {
-        for family in FAMILIES {
-            if nft.list(family, self.name)?.is_some() {
-                nft.delete(family, self.name)?;
-            }
-        }
-        self.target = None;
-        self.confirmed = None;
-        self.error = None;
-        Ok(())
-    }
-
     /// Whether the target is what the kernel was last read to hold.
     pub fn confirmed(&self) -> bool {
         self.target.as_ref().is_some_and(|t| self.confirmed == Some(t.number))
@@ -458,8 +444,6 @@ mod tests {
         nft.tables.remove(&key);
         assert!(t.reconcile(&mut nft).unwrap(), "a deleted family");
         assert!(!t.reconcile(&mut nft).unwrap());
-        t.remove(&mut nft).unwrap();
-        assert!(nft.tables.is_empty() && !t.confirmed());
         let _ = std::fs::remove_dir_all(t.file.parent().unwrap());
     }
 
@@ -548,7 +532,9 @@ mod tests {
         Cmd::new("nft", &["flush", "chain", "ip6", "u60_t", "pre"]).run().unwrap();
         assert!(t.reconcile(&mut nft).unwrap(), "a flushed chain is loaded again");
         assert!(!t.reconcile(&mut nft).unwrap());
-        t.remove(&mut nft).unwrap();
+        for family in FAMILIES {
+            nft.delete(family, "u60_t").unwrap();
+        }
         assert_eq!(nft.list_both("u60_t").unwrap(), [None, None]);
         nft.delete("ip", "u60_other").unwrap();
     }

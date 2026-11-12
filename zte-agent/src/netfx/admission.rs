@@ -62,6 +62,10 @@ pub fn held(what: &'static str) -> bool {
 #[derive(Debug)]
 pub struct Claim(u64);
 
+pub fn claim(what: &'static str, bound: Duration) -> Claim {
+    Claim(occupy(what, bound))
+}
+
 impl Drop for Claim {
     fn drop(&mut self) {
         release_id(self.0);
@@ -94,8 +98,8 @@ pub fn admit(lock: &Mutex<()>, what: &'static str, conflict: impl Fn() -> Option
 
 /// A relay operation the owner asked for (or a boot restore): refused while
 /// one of `blockers` is held, registered as `what` until the claim drops.
-pub fn begin(lock: &Mutex<()>, what: &'static str, blockers: &[&'static str]) -> Result<Claim, String> {
-    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+pub fn begin(lock: &Mutex<()>, what: &'static str, blockers: &[&'static str], wait: Duration) -> Result<Claim, String> {
+    let _guard = enter(lock, wait).ok_or_else(|| IN_PROGRESS.to_owned())?;
     if let Some(blocker) = blockers.iter().find(|b| held(b)) {
         return Err(if *blocker == VENDOR_WIFI_RELOAD {
             "Wi-Fi is still applying its new settings; retry in a moment".into()
@@ -107,7 +111,7 @@ pub fn begin(lock: &Mutex<()>, what: &'static str, blockers: &[&'static str]) ->
 }
 
 /// The lock within `wait`, or `None` when an operation still holds it.
-pub fn enter(lock: &Mutex<()>, wait: Duration) -> Option<MutexGuard<'_, ()>> {
+pub fn enter<T>(lock: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
     let deadline = Instant::now() + wait;
     loop {
         match lock.try_lock() {
@@ -148,7 +152,7 @@ mod tests {
     fn writes_and_relay_operations_admit_each_other_in_short_sections() {
         let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let lock = Mutex::new(());
-        let relay = begin(&lock, RELAY_OPERATION, &[VENDOR_WRITE]).unwrap();
+        let relay = begin(&lock, RELAY_OPERATION, &[VENDOR_WRITE], WAIT).unwrap();
         let started = Instant::now();
         assert_eq!(admit(&lock, VENDOR_WRITE, || None).err().as_deref(), Some(IN_PROGRESS));
         assert!(started.elapsed() >= WAIT);
@@ -156,12 +160,12 @@ mod tests {
         assert_eq!(admit(&lock, VENDOR_WRITE, || Some("Disconnect Wi-Fi relay first".into())).err().as_deref(), Some("Disconnect Wi-Fi relay first"));
         let write = admit(&lock, VENDOR_WRITE, || None).unwrap();
         assert!(lock.try_lock().is_ok(), "the lock is not held across the write");
-        assert!(begin(&lock, RELAY_OPERATION, &[VENDOR_WRITE]).unwrap_err().contains("router setting change"));
+        assert!(begin(&lock, RELAY_OPERATION, &[VENDOR_WRITE], WAIT).unwrap_err().contains("router setting change"));
         drop(write);
         occupy(VENDOR_WIFI_RELOAD, Duration::from_secs(60));
-        assert!(begin(&lock, RELAY_OPERATION, &[VENDOR_WIFI_RELOAD]).unwrap_err().contains("applying"));
+        assert!(begin(&lock, RELAY_OPERATION, &[VENDOR_WIFI_RELOAD], WAIT).unwrap_err().contains("applying"));
         release(VENDOR_WIFI_RELOAD);
-        assert!(begin(&lock, RELAY_OPERATION, &[VENDOR_WIFI_RELOAD]).is_ok());
+        assert!(begin(&lock, RELAY_OPERATION, &[VENDOR_WIFI_RELOAD], WAIT).is_ok());
     }
 
     /// Tests that use the shared registry's real names.
@@ -184,5 +188,14 @@ mod tests {
         let before = Instant::now();
         assert!(enter(&lock, Duration::from_millis(200)).is_none());
         assert!(before.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn relay_admission_also_stops_waiting_for_the_network_lock() {
+        let lock = Mutex::new(());
+        let _busy = lock.lock().unwrap();
+        let started = Instant::now();
+        assert_eq!(begin(&lock, "bounded relay admission test", &[], WAIT).unwrap_err(), IN_PROGRESS);
+        assert!(started.elapsed() >= WAIT && started.elapsed() < Duration::from_secs(1));
     }
 }

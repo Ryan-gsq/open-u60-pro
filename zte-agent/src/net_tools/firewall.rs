@@ -135,9 +135,8 @@ pub(super) fn has_chain(listing: &str, chain: &str) -> bool {
 /// Whether a rule (`-D`/`-A` arguments) is the agent's by the identity
 /// `Transaction::apply_network` relies on: it sits in an owned `U60_*`
 /// chain, jumps to one, or carries our comment. The relay's station name
-/// is no identity (the vendor's IPACM configuration lists it too); the
-/// names only older agents created (`ids::OLD_IFACES`) still are, for the
-/// rules their journals hold. Another writer's identical rule fails all four.
+/// is no identity (the vendor's IPACM configuration lists it too). Another
+/// writer's identical rule fails all three.
 pub(super) fn owned_rule(args: &[String]) -> bool {
     let Some(at) = args.iter().position(|a| matches!(a.as_str(), "-D" | "-A" | "-I")) else {
         return false;
@@ -145,7 +144,6 @@ pub(super) fn owned_rule(args: &[String]) -> bool {
     let values = |flag: &str| args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].as_str()).collect::<Vec<_>>();
     args.get(at + 1).is_some_and(|chain| chain.starts_with("U60_"))
         || values("-j").iter().any(|t| t.starts_with("U60_"))
-        || values("-i").iter().chain(&values("-o")).any(|name| crate::netfx::ids::OLD_IFACES.contains(name))
         || values("--comment").iter().any(|c| c.starts_with("zte-agent"))
 }
 
@@ -153,10 +151,10 @@ pub(super) fn owned_rule(args: &[String]) -> bool {
 /// journal for the next cleanup.
 const COPIES: usize = 32;
 
-/// The undo of an `-N` (`-X`) or `-A`/`-I` (`-D`) step. A rule may be in
-/// place more than once (a re-apply after a check that failed for another
-/// reason, before that was told apart; or an older agent's): every copy of
-/// an owned rule is deleted, and an owned chain that still holds rules is
+/// The undo of an `-N` (`-X`) or `-A`/`-I` (`-D`) step. No step adds a rule
+/// twice, but a copy left behind would survive every later `-D` (and on B31
+/// a second MASQUERADE for one interface drops new connections): every
+/// copy of an owned rule is deleted, and an owned chain that still holds rules is
 /// emptied before it is deleted, or its `-X` would fail on every later
 /// recovery. Another writer's rule keeps the single `-D` it always had, and
 /// a chain that is not `U60_*` is never emptied. Only a definite answer
@@ -601,21 +599,17 @@ mod tests {
     /// The relay's MASQUERADE is keyed by its interface alone. Under the
     /// station's name, which the vendor's IPACM configuration also lists,
     /// its comment is the identity: every copy goes, a vendor twin without
-    /// it is deleted once. A rule an older agent journaled under its own
-    /// interface names is still its own.
+    /// it is deleted once.
     #[test]
-    fn an_interface_is_an_identity_only_under_the_names_older_agents_used() {
+    fn an_interface_name_is_no_identity() {
         const OURS: &str = "-o ath20 -m comment --comment zte-agent-wifi-relay -j MASQUERADE";
         const BARE: &str = "-o ath20 -j MASQUERADE";
-        const OLD: &str = "-o u60sta0 -j MASQUERADE";
         let masquerade = |spec: &str| rule("iptables", "nat", "POSTROUTING", &args(spec), true).undo;
-        assert!(owned_rule(&masquerade(OURS).args) && owned_rule(&masquerade(OLD).args));
-        assert!(owned_rule(&masquerade("-i u60mh0 -j ACCEPT").args), "the core's former TUN device");
+        assert!(owned_rule(&masquerade(OURS).args));
         assert!(!owned_rule(&masquerade(BARE).args), "the station's name alone is not ours");
-        assert!(!owned_rule(&masquerade("-o u60sta1 -j MASQUERADE").args), "only the names older agents created");
         let mut kernel = Kernel::default();
-        kernel.chain("nat", "POSTROUTING", &[OURS, BARE, OURS, OLD, OLD, BARE]);
-        for spec in [OURS, OLD, BARE] {
+        kernel.chain("nat", "POSTROUTING", &[OURS, BARE, OURS, BARE]);
+        for spec in [OURS, BARE] {
             undo_with(&masquerade(spec), &mut kernel).unwrap_or_else(|e| panic!("{spec}: {e}"));
         }
         assert_eq!(kernel.rules("nat", "POSTROUTING").unwrap(), [BARE], "one delete for a rule we cannot tell apart");

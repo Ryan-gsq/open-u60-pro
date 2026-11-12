@@ -172,6 +172,13 @@ pub fn relay_page(pd: &PageData) -> Markup {
     let connected = s["connected"].as_bool() == Some(true);
     let recovery = s["recovery_required"].as_bool() == Some(true);
     let autostart = s["autostart"].as_bool() == Some(true);
+    let operation = match s["phase"].as_str() {
+        Some("scanning") => Some(("Scanning…", "Scanning nearby Wi-Fi networks…")),
+        Some("connecting") => Some(("Connecting…", "Connecting to upstream Wi-Fi… Hotspots may briefly reconnect.")),
+        Some("recovering") => Some(("Recovering…", "Recovering the Wi-Fi relay connection or its previous settings…")),
+        Some("disconnecting") => Some(("Disconnecting…", "Disconnecting… (the hotspot is returning to its channel, up to about 80 s)")),
+        _ => None,
+    };
     // Resuming the saved owner-selected network after startup.
     let restoring = s["restoring"].as_str().filter(|_| !connected);
     let networks = s["networks"].as_array().filter(|n| !n.is_empty());
@@ -181,11 +188,11 @@ pub fn relay_page(pd: &PageData) -> Markup {
                 div.relay-head {
                     span.relay-glyph { (kit::icon(kit::Icon::Wifi)) }
                     span class=(if connected { "relay-state on" } else { "relay-state" }) {
-                        (if connected { "Wi-Fi linked" } else if restoring.is_some() { "Reconnecting" } else if recovery { "Recovery required" } else { "Relay off" })
+                        (if let Some((label, _)) = operation { label } else if connected { "Wi-Fi linked" } else if restoring.is_some() { "Reconnecting" } else if recovery { "Recovery required" } else { "Relay off" })
                     }
                 }
                 h2 #relay-heading { (if connected { s["ssid"].as_str().unwrap_or("Wi-Fi relay") } else { restoring.unwrap_or("Share a Wi-Fi connection") }) }
-                p { (if connected { "Connected (internet not verified). Network authentication may still be required." } else if restoring.is_some() { "Trying the last selected remembered or open network. After a reboot this can take a few minutes. Stop reconnecting cancels this attempt and clears the restart choice." } else if recovery { "Some relay settings still need cleanup. Retry without scanning or connecting to Wi-Fi." } else { "Use nearby Wi-Fi as your U60's internet connection." }) }
+                p role="status" { (if let Some((_, description)) = operation { description } else if connected { "Connected (internet not verified). Network authentication may still be required." } else if restoring.is_some() { "Trying the last selected remembered or open network. After a reboot this can take a few minutes. Stop reconnecting cancels this attempt and clears the restart choice." } else if recovery { "Some relay settings still need cleanup. Retry without scanning or connecting to Wi-Fi." } else { "Use nearby Wi-Fi as your U60's internet connection." }) }
                 div.relay-path aria-label="Upstream Wi-Fi to U60 Pro to your devices" {
                     span.relay-hop { (kit::icon(kit::Icon::Wifi)) "Wi-Fi" }
                     (kit::icon(kit::Icon::Arrows))
@@ -246,7 +253,7 @@ pub fn relay_page(pd: &PageData) -> Markup {
                 @if autostart && !connected && restoring.is_none() {
                     p.relay-copy { "A restart connection choice is still saved. Disconnect clears it and cancels any pending restoration." }
                 }
-                @if connected || recovery || restoring.is_some() || autostart {
+                @if connected || recovery || restoring.is_some() || autostart || operation.is_some() {
                     form method="post" action=(DISCONNECT) {
                         (pd.csrf()) (once_field(&pd.once()))
                         button.relay-btn.relay-stop type="submit" data-busy-label="Disconnecting relay and restoring network settings..." { (kit::icon(kit::Icon::Power)) (if connected { "Disconnect relay" } else if recovery { "Retry relay cleanup" } else if restoring.is_some() { "Stop reconnecting" } else { "Disconnect & clear restart choice" }) }
@@ -334,7 +341,7 @@ pub fn relay_page(pd: &PageData) -> Markup {
                 p { "Experimental B31 AP + STA, IPv4 NAT. Keep both main hotspots enabled and Guest WiFi off. Do not change WiFi, LAN or USB settings while connected." }
                 p { "Open and WPA2-Personal networks on radio-enabled 2.4 GHz and 5 GHz channels, including DFS. DFS may delay hotspot availability during radar checks. WPA3-only, enterprise and hidden SSIDs are not supported." }
                 p { "Optional upstream IPv6 with LAN SLAAC/NAT66. Without a usable upstream IPv6 address and default route, relay stays IPv4-only. Cellular IPv6 bypass stays blocked. Internet access and hotel authorization are not verified automatically." }
-                p { "IPv6 needs the existing LAN odhcpd service and kernel NAT support. Its temporary settings are restored on disconnect; do not change the vendor LAN/DHCP settings while relaying. Restart resumes only the saved connection choice, not every remembered network. Upgrading an older agent cannot infer that choice from saved credentials." }
+                p { "IPv6 needs the existing LAN odhcpd service and kernel NAT support. Its temporary settings are restored on disconnect; do not change the vendor LAN/DHCP settings while relaying. Restart resumes only the saved connection choice, not every remembered network." }
                 p { "Refresh this page to read the current state. No background scanning or polling runs while relay is off and no startup restoration is pending." }
             }
             (offload_panel(pd, s, connected))

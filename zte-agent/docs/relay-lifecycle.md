@@ -1,6 +1,6 @@
 # 中继、蜂窝与热点的切换流程
 
-更新：2026-11-03；2026-11-12 更新 DFS 开关和宽度复位。适用当前 U60 Pro B31 实现。
+更新：2026-11-03；2026-11-12 更新 DFS 开关、宽度复位、阶段和取消。适用当前 U60 Pro B31 实现。
 
 ## 连接方案
 
@@ -57,7 +57,7 @@ flowchart LR
 ### 连接或更换上游
 
 1. 校验扫描选择、加密方式、密码及驱动开放信道。无效请求保留当前连接和恢复选择。
-2. 接受操作后取消旧的重启恢复任务；中继自己的锁串行处理扫描/连接/清理，并在准入（`netfx::admission`）登记，不跨功能持锁做设备操作（v4）。
+2. 校验选择后先取消旧的重启恢复任务，再有界等待操作资格，正在 join 的恢复可因此让出。中继自己的 `op` 串行处理扫描/连接/清理，每个持锁者（包括 tick）同时持有 `Operation` 和准入登记 `RELAY_OPERATION`，不跨功能持准入锁做设备操作。车主操作对准入和 `op` 合计最多等 3 s（`admission::WAIT`），忙时回带 `phase` 的 HTTP 409；选择校验等 `inner` 的时间也算在这 3 s 里。车主 Connect 抢占正在 join 的恢复未在真机验证。
 3. 若已有中继：新旧上游都在 5 GHz 时交接（`handover`），只拆旧会话的硬件路径、IPv6、
    路由、解析器、租约和关联，`ath20`、supplicant、防护、热点恢复日志和离线门户的抑制（开关改动和两条 RETURN，都在
    `dns.json`）留给新会话，热点只回
@@ -73,8 +73,10 @@ flowchart LR
 
 ### 手动取消/断开中继
 
-清除 `resume.json`，使以后重启也保持中继关闭；已记住的 Wi-Fi 凭据仍可保留。
-随后按同一条清理路径执行：
+Disconnect 先更新取消代次和待断开标志，立即发布 `disconnecting`。已有操作时回 HTTP 200，表示接受取消，
+由持有 `op` 的线程在释放之前执行拆除；没有操作时请求自己执行拆除，仍会等待热点回原信道。
+拆除清除 `resume.json`，使以后重启也保持中继关闭；已记住的 Wi-Fi 凭据仍可保留。
+两种情况都按同一条清理路径执行：
 
 1. 撤销 IPv6；nft 表缩回仅上游防护后，撤销 IPv4 中继路由/NAT/放行规则及 DNS/离线门户覆盖。
 2. 让 Mihomo 跟随当前可用出口。
@@ -84,6 +86,12 @@ flowchart LR
 **取消中继通常不会关闭原热点。** 2.4 GHz 恢复原运行信道/能力，5 GHz 恢复
 原主频/带宽/中心频率。恢复 36/160 可能需要约 60 秒 CAC；5 GHz 等待每秒查询，
 以 80 秒实际时间为截止，每条查询也有超时。失败保留剩余恢复日志供重试。
+
+2026-11-12 批次 4 真机补记：拆除期间状态请求在 0.00–0.01 s 返回，额外四次 Disconnect 各在 0.01 s
+回 HTTP 200；扫描和省电请求各等 3.02 s 后回 HTTP 409，带 `disconnecting`，没有误报需要恢复
+（`measurements/b4-final/phase-test.log`）。无其他操作时 Disconnect 用 65.085133 s 拆完并返回
+（`measurements/b4-final/phase-test-2.log`）。这些文件位于仓库旁的
+`../probe-reports/2026-11-11-relay-mihomo/measurements/`；更多验证边界见[批次 4](relay-mihomo-implementation.md#batch-4)。
 
 5 GHz 之间的切换不走这条清理路径：热点留在中继带去的 DFS 信道时，新的关联在同一信道上
 也完成不了（B31 实测一直 SCANNING），所以交接时热点先回过渡信道，再随新关联走；
@@ -116,18 +124,32 @@ flowchart LR
   进程，撤销旧运行状态（撤掉路由后通知 Mihomo），再恢复 Mihomo 和最近的上游选择。最多
   按退避策略尝试约 17 分钟，手动连接、断开或明确关闭热点会取消重试。
 - **整机重启**：日志携带 boot ID；旧开机的运行快照不会覆盖新启动的原厂热点。
-  等原厂启动栅栏后，根据保存选择重新扫描和连接。2026-11-12 最终版重启后第一次尝试就在开机 72.9 s 恢复
-  （`measurements/b2-reboot3/agent-boot.log`）。
-- **同一次开机里从用 `u60sta0` 的旧版更新**：旧连接不接管（"the relay interface is gone"），停掉旧助手、撤销旧日志，
-  在 `ath20` 上重连（`measurements/b2-final/agent.log`）。反方向退回旧版之前要先断开中继或重启：旧版的清理不认 `ath20`。
+  等原厂启动栅栏后，根据保存选择重新扫描和连接。2026-11-12 批次 3 构建第一次尝试在开机 72.9 s 恢复
+  （`measurements/b2-reboot3/agent-boot.log`）；同日批次 4 构建第一次尝试在开机 76.053 s 恢复
+  （`measurements/b4-final/agent-boot.log`）。两次是各自构建的记录，不是恢复时限。
+- **和 2026-11-12 之前的版本（站点叫 `u60sta0`）互相更换**：两边都不认对方留下的中继（旧接口名的助手、日志和
+  规则不再识别，车主决定不留兼容，2026-11-12）。更换之前先断开中继，或者更换之后重启。
 - **低电量关机后的关机充电模式**：恢复供电后路由器进入厂商的关机充电模式，Wi-Fi 不启动，厂商把
   `wireless.zte_mbb.wifi_onoff` 设成 0，而车主自己的开关 `wifi_onoff_by_user` 仍是 1
   （`measurements/observations-2026-11-12.md`）。之前的版本按 `wifi_onoff` 判断，把它当作车主关了热点，清除了
   `resume.json`，之后正常重启也不再恢复中继（2026-11-12 实测一次）。现在按 `hotspot::off_by_owner` 判断：
   开机恢复在 Wi-Fi 被固件关着时跳过这次尝试，保留重启选择；连接中途 Wi-Fi 被固件关掉而失败时也保留。这个修复
   只有单元测试，路由器上没有复现。
-- **清理中途失败**：已完成的步骤不重做，未完成 undo 留在日志；界面显示
-  `recovery_required`，可以再次断开/清理，必要时 USB 执行 `network-recover`。
+- **清理中途失败**：已完成的步骤不重做，未完成 undo 留在日志；操作结束后阶段为
+  `recovery_pending`，才显示 `recovery_required`，可以再次断开/清理，必要时 USB 执行 `network-recover`。
+
+### 状态阶段与请求边界（2026-11-12）
+
+状态只读内存，`phase` 为 `idle`、`scanning`、`connecting`、`active`、`recovering`、`disconnecting` 或
+`recovery_pending`；`recovering` 包括等待关联恢复和 agent 启动恢复，实际扫描/连接步骤显示对应阶段。
+只有日志尚存、阶段为 `idle`/`recovery_pending` 且没有待断开时，`recovery_required` 才为真。
+扫描、连接、恢复、拆除中不因日志存在而显示“需要恢复”。`autostart`、日志状态、IPACM 配置/开关、省电意图和
+已保存网络在 `publish` 时计算；conntrack 历史用独立短锁，GET 不等 tick 或删除。顶层恒定字段
+`experimental`、`cellular_fallback`、`internet` 已删除，`ipv6.internet` 保留。
+
+扫描、连接、省电、硬件转发开关、忘记网络和时钟六类请求共用上述 3 s 资格等待规则；忙时回 HTTP 409 和当前
+`phase`，其他操作失败仍回 503，HTTP gate 的等待是另一层限制。页面显示各操作阶段，操作中仍提供 Disconnect，
+接受取消后写“Disconnect requested”，拆完才写“Relay disconnected”。
 
 ## 审查与性能取舍
 

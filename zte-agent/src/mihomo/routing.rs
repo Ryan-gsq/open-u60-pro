@@ -158,6 +158,7 @@ impl Provider {
 #[derive(Clone, Debug, Default)]
 pub(super) struct Routes {
     rules: Vec<String>,
+    rule_targets: Vec<String>,
     groups: HashMap<String, Group>,
     providers: HashMap<String, Provider>,
     /// The subscription's own fake-ip-filter blacklist, as real-ip rules.
@@ -356,24 +357,46 @@ mod ranges {
     }
 
     pub(super) fn union(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
-        let mut all = [a, b].concat();
-        all.sort_unstable();
-        merge(all)
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        let (mut left, mut right) = (a.iter().peekable(), b.iter().peekable());
+        while left.peek().is_some() || right.peek().is_some() {
+            let &(low, high) = if right.peek().is_none() || left.peek().zip(right.peek()).is_some_and(|(left, right)| left <= right) {
+                left.next().unwrap()
+            } else {
+                right.next().unwrap()
+            };
+            match out.last_mut() {
+                Some(last) if low <= last.1.saturating_add(1) => last.1 = last.1.max(high),
+                _ => out.push((low, high)),
+            }
+        }
+        out
     }
 
     pub(super) fn subtract(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
         let mut out = Vec::new();
+        let mut cut = 0;
         for &(start, high) in a {
             let mut low = Some(start);
-            for &(cut_low, cut_high) in b {
-                let Some(at) = low else { break };
-                if cut_high < at || cut_low > high {
+            while cut < b.len() {
+                let (cut_low, cut_high) = b[cut];
+                let at = low.unwrap();
+                if cut_high < at {
+                    cut += 1;
                     continue;
+                }
+                if cut_low > high {
+                    break;
                 }
                 if cut_low > at {
                     out.push((at, cut_low - 1));
                 }
-                low = (cut_high < high).then(|| cut_high + 1);
+                if cut_high >= high {
+                    low = None;
+                    break;
+                }
+                low = Some(cut_high + 1);
+                cut += 1;
             }
             if let Some(at) = low {
                 out.push((at, high));
@@ -538,6 +561,7 @@ impl Routes {
     pub(super) fn from(config: &Yaml) -> Self {
         let strings = |v: &Yaml| v.as_sequence().map(|s| s.iter().filter_map(Yaml::as_str).map(str::to_owned).collect::<Vec<_>>());
         let rules = strings(&config["rules"]).unwrap_or_default();
+        let rule_targets = rules.iter().map(|line| parse(line, true).target).collect();
         let groups = config["proxy-groups"]
             .as_sequence()
             .into_iter()
@@ -569,7 +593,7 @@ impl Routes {
             .filter(|p| p["server"].as_str().is_some_and(|s| s.trim_start_matches('[').trim_end_matches(']').parse::<std::net::Ipv6Addr>().is_ok()))
             .filter_map(|p| p["name"].as_str().map(str::to_owned))
             .collect();
-        Self { rules, groups, providers, compat, geodata: config["geodata-mode"].as_bool() == Some(true), v6_only }
+        Self { rules, rule_targets, groups, providers, compat, geodata: config["geodata-mode"].as_bool() == Some(true), v6_only }
     }
 
     /// The nodes with only an IPv6 server address that traffic can reach now:
@@ -579,25 +603,25 @@ impl Routes {
         if self.v6_only.is_empty() {
             return Vec::new();
         }
-        let mut todo: Vec<(String, usize)> = match mode {
+        let mut todo: Vec<(&str, usize)> = match mode {
             Mode::Direct => return Vec::new(),
-            Mode::Global => vec![("GLOBAL".to_owned(), 0)],
-            Mode::Rule => self.rules.iter().map(|line| (parse(line, true).target, 0)).collect(),
+            Mode::Global => vec![("GLOBAL", 0)],
+            Mode::Rule => self.rule_targets.iter().map(|target| (target.as_str(), 0)).collect(),
         };
         let (mut seen, mut found) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
         while let Some((name, depth)) = todo.pop() {
-            if depth > MAX_DEPTH * 2 || !seen.insert(name.clone()) {
+            if depth > MAX_DEPTH * 2 || !seen.insert(name) {
                 continue;
             }
-            if self.v6_only.contains(&name) {
-                found.insert(name);
+            if self.v6_only.contains(name) {
+                found.insert(name.to_owned());
                 continue;
             }
-            match self.groups.get(&name) {
-                Some(group) if group.select => todo.extend(selected.get(&name).or(group.members.first()).map(|now| (now.clone(), depth + 1))),
-                Some(group) => todo.extend(group.members.iter().map(|m| (m.clone(), depth + 1))),
+            match self.groups.get(name) {
+                Some(group) if group.select => todo.extend(selected.get(name).or(group.members.first()).map(|now| (now.as_str(), depth + 1))),
+                Some(group) => todo.extend(group.members.iter().map(|member| (member.as_str(), depth + 1))),
                 // `GLOBAL` is the core's own group: its choice only.
-                None => todo.extend(selected.get(&name).map(|now| (now.clone(), depth + 1))),
+                None => todo.extend(selected.get(name).map(|now| (now.as_str(), depth + 1))),
             }
         }
         found.into_iter().collect()
@@ -1056,6 +1080,112 @@ fn compat_rule(entry: &str, providers: &HashMap<String, Provider>) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn old_subtract(left: &[(u32, u32)], right: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for &(start, high) in left {
+            let mut low = Some(start);
+            for &(cut_low, cut_high) in right {
+                let Some(at) = low else { break };
+                if cut_high < at || cut_low > high {
+                    continue;
+                }
+                if cut_low > at {
+                    out.push((at, cut_low - 1));
+                }
+                low = (cut_high < high).then(|| cut_high + 1);
+            }
+            if let Some(at) = low {
+                out.push((at, high));
+            }
+        }
+        out
+    }
+
+    fn old_union(left: &[(u32, u32)], right: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let mut sorted = [left, right].concat();
+        sorted.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for (low, high) in sorted {
+            match out.last_mut() {
+                Some(last) if low <= last.1.saturating_add(1) => last.1 = last.1.max(high),
+                _ => out.push((low, high)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn linear_range_operations_match_reference_at_boundaries_and_generated_inputs() {
+        let cases = [
+            vec![],
+            vec![(0, 0)],
+            vec![(u32::MAX, u32::MAX)],
+            vec![(0, u32::MAX)],
+            vec![(0, 0), (1, 1), (2, 2), (u32::MAX - 1, u32::MAX)],
+            vec![(0, 10), (20, 30), (40, 50)],
+            vec![(5, 45)],
+        ];
+        let compare = |left: &[(u32, u32)], right: &[(u32, u32)]| {
+            assert_eq!(ranges::subtract(left, right), old_subtract(left, right), "subtract {left:?} - {right:?}");
+            assert_eq!(ranges::union(left, right), old_union(left, right), "union {left:?} + {right:?}");
+        };
+        for left in &cases {
+            for right in &cases {
+                compare(left, right);
+            }
+        }
+        let mut state = 0x5834_7319_9613_872bu64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+        for index in 0..10_000 {
+            let mut make = || {
+                let count = random() % 64;
+                let mut points: Vec<u32> = (0..count * 2).map(|_| random()).collect();
+                if index % 2 == 0 {
+                    for point in &mut points {
+                        *point %= 256;
+                    }
+                }
+                points.sort_unstable();
+                points.dedup();
+                points.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect::<Vec<_>>()
+            };
+            let (left, right) = (make(), make());
+            compare(&left, &right);
+            compare(&right, &left);
+            compare(&left, &left);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_subtract_4500_ranges() {
+        let list: Vec<(u32, u32)> = (0..4500).map(|index| (index * 65536, index * 65536 + 255)).collect();
+        let start = std::time::Instant::now();
+        let old = std::hint::black_box(old_subtract(std::hint::black_box(&list), std::hint::black_box(&list)));
+        let old_time = start.elapsed();
+        let start = std::time::Instant::now();
+        let new = std::hint::black_box(ranges::subtract(std::hint::black_box(&list), std::hint::black_box(&list)));
+        let new_time = start.elapsed();
+        assert_eq!(old, new);
+        println!("Mac subtract 4500 - 4500 ranges: old={old_time:?}, new={new_time:?}");
+    }
+
+    #[test]
+    fn ipv6_targets_are_parsed_once_without_changing_rule_order() {
+        let mut routes = with_rules(&["AND,((NETWORK,UDP),(DST-PORT,443)),JP6", "MATCH,DIRECT"]);
+        routes.v6_only.insert("JP6".into());
+        assert_eq!(routes.rule_targets, routes.rules.iter().map(|line| parse(line, true).target).collect::<Vec<_>>());
+        routes.rules.clear();
+        for _ in 0..10 {
+            assert_eq!(routes.v6_only_in_use(Mode::Rule, &Selected::new()), ["JP6"]);
+        }
+    }
 
     /// The shape of the owner's subscription (2026-11-09).
     const CONFIG: &str = r#"

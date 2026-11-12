@@ -90,7 +90,7 @@ agent 只读 `/etc/data/ipa/IPACM_cfg.xml`，从不写它（`offload::config`）
 标记文件和“本次开机是否已加载”的记账。车主的路由器上，这个条目已在 2026-11-12 用旧版自己的移除操作删掉，
 文件又与原厂一致（`measurements/b2-final/disconnect-connect.log` 的 sha 前缀）。路由器上旧安装留下的备份
 `/data/zte-agent-relay/ipacm/IPACM_cfg.xml.orig`（核对过与正在用的文件相同）已在同一天按车主的要求删除。
-开发机上仓库旁边的 `../backups/ipacm/`（原厂文件、装过条目的文件和 `restore-stock.sh`）还在，agent 不读它。
+开发机上仓库旁边的 `../backups/ipacm/`（原厂文件、装过条目的文件和 `restore-stock.sh`）也在同一天按车主的要求删除。
 
 ### 1a. 状态机和固件指纹（`offload::Runtime`）
 
@@ -314,10 +314,12 @@ ZTE 会从很多地方改写 legacy iptables、sysctl 和路由：fw3 重载、�
   列表或工具本身失败算“查不了”，报出来，留给下一次检查。重做之后，这个列表在本次检查里重新读。
 - 撤销（`Cmd::undo` → `firewall::undo`）删掉自有规则的每一份副本，自有 `U60_*` 链先清空再删除；
   厂商链从不清空，别人的同样规则只删一次。只有确定的“不在”才算已撤销，工具或锁失败时保留日志。
-- `net_guard` 只决定什么时候查：inotify 监视 18 个 ZTE 脚本的 `IN_OPEN`
-  （`fw3`、`firewall_*.sh`、`module_firewall_*.sh`、`wifi_isolate_*`、`isolate_exclude.sh`、
-  `speedlimit.sh`、`mwan_speedlimit.sh`、`qos_set.sh`、`router_common.sh`、`15-mwan3` 等，
-  `net_guard::WATCHED`），订阅 ubus 事件 `zwrt_wlan`、`zwrt_router.msg`、`network.interface`；
+- `net_guard` 只决定什么时候查：inotify 监视 6 个 ZTE 脚本和工具的 `IN_OPEN`（`net_guard::WATCHED`）：`fw3`
+  （restart 或 flush 会清掉全部 legacy 规则，每次 reload 都运行后面几个脚本）、把 brnf 写成 1 的
+  `firewall_sys_fw.sh`、`wifi_isolate_and_second_ssid_access_control.sh` 和 `mwan_speedlimit.sh`、清空
+  `redirect_chain` 的 `firewall_redirect.sh` 和 `firewall_multi_wan_redirect.sh`。2026-11-12 之前监视 18 个；
+  去掉的 12 个只动厂商自己的链，或者只是上面几个的调用者，监视它们只会多查。订阅 ubus 事件
+  `zwrt_wlan`、`zwrt_router.msg`、`network.interface`；
   触发后安静 2 秒再查（到点直接唤醒中继和 Mihomo，不等它们下一个 tick）；某次检查真的补回了
   东西，5 秒后再查一次；没有触发时每 60 秒兜底一次。没有任何 owner 时什么都不跑。
   每次触发后的 3 秒内，每 0.5 秒只读一遍 owner 持有的 `@u60-sysctl`（如 Mihomo 的 brnf=0），

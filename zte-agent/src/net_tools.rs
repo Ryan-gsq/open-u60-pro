@@ -232,8 +232,6 @@ impl Cmd {
         }
         // A crash may have occurred after journaling but before applying a
         // step. Already-absent objects are successful, idempotent recovery.
-        // The interface is the one the command names: an older agent's
-        // journal names the station it used.
         if self.program == "iw" && matches!(self.args.as_slice(), [dev, name, ..] if dev == "dev" && !Path::new("/sys/class/net").join(name).exists()) {
             return Ok(());
         }
@@ -254,11 +252,6 @@ impl Cmd {
                             .any(|l| l.trim_start().starts_with(&format!("{p}:")))
                     }) {
                         return Ok(());
-                    }
-                    if let (Some(oif), Some(table)) = (value("oif"), value("lookup")) {
-                        if !has_oif_rule(&rules, oif, table) {
-                            return Ok(());
-                        }
                     }
                 }
                 "route" => {
@@ -382,7 +375,6 @@ impl Cmd {
                 [key, wanted] => sysctl_path(key).and_then(|p| fs::read_to_string(p).ok()).is_some_and(|v| v.trim() == wanted),
                 _ => true,
             }),
-            "@u60-mihomo-nft" => crate::mihomo::nft_present(&self.args),
             "@u60-relay-steer" => Ok(crate::wifi_relay::steering::present(&self.args)),
             "@u60-relay-power-save" => crate::wifi_relay::power_save::present(&self.args),
             "@u60-relay-portal-return" => {
@@ -673,14 +665,6 @@ pub fn sysctl_write(key: &str, value: &str) -> Result<(), String> {
     }
     let path = sysctl_path(key).ok_or("Unknown kernel setting")?;
     fs::write(path, value).map_err(|_| "Cannot set a kernel setting".into())
-}
-
-fn has_oif_rule(rules: &str, oif: &str, table: &str) -> bool {
-    rules.lines().any(|line| {
-        let words = line.split_whitespace().collect::<Vec<_>>();
-        words.windows(2).any(|w| w == ["oif", oif])
-            && words.windows(2).any(|w| w == ["lookup", table])
-    })
 }
 
 pub fn key<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -1445,23 +1429,6 @@ mod tests {
     }
 
     #[test]
-    fn core_tun_recovery_matches_only_its_exact_rule_including_detached_interfaces() {
-        let rules = "32765: from all oif u60mh0 [detached] lookup 60630\n32764: from all oif other lookup 60630\n";
-        assert!(has_oif_rule(rules, "u60mh0", "60630"));
-        assert!(!has_oif_rule(rules, "u60mh0", "6063"));
-        assert!(!has_oif_rule(
-            "32765: from all oif other lookup 60630",
-            "u60mh0",
-            "60630"
-        ));
-        assert!(!has_oif_rule(
-            "32765: from all oif u60mh0 lookup 2022",
-            "u60mh0",
-            "60630"
-        ));
-    }
-
-    #[test]
     fn generated_undo_matches_only_the_owned_rule() {
         let s = rule(
             "iptables",
@@ -1650,13 +1617,6 @@ mod tests {
         );
         let owned = [
             rule("ip6tables", "filter", "OUTPUT", &["-j", "U60_X"], true),
-            rule(
-                "iptables",
-                "nat",
-                "POSTROUTING",
-                &["-o", "u60sta0", "-j", "MASQUERADE"],
-                true,
-            ),
             rule(
                 "iptables",
                 "nat",

@@ -64,10 +64,12 @@ struct World {
     panic: bool,
     /// Changes the DNS filter a `prepare` gives (the bypass setting).
     dns: u32,
+    bypass_off: bool,
     /// The configuration a `prepare` gives routes for (none: empty).
     config: Option<&'static str>,
     reload: Option<Result<u16, String>>,
     verify: Option<String>,
+    running_configs: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -112,6 +114,7 @@ impl Port for FakePort {
         self.log(match (source, serving) {
             (Source::Previous(_), _) => "prepare previous",
             (Source::Reload(_), _) => "prepare reload",
+            (Source::Refresh(_), _) => "prepare refresh",
             (_, true) => "prepare serving",
             _ => "prepare",
         });
@@ -120,7 +123,14 @@ impl Port for FakePort {
         }
         let dns = vec![format!("filter {}", self.world().dns)];
         let routes = self.world().config.map_or_else(routing::Routes::default, |yaml| routing::Routes::from(&serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml).unwrap()));
-        Ok(Prepared { secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode": "rule"}), routes, dns, config: if previous { "previous".into() } else { "selected".into() } })
+        if let Source::Previous(previous) = source {
+            return Ok((**previous).clone());
+        }
+        let config = self.world().config.unwrap_or("profile: selected");
+        let bypass = !self.world().bypass_off;
+        let notice = super::super::geodata::bypass_notice(config, bypass);
+        let text = if previous { "profile: previous".into() } else { format!("{config}\nfilter: {}", self.world().dns) };
+        Ok(Prepared { secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode": "rule"}), routes, dns, bypass, notice, source: config.into(), config: text })
     }
     fn ports_free(&mut self) -> Result<(), String> {
         Ok(())
@@ -205,10 +215,11 @@ impl Port for FakePort {
         w.leftover = false;
         Ok(())
     }
-    fn spawn(&mut self, generation: u64, _: &Prepared, _: Sender<Message>) -> Result<Box<dyn CoreHandle>, String> {
+    fn spawn(&mut self, generation: u64, prepared: &Prepared, _: Sender<Message>) -> Result<Box<dyn CoreHandle>, String> {
         self.log(format!("spawn {generation}"));
         let mut w = self.world();
         w.spawned.push(generation);
+        w.running_configs.push(prepared.config.clone());
         w.unready_now = w.unready_spawns.pop_front().unwrap_or(false);
         Ok(Box::new(FakeCore { generation, alive: Arc::new(AtomicBool::new(true)), world: Arc::clone(&self.0) }))
     }
@@ -223,8 +234,8 @@ impl Port for FakePort {
         let direct = self.world().selected_direct;
         Some((Mode::Rule, [("G".to_owned(), if direct { "DIRECT" } else { "P" }.to_owned())].into(), json!({"mode": "rule", "log-level": "info"})))
     }
-    fn plan(&mut self, _: &routing::Routes, _: Mode, selected: &Selected, unsettled: &[String]) -> (Bypass, Chain) {
-        let direct = selected.get("G").is_some_and(|g| g == "DIRECT") && unsettled.is_empty();
+    fn plan(&mut self, _: &routing::Routes, bypass: bool, _: Mode, selected: &Selected, unsettled: &[String]) -> (Bypass, Chain) {
+        let direct = bypass && selected.get("G").is_some_and(|g| g == "DIRECT") && unsettled.is_empty();
         let chain = chain(direct);
         (if direct { Bypass::Rules { returns: 1, cut: None } } else { Bypass::None("none".into()) }, chain)
     }
@@ -547,14 +558,14 @@ fn a_new_profile_that_fails_falls_back_to_the_previous_one_without_going_direct(
     // It does not validate: the running core never stopped.
     h.port.world().prepare.push_back(Some("invalid profile".into()));
     let before = h.events().len();
-    let error = h.call(|reply| Message::Config { reply }).unwrap_err();
+    let error = h.call(|reply| Message::Config { refresh: false, reply }).unwrap_err();
     assert!(error.contains("running profile keeps serving"), "{error}");
     let s = h.snapshot();
     assert_eq!((s.phase, s.generation), (Phase::Running, 1));
     assert_eq!(h.events()[before..], ["prepare serving"], "nothing held, nothing stopped");
     // It validates but does not start: the previous one starts again.
     h.port.world().unready_spawns.push_back(true);
-    let error = h.call(|reply| Message::Config { reply }).unwrap_err();
+    let error = h.call(|reply| Message::Config { refresh: false, reply }).unwrap_err();
     assert!(error.contains("previous profile was started again"), "{error}");
     assert_eq!(h.snapshot().phase, Phase::Running);
     assert!(h.events().contains(&"prepare previous".to_owned()));
@@ -562,7 +573,7 @@ fn a_new_profile_that_fails_falls_back_to_the_previous_one_without_going_direct(
     // Both fail: the planned restart failed finally, D3.
     h.port.world().unready_spawns.push_back(true);
     h.port.world().prepare.extend([None, Some("previous broke too".into())]);
-    assert!(h.call(|reply| Message::Config { reply }).is_err());
+    assert!(h.call(|reply| Message::Config { refresh: false, reply }).is_err());
     h.until("backoff", |s| s.phase == Phase::Backoff);
 }
 
@@ -636,6 +647,80 @@ fn a_dns_filter_change_reloads_tightened_and_falls_back_to_a_restart() {
     let reloads = h.events().iter().filter(|e| e.starts_with("reload")).count();
     h.call(|reply| Message::Bypass { reply }).unwrap();
     assert_eq!(h.events().iter().filter(|e| e.starts_with("reload")).count(), reloads);
+}
+
+#[test]
+fn a_follow_uses_the_running_bypass_setting_until_reload_commits() {
+    let h = Harness::new(World { selected_direct: true, ..World::default() });
+    h.enable(true).unwrap();
+    h.port.world().bypass_off = true;
+    h.write("G", "DIRECT").unwrap();
+    assert_eq!(h.port.world().tables.as_deref(), Some("full/1"));
+}
+
+#[test]
+fn missing_geodata_mode_is_reported_without_changing_the_core_database() {
+    let h = Harness::new(World { config: Some("rules: ['GEOIP,CN,DIRECT', 'MATCH,REJECT']"), ..World::default() });
+    h.enable(true).unwrap();
+    assert!(h.snapshot().notice.unwrap().contains("geodata-mode"));
+}
+
+#[test]
+fn a_subscription_refresh_reloads_once_without_stopping_the_core() {
+    let h = Harness::new(World { selected_direct: true, ..World::default() });
+    h.enable(true).unwrap();
+    let before = h.events().len();
+    h.port.world().config = Some("rules: ['MATCH,G']");
+    h.call(|reply| Message::Config { refresh: true, reply }).unwrap();
+    assert_eq!(h.snapshot().generation, 1);
+    assert_eq!(&h.events()[before..], ["prepare refresh", "tables hold", "reload with tables hold", "tables full/1"]);
+    h.port.world().config = Some("tproxy-port: 9999");
+    h.call(|reply| Message::Config { refresh: true, reply }).unwrap();
+    assert_eq!(h.snapshot().generation, 2);
+    assert_eq!(h.events().iter().filter(|event| *event == "prepare refresh").count(), 2);
+}
+
+#[test]
+fn a_rejected_refresh_keeps_serving_and_a_failed_reload_reuses_validation_for_restart() {
+    let h = Harness::new(World::default());
+    h.enable(true).unwrap();
+    h.port.world().prepare.push_back(Some("validation failed".into()));
+    assert!(h.call(|reply| Message::Config { refresh: true, reply }).is_err());
+    assert_eq!(h.snapshot().generation, 1);
+    assert!(!h.events().iter().any(|event| event.starts_with("stop")));
+    h.port.world().reload = Some(Ok(400));
+    h.call(|reply| Message::Config { refresh: true, reply }).unwrap();
+    assert_eq!(h.snapshot().generation, 2);
+    assert_eq!(h.events().iter().filter(|event| *event == "prepare refresh").count(), 2);
+    assert_eq!(h.events().iter().filter(|event| *event == "prepare serving").count(), 0);
+    h.port.world().unready_spawns.push_back(true);
+    let error = h.call(|reply| Message::Config { refresh: true, reply }).unwrap_err();
+    assert!(error.contains("previous profile was started again"));
+    assert_eq!(h.snapshot().phase, Phase::Running);
+    assert!(!h.events().iter().any(|event| event == "direct"));
+}
+
+#[test]
+fn an_unknown_subscription_reload_restarts_instead_of_accepting_the_old_rules() {
+    let h = Harness::new(World::default());
+    h.enable(true).unwrap();
+    h.port.world().config = Some("rules: ['MATCH,REJECT']");
+    h.port.world().reload = Some(Err("timeout".into()));
+    h.call(|reply| Message::Config { refresh: true, reply }).unwrap();
+    assert_eq!(h.snapshot().generation, 2);
+}
+
+#[test]
+fn a_failed_change_after_a_hot_reload_falls_back_to_the_hot_reloaded_config() {
+    let h = Harness::new(World::default());
+    h.enable(true).unwrap();
+    h.port.world().config = Some("rules: ['MATCH,G']");
+    h.call(|reply| Message::Config { refresh: true, reply }).unwrap();
+    h.port.world().config = Some("rules: ['MATCH,REJECT']");
+    h.port.world().reload = Some(Ok(400));
+    h.port.world().unready_spawns.push_back(true);
+    assert!(h.call(|reply| Message::Config { refresh: true, reply }).is_err());
+    assert_eq!(h.port.world().running_configs.last().unwrap(), "rules: ['MATCH,G']\nfilter: 0");
 }
 
 /// D2 with a first wait long enough that only an early retry can start it.
@@ -832,7 +917,7 @@ fn a_panic_on_the_controller_thread_ends_the_agent() {
 fn a_planned_restart_prepares_before_it_holds_and_stops_the_old_core() {
     let h = Harness::new(World::default());
     h.enable(true).unwrap();
-    h.call(|reply| Message::Config { reply }).unwrap();
+    h.call(|reply| Message::Config { refresh: false, reply }).unwrap();
     let events = h.events();
     let at = |e: &str| events.iter().rposition(|x| x == e).unwrap_or_else(|| panic!("{e}: {events:?}"));
     assert!(at("prepare serving") < at("tables hold") && at("tables hold") < at("stop 1") && at("stop 1") < at("spawn 2"), "{events:?}");

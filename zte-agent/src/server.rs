@@ -231,7 +231,7 @@ pub fn lane(method: Method, path: &str) -> Lane {
         (Post, "/api/router/reservations") => true,
         (Get, "/api/mihomo/status" | "/api/mihomo/profiles" | "/api/mihomo/extensions" | "/api/wifi-relay/status") => false,
         // A cancellation: it must get in while long connects or scans hold
-        // both Slow permits (it cancels them before waiting for the lock).
+        // both Slow permits (it cancels them without waiting for the lock).
         (Post, "/api/wifi-relay/disconnect") => false,
         (Get, p) if p.starts_with("/api/mihomo/profiles/") => false,
         (_, p) if p.starts_with("/api/mihomo/") || p.starts_with("/api/wifi-relay/") => true,

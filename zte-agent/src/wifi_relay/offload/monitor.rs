@@ -195,7 +195,7 @@ mod tests {
         let record = Record { pid: 4242, start: 98765 };
         assert_eq!(Record::parse(&record.text("boot-a"), "boot-a"), Some(record));
         assert_eq!(Record::parse(&record.text("boot-a"), "boot-b"), None, "another boot's process ids are meaningless");
-        assert_eq!(Record::parse("4242", "boot-a"), None, "a bare id from an older agent identifies no process");
+        assert_eq!(Record::parse("4242", "boot-a"), None, "a bare id identifies no process");
         assert_eq!(Record::parse(&record.text(""), ""), None);
     }
 }

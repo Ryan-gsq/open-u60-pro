@@ -553,7 +553,6 @@ async fn relay_connection_form_explains_resume_policy_before_connect() {
     ] {
         assert!(connect_form.contains(policy), "Connection form omits policy: {policy}");
     }
-    assert!(text.contains("Upgrading an older agent cannot infer that choice from saved credentials."));
     assert!(text.contains("while relay is off and no startup restoration is pending."));
     assert_current_restart_copy(&text);
     assert!(device::calls(&c.app).is_empty(), "Reading restart policy must not connect");
@@ -716,6 +715,49 @@ async fn relay_shows_the_upstream_band_with_its_negotiated_bandwidth() {
         assert!(r.text().contains("UPSTREAM LINK") && r.text().contains(&format!("<span>{band} \u{b7} negotiated bandwidth</span>")), "{band}");
         assert!(!r.text().contains("MHz") && !r.text().contains("Settled"), "an older status's width state is not shown");
     }
+}
+
+#[tokio::test]
+async fn relay_describes_each_running_phase_without_a_recovery_warning() {
+    let c = ctx(Some(PW));
+    let cookie = format!("zte_ui_session={}", login(&c, 222, 1).await);
+    for (phase, label) in [
+        ("scanning", "Scanning…"),
+        ("connecting", "Connecting…"),
+        ("recovering", "Recovering…"),
+        ("disconnecting", "Disconnecting…"),
+    ] {
+        let _device = device::set(&c.app, device::Device {
+            gets: vec![("/api/wifi-relay/status", Ok(json!({"phase":phase,"connected":false,"recovery_required":false})))],
+            ..Default::default()
+        });
+        let page = get_with(&c, network::RELAY, peer(222, 2), &cookie).await;
+        page.assert_secure_html(200);
+        assert!(page.text().contains(label), "{phase}");
+        assert!(!page.text().contains("Recovery required") && !page.text().contains("Retry relay cleanup"), "{phase}");
+        assert!(page.text().contains(network::DISCONNECT), "a running operation can be stopped");
+        if phase == "disconnecting" {
+            assert!(page.text().contains("up to about 80 s"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn accepted_disconnect_does_not_claim_the_hotspot_is_already_restored() {
+    let c = ctx(Some(PW));
+    let cookie = format!("zte_ui_session={}", login(&c, 221, 1).await);
+    let _device = device::set(&c.app, device::Device {
+        gets: vec![("/api/wifi-relay/status", Ok(json!({"phase":"disconnecting","connected":false,"recovery_required":false})))],
+        replies: vec![("/api/wifi-relay/disconnect", (200, json!({"ok":true,"data":{"phase":"disconnecting"}})))],
+        ..Default::default()
+    });
+    let page = get_with(&c, network::RELAY, peer(221, 2), &cookie).await;
+    let body = format!("csrf={}&once={}", page.input("csrf"), page.input("once"));
+    let sent = post(&c, network::DISCONNECT, peer(221, 2), &cookie, &body).await;
+    let location = sent.header("location").unwrap();
+    let result = get_with(&c, location, peer(221, 2), &cookie).await;
+    assert!(result.text().contains("Disconnecting… (the hotspot is returning to its channel, up to about 80 s)"));
+    assert!(!result.text().contains("Previous hotspot settings restored"));
 }
 
 #[tokio::test]

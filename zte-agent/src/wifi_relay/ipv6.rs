@@ -1501,13 +1501,6 @@ fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
     p
 }
 
-fn boot_id() -> String {
-    fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .unwrap_or_default()
-        .trim()
-        .into()
-}
-
 #[cfg(all(test, target_os = "linux"))]
 fn read_option(key: &str) -> Result<Option<String>, String> {
     let all = Cmd::new("uci", &["-q", "show", "dhcp.lan"]).run()?;

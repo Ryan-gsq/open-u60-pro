@@ -43,7 +43,11 @@ pub static DISCONNECT: Action = Action {
     reads: &[],
     call: (Method::Post, "/api/wifi-relay/disconnect"),
     body: |_, _| Some(json!({})),
-    after: After::Flash(|_, _| (Some(true), "Relay disconnected. Previous hotspot settings restored; cellular data is used only if already enabled.".into())),
+    after: After::Flash(|_, data| (Some(true), if data["phase"] == "disconnecting" {
+        "Disconnect requested. The running operation is stopping; the hotspot may take up to about 80 s to return to its channel."
+    } else {
+        "Relay disconnected. Previous hotspot settings restored; cellular data is used only if already enabled."
+    }.into())),
     again: None,
     once: true,
 };

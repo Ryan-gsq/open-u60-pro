@@ -235,7 +235,6 @@ fn see_other(location: &str) -> Response {
 /// Everything after sign-in: the dashboard's files and the bridge.
 pub async fn serve(ctx: Ctx, mut req: Request, owner: SessionId) -> Response {
     let path = req.uri().path().to_owned();
-    // Firewall transactions can hold inner for seconds: never wait on it here.
     let secret = match core_secret(&ctx).await {
         Ok(Some(secret)) => secret,
         Ok(None) => return plain(409, "Mihomo is off"),
@@ -559,7 +558,7 @@ async fn websocket(ctx: &Ctx, req: &mut Request, path: &str, secret: &str, owner
 
 async fn core_secret(ctx: &Ctx) -> Result<Option<String>, GateError> {
     let core = Arc::clone(&ctx.app.mihomo);
-    ctx.gate.run(Lane::General, move || core.secret()).await
+    tokio::task::spawn_blocking(move || core.secret()).await.map_err(|_| GateError::Panicked)
 }
 
 /// Zashboard is a trusted, separately version-pinned SPA. Give only its

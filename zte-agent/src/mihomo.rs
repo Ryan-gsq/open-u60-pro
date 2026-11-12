@@ -35,6 +35,7 @@ mod geodata;
 mod geoip;
 mod intercept;
 pub mod profiles;
+mod reload;
 mod routing;
 pub mod transform;
 
@@ -75,10 +76,6 @@ const COMMAND_WAIT: Duration = Duration::from_secs(150);
 
 pub struct Mihomo {
     root: PathBuf,
-    /// The relay's network lock: Mihomo no longer takes it (I2); kept for
-    /// the constructor the application state uses.
-    #[allow(dead_code)]
-    lock: NetworkLock,
     /// Excludes installation, configuration and owner starts.
     operation: Mutex<()>,
     profile_operation: Mutex<()>,
@@ -106,11 +103,10 @@ impl Mihomo {
         Self::at(PathBuf::from(ROOT), lock)
     }
 
-    fn at(root: PathBuf, lock: NetworkLock) -> Self {
+    fn at(root: PathBuf, _lock: NetworkLock) -> Self {
         let validated = remembered_validation(&root);
         Self {
             root,
-            lock,
             operation: Mutex::new(()),
             profile_operation: Mutex::new(()),
             profile_wake: Condvar::new(),
@@ -324,11 +320,6 @@ impl Mihomo {
     }
 
     pub fn configure(&self, source: &str) -> Result<(), String> {
-        drop(
-            self.operation
-                .try_lock()
-                .map_err(|_| "A Mihomo operation is in progress")?,
-        );
         if self.running() {
             return Err("Turn off Mihomo before replacing its configuration".into());
         }
@@ -404,7 +395,6 @@ impl Mihomo {
 
     /// The owner turns Mihomo on.
     pub fn enable(&self, local_name: &str) -> Result<(), String> {
-        drop(self.operation.try_lock().map_err(|_| "A Mihomo operation is in progress")?);
         self.command(|reply| Message::Enable { local: local_name.into(), owner: true, reply: Some(reply) })
     }
 
@@ -441,7 +431,6 @@ impl Mihomo {
     }
 
     pub fn disable(&self) -> Result<(), String> {
-        drop(self.operation.try_lock().map_err(|_| "A Mihomo operation is in progress")?);
         self.command(|reply| Message::Disable { reply: Some(reply) })
     }
 
@@ -465,13 +454,12 @@ impl Mihomo {
         self.command(|reply| Message::Bypass { reply })
     }
 
-    /// The selected profile changed: a running core restarts with it (the
-    /// controller falls back to the previous configuration if it fails).
-    fn config_changed(&self) -> Result<(), String> {
-        if matches!(self.snapshot().phase, Phase::Off | Phase::CleanupPending) {
+    /// The selected profile changed; refreshes reload a healthy core.
+    fn config_changed(&self, refresh: bool) -> Result<(), String> {
+        if !refresh && matches!(self.snapshot().phase, Phase::Off | Phase::CleanupPending) {
             return Ok(());
         }
-        self.command(|reply| Message::Config { reply })
+        self.command(|reply| Message::Config { refresh, reply })
     }
 
     /// A routing write from the console, ordered with every switch.
@@ -503,7 +491,7 @@ impl Mihomo {
     }
 
     /// The relay changed its routes. Never blocks the relay (I2).
-    pub(crate) fn uplink_changed_locked(&self) {
+    pub(crate) fn uplink_changed(&self) {
         let _ = self.send(Message::Egress);
     }
 }
@@ -559,13 +547,13 @@ impl controller::Port for DevicePort {
         let m = &self.m;
         let prepared = match source {
             Source::Previous(previous) => (**previous).clone(),
-            Source::Reload(previous) => {
-                // The running configuration with the DNS filter the bypass
-                // setting gives now; everything else as it runs.
+            Source::Reload(previous) | Source::Refresh(previous) => {
                 let lan = lan_address()?;
                 self.lan = Some(lan);
-                let bypass = m.root.join(BYPASS).is_file();
-                let (managed, routes) = config_with_lan_host(&m.selected_source()?, &previous.secret, Some((&previous.local, lan)), bypass)?;
+                let refresh = matches!(source, Source::Refresh(_));
+                let bypass = if refresh { previous.bypass } else { m.root.join(BYPASS).is_file() };
+                let source = if refresh { m.selected_source()? } else { previous.source.clone() };
+                let (managed, routes) = config_with_lan_host(&source, &previous.secret, Some((&previous.local, lan)), bypass)?;
                 let running: Yaml = serde_yaml_ng::from_str(&previous.config).map_err(|_| "Cannot parse the running configuration")?;
                 let mut config: Yaml = serde_yaml_ng::from_str(&managed).map_err(|_| "Cannot parse managed configuration")?;
                 let map = config.as_mapping_mut().ok_or("Mihomo YAML must be a mapping")?;
@@ -582,7 +570,8 @@ impl controller::Port for DevicePort {
                 }
                 let dns = routes.dns(bypass);
                 let config = serde_yaml_ng::to_string(&config).map_err(|_| "Cannot encode managed configuration")?;
-                Prepared { secret: previous.secret.clone(), local: previous.local.clone(), runtime: previous.runtime.clone(), routes, dns, config }
+                let notice = geodata::bypass_notice(&config, bypass);
+                Prepared { secret: previous.secret.clone(), local: previous.local.clone(), runtime: previous.runtime.clone(), routes, dns, bypass, notice, source, config }
             }
             Source::Selected { local, runtime } => {
                 let local = if local.is_empty() { self.local.clone() } else { local.clone() };
@@ -610,16 +599,20 @@ impl controller::Port for DevicePort {
                 }
                 let runtime = json!({"mode": config["mode"].as_str().unwrap_or("rule"), "log-level": config["log-level"].as_str().unwrap_or("info")});
                 let config = serde_yaml_ng::to_string(&config).map_err(|_| "Cannot encode managed configuration")?;
-                Prepared { secret, local, runtime, routes, dns, config }
+                let notice = geodata::bypass_notice(&config, bypass);
+                Prepared { secret, local, runtime, routes, dns, bypass, notice, source, config }
             }
         };
-        net::write_private(&m.root.join("config.yaml"), prepared.config.as_bytes())?;
+        geodata::prepare(&m.root, &prepared.config, &m.downloader())?;
         let fingerprint = m.validation_fingerprint(&prepared.config, &prepared.secret);
         let reused = fingerprint.as_ref().is_some_and(|key| m.validated_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(key));
         if reused {
             crate::netlog!("[mihomo] validation reused");
         } else {
-            m.check_with("config.yaml", serving)?;
+            net::write_private(&m.root.join("candidate.yaml"), prepared.config.as_bytes())?;
+            let checked = m.check_with("candidate.yaml", serving);
+            let _ = fs::remove_file(m.root.join("candidate.yaml"));
+            checked?;
             // Only dependencies that stayed the same across the check passed it.
             let after = m.validation_fingerprint(&prepared.config, &prepared.secret);
             if let Some(key) = fingerprint.filter(|key| after.as_ref() == Some(key)) {
@@ -732,7 +725,8 @@ impl controller::Port for DevicePort {
         }
     }
 
-    fn spawn(&mut self, generation: u64, _: &Prepared, exits: Sender<Message>) -> Result<Box<dyn controller::CoreHandle>, String> {
+    fn spawn(&mut self, generation: u64, prepared: &Prepared, exits: Sender<Message>) -> Result<Box<dyn controller::CoreHandle>, String> {
+        net::write_private(&self.m.root.join("config.yaml"), prepared.config.as_bytes())?;
         let mut cmd = Command::new(self.m.root.join("mihomo"));
         // With cellular off and Relay disconnected B31 has only link-local
         // IPv6; the core must still listen on IPv6 to use the next uplink.
@@ -766,10 +760,10 @@ impl controller::Port for DevicePort {
         Some((mode, selected, json!({"mode": configs["mode"], "log-level": configs["log-level"]})))
     }
 
-    fn plan(&mut self, routes: &routing::Routes, mode: routing::Mode, selected: &routing::Selected, unsettled: &[String]) -> (controller::Bypass, routing::Chain) {
+    fn plan(&mut self, routes: &routing::Routes, bypass: bool, mode: routing::Mode, selected: &routing::Selected, unsettled: &[String]) -> (controller::Bypass, routing::Chain) {
         use controller::Bypass;
         let none = |why: String| (Bypass::None(why), routing::Chain::default());
-        if !self.m.root.join(BYPASS).is_file() {
+        if !bypass {
             return none("Bypass for DIRECT rules is off".into());
         }
         match mode {
@@ -800,6 +794,7 @@ impl controller::Port for DevicePort {
     }
 
     fn reload(&mut self, secret: &str, config: &str) -> Result<u16, String> {
+        net::write_private(&self.m.root.join("config.yaml"), config.as_bytes())?;
         let agent = ureq::Agent::config_builder().proxy(None).http_status_as_error(false).timeout_global(Some(Duration::from_secs(15))).build().new_agent();
         agent
             .put(&format!("http://{CONTROLLER}/configs?force=false"))
@@ -820,7 +815,7 @@ impl controller::Port for DevicePort {
             let answer = dns::first_address(name, ids::DNS_PORT)?;
             let is_fake = answer.is_some_and(|ip| routing::FAKE_NET.parse::<ipnet::Ipv4Net>().is_ok_and(|net| net.contains(&ip)));
             if is_fake != *fake {
-                return Err(format!("{name} still answers as before the reload"));
+                return Err("the DNS probe still answers as before the reload".into());
             }
         }
         Ok(())
@@ -894,15 +889,29 @@ fn reload_findings(prepared: &Prepared, configs: Option<&Value>, proxies: Option
         return Err("the egress interface changed".into());
     }
     let selected = proxies.and_then(routing::selected_from).ok_or("Mihomo did not report its groups")?;
-    if let Some((group, now)) = selected.iter().find(|(group, now)| *now == "COMPATIBLE" && before.get(*group).is_some_and(|b| b != "COMPATIBLE")) {
-        return Err(format!("group {group} fell back to {now}"));
+    if selected.iter().any(|(group, now)| now == "COMPATIBLE" && before.get(group).is_none_or(|old| old != "COMPATIBLE")) {
+        return Err("a group fell back to COMPATIBLE".into());
     }
-    if selected != *before {
-        return Err("a group's choice changed".into());
+    let listing = proxies.ok_or("Mihomo did not report its groups")?;
+    for (group, old) in before {
+        let Some(current) = selected.get(group) else {
+            if config["proxy-groups"].as_sequence().is_some_and(|groups| groups.iter().any(|entry| entry["name"].as_str() == Some(group))) {
+                return Err("a configured group is missing".into());
+            }
+            continue;
+        };
+        if current != old && listing["proxies"][group]["all"].as_array().is_none_or(|members| members.iter().any(|member| member.as_str() == Some(old))) {
+            return Err("a group's choice changed while its previous member still exists".into());
+        }
+    }
+    for group in config["proxy-groups"].as_sequence().into_iter().flatten().filter(|group| group["type"].as_str() == Some("select")) {
+        if group["name"].as_str().is_none_or(|name| !selected.contains_key(name)) {
+            return Err("a configured selector is missing".into());
+        }
     }
     let providers = providers.ok_or("Mihomo did not report its rule sets")?;
-    if let Some(missing) = config["rule-providers"].as_mapping().into_iter().flatten().filter_map(|(name, _)| name.as_str()).find(|name| providers["providers"].get(*name).is_none()) {
-        return Err(format!("rule set {missing} is missing"));
+    if config["rule-providers"].as_mapping().into_iter().flatten().filter_map(|(name, _)| name.as_str()).any(|name| providers["providers"][name]["ruleCount"].as_u64().is_none_or(|count| count == 0)) {
+        return Err("a configured rule set is missing or empty".into());
     }
     Ok(())
 }
@@ -949,8 +958,7 @@ fn check_clock() {
 }
 
 /// The validations' fingerprints (hashes and file identities, nothing
-/// secret), newest first, for this boot only. An older agent reads one
-/// fingerprint here: several never match it, so it validates again.
+/// secret), newest first, for this boot only.
 const VALIDATED: &str = "validated";
 /// The relay's and cellular's configurations, and a previous profile.
 const VALIDATIONS_KEPT: usize = 4;
@@ -1192,6 +1200,10 @@ fn config_with_lan_host(
     );
     set(m, "geo-auto-update", Yaml::from(false));
     set(m, "find-process-mode", Yaml::from("off"));
+    if !["keep-alive-idle", "keep-alive-interval", "disable-keep-alive"].iter().any(|key| m.contains_key(Yaml::from(*key))) {
+        set(m, "keep-alive-idle", Yaml::from(120));
+        set(m, "keep-alive-interval", Yaml::from(30));
+    }
     let profile = m
         .entry(Yaml::from("profile"))
         .or_insert_with(|| Yaml::Mapping(Mapping::new()));
@@ -1374,13 +1386,11 @@ fn controller_get(secret: &str, path: &str) -> Option<Value> {
 }
 
 /// `@u60-mihomo-nft`: `tables` marks the journal entry of the tables
-/// (`NftTables` loads them); `remove` deletes both families' tables. Older
-/// journals hold `release` (the interception chains, now the tables) and
-/// `remove`.
+/// (`NftTables` loads them); `remove` deletes both families' tables.
 pub(crate) fn nft_command(args: &[String]) -> Result<(), String> {
     match args {
         [a] if a == "tables" => Ok(()),
-        [a] if a == "remove" || a == "release" => {
+        [a] if a == "remove" => {
             // An unreadable kernel is no evidence the tables are gone: the
             // undo then fails and the journal stays.
             use effect::Nft;
@@ -1393,11 +1403,6 @@ pub(crate) fn nft_command(args: &[String]) -> Result<(), String> {
         }
         _ => Err("Invalid Mihomo nftables command".into()),
     }
-}
-
-/// The tables are checked by `NftTables::reconcile`, not here.
-pub(crate) fn nft_present(_args: &[String]) -> Result<bool, String> {
-    Ok(true)
 }
 
 /// Whether some socket listens on `port` (`/proc/net/tcp*`, hex port, state 0A).
@@ -1544,6 +1549,20 @@ mod tests {
     }
 
     #[test]
+    fn keepalive_defaults_apply_only_when_all_three_settings_are_absent() {
+        let config: Yaml = serde_yaml_ng::from_str(&managed_config("rules: ['MATCH,DIRECT']", "s").unwrap()).unwrap();
+        assert_eq!(config["keep-alive-idle"].as_u64(), Some(120));
+        assert_eq!(config["keep-alive-interval"].as_u64(), Some(30));
+        for setting in ["keep-alive-idle: 0", "keep-alive-interval: 5", "disable-keep-alive: false", "disable-keep-alive: true"] {
+            let source: Yaml = serde_yaml_ng::from_str(setting).unwrap();
+            let config: Yaml = serde_yaml_ng::from_str(&managed_config(setting, "s").unwrap()).unwrap();
+            for key in ["keep-alive-idle", "keep-alive-interval", "disable-keep-alive"] {
+                assert_eq!(config.get(key), source.get(key));
+            }
+        }
+    }
+
+    #[test]
     fn configuration_cannot_open_an_upstream_controller_or_override_routes() {
         let s = managed_config(
             "external-controller: 0.0.0.0:9090\nsecret: stolen\ntun: {enable: true}\nlisteners: [{port: 9999}]\nproxies: []\nrules: [MATCH,DIRECT]\n",
@@ -1590,7 +1609,7 @@ mod tests {
         let held = lock.lock().unwrap();
         let started = Instant::now();
         assert!(m.enable("u60.home.arpa").is_err(), "fails fast here (no ip/nft), but answers");
-        m.uplink_changed_locked();
+        m.uplink_changed();
         m.set_direct_bypass(true).unwrap();
         m.disable().unwrap();
         assert!(started.elapsed() < Duration::from_secs(5), "{:?} with the relay's lock held", started.elapsed());
@@ -1598,21 +1617,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Release blocker 1: every undo this version journals is one the
-    /// deployed HEAD build (c253113) executes itself: the same kernel
-    /// settings and policy routes it journaled, and `@u60-mihomo-nft remove`,
-    /// which deletes both tables. Nothing it would skip as unknown.
     #[test]
     fn every_journaled_undo_is_one_the_previous_agent_runs() {
         const HEAD_SYSCTL: [&str; 4] = ["tcp_pacing_ss_ratio", "tcp_pacing_ca_ratio", "bridge-nf-call-iptables", "bridge-nf-call-ip6tables"];
-        const HEAD_NFT: [&str; 4] = ["guard", "intercept", "release", "remove"];
         let mut undos: Vec<Cmd> = proxy_plan_with(|_| Ok("1".into())).unwrap().into_iter().map(|s| s.undo).collect();
         undos.push(tables_step().undo);
         for undo in &undos {
             let args: Vec<&str> = undo.args.iter().map(String::as_str).collect();
             let known = match (undo.program.as_str(), args.as_slice()) {
                 ("@u60-sysctl", [key, value]) => HEAD_SYSCTL.contains(key) && value.parse::<u32>().is_ok(),
-                ("@u60-mihomo-nft", [what]) => HEAD_NFT.contains(what),
+                ("@u60-mihomo-nft", ["remove"]) => true,
                 ("ip", [family, "route" | "rule", "del", ..]) => matches!(*family, "-4" | "-6"),
                 _ => false,
             };
@@ -1620,7 +1634,6 @@ mod tests {
         }
         // The undo list runs newest first: the tables go before routes and settings.
         assert_eq!(undos.last().unwrap().args, ["remove"]);
-        // HEAD's own plan journaled exactly these route and rule undos.
         let routes: Vec<String> = undos.iter().filter(|u| u.program == "ip").map(|u| u.args.join(" ")).collect();
         assert_eq!(routes, [
             "-4 route del local default dev lo table 60625",
@@ -1752,6 +1765,9 @@ mod tests {
             runtime: json!({"mode": "rule", "log-level": "info"}),
             routes: routing::Routes::default(),
             dns: Vec::new(),
+            bypass: true,
+            notice: None,
+            source: String::new(),
             config: "interface-name: ath20\nrule-providers:\n  Web: {type: http, behavior: ipcidr, url: 'https://x', path: ./w.yaml}\n".into(),
         };
         let before: routing::Selected = [("G".to_owned(), "DIRECT".to_owned())].into();
@@ -1762,10 +1778,15 @@ mod tests {
         let fell = reload_findings(&prepared, Some(&configs), Some(&proxies("COMPATIBLE")), Some(&providers), &before).unwrap_err();
         assert!(fell.contains("COMPATIBLE"), "{fell}");
         assert!(reload_findings(&prepared, Some(&configs), Some(&proxies("P")), Some(&providers), &before).is_err(), "a choice not restored");
-        assert!(reload_findings(&prepared, Some(&configs), Some(&proxies("DIRECT")), Some(&json!({"providers": {}})), &before).unwrap_err().contains("Web"));
+        assert!(reload_findings(&prepared, Some(&configs), Some(&proxies("DIRECT")), Some(&json!({"providers": {}})), &before).unwrap_err().contains("rule set"));
+        assert!(reload_findings(&prepared, Some(&configs), Some(&proxies("DIRECT")), Some(&json!({"providers": {"Web": {"ruleCount": 0}}})), &before).is_err());
         assert!(reload_findings(&prepared, Some(&json!({"mode": "global", "interface-name": "ath20"})), Some(&proxies("DIRECT")), Some(&providers), &before).is_err());
         assert!(reload_findings(&prepared, Some(&json!({"mode": "rule"})), Some(&proxies("DIRECT")), Some(&providers), &before).unwrap_err().contains("interface"));
         assert!(reload_findings(&prepared, None, Some(&proxies("DIRECT")), Some(&providers), &before).is_err(), "no answer is no proof");
+        let renamed = json!({"proxies": {"G": {"type": "Selector", "now": "New", "all": ["New"]}, "Added": {"type": "Selector", "now": "New", "all": ["New"]}}});
+        assert!(reload_findings(&prepared, Some(&configs), Some(&renamed), Some(&providers), &before).is_ok());
+        let unchanged = json!({"proxies": {"G": {"type": "Selector", "now": "New", "all": ["New", "DIRECT"]}}});
+        assert!(reload_findings(&prepared, Some(&configs), Some(&unchanged), Some(&providers), &before).is_err());
     }
 
     /// Q2: the core never refreshes a rule set by itself; the controller
@@ -1779,6 +1800,36 @@ mod tests {
         assert_eq!(v["rule-providers"]["Web"]["url"].as_str(), Some("https://x"));
         assert_eq!(v["rule-providers"]["Local"]["interval"].as_u64(), Some(60), "a file set is reloaded on change anyway; the plan treats it as unknown");
         assert_eq!(routes.refresh(), [("Web".to_owned(), 86400)]);
+    }
+
+    #[test]
+    fn a_validated_reload_candidate_is_reused_without_overwriting_the_serving_config() {
+        use controller::Port;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("u60-reload-validation-{}", std::process::id()));
+        let mihomo = Arc::new(Mihomo::at(dir.clone(), Arc::new(Mutex::new(()))));
+        net::write_private(&dir.join("mihomo"), b"#!/bin/sh\nprintf x >> \"$3/check-count\"\n").unwrap();
+        fs::set_permissions(dir.join("mihomo"), fs::Permissions::from_mode(0o700)).unwrap();
+        net::write_private(&dir.join("config.yaml"), b"serving config").unwrap();
+        let prepared = Prepared {
+            secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode":"rule"}),
+            routes: routing::Routes::default(), dns: Vec::new(), bypass: false, notice: None,
+            source: "rules: ['MATCH,DIRECT']".into(), config: "rules: ['MATCH,DIRECT']".into(),
+        };
+        let mut port = DevicePort::new(Arc::clone(&mihomo), "u60.home.arpa".into());
+        port.lan = Some(std::net::Ipv4Addr::LOCALHOST);
+        let first = port.prepare(&Source::Previous(Box::new(prepared)), true).unwrap();
+        port.prepare(&Source::Previous(Box::new(first)), false).unwrap();
+        assert_eq!(fs::read(dir.join("check-count")).unwrap(), b"x");
+        assert_eq!(fs::read(dir.join("config.yaml")).unwrap(), b"serving config");
+        assert!(!dir.join("candidate.yaml").exists());
+        let remembered = remembered_validation(&dir);
+        if net::boot_id().is_empty() {
+            assert!(remembered.is_empty());
+        } else {
+            assert_eq!(remembered, *mihomo.validated_config.lock().unwrap());
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1890,17 +1941,10 @@ mod tests {
             lock.try_lock().is_ok(),
             "install serialization must not stall the relay watchdog"
         );
-        for result in [
-            m.install(),
-            m.configure("{}"),
-            m.enable("u60.home.arpa"),
-            m.disable(),
-        ] {
-            assert_eq!(result.unwrap_err(), "A Mihomo operation is in progress");
-        }
+        assert_eq!(m.install().unwrap_err(), "A Mihomo operation is in progress");
         // M10: the relay's egress news while the core is off or being
         // installed is no error and starts nothing.
-        m.uplink_changed_locked();
+        m.uplink_changed();
         assert!(m.snapshot().error.is_none() && !m.running());
         assert!(!dir.exists());
     }
@@ -2095,8 +2139,8 @@ hosts: {interface-name: 192.0.2.1}
         std::thread::sleep(Duration::from_secs(1));
         let generation = m.snapshot().generation;
         // Duplicate notifications keep the core (the controller compares the egress).
-        m.uplink_changed_locked();
-        m.uplink_changed_locked();
+        m.uplink_changed();
+        m.uplink_changed();
         std::thread::sleep(Duration::from_secs(2));
         assert_eq!(m.snapshot().generation, generation);
         net::write_private(Path::new("/qa-state/cell-ready"), b"1").unwrap();
@@ -2124,7 +2168,7 @@ hosts: {interface-name: 192.0.2.1}
                 assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
             }
             let generation = m.snapshot().generation;
-            m.uplink_changed_locked();
+            m.uplink_changed();
             // The controller restarts the core for the new egress.
             for _ in 0..300 {
                 let s = m.snapshot();

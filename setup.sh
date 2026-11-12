@@ -439,9 +439,7 @@ rcmd 'test -d /data && command -v flock >/dev/null && command -v sha256sum >/dev
 rcmd 'test ! -e /etc/init.d/zte-agent' || fail "An init-managed agent exists; use its service manager instead."
 # Relay and Mihomo may stay on: the new agent rolls back what the old one
 # left and reconnects them (relay networks connected with Remember on).
-# The relay's station is ath20; the agent being replaced may be one that
-# still names it u60sta0.
-if ! rcmd 'test ! -e /sys/class/net/ath20 && test ! -e /sys/class/net/u60sta0 && test ! -e /sys/class/net/u60mh0'; then
+if ! rcmd 'test ! -e /sys/class/net/ath20 && ! pidof mihomo >/dev/null'; then
     info "Relay or Mihomo is on; the new agent turns them back on after a short interruption."
 fi
 STAGE="/data/zte-agent-install-$(date +%Y%m%d-%H%M%S)-$$"

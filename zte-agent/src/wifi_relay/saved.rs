@@ -111,14 +111,13 @@ fn annotate_with(status: &mut Value, saved: &[Saved]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// v6: a store with the retired `width_mode` (`auto` included) loads
-    /// with its passwords, reads as keeping the negotiated width, and loses
-    /// the field at the next write; an unchecked Remember stores nothing.
+    /// An unchecked Remember stores nothing, a checked one keeps the other
+    /// passwords, and the status never carries a password.
     #[test]
-    fn a_saved_width_choice_is_ignored_and_dropped_and_passwords_stay() {
-        let root = std::env::temp_dir().join(format!("u60-saved-v6-{}", std::process::id()));
+    fn an_unchecked_remember_stores_nothing_and_passwords_stay_private() {
+        let root = std::env::temp_dir().join(format!("u60-saved-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("saved-wifi.json"), r#"[{"ssid":"Home","security":"wpa2","password":"private-password","width_mode":"auto"},{"ssid":"Cafe","security":"wpa2","password":"","width_mode":"off"}]"#).unwrap();
+        std::fs::write(root.join("saved-wifi.json"), r#"[{"ssid":"Home","security":"wpa2","password":"private-password"},{"ssid":"Cafe","security":"wpa2","password":""}]"#).unwrap();
         let stored = load(&root).unwrap();
         assert_eq!((stored[0].password.as_str(), stored.len()), ("private-password", 2));
         let network = Network { id: "scan".into(), ssid: "Other".into(), security: "wpa2", bssid: "02:00:00:00:00:01".into(), frequency: 5260, supported: true, signal: -40 };
@@ -126,12 +125,11 @@ mod tests {
         assert_eq!(load(&root).unwrap().len(), 2, "an unchecked Remember stores nothing");
         remember_at(&root, &network, Some("other-password")).unwrap();
         let text = std::fs::read_to_string(root.join("saved-wifi.json")).unwrap();
-        assert!(!text.contains("width_mode"), "dropped at the next write");
         assert!(text.contains("private-password") && text.contains("other-password"));
         let mut status = json!({"networks":[{"ssid":"Home","security":"wpa2"},{"ssid":"Cafe","security":"wpa2"}]});
         annotate_with(&mut status, &load(&root).unwrap());
         assert_eq!((status["networks"][0]["remembered"].as_bool(), status["networks"][1]["remembered"].as_bool()), (Some(true), Some(false)));
-        assert!(!status.to_string().contains("width_mode") && !status.to_string().contains("private-password"));
+        assert!(!status.to_string().contains("private-password"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

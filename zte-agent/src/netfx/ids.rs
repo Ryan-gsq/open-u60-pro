@@ -10,14 +10,6 @@
 /// offloaded without changing that file (2026-11-12). No name with `wlan`:
 /// the vendor's Wi-Fi off waits for every such interface to disappear.
 pub const RELAY_IFACE: &str = "ath20";
-/// The relay's station interface before it took a name IPACM lists, still
-/// named by the journals and helpers of the builds that used it.
-pub const OLD_RELAY_IFACE: &str = "u60sta0";
-/// The core's former TUN device, still named by old recovery journals.
-pub const OLD_CORE_IFACE: &str = "u60mh0";
-/// Interfaces only older agents created: a rule matching one of them is the
-/// agent's (`net_tools::firewall::owned_rule`).
-pub const OLD_IFACES: [&str; 2] = [OLD_RELAY_IFACE, OLD_CORE_IFACE];
 /// The comment on the relay's legacy rules in chains it does not own and
 /// without a jump to one (the portal RETURN, the IPv4 MASQUERADE): their
 /// identity, since the station's name is one the vendor's files also list.
@@ -48,9 +40,6 @@ pub const RELAY_NFT: &str = "u60_relay";
 /// Legacy iptables chains of the relay: only accepts that must pass the
 /// vendor's DROP/REJECT (its denials are in `u60_relay`).
 pub const RELAY_CHAINS: [&str; 4] = ["U60_RELAY_IN", "U60_RELAY_FWD", "U60_R6_IN", "U60_R6_FWD"];
-/// Former relay chains (now rules in `u60_relay`), still named by the
-/// previous agent's journals: never reused.
-pub const RETIRED_RELAY_CHAINS: [&str; 4] = ["U60_RELAY_V6", "U60_RELAY_OUT", "U60_R6_OUT", "U60_R6_NAT"];
 /// Legacy chains of features that still write iptables themselves.
 pub const WG_FORWARD_CHAIN: &str = "OPENU60_WG_FORWARD";
 pub const WG_NAT_CHAIN: &str = "OPENU60_WG_NAT";
@@ -110,11 +99,10 @@ mod tests {
     fn no_name_or_number_is_used_twice() {
         distinct("route table", &[MIHOMO_TABLE, RELAY_TABLE]);
         distinct("policy priority", &[MIHOMO_PREF, RELAY_PREF]);
-        distinct("interface", &[RELAY_IFACE, OLD_RELAY_IFACE, OLD_CORE_IFACE]);
         assert!(!RELAY_IFACE.contains("wlan"), "the vendor's Wi-Fi off waits for every wlan interface");
         assert!(RELAY_COMMENT.starts_with("zte-agent"), "the comment identity `owned_rule` reads");
         distinct("nft table", &[MIHOMO_NFT, RELAY_NFT]);
-        let chains: Vec<&str> = RELAY_CHAINS.iter().chain(&RETIRED_RELAY_CHAINS).chain(&OTHER_CHAINS).copied().collect();
+        let chains: Vec<&str> = RELAY_CHAINS.iter().chain(&OTHER_CHAINS).copied().collect();
         distinct("legacy chain", &chains);
         distinct("port", &[DNS_PORT, DOWNLOAD_PORT, TPROXY_PORT, CONTROLLER_PORT, HTTP_PORT, HTTPS_PORT]);
         assert!(chains.iter().all(|c| c.starts_with("U60_") || c.starts_with("OPENU60_")), "owned chains carry our prefix");

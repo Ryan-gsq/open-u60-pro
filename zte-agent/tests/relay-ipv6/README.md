@@ -8,6 +8,17 @@ mounts; use a disposable development Docker VM.
 
 ## Exact rule plan and TCP/UDP traffic
 
+2026-11-12 status: the `netns.py` runner below no longer passes. The recorded
+run timed out at its first NAT66 TCP check (line 167): v5 moved NAT66 into the
+relay's nftables tables, but this export contains only the legacy plan. Its
+Mihomo section still models the former `u60mh0` TUN device and table 60630.
+It has not been repaired; the cases described below are its intended checks,
+not current acceptance results. `tests/relay-firewall-qa` covers the current
+NAT66 plan. The failure report is in the handoff
+`../probe-reports/2026-11-11-relay-mihomo/I-doc-changes-4.md` relative to the
+repository root; current QA evidence is recorded in
+[implementation batch 4](../../docs/relay-mihomo-implementation.md#batch-4).
+
 From the repository root, with Docker and Rust installed:
 
 ```sh

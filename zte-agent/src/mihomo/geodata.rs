@@ -98,6 +98,13 @@ fn required(config: &Value) -> Vec<Asset> {
     assets
 }
 
+pub(super) fn bypass_notice(config: &str, bypass: bool) -> Option<String> {
+    let config: Value = serde_yaml_ng::from_str(config).ok()?;
+    (bypass && config["geodata-mode"].as_bool() != Some(true)
+        && required(&config).iter().any(|asset| asset.local == "geoip.metadb"))
+        .then(|| "GEOIP rules cannot bypass the core while geodata-mode is off (the kernel needs GeoIP.dat). The core keeps using its configured database.".into())
+}
+
 fn checksum(text: &[u8], filename: &str) -> Result<String, String> {
     let text = std::str::from_utf8(text).map_err(|_| "Invalid geodata checksum")?;
     let fields: Vec<_> = text.split_whitespace().collect();

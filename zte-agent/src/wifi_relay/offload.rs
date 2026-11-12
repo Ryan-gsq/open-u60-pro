@@ -499,48 +499,6 @@ mod tests {
         assert_eq!(runtime.applied.len(), 4, "only the new route's undos");
     }
 
-    /// The build before this one journaled IPACM's mode as an internal step
-    /// (`@u60-relay-ipa`), which no longer exists. A journal it left is
-    /// recovered, or adopted and later rolled back, with every other undo
-    /// run and that one skipped: IPACM stays in whatever mode it is in.
-    #[test]
-    fn a_journal_with_the_retired_ipa_mode_step_is_recovered_and_adopted_around_it() {
-        let dir = std::env::temp_dir().join(format!("u60-ipa-retired-step-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let (older, newer) = (dir.join("older"), dir.join("newer"));
-        let touch = |path: &Path| Cmd::new("touch", &[path.to_str().unwrap()]);
-        // Oldest first: a step before the mode was taken, the mode taken
-        // from software, a second session that found it in hardware, a step
-        // after them.
-        let retired = Cmd::new("@u60-relay-ipa", &["sw"]);
-        let undo = [touch(&older), retired.clone(), Cmd::new("true", &[]), touch(&newer)];
-        let journal = serde_json::to_vec(&json!({"boot": net::boot_id(), "undo": undo})).unwrap();
-
-        let recovered = dir.join("recovered.json");
-        fs::write(&recovered, &journal).unwrap();
-        Transaction::recover(&recovered).unwrap();
-        assert!(older.exists() && newer.exists(), "the undos on both sides of the retired step ran");
-        assert!(!recovered.exists(), "nothing left to recover");
-
-        fs::remove_file(&older).unwrap();
-        fs::remove_file(&newer).unwrap();
-        let adopted = dir.join("adopted.json");
-        fs::write(&adopted, &journal).unwrap();
-        let mut tx = Transaction::load(&adopted).unwrap();
-        let mut fake = Fake::default();
-        let mut runtime = Runtime::start_with(&mut fake, &mut tx, GATEWAY, "192.168.2.0/24".into());
-        assert_eq!(runtime.state, State::Routed);
-        assert_eq!(fake.log, ["routes 4", "monitors"], "the route and the monitors, no mode");
-        fake.enabled = false;
-        assert!(runtime.sync_with(&mut fake, &mut tx).unwrap());
-        assert_eq!(tx.journaled("@u60-relay-ipa", "sw"), Some(&retired), "released with the route's undos only; the old step waits for the teardown");
-        tx.rollback().unwrap();
-        assert!(older.exists() && newer.exists(), "the teardown ran every other undo");
-        assert!(!adopted.exists());
-        let _ = fs::remove_dir_all(dir);
-    }
-
     #[test]
     fn the_firmware_fingerprint_is_b31_and_its_ipacm() {
         assert!(fingerprint(FIRMWARE, Some(IPACM_SHA256)).is_ok());

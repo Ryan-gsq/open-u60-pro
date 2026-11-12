@@ -40,18 +40,17 @@ pub(super) fn save(root: &Path, auto_off: bool) -> Result<(), String> {
 /// journal must stay undoable by the agent it may roll back to, which does
 /// not know this step (`relay-mihomo-architecture.md` section 4.2).
 fn step() -> Step {
-    Step::new(Cmd::new(PROGRAM, &["off"]), restore(IFACE))
+    Step::new(Cmd::new(PROGRAM, &["off"]), restore())
 }
 
-fn restore(station: &str) -> Cmd {
-    Cmd::new("iw", &["dev", station, "set", "power_save", "on"])
+fn restore() -> Cmd {
+    Cmd::new("iw", &["dev", IFACE, "set", "power_save", "on"])
 }
 
 /// Whether `cmd` is this step's undo, which never pauses a cleanup: the
-/// interface is deleted right after, or is already gone. An older agent's
-/// journal names the station it used.
+/// interface is deleted right after, or is already gone.
 pub(crate) fn is_restore(cmd: &Cmd) -> bool {
-    super::STATIONS.iter().any(|station| *cmd == restore(station))
+    *cmd == restore()
 }
 
 /// This connection: whether the step is applied, or why it failed.
@@ -98,20 +97,10 @@ fn parse(text: &str) -> Option<bool> {
     }
 }
 
-/// `@u60-relay-power-save off|on`. Restoring it never pauses a cleanup: the
-/// interface is deleted right after, or is already gone.
+/// `@u60-relay-power-save off`. The undo is `restore`'s plain `iw` command.
 pub(crate) fn command(args: &[String]) -> Result<(), String> {
-    let set = |mode: &str| Cmd::new("iw", &["dev", IFACE, "set", "power_save", mode]).run().map(|_| ());
     match args {
-        [mode] if mode == "off" => set("off"),
-        [mode] if mode == "on" => {
-            if let Err(e) = set("on").and_then(|()| read()).and_then(|on| if on { Ok(()) } else { Err("still off".into()) }) {
-                if Path::new("/sys/class/net").join(IFACE).exists() {
-                    crate::netlog!("[relay] upstream Wi-Fi power save not restored: {e}");
-                }
-            }
-            Ok(())
-        }
+        [mode] if mode == "off" => Cmd::new("iw", &["dev", IFACE, "set", "power_save", "off"]).run().map(|_| ()),
         _ => Err("Invalid relay power save command".into()),
     }
 }

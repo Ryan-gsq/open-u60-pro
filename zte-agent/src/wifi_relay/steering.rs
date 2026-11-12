@@ -7,7 +7,7 @@
 
 use std::{fs, path::Path};
 
-use super::{Cmd, Step, IFACE, STATIONS};
+use super::{Cmd, Step, IFACE};
 
 const DOWNSTREAM: &str = "wlan2";
 const BACKLOG: &str = "/proc/sys/net/core/netdev_max_backlog";
@@ -75,11 +75,10 @@ fn rps(iface: &str) -> Option<u32> {
     masks.first().copied().filter(|m| masks.iter().all(|x| x == m))
 }
 
-/// `@u60-relay-steer rps <iface> <hex>` | `backlog <n>`. An older agent's
-/// journal names the station it used.
+/// `@u60-relay-steer rps <iface> <hex>` | `backlog <n>`.
 pub(crate) fn command(args: &[String]) -> Result<(), String> {
     match args {
-        [what, iface, mask] if what == "rps" && (STATIONS.contains(&iface.as_str()) || iface == DOWNSTREAM) => {
+        [what, iface, mask] if what == "rps" && (iface == IFACE || iface == DOWNSTREAM) => {
             let mask = u32::from_str_radix(mask, 16).map_err(|_| "Invalid RPS mask")?;
             // Undo after the relay interface is gone: nothing left to restore.
             if !Path::new(&format!("/sys/class/net/{iface}")).exists() {

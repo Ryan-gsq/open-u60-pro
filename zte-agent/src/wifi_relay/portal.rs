@@ -42,9 +42,7 @@ pub(super) fn web_bypass(tool: &str) -> Step {
 }
 
 /// The RETURN for both families, as the session's `dns` transaction
-/// journals it (with the switch, so a handover keeps both). The undo is the
-/// `-D` the previous build journaled in `network.json`: either build
-/// recovers the other's journal.
+/// journals it (with the switch, so a handover keeps both).
 pub(super) fn web_bypasses() -> Vec<Step> {
     ["iptables", "ip6tables"].into_iter().map(web_bypass).collect()
 }

@@ -104,8 +104,6 @@ fn take_over(session: &mut Session, installed: &Lease, prefix: u32, lan_ip: Ipv4
         }
     }
     session.dns = Transaction::load(&root.join("dns.json"))?;
-    // The previous build journaled the RETURN in `network.json`; either
-    // journal's `-D` undoes it.
     for step in super::portal::web_bypasses() {
         session.dns.adopt(step)?;
     }

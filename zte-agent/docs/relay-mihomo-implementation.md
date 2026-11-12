@@ -81,6 +81,8 @@
 
 **源码已实现（M7）**：Q3 之后 DNS 过滤表只随配置和绕过开关变化，所以同一配置下的过滤表变化只来自绕过开关（`Message::Bypass`）。控制器先收紧（Hold，确认不了就拒绝），按运行中的配置重新生成托管配置（同一 secret、实际 mode/log-level、出口接口和端口，只换 DNS 过滤表），`PUT /configs?force=false` 提交完整配置；无论答复是 204、错误还是超时，都读回核对：模式、出口接口、各组选择与之前一致且没有退到 `COMPATIBLE`、配置里的规则集都在、下载代理和透明监听在，并向 1053 查询一个答案必须改变的名字（`routing::reload_probe`：默认动作变了用永不解析的 `u60-reload-probe.invalid`，否则用固定 DIRECT 的 `DOMAIN`/`DOMAIN-SUFFIX` 名字），按新过滤表应为假地址/非假地址。确认后才装新链并只重置失去 DIRECT 的连接；确认不了改走保留拦截的计划内重启。重载期间状态为 `reloading`，桥接写回 503。整份订阅/配置切换仍走重启并保留上一份可用配置。
 
+> 2026-11-12 批次 4 补记：以上保留 v3 当时的实现记录。选中订阅的变更刷新现在也热重载，明确拒绝的响应直接走重启，订阅内容改变后的未知结果也走重启；重启复用已经校验的候选，不再校验一次。切换配置、修改生效配置内容和修改扩展仍走配置变更重启。当前规则与真机验证见文末“批次 4”。
+
 **本机已验证**：`mihomo::controller::tests::a_dns_filter_change_reloads_tightened_and_falls_back_to_a_restart`（重载时内核为 Hold、同一核心代次；204 但读回不证明 → 计划内重启；超时但读回证明 → 提交不重启；过滤表不变只跟随内核链）、`mihomo::tests::a_reload_is_confirmed_only_by_what_the_core_reports`（COMPATIBLE 回退、选择未恢复、规则集缺失、模式/出口接口变化、无答复均不算确认）、`mihomo::routing::tests::a_reload_probe_is_a_name_whose_answer_must_change`、`mihomo::dns::tests::the_first_address_skips_a_cname_and_an_error_has_none`。
 
 **仍待设备验证（需维护窗口）**：真实核心上 204 但 provider 为空、退到 `COMPATIBLE`、客户端超时而核心已 apply；保留旧选择与运行时接口；双出口探针分别观测已有 TCP 与 UDP/QUIC/hy2；连续 10 次重载记录暂停时长（日志 `elapsed_ms`）、实际丢包和内存趋势；“新查 DNS”与“复用切换前缓存的真实 A”两项测试（Q3：可切换域名本就只得到假地址）。
@@ -299,8 +301,8 @@
 
 | 条目 | 位置与做法 |
 | --- | --- |
-| 站点 `ath20` | `netfx::ids::RELAY_IFACE = "ath20"`：B31 的原厂 `IPACM_cfg.xml` 本来就把它列成 Wi-Fi 接口，所以不用改那个文件就能硬件转发；不用 `wlan*` 名字（厂商关 Wi-Fi 时等这些接口消失）。`OLD_RELAY_IFACE`（`u60sta0`）和 `OLD_IFACES`（`u60sta0`、`u60mh0`）只用来找到并撤销旧版的会话、助手和日志（`wifi_relay::STATIONS`）。`httpd::mobile` 拒绝 `rmnet*` 和确切名字 `ath20`。 |
-| 自有规则的身份 | `firewall::owned_rule`：`U60_*` 链、跳到 `U60_*` 链，或 `zte-agent*` 注释；接口名只对两个旧名算数。IPv4 MASQUERADE 现在是 `-o ath20 -m comment --comment zte-agent-wifi-relay -j MASQUERADE`，门户 RETURN 用 `ids::RELAY_COMMENT`。 |
+| 站点 `ath20` | `netfx::ids::RELAY_IFACE = "ath20"`：B31 的原厂 `IPACM_cfg.xml` 本来就把它列成 Wi-Fi 接口，所以不用改那个文件就能硬件转发；不用 `wlan*` 名字（厂商关 Wi-Fi 时等这些接口消失）。当时还留着 `OLD_RELAY_IFACE`、`OLD_IFACES` 和 `wifi_relay::STATIONS`，用来找到并撤销旧版的会话、助手和日志；这些已在批次 4 删除。`httpd::mobile` 拒绝 `rmnet*` 和确切名字 `ath20`。 |
+| 自有规则的身份 | `firewall::owned_rule`：`U60_*` 链、跳到 `U60_*` 链，或 `zte-agent*` 注释；接口名不算身份（两个旧名的例外已在批次 4 删除）。IPv4 MASQUERADE 现在是 `-o ath20 -m comment --comment zte-agent-wifi-relay -j MASQUERADE`，门户 RETURN 用 `ids::RELAY_COMMENT`。 |
 | 删除 IPACM 安装 | `offload.rs` 没有安装、移除、改写、备份、标记和“开机时是否已加载”的记账；`Config` 是 `listed` / `not_listed` / `unavailable`，agent 只读 `/etc/data/ipa/IPACM_cfg.xml`。`POST /api/wifi-relay/offload` 只接受 `{"enabled":bool}`；页面有一行 “IPA CONFIGURATION”，没有安装控件。车主开关仍是 `/data/zte-agent-relay/ipacm/off`。页面和模块注释改为：极速模式打开加速，其他工作模式、路由器限速或省电模式（以及 `ipa_disable`）让流量走 CPU。 |
 | 交接保留离线门户的抑制 | 两条 RETURN 从 `network.json` 移到 `dns.json`（`portal::web_bypasses`），和开关步骤放在一起。`handover` 只从 `dns` 释放解析器那一行；`successor` 把其余交给下一个会话；`join` 用 `ensure` 重新登记 RETURN 和开关；guard 的核对在同一拍里核对 `dns`；`adopt::take_over` 把 RETURN 接进 `dns`。`cleanup` 仍全部撤掉。 |
 | 关机充电模式下的重启选择 | `hotspot::off_by_owner` 读 `wifi_onoff_by_user`（没有这个键时退回 `wifi_onoff`）和射频、SSID 的 `disabled`。tick 和 `join` 失败后的清理只在热点是车主自己关的时候清除 `resume.json`；`restore()` 在 Wi-Fi 关着但不是车主关的时候跳过这次尝试，保留选择。只有针对配置文本的单元测试；路由器上没有复现（需要再一次低电量关机）。 |
@@ -315,7 +317,7 @@
 | 车主断开再连接 | 中继什么都没留下，IPACM 文件 sha 不变，重连 5 s（`measurements/b2-final/disconnect-connect.log`）。 |
 | agent SIGABRT | guard 重启，992 ms 接管连接，Mihomo 在结束后约 6.5 s 运行（`measurements/b2-final/agent-abort.log`）。 |
 | 重启 | `dmesg` 没有厂商 DFS 行，ini `gDisableDFSChSwitch=0`，第一次尝试在开机 72.9 s 恢复（`measurements/b2-reboot3/observations.txt`、`agent-boot.log`）。 |
-| 车主路由器上的旧条目和旧文件 | `u60sta0` 条目已在 2026-11-12 用旧版自己的移除操作删掉，文件与原厂一致（`disconnect-connect.log` 的 sha 前缀）。同一天按车主的要求删除了旧版留下、已没有代码读取的 5 个文件：`/data/zte-agent-relay/` 下的 `widths.json` 和 `ipacm/IPACM_cfg.xml.orig`（核对过与正在用的文件相同），`/data/zte-agent-mihomo/` 下的 `nft-guard.conf`、`nft-intercept.conf`、`cn4.ipset`；删除后状态接口和日志正常。`../backups/ipacm/` 仍在开发机上，agent 不读它。 |
+| 车主路由器上的旧条目和旧文件 | `u60sta0` 条目已在 2026-11-12 用旧版自己的移除操作删掉，文件与原厂一致（`disconnect-connect.log` 的 sha 前缀）。同一天按车主的要求删除了旧版留下、已没有代码读取的 5 个文件：`/data/zte-agent-relay/` 下的 `widths.json` 和 `ipacm/IPACM_cfg.xml.orig`（核对过与正在用的文件相同），`/data/zte-agent-mihomo/` 下的 `nft-guard.conf`、`nft-intercept.conf`、`cn4.ipset`；删除后状态接口和日志正常。开发机上的 `../backups/ipacm/` 也在同一天删除。 |
 | 极速模式下换上游后的硬件转发 | 重连同一个 5 GHz 上游、5→2.4 GHz、2.4→5 GHz、断开再连接，每次连上后立刻和 60 秒后各测一次：8 次测量走内核的包数 41–377（全走 CPU 约 35,400–70,900 个），厂商没有 HW/SW 切换（`measurements/b3-final/ipa-switch.log`；开发机经 USB）。 |
 | 错密码连接（构建 `acc6a3f6…`） | 从 5 GHz 上游连 2.4 GHz 上游，密码错：100 s 后返回 "Wi-Fi association failed; check password and signal"；之后中继的规则、表、接口、助手、日志和策略规则都是 0，已保存的 3 个网络不变（`measurements/b3-final/band-switch.log`）。 |
 | 2.4 GHz 上游 | 7 s 连上，IPv6 `configured`，Mihomo 断流 2.3 s。保持约 4.5 分钟：47/47 → 42/59 Mbit/s，103 MB 只有约 100 个包走内核（全走 CPU 约 70,857 个），宽度一直 40 MHz（同一文件；开发机经 USB）。 |
@@ -323,3 +325,68 @@
 | 隔离 Linux 验收 | `tests/relay-firewall-qa`：36 项全部通过，旧 agent 用 4155f03 的构建（`measurements/b3-final/docker-qa.log`）。 |
 
 **已知注意**：同一次开机里退回到改名之前的构建时，若中继连着，旧版的清理会暂停（它的 RPS 撤销不认 `ath20`）；先断开中继或重启。
+
+<a id="batch-4"></a>
+
+## 批次 4（2026-11-12）
+
+本批以 `82fd0a4` 上的工作树为准。下面的真机结果除另有说明外来自发布构建 `4974f0dc87d579f5`；当天的最终构建是 `05582d93f44d4825`，见本节末尾。
+下文 `measurements/` 文件均位于仓库旁的
+`../probe-reports/2026-11-11-relay-mihomo/measurements/`；源码、开发机测试、隔离 Linux QA 和真机结果分别列出。
+这次文档核对只读取留存证据，没有再次运行测试、构建或操作路由器。
+
+**源码已实现**
+
+| 条目 | 位置与做法 |
+| --- | --- |
+| 中继阶段与恢复提示 | `wifi_relay.rs` 发布 `idle`、`scanning`、`connecting`、`active`、`recovering`、`disconnecting`、`recovery_pending`。`recovering` 包括关联宽限和 agent 启动恢复；恢复中的实际扫描/连接显示各自阶段。只有 `idle`/`recovery_pending`、日志尚存且无待断开时才报 `recovery_required`。删除顶层恒定字段 `experimental`、`cellular_fallback`、`internet`，保留 `ipv6.internet`。 |
+| 操作资格与取消 | `Operation` 同时持有 `op` 和 `RELAY_OPERATION`，包括 3 s tick。锁序为 `op` → `inner` → `restore` → `snapshot`，准入锁不嵌套其中；`active()` 和 `owns_network()` 使用发布时更新的原子值和准入登记。扫描、连接、省电、IPA 开关、忘记网络和时钟请求对准入与 `op` 合计最多等 3 s（`admission::WAIT`），忙时 409 并返回 `phase`，其他操作失败仍为 503。 |
+| 断开与手动连接 | Disconnect 先取消代次、设置待断开；已有操作时立即回 200/`disconnecting`，持 `op` 的线程在释放前完成拆除；空闲时请求自己拆除，仍可能等待热点 CAC。Connect 先校验选择，再取消恢复，最后有界等操作资格，使正在 join 的恢复有机会让出。 |
+| 只读状态与页面 | `publish` 预先计算恢复选择、残留日志、IPACM 配置与开关、省电意图和已保存网络；GET 只读内存。conntrack 历史移到独立 `RESULTS` 短锁，不在删除期间持有。页面显示扫描、连接、恢复、断开，操作中仍可断开；接受异步取消时显示“Disconnect requested”，不提前报已断开。 |
+| 订阅刷新 | `profiles::refresh_source` 对字节相同的源只更新刷新元数据，不编译、不校验。变更的选中订阅经控制器用 `candidate.yaml` 校验一次，不覆盖服务中的 `config.yaml`；先准备、再收紧、写配置、`PUT /configs?force=false`、读回、只重置失去 DIRECT 的范围、装新计划。切换配置、修改生效配置内容和修改扩展仍按配置变更重启。 |
+| 重载与重启选择 | `mihomo/reload.rs::needs_restart` 为纯函数：经典监听/LAN 访问、外部控制器及其认证/TLS/界面、QUIC GSO/ECN、入站 TFO/MPTCP 变化或删除 `geodata-mode: true` 时重启。核心拒绝、核验失败或变更订阅的结果未知时，用已校验候选重启；起不来用 `Run.prepared` 的最后应用配置回退，删除控制器独立的 `previous` 副本。 |
+| 每代的绕过设置与 geodata | 所有计划使用 `Prepared.bypass`，`cn-direct` 文件只表示意图。`geodata-mode` 保留订阅原值；绕过开启且核心使用 `geoip.metadb` 时，`notice` 说明 GEOIP 不能在内核绕过。不会为此强制使用离线时可能缺失的 `GeoIP.dat`。 |
+| TCP keep-alive | 仅当订阅三个键 `keep-alive-idle`、`keep-alive-interval`、`disable-keep-alive` 全部缺省时，托管配置写空闲 120 s、间隔 30 s；保留任何显式设置。核心原缺省值为 0，Go 实际按空闲 15 s、间隔 15 s 探测（`I-doc-changes-4.md` 的核心源码核对记录）。真机计数见下表。 |
+| 规则计算 | `geoip` 缓存同一当前文件中已载入的代码，范围上限 8 MiB、代码上限 1024 个；先读代码，不为非目标国家分配 CIDR 范围。`ranges::subtract`/`union` 线性扫描，`v6_only_in_use` 复用已解析目标。上限见 `mihomo/geoip.rs` 的 `MAX_CACHE_BYTES`、`MAX_CACHE_CODES`。 |
+| I1 源码扫描 | `netfx::boundary` 在命令构造处识别所有 `ip` 对象、iptables/ip6tables/restore、nft、conntrack、sysctl 和 `/proc/sys` 写入；轻量扫描跳过注释、无关字符串与测试，不依赖 Rust 语法解析器。11 项例外按文件、函数、命令和原因登记，未再命中的例外使测试失败；逐项见[架构 §4](relay-mihomo-architecture.md#4-网络效果层net_toolstransaction-与-netfx)。 |
+| 清理遗留入口 | 删除未用网络锁字段、`drop(try_lock())` 探针（改由 `Port::busy` 检查）、`@u60-mihomo-nft release` 和旧命令表、`nft_present`，dashboard 的状态快照不再占 gate；`uplink_changed_locked` 改名 `uplink_changed`。删除旧接口名常量、助手与规则身份例外（批次 3 的后续）；与改名前构建互换仍须先断开或重启，不能以跳过未知 undo 作为兼容验收。 |
+
+**真机已验证（B31，2026-11-12）**
+
+| 项目 | 结果与来源 |
+| --- | --- |
+| 拆除期间读状态与重复取消 | 中继状态 HTTP 200，耗时 0.00–0.01 s；额外四次 Disconnect 各在 0.01 s 回 HTTP 200，Mihomo 状态为 0.003778 s。扫描和省电请求各等 3.02 s 后回 HTTP 409，带 `disconnecting` 阶段；操作中 `recovery_required=false`（`measurements/b4-final/phase-test.log`）。这些是留存测量精度下的结果，不是所有请求的延迟上限。 |
+| 空闲时断开、再连接 | 无其他操作时 Disconnect 在 65.085133 s 回 HTTP 200，热点回原信道；接口、助手、策略规则和中继自有规则均已撤销，保存的网络仍在。连接时 +0 s 为 `idle`、+1 s 为 `connecting`、+5 s 为 `active`，连接请求 5.279753 s；随后 103 MB 下载只有 159 个包走内核（`measurements/b4-final/phase-test-2.log`）。 |
+| 整机重启恢复 | 第一次尝试在开机 76.053 s 恢复（`measurements/b4-final/agent-boot.log`；外部观测见 `b4-reboot.log`）；随后 154 MB 下载只有 180 个包走内核（`measurements/b4-final/b4-after-reboot.log`）。这次证明恢复后硬件路径可用，不证明全部冷启动条件。 |
+| 选中订阅变更刷新 | 源减少 2 B，一次低优先级校验耗时 3204 ms；随后日志为 `reloading: the selected subscription refreshed`、`reload answered=Ok(204)`，重载与核验耗时 289 ms，核心 PID 不变。跨重载的 6,000,000 B 下载持续 48.9 s，HTTP 200、curl 退出码 0。旧构建同类变更两次校验为 3166 ms、3176 ms，重启持流量 2301 ms；旧构建相同源刷新仍校验 3169 ms（`measurements/b4-final/mihomo-refresh.txt`）。这一条下载不能代替双出口无泄漏和 UDP 验收。 |
+| TCP keep-alive 计数 | 路由器 `/proc/net/netstat` 的 `TcpExt TCPKeepAlive`：旧核心缺省空闲/间隔各 15 s，60 s 内 88 次探针，核心打开 87 个描述符（`measurements/b4-final/mihomo-refresh.txt`）。新核心运行 441 s 后，运行配置空闲 120 s、间隔 30 s，120 s 内 12 次，即每分钟 6 次，核心打开 99 个描述符（`measurements/b4-final/keepalive-later.txt`）。这是路由器总探针计数；两次描述符数量不同。`mihomo-refresh.txt` 中新核心启动较早时的 2 次/60 s 不作可比结果。 |
+| fw3 两种接入实验 | 沿用主线程已写的[架构 §9](relay-mihomo-architecture.md#9-实验过没有采用的两种接入厂商防火墙的办法2026-11-12)，证据为 `measurements/b4-fw3/fwprobe.log`、`nf-nat-warning-times.txt`、`second-masquerade-control.txt`；两种办法均未采用，本次没有重写实验记录。 |
+
+**开发机与隔离环境已验证**
+
+- 留存的全量单元测试为 1514 项通过、0 项失败、10 项忽略；`auth-startup` 集成测试 1 项通过（`measurements/b4-final/unit-tests.txt`、`build.txt`）。其中覆盖阶段与恢复提示、所有六类请求的忙响应、重复断开不占满 General lane、tick/conntrack 持锁时状态仍能读取、相同源跳过编译校验、候选不覆盖服务配置、重载失败复用校验及最后应用配置回退、每代绕过设置、keep-alive 缺省和 I1 扫描边界。这些测试不等于上述每条都在真机执行过。
+- 同一发布产物在隔离 Linux QA 中，relay 防火墙 36/36 项通过，Mihomo 23/23 项通过；旧 agent 使用原先部署的 `acc6a3f6b2b8c08b` 构建（`measurements/b4-final/qa-b4.log`、`qa-b4-mh.log`、`build.txt`）。覆盖真实内核规则/流量及新旧二进制日志撤销，不验证 B31 驱动、IPA 或真实核心刷新。
+- `tests/mihomo-qa/hot_reload.py` 的本机真实 Mihomo v1.19.33 检查证明已有 TCP 可跨重载、经典监听保留、新规则生效；它复现全新持久缓存第一次重载可能清空 fake-ip 池，后续保留映射。该脚本报告首次映射是否保留，不要求为真；源码与复现结论来自 `I-doc-changes-4.md`，`b4-final/` 没有单独保存该脚本的原始输出。未在路由器验证，也未规避核心限制。
+- Mac release 计算测试：16.5 MB 合成 GeoIP 文件的首次计划从 92.0 ms 降为 14.0 ms；4500 段减去自身从 4.12 ms 降为 23 µs（`I-doc-changes-4.md` 的工程师记录；对应忽略测试为 `mihomo::geoip::tests::benchmark_first_geoip_plan` 和 `mihomo::routing::tests::benchmark_subtract_4500_ranges`）。没有单独留存原始计时输出，未在路由器测时。
+- 旧 `tests/relay-ipv6/netns.py` 于 2026-11-12 在第一个 NAT66 TCP 检查（第 167 行）超时：导出只有 legacy 计划，缺少 v5 迁入 nft 的 NAT66；其 Mihomo 部分还模拟旧 TUN。未修复，不能记为通过，当前 NAT66 由 `tests/relay-firewall-qa` 覆盖（`I-doc-changes-4.md`；[README](../tests/relay-ipv6/README.md#exact-rule-plan-and-tcpudp-traffic)）。
+
+**发布构建**：文件大小 9,108,448 B，`llvm-size -A` Total 9,114,320 B，较 `82fd0a4` 构建增加 9,044 B；
+`gzip -n -9` 为 4,484,101 B，增加 6,025 B；aarch64 编译有 15 条警告（`measurements/b4-final/build.txt`）。
+
+**未在路由器验证**：热重载失败并回退重启；全新持久缓存第一次重载的 fake-ip 限制；开机恢复正在 join 时车主 Connect 抢占恢复；规则计算耗时。
+真实核心上的 UDP/QUIC 暂停、连续重载内存趋势及完整失败矩阵也不由一次成功刷新推定通过。
+
+**文档与源码核对发现的限制（同一天已修）**：`connect_remembered` 校验扫描选择时要拿 `inner`，原先发生在 `operation()` 启动 3 s 计时之前，tick 持 `inner` 时这段等待不在预算内。现在这段等待用 `admission::enter` 限时，并和后面的准入、`op` 共用一个期限（`operation_by`）；在这里放弃的请求回 409，不取消恢复。只有单元测试（`a_connect_gives_up_on_the_tick_within_the_same_wait_and_cancels_nothing`），路由器上没有触发过。
+这 3 s 限的是等待，不是连接本身的设备操作。
+
+**当天的最终构建**：上面那处修复之后重新构建，SHA-256 前缀 `05582d93f44d4825`：文件 9,108,944 B，`llvm-size -A` Total 9,114,352 B
+（较 `82fd0a4` 构建 +9,076 B），`gzip -n -9` 4,484,117 B（+6,041 B），15 条警告；全量单元测试 1515 项通过、0 项失败、10 项忽略，
+集成测试 1 项通过（`measurements/b4-final/build.txt`、`unit-tests.txt`）。在这个构建上又在路由器上做了一遍（都是开发机经 USB）：
+
+| 项目 | 结果与来源 |
+| --- | --- |
+| 不重启部署 | 新 agent 1333 ms 接管连接，Mihomo 约 3.6 s 后运行（`measurements/b4-final/deploy-final-build.log`、`agent-after-deploy-final-build.log`）。 |
+| 断开再连接 | Disconnect 65.25 s 回 200，中继什么都没留下；Connect 5.52 s，状态 +1 s `connecting`、+6 s `active`；20 s 后 103 MB 下载只有 142 个包走内核（全走 CPU 约 70,857 个）（`measurements/b4-final/phase-test-final-build.log`）。 |
+| 订阅刷新，内容变了 | 一次后台校验 3129 ms，`reload answered=Ok(204)`，重载与核验 212 ms，核心 PID 不变（`measurements/b4-final/mihomo-refresh-final-build.txt`）。 |
+| 订阅刷新，内容没变 | 只有刷新时间变了，agent 日志里没有任何 Mihomo 行：没有校验、没有重载、没有重启，核心 PID 不变（同一文件）。 |
+| 稳态开销（中继 5 GHz 带 IPv6、Mihomo rule 模式，120 s） | agent 自身 68 个 tick，它派生的工具 64 个 tick，分别是单核的 0.57% 和 0.53%（批次 1 之后是 0.52% 和 0.60%）（`measurements/b4-final/steady-cpu.txt`）。 |

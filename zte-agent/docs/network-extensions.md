@@ -111,12 +111,44 @@ none), using bounded BusyBox nslookup and reqwest address overrides; the HTTPS
 hostname/SNI and certificate verification are retained. System DNS files are not
 changed, and relay disconnect clears the per-download resolver override.
 
-Selecting while off does not start Clash. Selecting/refreshing the active profile
-or changing active extensions while running briefly restarts the owned core;
-connections reconnect, and failed startup attempts restore the previous selected
-config. Downloads/validation do not hold the shared network or lifecycle lock,
-so relay loss can still trigger fallback. Zashboard remains the pinned, separate
-runtime dashboard, not a forked subscription manager.
+Selecting while off does not start Clash. Selecting another profile, editing the
+active configuration or changing active extensions still uses a planned restart
+when the compiled selection changes. Refreshing the selected subscription, manually
+or on its timer, instead hot-reloads the core. A byte-identical source updates only
+refresh metadata: no compilation or validation. A changed selected source is
+validated once by the controller as `candidate.yaml`, leaving the serving
+`config.yaml` intact, before it holds traffic, writes the configuration, reloads,
+reads back, resets only lost DIRECT ranges and loads the new plan. Classic
+listener/LAN access settings, external controller/authentication/TLS/UI settings,
+QUIC GSO/ECN, inbound TFO/MPTCP and removal of `geodata-mode: true` require a
+restart (`mihomo/reload.rs::needs_restart`). Rejected or unconfirmed reloads use
+the already validated candidate for a planned restart; a failed new core falls
+back to the last applied `Run.prepared`. Validation is synchronous on the
+controller, even when logged `background=true` (reduced priority). Saves and
+non-selected changed refreshes still validate on the caller's thread. Downloads
+and validation hold no shared network lock. Zashboard remains the pinned,
+separate runtime dashboard, not a forked subscription manager.
+
+Router acceptance on 2026-11-12: a source change of 2 B caused one 3204 ms
+validation and a 289 ms hot reload/read-back, kept the same core PID, and a
+6,000,000 B download lasting 48.9 s crossed it with HTTP 200 and curl exit 0
+(`../probe-reports/2026-11-11-relay-mihomo/measurements/b4-final/mihomo-refresh.txt`,
+relative to the repository root). Failed reload fallback, UDP/QUIC continuity
+and the first-reload fake-ip case were not verified on the router; see
+[implementation batch 4](relay-mihomo-implementation.md#batch-4).
+
+The managed configuration preserves `geodata-mode`. When bypass is on but the
+core uses `geoip.metadb`, status `notice` explains why GEOIP rules cannot bypass
+the core in the kernel; forcing `GeoIP.dat` could break an offline start when the
+file is absent. Every plan uses the running generation's `Prepared.bypass`, not
+the `cn-direct` intent file. If `keep-alive-idle`, `keep-alive-interval` and
+`disable-keep-alive` are all absent, managed defaults are 120 s idle and 30 s
+between probes. On the router, `TcpExt TCPKeepAlive` in `/proc/net/netstat`
+counted 88 probes in 60 s before (87 core descriptors; core defaults translated
+by Go to 15 s idle/15 s interval), versus 12 probes in 120 s, or 6/min, afterwards
+(99 descriptors; core up 441 s; running configuration 120 s/30 s). Sources are
+`measurements/b4-final/mihomo-refresh.txt` and `keepalive-later.txt` at the evidence
+location above. These are router-wide counters with different descriptor counts.
 
 ## Remembered Wi-Fi and DHCP reservations
 
@@ -250,8 +282,15 @@ database or subscription is embedded in the Rust binary.
   be there, and a name whose answer must change (`routing::reload_probe`: the
   never-resolving `u60-reload-probe.invalid` when the default changed, else a
   fixed DIRECT name) must answer as the new filter says on 1053 (fake or not). A
-  timeout is an unknown result decided by the same read-back. Anything not proven
-  falls back to a planned restart behind the interception. Status `state` is
+  timeout for the same source is an unknown result decided by the same read-back;
+  a changed subscription's unknown reload result instead requires a restart.
+  A rejected or unproven reload falls back behind the interception using the
+  already validated candidate, without a second validation. Mihomo v1.19.33 keeps
+  existing connections across `ApplyConfig`, but can lose UDP/QUIC uplink packets
+  while new connections are suspended. With a brand-new persistent cache its first
+  reload can clear the fake-ip pool once; subsequent reloads preserve mappings.
+  The local real-core `tests/mihomo-qa/hot_reload.py` reproduces this limitation;
+  it is not worked around or verified on the router. Status `state` is
   `reloading` meanwhile; Zashboard's writes get 503. The log line
   `[mihomo] reload answered=… verified=… elapsed_ms=…` records each reload. The current
   HTTPS management name (`u60.home.arpa` by default) is forced to the actual
@@ -507,8 +546,8 @@ This is a fresh Rust implementation based on public device interfaces and the
 earlier B31 association observations, not a translation of enhanced's GPL code.
 
 - Creates only its own station `ath20` (named `u60sta0` before 2026-11-12;
-  helpers and journals an older build left on that name are still found and
-  undone, `OLD_RELAY_IFACE`); PHY is discovered from `wlan2/phy80211`. B31's
+  what a build from before that date left is not recognised: disconnect the
+  relay before updating from one, or reboot); PHY is discovered from `wlan2/phy80211`. B31's
   stock IPACM configuration lists `ath20`, which is why the station has that
   name (section Hardware forwarding); a `wlan*` name would stall the vendor's
   Wi-Fi off, which waits for every such interface to disappear.
@@ -809,8 +848,10 @@ An owned legacy rule is identified by its chain or target (`U60_*`) or by a
 `zte-agent*` comment, which every rule in a vendor chain without a jump to one
 carries (the portal RETURN, the MASQUERADE); `firewall::owned_rule`. The
 station's name is no identity, since the vendor's IPACM file lists `ath20`
-too; only the names older agents created (`ids::OLD_IFACES`: `u60sta0`,
-`u60mh0`) still count, for the rules their journals hold.
+too. Two MASQUERADE rules that match the station must never exist together:
+on B31 the first does not end the chain for every packet, and the second
+then drops the new connection with a kernel warning (`nf_nat_setup_info`;
+measured 2026-11-12: 9 warnings in 12 s with a second rule, none without).
 
 The core's own plain DNS keeps its destination once the core marks its
 sockets with a bit verified free on the device (M13, `ids::CORE_OUT_MARK`,
@@ -961,7 +1002,7 @@ during an agent crash is not promised. The kernel clears that signal when an
 exec changes the SELinux domain, which B31 does for `wpa_supplicant`
 (`wpad.subj`) and `odhcp6c` (`odhcp6c.subj`) even in permissive mode, so
 those two survive the agent (seen on every update). Relay recovery therefore
-first stops any `wpa_supplicant`, `odhcp6c` or `udhcpc` on `ath20` (or on `u60sta0`, left by an older build) with the
+first stops any `wpa_supplicant`, `odhcp6c` or `udhcpc` on `ath20` with the
 relay's private paths that is not its own child (SIGTERM, then SIGKILL after
 1 s); otherwise the old supplicant keeps the control socket, the new one
 exits, and every reconnect fails at association.
@@ -1010,9 +1051,15 @@ choice offers **Disconnect & clear restart choice**, even after restoration has
 stopped. When cleanup is needed, the existing cleanup button performs both jobs
 rather than showing duplicate stop controls.
 
-Owner Connect/Disconnect cancels pending relay restoration immediately,
-before waiting for the shared network lock; already-running device work still
-needs to finish or roll back. Switching Clash off cancels its pending restoration.
+Owner Connect validates the scan selection before cancelling pending restoration,
+then waits within the admission/operation budget. The selection check takes
+`inner`, which the 3 s watch holds over its device calls; that wait counts in the
+same 3 s, and a Connect that gives up there has cancelled nothing (unit-tested,
+not provoked on the router). Disconnect marks cancellation immediately; when an operation
+is running it returns acceptance without waiting for teardown, and that operation's
+owner finishes cleanup before releasing `op`. Otherwise the request performs the
+teardown itself and waits for the hotspot to return. Switching Clash off cancels
+its pending restoration.
 If the initial core start failed, one more bounded restore sequence (up to four
 attempts) after relay success rechecks the saved enabled choice and this process's
 owner-cancellation flag, so an owner Off is not undone. A dropped link is not
@@ -1050,16 +1097,16 @@ never URLs. Zashboard's bridge uses the pass cookie instead of a bearer token.
 | PUT | `/api/mihomo/config` | Validate and save `{"yaml":"..."}` |
 | POST | `/api/mihomo/switch` | Start/stop with `{"enabled":true/false}` |
 | POST | `/api/mihomo/cn-direct` | `{"enabled":true/false}`: the DIRECT bypass, IPv4 the core's mode and rules send DIRECT skips it in the kernel; a running core keeps running, LAN IPv4 connections are reset; status `kernel` (`bypass`, `returns`, `reason`) |
-| GET | `/api/wifi-relay/status` | Relay state and last scan, no BSSID/password |
-| POST | `/api/wifi-relay/scan` | Explicit scan, no background scanning |
-| POST | `/api/wifi-relay/connect` | `{"network":"opaque scan id","password":"...","confirmed":true,"ipv6":true}`; omitted IPv6 defaults on |
-| POST | `/api/wifi-relay/disconnect` | Restore runtime hotspot/routes |
-| POST | `/api/wifi-relay/clock` | Explicit fresh HTTPS time check; requires an active relay, never reconnects it |
+| GET | `/api/wifi-relay/status` | Memory-only state and last scan; `phase` as listed below, `connected`, `recovery_required`, `autostart`, saved networks, offload/power-save state and `connection_resets`; no BSSID/password |
+| POST | `/api/wifi-relay/scan` | Explicit scan, no background scanning; bounded admission/operation wait, busy 409 with `phase` |
+| POST | `/api/wifi-relay/connect` | `{"network":"opaque scan id","password":"...","confirmed":true,"ipv6":true}`; omitted IPv6 defaults on; validate selection, cancel pending restore, then bounded admission/operation wait (409) |
+| POST | `/api/wifi-relay/disconnect` | Cancel immediately; 200 with `disconnecting` means accepted during another operation, not finished. Otherwise restore runtime hotspot/routes synchronously, including CAC |
+| POST | `/api/wifi-relay/clock` | Explicit fresh HTTPS time check; requires an active relay, never reconnects it; bounded admission/operation wait (409) |
 | POST | `/api/wifi-relay/offload` | `{"enabled":true/false}`: the hardware forwarding switch; a connected relay follows at once; status `offload.config` (`listed`/`not_listed`/`unavailable`, read from IPACM's file), `offload.enabled`, `offload.state`, `offload.route` |
 | POST | `/api/wifi-relay/power-save` | `{"auto_off":true/false}`: turn the upstream Wi-Fi power save off at each connection (default) or keep the driver's; a connected relay follows at once; status `power_save.auto_off`, `power_save.off`, `power_save.error` |
 | GET | `/api/mihomo/profiles` | Profile library status, no URLs or YAML |
 | GET | `/api/mihomo/profiles/{id}` | Explicit private editor read (metadata and URL, never saved YAML) for one profile |
-| POST | `/api/mihomo/profiles` | Add, edit, select, refresh and delete profiles; set Merge and Script |
+| POST | `/api/mihomo/profiles` | Add, edit, select, refresh and delete profiles; set Merge and Script. Selected-subscription refresh hot-reloads when possible; identical source skips compile/validation |
 | GET | `/api/mihomo/extensions` | Explicit private editor read of the global Merge and Script |
 | GET | `/api/mihomo/proxies` | Proxy groups, members, current choice, last delay and routing mode; 409 when Clash is off |
 | POST | `/api/mihomo/proxies/select` | `{"group":"...","name":"..."}`; slow lane |
@@ -1069,6 +1116,29 @@ never URLs. Zashboard's bridge uses the pass cookie instead of a bearer token.
 | POST | `/api/mihomo/dashboard` | Console login only; issues the Zashboard pass cookie and returns `{"url":"/ui/mihomo/dashboard/#/proxies"}`; 409 when Clash is off |
 | GET | `/ui/mihomo/dashboard/*` | Running-only local third-party panel, pass cookie required |
 | restricted | `/ui/mihomo/api/*` | Same-origin pass-cookie HTTP/WebSocket bridge |
+
+Relay `phase` is `idle`, `scanning`, `connecting`, `active`, `recovering`,
+`disconnecting` or `recovery_pending`. `recovering` covers association recovery
+and restore after agent start; actual scan/join steps show their own phases.
+`recovery_required` is true only with journals left, `idle`/`recovery_pending`,
+and no pending disconnect. The constant top-level `experimental`,
+`cellular_fallback` and `internet` fields are removed; `ipv6.internet` remains.
+Restart choice, journals, offload configuration/switch, power-save intent and
+saved networks are computed at publish time. GET does not read files or wait
+for `op`, `inner` or conntrack deletion; reset history has its own short lock.
+
+All six owner actions (scan, connect, power-save, offload, forget and clock)
+wait at most `admission::WAIT` (3 s) for admission plus `op` together; this is
+separate from the HTTP gate and the device operation itself. If `op` remains
+busy, they return HTTP 409 with
+`{"ok":false,"error":"A network operation is in progress (<phase>); retry after it finishes","phase":…}`.
+Vendor-write/reload conflicts also return 409 with their own reason; other relay
+operation errors remain 503. The offload, power-save and forget rows above use
+this same wait rule. On the router, scan and power-save during teardown returned
+409 after 3.02 s; status answered in 0.00–0.01 s and four extra disconnects in
+0.01 s each (`measurements/b4-final/phase-test.log`). An idle Disconnect took
+65.085133 s to finish (`phase-test-2.log` at the same evidence location).
+Connect while boot restore is joining is source-checked but not router-tested.
 
 ## Historical validation snapshot (2026-10-26)
 

@@ -6,8 +6,8 @@ use std::{fs, path::Path, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use super::{boot_id, reload_ra, Fault, JOURNAL};
-use crate::net_tools::{self as net, Cmd};
+use super::{reload_ra, Fault, JOURNAL};
+use crate::net_tools::{self as net, boot_id, Cmd};
 
 const STATE: &str = "ra-runtime.json";
 const OWNER: &str = "u60_relay_ra";

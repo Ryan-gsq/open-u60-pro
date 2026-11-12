@@ -199,6 +199,20 @@ impl Mihomo {
         result
     }
 
+    fn refresh_source(&self, profile: &mut Profile, extensions: &Extensions, source: String, selected: bool) -> Result<(), String> {
+        if source != profile.source {
+            let compiled = transform::compile(&source, &profile.name, extensions)?;
+            if !selected {
+                self.validate_profile(&compiled)?;
+            }
+            profile.source = source;
+            profile.compiled = compiled;
+        }
+        profile.updated = now();
+        profile.error = None;
+        Ok(())
+    }
+
     pub fn profiles_change(&self, request: Request) -> Result<(), String> {
         let _profiles = self
             .profile_operation
@@ -342,13 +356,8 @@ impl Mihomo {
                             .as_deref()
                             .ok_or("Local files have no subscription to update")?,
                     )?;
-                    let compiled = transform::compile(&source, &profile.name, &next.extensions)?;
-                    self.validate_profile(&compiled)?;
-                    profile.source = source;
-                    profile.compiled = compiled;
-                    profile.updated = now();
-                    profile.error = None;
-                    Ok::<_, String>(())
+                    let active = next.selected.as_deref() == Some(&profile.id);
+                    self.refresh_source(profile, &next.extensions, source, active)
                 })();
                 profile.attempted = now();
                 if let Err(e) = result {
@@ -405,7 +414,7 @@ impl Mihomo {
             }
             _ => return Err("Unknown profile action".into()),
         }
-        if let Err(error) = self.commit_library(&old, &next, request.action == "replace-current") {
+        if let Err(error) = self.commit_library(&old, &next, request.action == "replace-current", request.action == "refresh") {
             if request.action == "refresh" {
                 let mut failed = old;
                 if let Some(profile) = failed.profiles.iter_mut().find(|p| p.id == request.id) {
@@ -426,9 +435,8 @@ impl Mihomo {
         old: &Library,
         next: &Library,
         require_off: bool,
+        refresh: bool,
     ) -> Result<(), String> {
-        // Downloads, scripts and validation finish first; the relay's
-        // network lock is never taken here (I2).
         {
             let _operation = self
                 .operation
@@ -444,9 +452,7 @@ impl Mihomo {
         let changed = old.selected != next.selected
             || selected(old).map(|p| &p.compiled) != selected(next).map(|p| &p.compiled);
         if changed {
-            // A running core restarts with it; the controller falls back to
-            // the configuration that ran before if the new one fails.
-            if let Err(error) = self.config_changed() {
+            if let Err(error) = self.config_changed(refresh) {
                 // Keep the previous selection and processed config together.
                 self.save_library(old)?;
                 return Err(if self.running() {
@@ -699,6 +705,45 @@ mod tests {
     }
 
     #[test]
+    fn identical_refresh_only_updates_metadata_without_compilation_or_validation() {
+        let dir = std::env::temp_dir().join(format!("u60-refresh-identical-{}", std::process::id()));
+        let mihomo = Mihomo::at(dir.clone(), Arc::new(std::sync::Mutex::new(())));
+        let mut library = seed(&mihomo, "rules: ['MATCH,DIRECT']");
+        let profile = &mut library.profiles[0];
+        profile.compiled = "previous compiled text".into();
+        profile.error = Some("previous failure".into());
+        let extensions = Extensions { script_enabled: true, script: "function main(){throw Error()}".into(), ..Extensions::default() };
+        mihomo.refresh_source(profile, &extensions, profile.source.clone(), true).unwrap();
+        assert_eq!(profile.source, "rules: ['MATCH,DIRECT']");
+        assert_eq!(profile.compiled, "previous compiled text");
+        assert!(profile.updated > 0 && profile.error.is_none());
+        assert!(!dir.join("check.yaml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn changed_selected_refresh_is_validated_by_the_controller_and_failed_commit_restores_library() {
+        use super::super::controller::{Message, Phase};
+        let dir = std::env::temp_dir().join(format!("u60-refresh-commit-{}", std::process::id()));
+        let mihomo = Mihomo::for_bridge(dir.clone(), Arc::new(std::sync::Mutex::new(())), "s".into());
+        let old = seed(&mihomo, "rules: ['MATCH,DIRECT']");
+        let mut next = old.clone();
+        mihomo.refresh_source(&mut next.profiles[0], &next.extensions, "rules: ['MATCH,REJECT']".into(), true).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *mihomo.commands.lock().unwrap() = Some(sender);
+        let worker = std::thread::spawn(move || {
+            let Message::Config { refresh, reply } = receiver.recv().unwrap() else { panic!("wrong command") };
+            assert!(refresh);
+            reply.send(Err("validation failed; running profile keeps serving".into())).unwrap();
+        });
+        assert!(mihomo.commit_library(&old, &next, false, true).is_err());
+        worker.join().unwrap();
+        assert_eq!(mihomo.selected_source().unwrap(), old.profiles[0].compiled);
+        assert_eq!(mihomo.snapshot().phase, Phase::Running);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn refresh_failure_retries_hourly_not_in_a_busy_loop() {
         let p = Profile {
             id: "x".into(),
@@ -732,8 +777,8 @@ mod tests {
             profiles: Vec::new(),
             ..old.clone()
         };
-        assert!(mihomo.commit_library(&old, &next, false).is_err());
-        assert!(mihomo.commit_library(&old, &old, true).is_err());
+        assert!(mihomo.commit_library(&old, &next, false, false).is_err());
+        assert!(mihomo.commit_library(&old, &old, true, false).is_err());
         assert_eq!(fs::read(mihomo.library_path()).unwrap(), before);
         assert!(mihomo.running());
         fs::remove_dir_all(dir).unwrap();
