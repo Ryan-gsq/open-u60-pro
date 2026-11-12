@@ -4,7 +4,11 @@ Disposable checks for `relay-mihomo-refactor-plan.md` v2 that need a real
 Linux kernel and real `nft`/`ip`, but no router and no Mihomo core: the
 exact table batches the agent loads (exported from the production
 generators), a transparent listener standing in for the core, and the
-agent binaries' `network-recover`. **Never run this on the U60, a host or a
+agent binaries' `network-recover`. The exported journal is written by
+`EffectSet`, and the fixture checks the same nine undo commands in the same
+order as `ef58bd4`. Before sending test traffic it waits for the IPv6
+gateway's neighbour entry, avoiding an occasional first-packet failure.
+**Never run this on the U60, a host or a
 shared container**: it creates network namespaces and changes their
 routing. Use a disposable Docker VM (`--privileged --network none`).
 
@@ -22,7 +26,9 @@ docker run --rm --privileged --network none \
   u60-relay-ipv6-qa:local python3 /qa/qa.py
 ```
 
-What it checks:
+The final batch 5 run passed 23/23 checks in isolated Linux
+(`measurements/b5-final/summary.txt` beside the handoff). It covers the
+following cases.
 
 - Every exported batch loads with the real `nft` and its generation marker
   reads back from both families with `nft -t`; a batch whose IPv6 half is

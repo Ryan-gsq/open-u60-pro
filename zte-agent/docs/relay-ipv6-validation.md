@@ -70,9 +70,13 @@ dnsmasq restart action, not the Rust cleanup or UCI commands. All containers
 use `--network none`, disposable namespaces and read-only artifact bindings;
 no host networking or physical router settings are used.
 
-Repeatable rule-plan/traffic and full lifecycle runners are in
+The full lifecycle and RA runners are in
 [tests/relay-ipv6](../tests/relay-ipv6/README.md). Official OpenWrt artifacts are
-SHA-256-pinned in that directory. Separate one-off callback/RA packet probes
+SHA-256-pinned in that directory. The rule-plan/traffic, real-core and B31
+isolated-bridge runners behind the rows above were removed on 2026-11-12: they
+no longer matched the nftables rules or the Mihomo controller; current rule and
+traffic acceptance is `tests/relay-firewall-qa` and `tests/mihomo-qa`.
+Separate one-off callback/RA packet probes
 were also run locally; they are supplemental evidence, not a claim that every
 probe is covered by the committed runner.
 

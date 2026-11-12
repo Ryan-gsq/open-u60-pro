@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use super::{net, Cmd, Step, Transaction, IFACE};
+use super::{net, Cmd, Resource, Internal, EffectSet, IFACE};
 
 /// In the relay's state directory: the owner keeps the driver's power save.
 const KEEP: &str = "keep-power-save";
@@ -39,8 +39,8 @@ pub(super) fn save(root: &Path, auto_off: bool) -> Result<(), String> {
 /// The undo is a plain `iw` command, not `@u60-relay-power-save on`: a
 /// journal must stay undoable by the agent it may roll back to, which does
 /// not know this step (`relay-mihomo-architecture.md` section 4.2).
-fn step() -> Step {
-    Step::new(Cmd::new(PROGRAM, &["off"]), restore())
+fn step() -> Resource {
+    Resource::Internal(Internal::new(PROGRAM, vec!["off".into()], vec![]).with_undo(restore()))
 }
 
 fn restore() -> Cmd {
@@ -62,11 +62,11 @@ pub(super) struct State {
 
 impl State {
     /// Turns power save off (`auto_off`) or back on for this connection.
-    pub(super) fn set(&mut self, network: &mut Transaction, auto_off: bool) -> Result<(), String> {
+    pub(super) fn set(&mut self, network: &mut EffectSet, auto_off: bool) -> Result<(), String> {
         let result = if auto_off {
-            network.ensure(step()).map_err(|e| format!("Power save could not be turned off on this connection ({e})"))
+            network.declare(vec![step()]).map_err(|e| format!("Power save could not be turned off on this connection ({e})"))
         } else {
-            match network.release(&[step().undo]).and_then(|()| read()) {
+            match network.withdraw(&[step().key()]).and_then(|()| read()) {
                 Ok(true) => Ok(()),
                 _ => Err("Power save could not be turned back on; it stays off until the relay reconnects".into()),
             }
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn the_step_turns_it_off_and_its_undo_back_on() {
-        let step = step();
+        let step = step().step_with(|_| Ok("1".into())).unwrap();
         assert_eq!((step.apply.program.as_str(), step.apply.args.as_slice()), (PROGRAM, &["off".to_owned()][..]));
         assert_eq!((step.undo.program.as_str(), step.undo.args.join(" ")), ("iw", format!("dev {IFACE} set power_save on")), "an undo the previous agent runs");
         assert!(is_restore(&step.undo));
@@ -151,8 +151,8 @@ mod tests {
     #[test]
     fn releasing_a_step_that_never_applied_changes_nothing() {
         let dir = std::env::temp_dir().join(format!("u60-power-save-tx-{}", std::process::id()));
-        let mut network = Transaction::new(dir.join("network.json"));
-        network.release(&[step().undo]).unwrap();
+        let mut network = EffectSet::new("relay", dir.join("network.json"));
+        network.withdraw(&[step().key()]).unwrap();
         assert!(!dir.join("network.json").exists());
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -330,7 +330,7 @@
 
 ## 批次 4（2026-11-12）
 
-本批以 `82fd0a4` 上的工作树为准。下面的真机结果除另有说明外来自发布构建 `4974f0dc87d579f5`；当天的最终构建是 `05582d93f44d4825`，见本节末尾。
+本批以 `82fd0a4` 上的工作树为准。下面的真机结果除另有说明外来自发布构建 `4974f0dc87d579f5`；当天的最终构建是 `05582d93f44d4825`，见本节末尾。下文的 `Operation`、`op`/`inner` 锁设计和 Connect 选择校验等待均为本批记录（批次 5 改为控制器线程和已发布扫描快照）。
 下文 `measurements/` 文件均位于仓库旁的
 `../probe-reports/2026-11-11-relay-mihomo/measurements/`；源码、开发机测试、隔离 Linux QA 和真机结果分别列出。
 这次文档核对只读取留存证据，没有再次运行测试、构建或操作路由器。
@@ -348,7 +348,7 @@
 | 每代的绕过设置与 geodata | 所有计划使用 `Prepared.bypass`，`cn-direct` 文件只表示意图。`geodata-mode` 保留订阅原值；绕过开启且核心使用 `geoip.metadb` 时，`notice` 说明 GEOIP 不能在内核绕过。不会为此强制使用离线时可能缺失的 `GeoIP.dat`。 |
 | TCP keep-alive | 仅当订阅三个键 `keep-alive-idle`、`keep-alive-interval`、`disable-keep-alive` 全部缺省时，托管配置写空闲 120 s、间隔 30 s；保留任何显式设置。核心原缺省值为 0，Go 实际按空闲 15 s、间隔 15 s 探测（`I-doc-changes-4.md` 的核心源码核对记录）。真机计数见下表。 |
 | 规则计算 | `geoip` 缓存同一当前文件中已载入的代码，范围上限 8 MiB、代码上限 1024 个；先读代码，不为非目标国家分配 CIDR 范围。`ranges::subtract`/`union` 线性扫描，`v6_only_in_use` 复用已解析目标。上限见 `mihomo/geoip.rs` 的 `MAX_CACHE_BYTES`、`MAX_CACHE_CODES`。 |
-| I1 源码扫描 | `netfx::boundary` 在命令构造处识别所有 `ip` 对象、iptables/ip6tables/restore、nft、conntrack、sysctl 和 `/proc/sys` 写入；轻量扫描跳过注释、无关字符串与测试，不依赖 Rust 语法解析器。11 项例外按文件、函数、命令和原因登记，未再命中的例外使测试失败；逐项见[架构 §4](relay-mihomo-architecture.md#4-网络效果层net_toolstransaction-与-netfx)。 |
+| I1 源码扫描 | `netfx::boundary` 在命令构造处识别所有 `ip` 对象、iptables/ip6tables/restore、nft、conntrack、sysctl 和 `/proc/sys` 写入；轻量扫描跳过注释、无关字符串与测试，不依赖 Rust 语法解析器。11 项例外按文件、函数、命令和原因登记，未再命中的例外使测试失败；当前清单见[架构 §4](relay-mihomo-architecture.md#4-网络效果层netfxeffecteffectset)（批次 5 为 10 项）。 |
 | 清理遗留入口 | 删除未用网络锁字段、`drop(try_lock())` 探针（改由 `Port::busy` 检查）、`@u60-mihomo-nft release` 和旧命令表、`nft_present`，dashboard 的状态快照不再占 gate；`uplink_changed_locked` 改名 `uplink_changed`。删除旧接口名常量、助手与规则身份例外（批次 3 的后续）；与改名前构建互换仍须先断开或重启，不能以跳过未知 undo 作为兼容验收。 |
 
 **真机已验证（B31，2026-11-12）**
@@ -368,7 +368,8 @@
 - 同一发布产物在隔离 Linux QA 中，relay 防火墙 36/36 项通过，Mihomo 23/23 项通过；旧 agent 使用原先部署的 `acc6a3f6b2b8c08b` 构建（`measurements/b4-final/qa-b4.log`、`qa-b4-mh.log`、`build.txt`）。覆盖真实内核规则/流量及新旧二进制日志撤销，不验证 B31 驱动、IPA 或真实核心刷新。
 - `tests/mihomo-qa/hot_reload.py` 的本机真实 Mihomo v1.19.33 检查证明已有 TCP 可跨重载、经典监听保留、新规则生效；它复现全新持久缓存第一次重载可能清空 fake-ip 池，后续保留映射。该脚本报告首次映射是否保留，不要求为真；源码与复现结论来自 `I-doc-changes-4.md`，`b4-final/` 没有单独保存该脚本的原始输出。未在路由器验证，也未规避核心限制。
 - Mac release 计算测试：16.5 MB 合成 GeoIP 文件的首次计划从 92.0 ms 降为 14.0 ms；4500 段减去自身从 4.12 ms 降为 23 µs（`I-doc-changes-4.md` 的工程师记录；对应忽略测试为 `mihomo::geoip::tests::benchmark_first_geoip_plan` 和 `mihomo::routing::tests::benchmark_subtract_4500_ranges`）。没有单独留存原始计时输出，未在路由器测时。
-- 旧 `tests/relay-ipv6/netns.py` 于 2026-11-12 在第一个 NAT66 TCP 检查（第 167 行）超时：导出只有 legacy 计划，缺少 v5 迁入 nft 的 NAT66；其 Mihomo 部分还模拟旧 TUN。未修复，不能记为通过，当前 NAT66 由 `tests/relay-firewall-qa` 覆盖（`I-doc-changes-4.md`；[README](../tests/relay-ipv6/README.md#exact-rule-plan-and-tcpudp-traffic)）。
+- 过时的隔离脚本已于 2026-11-12 删除：`tests/relay-ipv6/netns.py`（第一个 NAT66 TCP 检查超时：导出只有 legacy 计划，NAT66 自 v5 起在 nft；Mihomo 部分还模拟旧 TUN）、`real_core.py`（其 Rust 测试 `isolated_real_core_uplink_transitions` 在第一阶段之前就失败：它绕过 agent 直接改核心的模式，再断言重启保留该模式）、同一测试的真机版 `b31-isolated.sh` 与 `device_peer.rs`，以及只为它们导出的 `export_plans_for_isolated_linux_acceptance`。规则与 NAT66 流量由 `tests/relay-firewall-qa` 覆盖，Mihomo 表与日志由 `tests/mihomo-qa` 覆盖；真实核心经网桥的流量不再有隔离测试，只在真机回归中验证。
+- 同日其余脚本逐个运行：OpenWrt 生命周期原先停在一条过时断言（`U60_R6_DNS` 链自 v5 起不存在），改为删除并修复一条 `U60_R6_FWD` 放行规则后 3 项 Rust 测试通过；OpenWrt 运行时 RA 通过；`b31-ra-runtime.sh` 在 B31 私有命名空间通过 4 次，抓到的 RA 字段符合预期，其清理原先会留下 `/var/run/netns` 的 tmpfs、偶尔留下 `proc` 绑定挂载，现已补上（之后 3 次运行前后 `mount` 输出一致）；`tests/network-ui.cjs`、`tests/mihomo-dashboard.cjs`、`scripts/check-relay-internet.sh`、`scripts/probe-admission.sh` 均可用（`measurements/b5-qa-scripts/summary.txt`；说明见 [README](../tests/relay-ipv6/README.md)）。
 
 **发布构建**：文件大小 9,108,448 B，`llvm-size -A` Total 9,114,320 B，较 `82fd0a4` 构建增加 9,044 B；
 `gzip -n -9` 为 4,484,101 B，增加 6,025 B；aarch64 编译有 15 条警告（`measurements/b4-final/build.txt`）。
@@ -390,3 +391,75 @@
 | 订阅刷新，内容变了 | 一次后台校验 3129 ms，`reload answered=Ok(204)`，重载与核验 212 ms，核心 PID 不变（`measurements/b4-final/mihomo-refresh-final-build.txt`）。 |
 | 订阅刷新，内容没变 | 只有刷新时间变了，agent 日志里没有任何 Mihomo 行：没有校验、没有重载、没有重启，核心 PID 不变（同一文件）。 |
 | 稳态开销（中继 5 GHz 带 IPv6、Mihomo rule 模式，120 s） | agent 自身 68 个 tick，它派生的工具 64 个 tick，分别是单核的 0.57% 和 0.53%（批次 1 之后是 0.52% 和 0.60%）（`measurements/b4-final/steady-cpu.txt`）。 |
+
+<a id="batch-5"></a>
+
+## 批次 5（2026-11-12）
+
+本批以 `ef58bd4` 上的工作树为准，最终发布构建为 `d970f35aeaeb8559`，两槽均已部署。
+下文证据位于仓库旁的 `../probe-reports/2026-11-11-relay-mihomo/measurements/`，分别为
+`b5-qa-scripts/summary.txt`、`b5-phase1/summary.txt`、`b5-final/summary.txt`，整链行为另见
+`b5-qa-scripts/restore-chain-probe.txt`。这次文档核对只读源码和留存证据。
+
+**源码已实现**
+
+| 条目 | 位置与做法 |
+| --- | --- |
+| 中继控制器 | `wifi_relay/controller.rs` 的 `relay` 线程独占会话、扫描列表、错误、阶段、关联计时、guard 游标及开机恢复日程，处理请求、断开、Tick 和内部 Retry/Wake。设备操作经 `controller::Port`，实际为 `DevicePort`，测试用假端口和假时钟。`decide`、`lease_change`、`Association` 继续作为纯决策，join、交接、清理、接管和恢复沿用原步骤。 |
+| 请求与取消 | HTTP 阻塞池取得准入后入队，准入与开始执行合计最多等 3 s，超时回带阶段的 409。开始/放弃在同一握手锁下决定，已放弃请求随后跳过，已开始请求等结果。Connect 从发布的扫描列表校验，再取消恢复并入队。Disconnect 工作中立即回 200，控制器先拆除再处理下一条消息或发布取消结果，空闲时请求等拆完，额外断开合并。 |
+| 状态、计时和恢复 | 共享快照短锁、取消单元、原子值、发送端、Tick 合并标志和准入登记。锁序为取消单元 → 请求开始握手 → 快照。`start()` 先排 Boot，`recover_idle()` 等待第二次幂等 Boot，`restore()` 等整个恢复结束。重试等待由控制器定时器安排，其间可处理请求。活动会话每 3 s 检查，guard 安静后提前排 Tick。Clock 也在控制器执行。控制器 panic 会 abort，由 guard 重启接管，关联/拆除日志去掉 `lock_ms`。 |
+| 统一效果层 | `netfx::effect::EffectSet` 一份日志一个 set，`declare` 批量声明/替换、`adopt` 接管、`withdraw` 按键撤销、`step` 记命令式步骤、`release` 释放全部。旧 `Transaction`、argv 推断、计划构造器和 `firewall::Batch` 已删除，`net_tools` 保留命令、步骤、列表、核对结果及进程工具。 |
+| 资源与核对 | 类型为 `NftTable`、`LegacyChain`、`LegacyHook`、`Route`、`Rule`、`Addr`、`Sysctl`、`Internal`。先一次持久写入整批 undo，再应用。自有链整链核对/替换，钩子查恰一份，目标链存在后才挂钩子。INPUT/FORWARD/MASQUERADE 添加时插首位，之后允许厂商规则留在前面，只有门户 RETURN 持续排在厂商规则前。`Pass` 共用核对列表，读失败报 `not checked`，nft 载入失败报具体错误。 |
+| 日志与回退 | 中继沿用五份日志，nft 表归 `wireless`，IPA main 路由归 `network`，门户开关与 RETURN 归 `dns`。Mihomo 仍是同序九条 undo，外壳均为 `{boot, undo: Vec<Cmd>}`。撤销逆序、首次失败即停，失败或结束时保存一次，完全撤完删除日志。新版撤旧日志及旧版撤新日志分别有下述主机、隔离 Linux 和真机证据。 |
+| IPv6 legacy 布局 | 新会话的 INPUT 直接挂 `-i ath20 -j U60_R6_IN`。两族各两条自有链，IPv4 为 `U60_RELAY_IN`/`U60_RELAY_FWD`，IPv6 为 `U60_R6_IN`/`U60_R6_FWD`。接管旧布局时，旧 IPv6 `U60_RELAY_IN` 及跳转留到该会话拆除。 |
+| 写入边界与日志措辞 | `netfx::boundary` 识别 set 资源和步骤，`ALLOWED` 为 10 项，IPv6 地址 undo 已纳入资源路径。guard 列应用命令或资源描述，例如 `iptables -t nat hook redirect_chain …`，原 `@u60-relay-portal-return` 已删除，它从未作为 undo 写入日志。 |
+
+**真机发现的回归与修复**
+
+阶段 1 构建 `4736a6ca891b4702` 在热点切换内部增加取消检查。连接开始 1.5 s 后断开，
+过渡信道切换中止，撤销报 `Network cleanup paused: Hotspot refused the channel switch`，
+`recovery_pending` 持续 170 s，救援重连后清除。修复让已开始的热点信道切换完整结束，
+取消仍在 join 步骤之间、扫描轮次之间和最终发布前检查（`b5-phase1/summary.txt`）。
+
+阶段 1 修复版 `670bf66a01595eb6` 在连接开始 1.5 s、3.5 s 后取消，两次 Disconnect 在 7–12 ms 返回，
+Connect 在清理后回 503 `Restore cancelled by the owner`，分别耗时 64.5 s、66.2 s，最后 idle、无残留、
+热点回 36/160 MHz、autostart=false。最终版重复结果见下表。
+
+**真机已验证（B31，最终构建，`b5-final/summary.txt`）**
+
+| 项目 | 结果 |
+| --- | --- |
+| 活动会话升级接管 | 从阶段 1 的旧事务布局接管耗时 1225 ms。IPv6 INPUT 新增直挂 `U60_R6_IN`，旧链/跳转保留。只有一条 MASQUERADE，两族门户 RETURN 在前，经 `ath20` 的 IPv4/IPv6 HTTPS 均为 200。 |
+| 拆除、状态与忙响应 | 空闲 Disconnect 65.17 s，旧布局随日志完全撤销，两族无残留 legacy 规则。其间状态 0.01 s，额外四次断开各 0.01 s，扫描/省电在 3.01 s 后回 409 `disconnecting`，Mihomo 状态 0.007 s。 |
+| 再连接与布局 | Connect 5.65 s，3 s 后路由器上挂在 `br-lan` 的命名空间客户端经中继得到 HTTP 200。新会话两族各两条自有链，IPv6 直接挂 `U60_R6_IN`，只有一条 MASQUERADE。 |
+| 连接中取消 | 在 1.5 s、3.5 s 取消，两次 Disconnect 6–10 ms 返回，Connect 清理后回 503，耗时 64.0 s、68.9 s。最后 idle、无残留，热点回 36/160 MHz，autostart=false。随后连接 5.36 s，命名空间客户端 HTTP 200。 |
+| agent 异常退出 | SIGABRT 后 guard 自动重启，720 ms 接管同布局会话，Mihomo generation 1。 |
+| 厂商重写 | `fw3 -q reload` 触发后 0.75 s brnf 写回。guard 日志列两族 `redirect_chain` hook 描述，之后 INPUT/FORWARD 各一份钩子，MASQUERADE 一份，两族 RETURN 均在前。 |
+| 订阅刷新 | 一次校验 3161 ms，热重载 177 ms，核心 PID 前后相同。 |
+| 整机重启 | 第一次恢复尝试在 uptime 70.7 s 成功，74 s 观测到 connected。 |
+| 日志检查 | agent 日志未见 `paused`、`could not`、`not checked`、`not predicted`、`panick`，内核日志未见 `nf_nat_core.c:594`。 |
+
+**开发机与隔离环境已验证**
+
+- 最终版主机单元测试 1559 项通过、0 失败、10 忽略，`auth-startup` 1 项通过（`b5-final/summary.txt`）。覆盖假端口/时钟、请求开始与放弃、取消/重试、资源核对及旧日志字面量的撤销/接管。测试覆盖范围以源码为准，真机范围列于上表。
+- 最终版隔离 Linux 的 relay-firewall-qa 39/39、mihomo-qa 23/23，旧二进制为 `ef58bd4` 构建 `05582d93f44d4825`（`b5-final/summary.txt`）。使用真实内核、nft/legacy 工具，包含整链替换、重复钩子归一、门户 RETURN 前移、拒绝外部同名链，以及旧/新二进制完整撤销新日志。Mihomo fixture 先等 IPv6 网关邻居项就绪再发流量，修复偶发首包失败。
+- 同源隔离 OpenWrt 生命周期 PASS，运行时 RA 3 PASS，由工程师运行（`b5-final/summary.txt`）。这些 Docker/Linux 检查覆盖内核规则和 OpenWrt 组件，B31 无线驱动与 IPA 另由真机验收。
+- 批次前的脚本核对为主机 1515 项通过、0 失败、10 忽略，`auth-startup` 1 项通过，防火墙 36/36、Mihomo 23/23（`b5-qa-scripts/summary.txt`）。过时脚本的删除及替代入口见批次 4 末尾和 [IPv6 README](../tests/relay-ipv6/README.md)。B31 RA 私有命名空间检查的清理修复后三次 `mount` 前后相同，每创建一个命名空间会因厂商 `nf_conntrack_pkt_threshold` sysctl 出现一次 `net/sysctl_net.c:156 register_net_sysctl` WARNING。
+
+**发布构建**
+
+最终 aarch64 release 有 15 条警告，文件 9,201,064 B，`llvm-size -A` Total 9,209,540 B，
+`gzip -n -9` 4,525,385 B。`ef58bd4` 对照依次为 9,108,944 B、9,114,352 B、4,484,117 B
+（`b5-final/summary.txt`）。
+
+**未测与未完成**
+
+最终版未测吞吐及真实 LAN 客户端的 IPA 硬件转发。阶段 1 测试期间 Mac 的 USB 网络服务已关闭，
+Wi-Fi 改连 5 GHz 上游，最终回归只有路由器命名空间客户端。最后一次硬件路径测量来自阶段 1 初版，
+64 MB 下载的内核转发计数增加 816 包（全走 CPU 约 44,208 包，`b5-phase1/summary.txt`）。
+最终版的命名空间 HTTP 200 只覆盖该客户端的连通性。车主 Connect 抢占正在 join 的开机恢复、
+Mihomo 热重载失败回退及完整故障矩阵仍无本批真机结果。
+
+尚未实现的部分为中继出口快照、IPv6 自己的设备端口、Mihomo 带代次的后台结果、`follow::plan/decide`、
+200 ms conntrack 合并窗口及 nft 内容核验。门户 RETURN 以外的钩子只在添加/补回时插首位，
+之后保留厂商后来插入的前置过滤，依据为 D8。详见[架构 §8](relay-mihomo-architecture.md#8-规定了但未实现)。

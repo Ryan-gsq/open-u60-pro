@@ -6,39 +6,9 @@ require an otherwise empty Docker network namespace and only bind read-only
 test artifacts. `--privileged` is needed for nested namespaces and chroot
 mounts; use a disposable development Docker VM.
 
-## Exact rule plan and TCP/UDP traffic
-
-2026-11-12 status: the `netns.py` runner below no longer passes. The recorded
-run timed out at its first NAT66 TCP check (line 167): v5 moved NAT66 into the
-relay's nftables tables, but this export contains only the legacy plan. Its
-Mihomo section still models the former `u60mh0` TUN device and table 60630.
-It has not been repaired; the cases described below are its intended checks,
-not current acceptance results. `tests/relay-firewall-qa` covers the current
-NAT66 plan. The failure report is in the handoff
-`../probe-reports/2026-11-11-relay-mihomo/I-doc-changes-4.md` relative to the
-repository root; current QA evidence is recorded in
-[implementation batch 4](../../docs/relay-mihomo-implementation.md#batch-4).
-
-From the repository root, with Docker and Rust installed:
-
-```sh
-QA="$(mktemp -d)"
-export QA
-U60_IPV6_QA_PLAN="$QA/plan.json" cargo test -p zte-agent export_plans_for_isolated_linux_acceptance
-docker build -t u60-relay-ipv6-qa:local zte-agent/tests/relay-ipv6
-docker run --rm --privileged --network none \
-  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
-  -v "$PWD/zte-agent/tests/relay-ipv6:/qa:ro" \
-  -v "$QA/plan.json:/plan.json:ro" u60-relay-ipv6-qa:local
-```
-
-The plan is exported from the production Rust generators, not reimplemented in
-Python. The test checks IPv4-only cellular IPv6 rejection, downstream ULA and
-retained-global-source TCP/UDP NAT66, router-native IPv6 TCP/UDP including an
-upstream ULA destination, finite-lifetime update commands, Mihomo marked-route
-precedence and reverse rollback without changing cellular main routes.
-The internal DAD step is emulated by checking actual kernel address flags.
-There is **no actual Mihomo core, node or Internet service** in this test.
+The relay's firewall rules and NAT66 traffic are checked in
+`tests/relay-firewall-qa`, Mihomo's tables and journals in `tests/mihomo-qa`;
+both use the image built from this directory's `Dockerfile`.
 
 ## Complete OpenWrt client/lifecycle
 
@@ -47,6 +17,9 @@ and Python 3.12+ for safe package extraction. On macOS, the Homebrew Python is
 usually `/opt/homebrew/bin/python3`; the system Python may be too old.
 
 ```sh
+QA="$(mktemp -d)"
+export QA
+docker build -t u60-relay-ipv6-qa:local zte-agent/tests/relay-ipv6
 python3 zte-agent/tests/relay-ipv6/prepare_openwrt.py "$QA"
 cargo build -p zte-agent --release --target aarch64-unknown-linux-musl
 cargo test -p zte-agent --release --target aarch64-unknown-linux-musl \
@@ -92,9 +65,13 @@ releases typed overrides; it does not delete keys from netifd's runtime map.
 push only its named test executable/script into `/tmp/u60-ra-runtime-qa`, then
 invoke over USB. It uses private mount/network namespaces, private config and
 ubus; it never operates physical br-lan, Wi-Fi or SIM. Pull results/*.pcap and
-assert decoded packet fields before accepting the adapter. Cleanup unmounts and
-removes namespaces; archive evidence on the computer and remove the owned QA
-directory afterwards. It must not be run as an ordinary test or boot hook.
+assert decoded packet fields before accepting the adapter. Cleanup unmounts,
+removes namespaces and the `/var/run/netns` mount it caused; archive evidence
+on the computer, check `mount` lists nothing under the QA directory and then
+remove it. It must not be run as an ordinary test or boot hook.
+On B31 each network namespace this script creates logs one harmless kernel
+`WARNING … net/sysctl_net.c:156 register_net_sysctl` for the vendor sysctl
+`nf_conntrack_pkt_threshold`, originating in the vendor's namespace initialization.
 
 The test also invokes the real Rust DoH DNS cleanup while RA deltas are active,
 asserting that `/etc/config/dhcp` is not committed and recovery leaves no relay
@@ -106,40 +83,6 @@ verify the B31 service manager, Wi-Fi driver, kernel modules or hardware NAT.
 Ordinary `cargo test` never executes the mutating test. It is Linux-only and
 requires both an explicit environment marker and a disposable-chroot marker.
 
-## Actual core on a real bridge
-
-Supply the pinned ARM64 Mihomo executable as `$QA/mihomo` (v1.19.33, verify the
-archive SHA-256 in `src/mihomo.rs`) and the cross-built test artifact above:
-
-```sh
-docker run --rm --privileged --network none \
-  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
-  -v "$PWD/zte-agent/tests/relay-ipv6:/qa:ro" \
-  -v "$QA/plan.json:/plan.json:ro" \
-  -v "$QA/mihomo:/core-bin:ro" \
-  -v "$AGENT_TESTS:/agent-tests:ro" \
-  u60-relay-ipv6-qa:local python3 /qa/real_core.py
-```
-
-This runner creates an actual Linux bridge with a member veth, starts with both
-bridge-netfilter switches on (as B31 boots), and applies default-DROP
-INPUT/FORWARD. A veth only named `br-lan` is not an adequate substitute: it
-missed the B31 TPROXY/bridge failure. Interception is TPROXY through the agent's
-`u60_mihomo` nftables tables; the core's start sets both bridge switches to 0
-and its rollback restores them (the runner asserts they are back on). Its
-acceptance cases cover dual-stack TCP, UDP 1400/2000 bytes (including source
-fragmentation), persistent UDP across uplink changes, local-address
-addition/removal, offline cellular state and controller failure. The runner was
-adapted from the earlier TUN design on 2026-11-08 and has not been rerun since;
-earlier TUN passes say nothing about TPROXY, so rerun with matching current
-artifacts (the container needs nftables with TPROXY/socket support). Cleanup
-asserts the nft tables, rule pref 18620 and table 60625 disappear.
-It uses DIRECT nodes and controlled network namespaces, not paid proxy servers.
-The core test also creates two profiles, switches them while running, applies
-global Merge+Script, and asserts the managed rule order before uplink transitions.
-Address-change acceptance waits for bounded rule and actual traffic convergence,
-not a fixed sleep that can observe the core restart's intermediate firewall state.
-
 ## DHCP reservations
 
 `reservations.sh` runs only in a disposable ARM64 OpenWrt container, with
@@ -149,12 +92,6 @@ Rust add/remove, asserts the requested fixed lease, refuses a duplicate address,
 and checks unrelated `/etc/ethers` bytes and the dnsmasq PID survive unchanged.
 No physical client or host network is used. The B31 client-renewal and UI test
 still needs a user-connected hotspot client.
-
-`b31-isolated.sh` is a separately gated USB runner for the intended physical B31.
-It builds four temporary namespaces and a private chroot, binds only `/dev/null`
-and `/dev/net/tun`, and uses the same actual bridge/core lifecycle. It does not
-change physical Wi-Fi/SIM routes. Prepare its named artifacts and inspect the
-script before running; it deliberately refuses preexisting namespace/root names.
 
 ## Include the real port-9090 panel
 

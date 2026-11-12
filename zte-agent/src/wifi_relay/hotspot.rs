@@ -2,7 +2,7 @@
 //! 2.4 GHz uses disable/set/enable (CSA cannot restore HT40 on B31);
 //! 5 GHz always stages at non-DFS 20 MHz, then lets the driver follow STA.
 //! Every changed runtime setting has a journaled undo. Owner OFF wins.
-use super::{ap, dfs_switch, net, scan::Channels, Cmd, Step, Transaction, HOSTAPD};
+use super::{ap, dfs_switch, net, scan::Channels, Cmd, Step, EffectSet, HOSTAPD};
 use std::{
     fs,
     path::Path,
@@ -10,19 +10,20 @@ use std::{
 };
 
 pub(super) fn prepare(
-    tx: &mut Transaction,
+    effects: &mut std::sync::Arc<std::sync::Mutex<EffectSet>>,
     upstream: u32,
     channels: &Channels,
 ) -> Result<(), String> {
+    let mut tx = effects.lock().unwrap();
     if upstream < 3000 {
-        return prepare_2ghz(tx, upstream);
+        return prepare_2ghz(&mut tx, upstream);
     }
     dfs_switch::allow();
     let before = Cmd::new("iw", &["dev", "wlan2", "info"]).run()?;
     let (frequency, bandwidth, center) =
         parse_channel(&before).ok_or("Cannot snapshot hotspot channel")?;
     let staging = staging(channels, frequency, bandwidth).ok_or("No enabled non-DFS hotspot staging channel")?;
-    tx.apply(Step::new(
+    tx.step(Step::new(
         command(staging, 20, staging),
         command(frequency, bandwidth, center),
     ))
@@ -121,7 +122,7 @@ pub(crate) fn skip_undo(cmd: &Cmd) -> bool {
         .is_some_and(|i| owner_off(i) || !Path::new(&format!("/sys/class/net/{i}")).exists())
 }
 
-fn prepare_2ghz(tx: &mut Transaction, frequency: u32) -> Result<(), String> {
+fn prepare_2ghz(tx: &mut EffectSet, frequency: u32) -> Result<(), String> {
     let iface = "wlan0";
     let channel =
         super::channel(frequency).ok_or("Only 2.4 GHz and 5 GHz upstreams are supported")?;
@@ -180,9 +181,9 @@ fn prepare_2ghz(tx: &mut Transaction, frequency: u32) -> Result<(), String> {
         a.extend_from_slice(args);
         Cmd::new("hostapd_cli", &a)
     };
-    tx.apply(Step::new(control("disable", &[]), control("enable", &[])))?;
+    tx.step(Step::new(control("disable", &[]), control("enable", &[])))?;
     for (key, new, old) in &pairs {
-        tx.apply(Step::new(
+        tx.step(Step::new(
             control("set", &[key, new]),
             control("set", &[key, old]),
         ))?;
@@ -190,7 +191,7 @@ fn prepare_2ghz(tx: &mut Transaction, frequency: u32) -> Result<(), String> {
     if owner_off(iface) {
         return Err("Hotspot was turned off while preparing relay".into());
     }
-    tx.apply(Step::new(control("enable", &[]), control("disable", &[])))?;
+    tx.step(Step::new(control("enable", &[]), control("disable", &[])))?;
     std::thread::sleep(Duration::from_secs(2));
     let after = ap(iface, "status", &[])?;
     let driver = Cmd::new("iw", &["dev", iface, "info"]).run()?;

@@ -3,7 +3,8 @@
 //! replaced. Optional upstream IPv6 and downstream NAT66 use owned runtime state.
 
 pub(crate) mod ipv6;
-mod adopt;
+pub(crate) mod adopt;
+mod controller;
 pub(crate) mod dns;
 pub(crate) mod portal;
 mod dfs_switch;
@@ -21,7 +22,8 @@ use std::num::NonZeroU32;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use controller::{Command as RelayCommand, Message, Observation, Selection, State};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +31,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::boottime::{BootClock, BootInstant, Clock};
-use crate::net_tools::{self as net, Cmd, NetworkLock, Step, Transaction};
+use crate::net_tools::{self as net, Cmd, NetworkLock, Step};
+use crate::netfx::effect::{EffectSet, Resource, Addr, Family, Internal, Key, LegacyChain, LegacyHook, LegacyTool, Position, Route, RouteType, Rule};
 
 const IFACE: &str = crate::netfx::ids::RELAY_IFACE;
 mod saved;
@@ -60,12 +63,12 @@ pub struct Lease {
 }
 
 struct Session {
-    wireless: Transaction,
-    network: Transaction,
+    wireless: Arc<Mutex<EffectSet>>,
+    network: EffectSet,
     /// The resolver line (`dns`) and the suppression of the vendor's offline
     /// redirect (`portal`: the switch delta and the RETURN). A handover
     /// releases only the resolver and moves the rest to the next session.
-    dns: Transaction,
+    dns: EffectSet,
     /// The relay's nftables tables (`uplink`), shared with `ipv6`.
     uplink: uplink::Shared,
     dns_error: Option<String>,
@@ -141,11 +144,12 @@ fn stop_helper(helper: &mut Option<Helper>) {
 impl Session {
     /// A session journaled under `journal`, before anything is applied.
     fn new(journal: &Path) -> Self {
-        let uplink = uplink::Shared::new(journal.join("uplink.nft"));
+        let wireless = Arc::new(Mutex::new(EffectSet::new("relay", journal.join("wireless.json"))));
+        let uplink = uplink::Shared::new(journal.join("uplink.nft"), Arc::clone(&wireless));
         Session {
-            wireless: Transaction::new(journal.join("wireless.json")),
-            network: Transaction::new(journal.join("network.json")),
-            dns: Transaction::new(journal.join("dns.json")),
+            wireless,
+            network: EffectSet::new("relay", journal.join("network.json")),
+            dns: EffectSet::new("relay", journal.join("dns.json")),
             ipv6: ipv6::Upstream::new(uplink.clone()),
             uplink,
             dns_error: None,
@@ -186,89 +190,114 @@ impl Session {
     }
 }
 
-struct Inner {
-    session: Option<Session>,
-    scans: Vec<Network>,
-    error: Option<String>,
-    phase: Phase,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Phase {
-    Idle,
-    Scanning,
-    Connecting,
-    Active,
-    Recovering,
-    Disconnecting,
-    RecoveryPending,
-}
+enum Phase { Idle, Scanning, Connecting, Active, Recovering, Disconnecting, RecoveryPending }
 
 #[derive(Default)]
-struct Restore {
-    /// SSID being reconnected after the agent started (`restore`).
+struct Cancel {
     restoring: Option<String>,
-    /// Owner operations invalidate every pending restore, even for the same BSS.
     restore_generation: u64,
     disconnect: bool,
+    working: bool,
+    tearing_down: bool,
+    reply: Option<controller::Reply>,
+}
+
+struct Snapshot {
+    value: Value,
+    scans: Vec<Network>,
+}
+
+struct Shared {
+    cancel: Mutex<Cancel>,
+    snapshot: Mutex<Snapshot>,
+    active: AtomicBool,
+    owned: AtomicBool,
+    tick_pending: AtomicBool,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            cancel: Mutex::new(Cancel::default()),
+            snapshot: Mutex::new(Snapshot { value: snapshot(&State::default(), BootClock.now()), scans: Vec::new() }),
+            active: AtomicBool::new(false),
+            owned: AtomicBool::new(false),
+            tick_pending: AtomicBool::new(false),
+        }
+    }
+
+    fn generation_matches(&self, generation: u64) -> bool {
+        let cancel = self.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        cancel.restore_generation == generation && !cancel.disconnect
+    }
+
+    fn queue_tick(&self, sender: &std::sync::mpsc::Sender<Message>) -> Result<(), String> {
+        if self.tick_pending.swap(true, Ordering::AcqRel) { return Ok(()); }
+        if sender.send(Message::Tick).is_err() {
+            self.tick_pending.store(false, Ordering::Release);
+            return Err("The relay controller stopped".into());
+        }
+        Ok(())
+    }
+
+    fn cancel_restore(&self) -> u64 {
+        let mut cancel = self.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        cancel.restore_generation = cancel.restore_generation.wrapping_add(1);
+        cancel.restoring = None;
+        self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).value["restoring"] = Value::Null;
+        cancel.restore_generation
+    }
+
+    fn phase(&self, phase: Phase) {
+        let cancel = self.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut snapshot = self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.value["phase"] = json!(if cancel.disconnect { Phase::Disconnecting } else { phase });
+        snapshot.value["recovery_required"] = json!(false);
+    }
+
+    fn in_progress(&self) -> String {
+        let snapshot = self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        format!("A network operation is in progress ({}); retry after it finishes", snapshot.value["phase"].as_str().unwrap_or("idle"))
+    }
+
+    fn publish(&self, state: &State, mut value: Value, pending: bool, cancel: &Cancel) {
+        value["restoring"] = json!(cancel.restoring);
+        if cancel.disconnect { value["phase"] = json!(Phase::Disconnecting); }
+        value["recovery_required"] = json!(pending && matches!(state.phase, Phase::Idle | Phase::RecoveryPending) && !cancel.disconnect);
+        self.active.store(state.session.as_ref().is_some_and(|session| session.selected.is_some()), Ordering::Release);
+        self.owned.store(state.session.is_some() || pending || cancel.disconnect, Ordering::Release);
+        *self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Snapshot { value, scans: state.scans.clone() };
+    }
+}
+
+struct Cancellation {
+    shared: Arc<Shared>,
+    generation: u64,
+    target: Option<resume::Resume>,
+}
+
+impl Cancellation {
+    fn check(&self) -> Result<(), String> {
+        if self.shared.generation_matches(self.generation) { Ok(()) } else { Err(RESTORE_CANCELLED.into()) }
+    }
 }
 
 pub struct WifiRelay {
-    /// The shared admission lock: held only to check and register an
-    /// operation (`netfx::admission`), never across device work.
     lock: NetworkLock,
-    /// Serializes the relay's own operations and its 3 s watch.
-    op: Mutex<()>,
-    // The network admission lock never nests with op/inner/restore: op -> inner
-    // -> restore -> snapshot; cancellation uses only restore -> snapshot.
-    // Status takes only short memory locks, never op or inner.
-    inner: Mutex<Inner>,
-    restore: Mutex<Restore>,
-    restore_wake: Condvar,
-    wake: Condvar,
-    snapshot: Mutex<Value>,
-    active: AtomicBool,
-    owned: AtomicBool,
+    shared: Arc<Shared>,
+    commands: OnceLock<std::sync::mpsc::Sender<Message>>,
     mihomo: Option<Arc<crate::mihomo::Mihomo>>,
-}
-
-struct Operation<'a> {
-    relay: &'a WifiRelay,
-    lock: Option<std::sync::MutexGuard<'a, ()>>,
-    _claim: crate::netfx::admission::Claim,
-}
-
-impl Drop for Operation<'_> {
-    fn drop(&mut self) {
-        loop {
-            let disconnect = self.relay.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner).disconnect;
-            if disconnect { let _ = self.relay.teardown(); }
-            self.relay.settle();
-            let restore = self.relay.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !restore.disconnect {
-                self.lock.take();
-                return;
-            }
-        }
-    }
 }
 
 impl WifiRelay {
     pub fn new(lock: NetworkLock) -> Self {
-        let relay = Self {
-            lock,
-            op: Mutex::new(()),
-            inner: Mutex::new(Inner { session: None, scans: Vec::new(), error: None, phase: Phase::Idle }),
-            restore: Mutex::new(Restore::default()),
-            restore_wake: Condvar::new(),
-            wake: Condvar::new(),
-            snapshot: Mutex::new(Value::Null),
-            active: AtomicBool::new(false),
-            owned: AtomicBool::new(false),
-            mihomo: None,
-        };
-        relay.settle();
+        let relay = Self { lock, shared: Arc::new(Shared::new()), commands: OnceLock::new(), mihomo: None };
+        let mut port = DevicePort { shared: Arc::clone(&relay.shared), mihomo: None };
+        let mut state = State::default();
+        if recovery_pending(Path::new(JOURNAL)) { state.phase = Phase::RecoveryPending; }
+        port.publish(&state);
         relay
     }
 
@@ -276,121 +305,99 @@ impl WifiRelay {
         Self { mihomo: Some(core), ..Self::new(lock) }
     }
 
-    /// Mihomo follows a change of the routes this relay installed.
-    fn uplink_changed(&self) {
-        if let Some(core) = &self.mihomo {
-            core.uplink_changed();
-        }
+    pub fn start(self: &Arc<Self>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        controller::boot(&sender, reply);
+        if self.commands.set(sender.clone()).is_err() { return; }
+        let port = DevicePort { shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone() };
+        let controller = controller::Controller::new(port, receiver, sender.clone(), Arc::clone(&self.shared), Arc::clone(&self.lock), controller::Timings::default());
+        crate::system::spawn_named("relay", move || controller.supervised(|_| {
+            crate::netlog!("[relay] the controller thread panicked; ending the agent so that its guard starts it again and it adopts the connection");
+            std::process::abort();
+        }));
+        let shared = Arc::clone(&self.shared);
+        crate::net_guard::on_settled(move || { let _ = shared.queue_tick(&sender); });
     }
 
-    pub fn active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+    fn send(&self, message: Message) -> Result<(), String> {
+        let sender = self.commands.get().ok_or("The relay controller is not running")?;
+        if matches!(message, Message::Tick) { return self.shared.queue_tick(sender); }
+        sender.send(message).map_err(|_| "The relay controller stopped".into())
     }
 
-    /// A session, an operation in progress or effects left to recover.
+    fn call(&self, command: RelayCommand) -> Result<Option<Value>, String> {
+        controller::request(self, command, Some(Instant::now() + crate::netfx::admission::WAIT))
+    }
+
+    fn in_progress(&self) -> String { self.shared.in_progress() }
+    pub fn active(&self) -> bool { self.shared.active.load(Ordering::Acquire) }
     pub fn owns_network(&self) -> bool {
-        self.owned.load(Ordering::Acquire) || crate::netfx::admission::held(crate::netfx::admission::RELAY_OPERATION)
+        self.shared.owned.load(Ordering::Acquire) || crate::netfx::admission::held(crate::netfx::admission::RELAY_OPERATION)
     }
 
-    /// Teardown cannot be refused or wait behind another admission check.
-    fn begin_teardown(&self) -> crate::netfx::admission::Claim {
-        use crate::netfx::admission::{claim, RELAY_OPERATION};
-        claim(RELAY_OPERATION, Duration::from_secs(3600))
-    }
-
-    fn operation(&self, phase: Option<Phase>) -> Result<Operation<'_>, String> {
-        self.operation_by(phase, Instant::now() + crate::netfx::admission::WAIT)
-    }
-
-    /// The same, for a request that already spent part of its wait.
-    fn operation_by(&self, phase: Option<Phase>, deadline: Instant) -> Result<Operation<'_>, String> {
-        use crate::netfx::admission::{begin, enter, RELAY_OPERATION, VENDOR_WIFI_RELOAD, VENDOR_WRITE};
-        let left = || deadline.saturating_duration_since(Instant::now());
-        let claim = begin(&self.lock, RELAY_OPERATION, &[VENDOR_WRITE, VENDOR_WIFI_RELOAD], left())?;
-        let lock = enter(&self.op, left()).ok_or_else(|| self.in_progress())?;
-        Ok(self.hold_operation(lock, claim, phase))
-    }
-
-    fn hold_operation<'a>(&'a self, lock: std::sync::MutexGuard<'a, ()>, claim: crate::netfx::admission::Claim, phase: Option<Phase>) -> Operation<'a> {
-        let operation = Operation { relay: self, lock: Some(lock), _claim: claim };
-        if let Some(phase) = phase { self.set_phase(phase); }
-        operation
-    }
-
-    fn in_progress(&self) -> String {
-        let snapshot = self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        format!("A network operation is in progress ({}); retry after it finishes", snapshot["phase"].as_str().unwrap_or("idle"))
-    }
-
-    fn set_phase(&self, phase: Phase) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.phase = phase;
-        self.publish(&inner);
-    }
-
-    fn settle(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.phase = if let Some(session) = &inner.session {
-            if session.association.since.is_some() { Phase::Recovering } else { Phase::Active }
-        } else if self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner).restoring.is_some() {
-            Phase::Recovering
-        } else if recovery_pending(Path::new(JOURNAL)) {
-            Phase::RecoveryPending
-        } else {
-            Phase::Idle
-        };
-        self.publish(&inner);
-    }
-
-    pub fn status(&self) -> Value {
-        self.status_with_clock(&crate::network_clock::WIFI)
-    }
-
+    pub fn status(&self) -> Value { self.status_with_clock(&crate::network_clock::WIFI) }
     fn status_with_clock(&self, clock: &crate::network_clock::WifiClock) -> Value {
-        let mut value = self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let mut value = self.shared.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).value.clone();
         value["clock_error"] = if value["connected"] == true { json!(clock.error()) } else { Value::Null };
-        // Public IPv4 Mihomo intercepts stays on the CPU whatever IPA does.
         value["offload"]["ipv4_through_mihomo"] = json!(self.mihomo.as_ref().map_or("none", |core| core.ipv4_share()));
         value["connection_resets"] = crate::netfx::conntrack::history();
         value
     }
 
-    fn recheck_clock_with(&self, check: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
-        let _operation = self.operation(None)?;
-        // op keeps the uplink stable; no status lock is held over HTTPS.
-        if self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner)["connected"] != true {
+    pub fn recover(&self) -> Result<(), String> {
+        DevicePort { shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone() }.recover()
+    }
+
+    pub fn recover_idle(&self) { let _ = controller::request(self, RelayCommand::Boot, None); }
+    pub fn wants_restore(&self) -> bool { resume::load(Path::new(JOURNAL)).is_some() }
+    pub fn restore(&self) { let _ = controller::request(self, RelayCommand::Restore, None); }
+    pub fn scan(&self) -> Result<(), String> { self.call(RelayCommand::Scan).map(|_| ()) }
+
+    fn connect_remembered(&self, id: &str, password: &str, confirmed: bool, ipv6: bool, remember: bool) -> Result<(), String> {
+        if !confirmed { return Err("Confirm hotspot interruption and possible cellular charges first".into()); }
+        let deadline = Instant::now() + crate::netfx::admission::WAIT;
+        let scans = self.shared.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).scans.clone();
+        let selection = Selection::from(&scans, id, password)?;
+        let generation = self.shared.cancel_restore();
+        let _ = self.send(Message::Wake);
+        controller::request(self, RelayCommand::Connect { selection, ipv6, remember, generation }, Some(deadline)).map(|_| ())
+    }
+
+    pub fn disconnect(&self) -> Result<(), String> {
+        let receiver = {
+            let mut cancel = self.shared.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            cancel.restore_generation = cancel.restore_generation.wrapping_add(1);
+            cancel.restoring = None;
+            cancel.disconnect = !cancel.tearing_down;
+            let mut snapshot = self.shared.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot.value["restoring"] = Value::Null;
+            snapshot.value["phase"] = json!(Phase::Disconnecting);
+            snapshot.value["recovery_required"] = json!(false);
+            self.shared.owned.store(true, Ordering::Release);
+            if cancel.working { None } else {
+                cancel.working = true;
+                let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+                cancel.reply = Some(reply);
+                Some(receiver)
+            }
+        };
+        self.send(Message::Disconnect)?;
+        receiver.map_or(Ok(()), |receiver| receiver.recv().map_err(|_| "The relay controller stopped".to_owned())?.map(|_| ()))
+    }
+
+    fn set_power_save(&self, enabled: bool) -> Result<(), String> { self.call(RelayCommand::PowerSave(enabled)).map(|_| ()) }
+    fn set_offload_enabled(&self, enabled: bool) -> Result<Option<Value>, String> { self.call(RelayCommand::Offload(enabled)) }
+    fn forget(&self, id: &str) -> Result<(), String> { self.call(RelayCommand::Forget(id.into())).map(|_| ()) }
+    fn recheck_clock(&self) -> Result<(), String> {
+        if self.commands.get().is_none() && !self.active() {
             return Err("Connect Wi-Fi relay before checking time".into());
         }
-        check()
+        self.call(RelayCommand::Clock).map(|_| ())
     }
+}
 
-    fn publish(&self, inner: &Inner) {
-        self.publish_at(inner, Path::new(JOURNAL));
-    }
-
-    fn publish_at(&self, inner: &Inner, root: &Path) {
-        if let Some(core) = &self.mihomo {
-            core.set_subscription_dns(inner.session.as_ref().and_then(|s| s.lease.as_ref()).map(|lease| if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() }).unwrap_or_default());
-        }
-        let mut value = Self::snapshot(inner);
-        let pending = recovery_pending(root);
-        value["autostart"] = json!(resume::load(root).is_some());
-        if !value["offload"].is_object() { value["offload"] = json!({}); }
-        value["offload"]["config"] = json!(offload::config());
-        value["offload"]["enabled"] = json!(offload::enabled());
-        if !value["power_save"].is_object() { value["power_save"] = json!({}); }
-        value["power_save"]["auto_off"] = json!(power_save::auto_off(root));
-        saved::annotate(&mut value);
-        let restore = self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        value["restoring"] = json!(restore.restoring);
-        if restore.disconnect { value["phase"] = json!(Phase::Disconnecting); }
-        value["recovery_required"] = json!(pending && matches!(inner.phase, Phase::Idle | Phase::RecoveryPending) && !restore.disconnect);
-        self.active.store(inner.session.as_ref().is_some_and(|s| s.selected.is_some()), Ordering::Release);
-        self.owned.store(inner.session.is_some() || pending || restore.disconnect, Ordering::Release);
-        *self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = value;
-    }
-
-    fn snapshot(i: &Inner) -> Value {
+fn snapshot(i: &State, now: BootInstant) -> Value {
         let s = i.session.as_ref();
         let lease = s.and_then(|s| s.lease.as_ref());
         let ipv6 = s.map(|s| s.ipv6.status()).unwrap_or_else(ipv6::off_status);
@@ -403,22 +410,28 @@ impl WifiRelay {
             "phase": i.phase, "ipv6_relay": ipv6["nat66"], "ipv6": ipv6,
             "association_state": s.map(|s| s.association.state),
             "association_recovering": s.is_some_and(|s| s.association.since.is_some()),
-            "association_recovery_ms": s.map(|s| s.association.elapsed(BootClock.now()).as_millis() as u64),
+            "association_recovery_ms": s.map(|s| s.association.elapsed(now).as_millis() as u64),
             "offload": s.map(|s| s.offload.status()),
             "power_save": s.map(|s| s.power_save.status()),
             "tables": s.map(|s| s.uplink.status()),
             "error": i.error.as_ref().or_else(|| s.and_then(|s| s.dns_error.as_ref()))})
     }
 
+struct DevicePort {
+    shared: Arc<Shared>,
+    mihomo: Option<Arc<crate::mihomo::Mihomo>>,
+}
+
+impl DevicePort {
     pub fn recover(&self) -> Result<(), String> {
         stop_strays(&[])?;
         let ipv6 = ipv6::recover();
-        let ipv4 = Transaction::recover(&Path::new(JOURNAL).join("network.json"));
-        let dns = Transaction::recover(&Path::new(JOURNAL).join("dns.json"));
+        let ipv4 = EffectSet::recover(&Path::new(JOURNAL).join("network.json"));
+        let dns = EffectSet::recover(&Path::new(JOURNAL).join("dns.json"));
         // Preserve the interface while failed IPv6 recovery still owns it,
         // but never strand IPv4 on an already disconnected STA.
         ipv6.and(ipv4)?;
-        let wireless = Transaction::recover(&Path::new(JOURNAL).join("wireless.json"));
+        let wireless = EffectSet::recover(&Path::new(JOURNAL).join("wireless.json"));
         if let Ok(entries) = fs::read_dir(ROOT) {
             for entry in entries.flatten() {
                 if entry.file_name().to_str().is_some_and(|name| name.strip_prefix("ipv4-lease-")
@@ -431,186 +444,6 @@ impl WifiRelay {
         wireless.and(dns)
     }
 
-    pub fn start(self: &Arc<Self>) {
-        let this = Arc::clone(self);
-        // A settled ZTE trigger: the next tick checks at once (`net_guard`).
-        let waker = Arc::clone(self);
-        crate::net_guard::on_settled(move || waker.wake.notify_all());
-        crate::system::spawn_named("relay-watch", move || {
-            this.recover_idle();
-            loop {
-                let mut i = this.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                while !i.session.as_ref().is_some_and(|s| s.selected.is_some()) {
-                    i = this.wake.wait(i).unwrap_or_else(std::sync::PoisonError::into_inner);
-                }
-                let (next, _) = this.wake.wait_timeout(i, Duration::from_secs(3)).unwrap_or_else(std::sync::PoisonError::into_inner);
-                drop(next);
-                let wait_started = Instant::now();
-                let lock = this.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _operation = this.hold_operation(lock, this.begin_teardown(), None);
-                let lock_ms = wait_started.elapsed().as_millis();
-                if !this.active() {
-                    continue;
-                }
-                let query_started = Instant::now();
-                let status = scan::status(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT)).ok();
-                let link = status.as_deref().and_then(|t| net::key(t, "wpa_state"));
-                let query_ms = query_started.elapsed().as_millis();
-                let mut i = this.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(s) = i.session.as_mut().filter(|s| s.selected.is_some()) else { continue };
-                let previous = s.association.state;
-                let recovering = s.association.since.is_some();
-                let link = s.association.observe(link, BootClock.now());
-                if previous != s.association.state {
-                    crate::netlog!("[relay] association state={} recovery_ms={} query_ms={query_ms} lock_ms={lock_ms}", s.association.state, s.association.elapsed(BootClock.now()).as_millis());
-                }
-                if recovering && link == AssociationResult::Ready {
-                    s.renew_lease();
-                }
-                let current = s
-                    .dhcp_session
-                    .as_deref()
-                    .and_then(|session| read_lease(session).ok());
-                let child_ok = s.supplicant.as_mut().is_some_and(Helper::alive)
-                    && s.dhcp.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
-                let change = match s.lease.as_ref().map_or(LeaseChange::Replaced, |installed| {
-                    lease_change(installed, current.as_ref())
-                }) {
-                    LeaseChange::Resolvers(next) if !resolvers_acceptable(&next) => {
-                        LeaseChange::Replaced
-                    }
-                    other => other,
-                };
-                let hotspot_off = hotspot::owner_off("wlan2")
-                    || s.selected
-                        .as_ref()
-                        .is_some_and(|n| n.frequency < 3000 && hotspot::owner_off("wlan0"));
-                // Off by the owner's switch cancels the restart choice; Wi-Fi
-                // the firmware keeps off for now (power-off charging) does not.
-                let by_owner = hotspot_off
-                    && (hotspot::off_by_owner("wlan2")
-                        || s.selected
-                            .as_ref()
-                            .is_some_and(|n| n.frequency < 3000 && hotspot::off_by_owner("wlan0")));
-                let decision = decide(link, child_ok, change, hotspot_off);
-                if let Decision::Teardown(reason) = decision {
-                    crate::netlog!("[relay] teardown reason={reason} recovery_ms={} query_ms={query_ms} lock_ms={lock_ms}", s.association.elapsed(BootClock.now()).as_millis());
-                    let mut session = i.session.take().unwrap();
-                    if hotspot_off {
-                        this.cancel_restore();
-                    }
-                    i.phase = Phase::Disconnecting;
-                    this.publish(&i);
-                    drop(i);
-                    let intent = if by_owner { resume::clear(Path::new(JOURNAL)) } else { Ok(()) };
-                    let restored = cleanup(&mut session, || this.uplink_changed());
-                    let mut i = this.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    i.error = Some(
-                        restored.err().or_else(|| intent.err()).unwrap_or_else(||
-                            if by_owner { "Hotspot was turned off; relay stopped and restart recovery cancelled".into() }
-                            else if hotspot_off { "Wi-Fi is off; relay stopped. It reconnects when the router next starts with Wi-Fi on.".into() }
-                            else { "Wi-Fi relay disconnected or lease changed; previous routing restored. Cellular data is used only if already enabled. Scan and reconnect.".into() }),
-                    );
-                    this.publish(&i);
-                } else if decision == Decision::Hold {
-                    // Only retain the configured path while its original lease
-                    // and both helpers remain valid. No lease is extended here.
-                    i.phase = Phase::Recovering;
-                    this.publish(&i);
-                    continue;
-                } else {
-                    if let Decision::Keep(Some(next)) = decision {
-                        s.lease = Some(next);
-                    }
-                    let lease = s.lease.as_ref().unwrap();
-                    let resolvers = if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() };
-                    let dns = dns::reconcile(&resolvers);
-                    if let Some(Err(e)) = crate::netfx::conntrack::retry() {
-                        crate::netlog!("[relay] connection reset retry failed: {e}");
-                    }
-                    // `due` answers once per trigger: IPv6 reuses this answer.
-                    let guard_due = s.guard.due();
-                    let guarded = if guard_due {
-                        // One set of listings for the five transactions below.
-                        let _pass = net::Pass::open();
-                        // The tables and the upstream INPUT accepts first:
-                        // IPv6's own chain hooks into them.
-                        let mut result = s.uplink.reconcile();
-                        result.extend(s.wireless.reconcile_only(firewall_step));
-                        result.extend(s.network.reconcile());
-                        // The portal RETURN, held with the switch.
-                        result.extend(s.dns.reconcile());
-                        result.extend(s.ipv6.reconcile());
-                        s.guard.after(&result);
-                        crate::net_guard::report("relay", result)
-                    } else {
-                        Ok(())
-                    };
-                    s.dns_error = dns.and(guarded).err();
-                    let before = s.ipv6.revision();
-                    let tick = s.ipv6.tick(guard_due);
-                    let changed = before != s.ipv6.revision();
-                    if let Err(e) = tick {
-                        // A failed IPv6 undo must not leave an unsupervised path.
-                        let mut session = i.session.take().unwrap();
-                        i.phase = Phase::Disconnecting;
-                        this.publish(&i);
-                        drop(i);
-                        let restored = cleanup(&mut session, || this.uplink_changed());
-                        let mut i = this.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        i.error = Some(restored.err().unwrap_or(e));
-                        this.publish(&i);
-                    } else if changed {
-                        i.phase = Phase::Active;
-                        this.publish(&i);
-                        // The core restart takes seconds; do not hold the
-                        // session lock for it (op still orders it).
-                        drop(i);
-                        this.uplink_changed();
-                    } else {
-                        i.phase = Phase::Active;
-                        this.publish(&i);
-                    }
-                }
-            }
-        });
-    }
-
-    /// Roll back what a previous process left (crash, update, reboot).
-    /// A connection the previous agent left working in this boot is taken
-    /// over instead (`adopt`, owner choice Q1).
-    pub fn recover_idle(&self) {
-        let claim = self.begin_teardown();
-        let lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _operation = self.hold_operation(lock, claim, Some(Phase::Recovering));
-        // A request may have started the relay before this ran.
-        let idle = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).session.is_none();
-        if idle {
-            if let Some(session) = self.adopt_previous() {
-                let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                i.session = Some(session);
-                i.error = None;
-                self.publish(&i);
-                self.wake.notify_all();
-                return;
-            }
-            // Routes a previous agent left may be what Mihomo (adopted after
-            // an agent restart) runs on: tell it once they are gone.
-            let routed = routes_journaled(Path::new(JOURNAL));
-            let recovered = self.recover();
-            if routed && !routes_journaled(Path::new(JOURNAL)) {
-                self.uplink_changed();
-            }
-            if let Err(e) = recovered {
-                let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                i.error = Some(e);
-                self.publish(&i);
-            }
-        }
-    }
-
-    /// The previous agent's working connection, when the owner left it on
-    /// and it still matches; `None` rolls back and restores as before.
     fn adopt_previous(&self) -> Option<Session> {
         let target = resume::load(Path::new(JOURNAL))?;
         if !routes_journaled(Path::new(JOURNAL)) || hotspot::owner_off("wlan2") {
@@ -631,153 +464,7 @@ impl WifiRelay {
         }
     }
 
-    pub fn wants_restore(&self) -> bool {
-        resume::load(Path::new(JOURNAL)).is_some()
-    }
-
-    /// After the agent starts: rejoin the network the owner left connected
-    /// (`resume`), retrying while the hotspot, radio or upstream comes up.
-    /// Stops once the owner connects, disconnects or picks another network.
-    pub fn restore(&self) {
-        let root = Path::new(JOURNAL);
-        let Some((target, generation)) = self.begin_restore(root) else { return };
-        let mut last = String::new();
-        for (attempt, wait) in RESTORE_WAITS.into_iter().enumerate() {
-            if !self.wait_restore(generation, Duration::from_secs(wait)) {
-                return;
-            }
-            if hotspot::owner_off("wlan2") {
-                if !hotspot::off_by_owner("wlan2") {
-                    // The firmware keeps Wi-Fi off for now: the restart
-                    // choice stays for the next start.
-                    crate::netlog!("[relay] restore attempt {} skipped: Wi-Fi is off, but not by the owner's switch", attempt + 1);
-                    last = "Wi-Fi is off".into();
-                    continue;
-                }
-                let lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _operation = self.hold_operation(lock, self.begin_teardown(), None);
-                let current = self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner).restore_generation == generation;
-                if current {
-                    let error = resume::clear(root).err();
-                    self.cancel_restore();
-                    if let Some(error) = error {
-                        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        i.error = Some(error);
-                        self.publish(&i);
-                    }
-                }
-                return;
-            }
-            let found = self.scan_for_restore(Some((&target, generation))).and_then(|()| {
-                let i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                resume::pick(&target, &i.scans).map(|n| n.id.clone()).ok_or_else(|| "The network was not found in the scan".to_owned())
-            });
-            match found.and_then(|id| self.join(&id, "", target.ipv6, Origin::Restore(&target, generation))) {
-                Ok(()) => {
-                    crate::netlog!("[relay] restored after {} attempt(s)", attempt + 1);
-                    return self.finish_restore(generation, None);
-                }
-                Err(e) if e == RESTORE_CANCELLED => return self.finish_restore(generation, None),
-                Err(e) if e == RESTORE_NO_PASSWORD => {
-                    last = e;
-                    break;
-                }
-                Err(e) => {
-                    crate::netlog!("[relay] restore attempt {} failed: {e}", attempt + 1);
-                    last = e;
-                }
-            }
-        }
-        self.finish_restore(generation, Some(format!("Could not reconnect after the agent restarted: {last}. Scan and reconnect.")));
-    }
-
-    fn begin_restore(&self, root: &Path) -> Option<(resume::Resume, u64)> {
-        let lock = self.op.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _operation = self.hold_operation(lock, self.begin_teardown(), None);
-        let target = resume::load(root)?;
-        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut restore = self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if i.session.is_some() || restore.restore_generation != 0 { return None; }
-        restore.restoring = Some(target.ssid.clone());
-        let generation = restore.restore_generation;
-        drop(restore);
-        i.phase = Phase::Recovering;
-        self.publish(&i);
-        Some((target, generation))
-    }
-
-    fn cancel_restore(&self) -> u64 {
-        let mut restore = self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        restore.restore_generation = restore.restore_generation.wrapping_add(1);
-        restore.restoring = None;
-        self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner)["restoring"] = Value::Null;
-        self.restore_wake.notify_all();
-        restore.restore_generation
-    }
-
-    fn wait_restore(&self, generation: u64, wait: Duration) -> bool {
-        let restore = self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (restore, _) = self.restore_wake.wait_timeout_while(restore, wait, |restore| {
-            restore.restore_generation == generation && restore.restoring.is_some() && !self.active()
-        }).unwrap_or_else(std::sync::PoisonError::into_inner);
-        restore.restore_generation == generation && restore.restoring.is_some() && !self.active()
-    }
-
-    fn finish_restore(&self, generation: u64, error: Option<String>) {
-        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut restore = self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if restore.restore_generation != generation { return; }
-        restore.restoring = None;
-        drop(restore);
-        if error.is_some() { i.error = error; }
-        drop(i);
-        self.settle();
-    }
-
-    /// Caller holds op; reject stale work before any device call.
-    fn check_restore(&self, root: &Path, target: &resume::Resume, generation: u64) -> Result<(), String> {
-        let generation_matches = self.generation_matches(generation);
-        if !generation_matches || self.active() || resume::load(root).as_ref() != Some(target) {
-            return Err(RESTORE_CANCELLED.into());
-        }
-        Ok(())
-    }
-
-    fn generation_matches(&self, generation: u64) -> bool {
-        let restore = self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        restore.restore_generation == generation && !restore.disconnect
-    }
-
-    pub fn scan(&self) -> Result<(), String> {
-        self.scan_for_restore(None)
-    }
-
-    fn scan_for_restore(&self, restore: Option<(&resume::Resume, u64)>) -> Result<(), String> {
-        let _operation = self.operation(Some(Phase::Scanning))?;
-        if let Some((target, generation)) = restore {
-            self.check_restore(Path::new(JOURNAL), target, generation)?;
-        }
-        let idle = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).session.is_none();
-        let mut temporary = if idle { Some(self.prepare()?) } else { None };
-        let result: Result<_, String> = (|| {
-            let channels = scan::Channels::parse(&Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?);
-            let plan = channels.plan();
-            let mut ctrl = scan::Ctrl::attach(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT))?;
-            let (table, took) = scan::run(&mut ctrl, &plan)?;
-            Ok(parse_bss_on_channels(&table, took.as_secs() + 1, &channels))
-        })();
-        if let Some(s) = &mut temporary {
-            self.set_phase(Phase::Disconnecting);
-            cleanup(s, || ())?;
-        }
-        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        i.scans = result?;
-        i.error = None;
-        self.publish(&i);
-        Ok(())
-    }
-
-    fn prepare(&self) -> Result<Session, String> {
+    fn prepare(&self, cancel: &Cancellation) -> Result<Session, String> {
         // A Wi-Fi reload the agent started is still reconfiguring the radio.
         if crate::netfx::admission::held(crate::netfx::admission::VENDOR_WIFI_RELOAD) {
             return Err("Wi-Fi is still applying its new settings; retry in a moment".into());
@@ -808,19 +495,14 @@ impl WifiRelay {
             // Protect INPUT and forwarding before the interface exists,
             // including scan-only sessions (`uplink`). The journal undoes in
             // reverse, so the interface is deleted before its guard goes.
-            for tool in ["iptables", "ip6tables"] {
-                if Cmd::new(tool, &["-w", "2", "-t", "filter", "-S", "U60_RELAY_IN"]).run().is_ok() {
-                    return Err("Relay firewall chains are already in use".into());
-                }
-            }
             session.uplink.claim()?;
             let mut guards = input_guards();
-            guards.extend(uplink::steps());
-            session.wireless.apply_network(guards)?;
+            guards.push(session.uplink.resource(None));
+            session.wireless.lock().unwrap().declare(guards)?;
             session.uplink.guard()?;
             session
                 .wireless
-                .apply(Step::new(Cmd::new("iw", &["phy", phy, "interface", "add", IFACE, "type", "managed"]), Cmd::new("iw", &["dev", IFACE, "del"])))?;
+                .lock().unwrap().step(Step::new(Cmd::new("iw", &["phy", phy, "interface", "add", IFACE, "type", "managed"]), Cmd::new("iw", &["dev", IFACE, "del"])))?;
             let base = fs::read_to_string("/sys/class/net/wlan2/address").map_err(|_| "Cannot read radio MAC")?;
             let mut bytes: Vec<u8> = base.trim().split(':').map(|b| u8::from_str_radix(b, 16)).collect::<Result<_, _>>().map_err(|_| "Invalid radio MAC")?;
             if bytes.len() != 6 {
@@ -831,20 +513,22 @@ impl WifiRelay {
             let mac = bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
             Cmd::new("ip", &["link", "set", "dev", IFACE, "address", &mac]).run()?;
             // Deleting the interface is the undo.
-            session.wireless.apply(Step::new(Cmd::new("sysctl", &["-w", &format!("net.ipv6.conf.{IFACE}.disable_ipv6=1")]), Cmd::new("true", &[])))?;
+            session.wireless.lock().unwrap().step(Step::new(Cmd::new("sysctl", &["-w", &format!("net.ipv6.conf.{IFACE}.disable_ipv6=1")]), Cmd::new("true", &[])))?;
             Cmd::new("ip", &["link", "set", "dev", IFACE, "up"]).run()?;
             net::write_private(&Path::new(ROOT).join("wpa.conf"), format!("ctrl_interface={ROOT}/ctrl\nupdate_config=0\n").as_bytes())?;
             let mut cmd = Command::new("wpa_supplicant");
             cmd.args(["-D", "nl80211", "-i", IFACE, "-c", &format!("{ROOT}/wpa.conf"), "-qq"]);
             session.supplicant = Some(Helper::Owned(net::owned_child(cmd)?));
-            let ready = (0..30).any(|_| {
+            let mut ready = false;
+            for _ in 0..30 {
+                self.check(cancel)?;
                 if wpa("ping", &[]).is_ok_and(|s| s.ends_with("PONG")) {
-                    true
+                    ready = true;
+                    break;
                 } else {
                     std::thread::sleep(Duration::from_millis(100));
-                    false
                 }
-            });
+            }
             if !ready {
                 return Err("wpa_supplicant did not become ready".into());
             }
@@ -854,7 +538,7 @@ impl WifiRelay {
             }
             let old = wpa("driver", &["GETROAMMODE"])?;
             let mode = old.split_whitespace().last().filter(|s| matches!(*s, "0" | "1")).ok_or("Cannot determine original roam mode")?;
-            session.wireless.apply(roam_step(mode))?;
+            session.wireless.lock().unwrap().step(roam_step(mode))?;
             Ok(())
         })();
         if let Err(e) = result {
@@ -863,39 +547,85 @@ impl WifiRelay {
         Ok(session)
     }
 
-    fn connect_remembered(&self, id: &str, password: &str, confirmed: bool, ipv6: bool, remember: bool) -> Result<(), String> {
-        if !confirmed {
-            return Err("Confirm hotspot interruption and possible cellular charges first".into());
-        }
-        // Invalid selection/password must not cancel a working connection's
-        // restart intent. No device calls or state changes until validation.
-        // The tick holds `inner` over its device calls: that wait counts too.
-        let deadline = Instant::now() + crate::netfx::admission::WAIT;
-        {
-            let i = crate::netfx::admission::enter(&self.inner, crate::netfx::admission::WAIT).ok_or_else(|| self.in_progress())?;
-            selected_config(&i.scans, id, password)?;
-        }
-        // The owner's choice ends a restore first, so one that is joining
-        // gives the operation up instead of refusing this request each time.
-        let generation = self.cancel_restore();
-        let _operation = self.operation_by(Some(Phase::Connecting), deadline)?;
-        self.join_locked(id, password, ipv6, Origin::Owner { remember, generation })
+}
+
+impl DevicePort {
+    fn uplink_changed(&self) {
+        if let Some(core) = &self.mihomo { core.uplink_changed(); }
     }
 
-    fn join(&self, id: &str, password: &str, ipv6: bool, origin: Origin) -> Result<(), String> {
-        let _operation = self.operation(Some(Phase::Connecting))?;
-        self.join_locked(id, password, ipv6, origin)
+    fn check(&self, cancel: &Cancellation) -> Result<(), String> {
+        cancel.check()?;
+        if cancel.target.as_ref().is_some_and(|target| self.shared.active.load(Ordering::Acquire) || resume::load(Path::new(JOURNAL)).as_ref() != Some(target)) {
+            return Err(RESTORE_CANCELLED.into());
+        }
+        Ok(())
     }
 
-    fn join_locked(&self, id: &str, password: &str, ipv6: bool, origin: Origin) -> Result<(), String> {
+    fn set_phase(&self, phase: Phase) { self.shared.phase(phase); }
+
+    fn publish(&mut self, state: &State) {
+        let value = <Self as controller::Port>::snapshot(self, state);
+        let pending = recovery_pending(Path::new(JOURNAL));
+        let cancel = self.shared.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.shared.publish(state, value, pending, &cancel);
+    }
+}
+
+impl controller::Port for DevicePort {
+    fn now(&self) -> Instant { Instant::now() }
+    fn boot_now(&self) -> BootInstant { BootClock.now() }
+    fn snapshot(&mut self, state: &State) -> Value {
+        if let Some(core) = &self.mihomo {
+            core.set_subscription_dns(state.session.as_ref().and_then(|session| session.lease.as_ref()).map(|lease| if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() }).unwrap_or_default());
+        }
+        let mut value = snapshot(state, BootClock.now());
+        value["autostart"] = json!(resume::load(Path::new(JOURNAL)).is_some());
+        if !value["offload"].is_object() { value["offload"] = json!({}); }
+        value["offload"]["config"] = json!(offload::config());
+        value["offload"]["enabled"] = json!(offload::enabled());
+        if !value["power_save"].is_object() { value["power_save"] = json!({}); }
+        value["power_save"]["auto_off"] = json!(power_save::auto_off(Path::new(JOURNAL)));
+        saved::annotate(&mut value);
+        value
+    }
+
+    fn pending(&self) -> bool { recovery_pending(Path::new(JOURNAL)) }
+    fn target(&mut self) -> Option<resume::Resume> { resume::load(Path::new(JOURNAL)) }
+    fn clear(&mut self) -> Result<(), String> { resume::clear(Path::new(JOURNAL)) }
+    fn hotspot(&mut self) -> (bool, bool) { (hotspot::owner_off("wlan2"), hotspot::off_by_owner("wlan2")) }
+    fn recover(&mut self) -> Result<(), String> {
+        let routed = routes_journaled(Path::new(JOURNAL));
+        let recovered = DevicePort::recover(self);
+        if routed && !routes_journaled(Path::new(JOURNAL)) { self.uplink_changed(); }
+        recovered
+    }
+    fn adopt(&mut self) -> Option<Session> { self.adopt_previous() }
+
+    fn scan(&mut self, state: &mut State, cancel: &Cancellation) -> Result<Vec<Network>, String> {
+        self.check(cancel)?;
+        let mut temporary = if state.session.is_none() { Some(self.prepare(cancel)?) } else { None };
+        let result = (|| {
+            self.check(cancel)?;
+            let channels = scan::Channels::parse(&Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?);
+            let plan = channels.plan();
+            let mut ctrl = scan::Ctrl::attach(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT))?;
+            let (table, took) = scan::run(&mut ctrl, &plan, || self.check(cancel))?;
+            Ok(parse_bss_on_channels(&table, took.as_secs() + 1, &channels))
+        })();
+        if let Some(session) = &mut temporary {
+            self.set_phase(Phase::Disconnecting);
+            cleanup(session, || ())?;
+        }
+        self.check(cancel)?;
+        result
+    }
+
+    fn join(&mut self, state: &mut State, selection: Selection, ipv6: bool, cancel: &Cancellation) -> Result<Session, String> {
+        self.check(cancel)?;
         let root = Path::new(JOURNAL);
-        match origin {
-            Origin::Owner { .. } => {},
-            Origin::Restore(target, generation) => self.check_restore(root, target, generation)?,
-        }
-        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.generation_matches(origin.generation()) { return Err(RESTORE_CANCELLED.into()); }
-        let (selected, password, network_config) = selected_config(&i.scans, id, password)?;
+        let selected = selection.network;
+        let network_config = selection.config;
         // Country/driver restrictions may have changed since the last scan.
         let channels = scan::Channels::parse(&Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?);
         if !channels.contains(selected.frequency) {
@@ -903,17 +633,9 @@ impl WifiRelay {
         }
         // A validated replacement owns the next restart choice only once it
         // succeeds. Until then, do not silently restart the previous network.
-        if matches!(origin, Origin::Owner { .. }) { resume::clear(root)?; }
-        let old = i.session.take();
-        self.publish(&i);
-        drop(i);
-        // Publish early failures too, or the page keeps an older attempt's error.
-        let failed = |e: String| {
-            let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            i.error = Some(e.clone());
-            self.publish(&i);
-            Err(e)
-        };
+        if cancel.target.is_none() { resume::clear(root)?; }
+        let old = state.session.take();
+        self.publish(state);
         // Between 5 GHz upstreams the station and hotspot are handed over
         // (`handover`); otherwise the old session is torn down first.
         let mut handed = None;
@@ -931,32 +653,28 @@ impl WifiRelay {
             }
             if handed.is_none() {
                 if let Err(e) = cleanup(&mut old, || self.uplink_changed()) {
-                    return failed(e);
+                    return Err(e);
                 }
             }
         }
         let kept = handed.is_some();
         let ipv6_kept = handed.as_ref().is_some_and(|(_, ipv6)| *ipv6);
-        let mut session = match handed.map_or_else(|| self.prepare(), |(next, _)| Ok(next)) {
+        let mut session = match handed.map_or_else(|| self.prepare(cancel), |(next, _)| Ok(next)) {
             Ok(session) => session,
-            Err(e) => return failed(e),
+            Err(e) => return Err(e),
         };
-        let check = || match origin {
-            Origin::Restore(target, generation) => self.check_restore(root, target, generation),
-            Origin::Owner { generation, .. } => {
-                if self.generation_matches(generation) { Ok(()) } else { Err(RESTORE_CANCELLED.into()) }
-            },
-        };
+        let check = || self.check(cancel);
         let result = (|| {
             check()?;
             if !kept {
                 hotspot::prepare(&mut session.wireless, selected.frequency, &channels)?;
             }
+            check()?;
             net::write_private(&Path::new(ROOT).join("wpa.conf"), format!("ctrl_interface={ROOT}/ctrl\nupdate_config=0\n{network_config}").as_bytes())?;
             // Undo must detach STA before restoring the same-radio AP channel,
             // including a crash between reconfigure and association completion
             // (a handed-over station has that undo already).
-            session.wireless.ensure(association_step())?;
+            session.wireless.lock().unwrap().step(association_step())?;
             if kept {
                 // `handover` disconnected it; a reconfigure alone keeps it so.
                 wpa("reconnect", &[]).and_then(expect_ok)?;
@@ -989,7 +707,6 @@ impl WifiRelay {
             let lan_ip: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.ipaddr"]).run()?.parse().map_err(|_| "Invalid LAN address")?;
             let lan_mask: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.netmask"]).run()?.parse().map_err(|_| "Invalid LAN mask")?;
             let prefix = validate_lease(&lease, lan_ip, lan_mask)?;
-            net::reserve("iptables", "filter", &["U60_RELAY_FWD"], "-4", TABLE, PREF)?;
             if fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default().trim() != "1" {
                 return Err("Router IPv4 forwarding is disabled".into());
             }
@@ -997,14 +714,14 @@ impl WifiRelay {
             // legacy accepts and routes, before the policy rule moves traffic.
             let mut plan = relay_plan(&lease, prefix, lan_ip, lan_mask);
             let rule = plan.pop().expect("the policy rule is the plan's last step");
-            session.network.apply_network(plan)?;
+            session.network.declare(plan)?;
             // LAN web traffic skips the vendor's offline redirect before the
             // policy rule moves it; a handed-over session holds the RETURN.
             for step in portal::web_bypasses() {
-                session.dns.ensure(step)?;
+                session.dns.declare(vec![step])?;
             }
             session.uplink.update(|l| l.relay = Some(relay_layout(&lease, lan_ip, lan_mask)))?;
-            session.network.apply_network(vec![rule])?;
+            session.network.declare(vec![rule])?;
             session.routed = true;
             let route = Cmd::new("ip", &["-4", "route", "get", "1.1.1.1"]).run()?;
             if !route.contains(&format!("dev {IFACE}")) {
@@ -1012,7 +729,7 @@ impl WifiRelay {
             }
             // CPU-path help and hardware forwarding are optional: the relay
             // works without them.
-            if let Err(e) = session.network.apply_network(steering::plan()) {
+            if let Err(e) = session.network.declare(steering::plan()) {
                 crate::netlog!("[relay] receive steering not applied: {e}");
             }
             if power_save::auto_off(Path::new(JOURNAL)) {
@@ -1020,11 +737,11 @@ impl WifiRelay {
             }
             let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(lease.ip) & u32::from(lease.subnet)));
             session.offload = offload::Runtime::start(&mut session.network, lease.gateway, subnet);
-            session.dns.apply(resolver(&lease))?;
+            session.dns.declare(vec![resolver(&lease)])?;
             // After a handover the switch already reads 0 (held): no step,
             // no dnsmasq restart.
             if let Some(step) = portal::plan()? {
-                session.dns.ensure(step)?;
+                session.dns.declare(vec![step])?;
             }
             // A new uplink must not reuse the previous network's clock check.
             let _ = crate::network_clock::recheck_wifi();
@@ -1043,141 +760,91 @@ impl WifiRelay {
             let off = hotspot::owner_off("wlan2") || (selected.frequency < 3000 && hotspot::owner_off("wlan0"));
             let by_owner = off && (hotspot::off_by_owner("wlan2") || (selected.frequency < 3000 && hotspot::off_by_owner("wlan0")));
             let clear_error = if by_owner { resume::clear(root).err() } else { None };
-            if off { self.cancel_restore(); }
+            if off { self.shared.cancel_restore(); }
             self.set_phase(Phase::Disconnecting);
             let e = cleanup(&mut session, || self.uplink_changed()).err().unwrap_or(e);
-            let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            i.error = clear_error.or_else(|| (e != RESTORE_CANCELLED).then(|| e.clone()));
-            self.publish(&i);
+            state.error = clear_error.or_else(|| (e != RESTORE_CANCELLED).then(|| e.clone()));
             return Err(e);
         }
-        if !self.generation_matches(origin.generation()) {
+        if !cancel.shared.generation_matches(cancel.generation) {
             self.set_phase(Phase::Disconnecting);
             let cleaned = cleanup(&mut session, || self.uplink_changed());
             return cleaned.and(Err(RESTORE_CANCELLED.into()));
         }
+        Ok(session)
+    }
+
+    fn persist(&mut self, selection: &Selection, ipv6: bool, remember: bool) -> Option<String> {
         let mut error = None;
-        if let Origin::Owner { remember, .. } = origin {
-            if let Err(e) = saved::remember(&selected, remember.then_some(password.as_str())) { error = Some(format!("Relay connected, but {e}")); }
-            // Only a credential the router keeps can be rejoined after a restart.
-            let kept = selected.security == "open" || saved::password(&selected).ok().flatten().is_some_and(|p| p == password);
-            if kept {
-                if let Err(e) = resume::save(root, &selected, ipv6) { error = Some(format!("Relay connected, but {e}")); }
-            }
+        if let Err(problem) = saved::remember(&selection.network, remember.then_some(selection.password.as_str())) { error = Some(format!("Relay connected, but {problem}")); }
+        let kept = selection.network.security == "open" || saved::password(&selection.network).ok().flatten().is_some_and(|password| password == selection.password);
+        if kept {
+            if let Err(problem) = resume::save(Path::new(JOURNAL), &selection.network, ipv6) { error = Some(format!("Relay connected, but {problem}")); }
         }
-        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // No I/O under the cancellation lock. A pending disconnect clears
-        // any intent saved above before this operation releases op.
-        let restore = self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if restore.restore_generation != origin.generation() || restore.disconnect {
-            drop(restore);
-            drop(i);
-            self.set_phase(Phase::Disconnecting);
-            let cleaned = cleanup(&mut session, || self.uplink_changed());
-            return cleaned.and(Err(RESTORE_CANCELLED.into()));
-        }
-        i.session = Some(session);
-        i.error = error;
-        drop(restore);
-        i.phase = Phase::Active;
-        self.publish(&i);
-        self.wake.notify_all();
-        // Restarting the core takes seconds: do it without the session lock.
-        drop(i);
-        self.uplink_changed();
-        Ok(())
+        error
     }
 
-    pub fn disconnect(&self) -> Result<(), String> {
-        {
-            let mut restore = self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            restore.restore_generation = restore.restore_generation.wrapping_add(1);
-            restore.restoring = None;
-            restore.disconnect = true;
-            let mut snapshot = self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snapshot["restoring"] = Value::Null;
-            snapshot["phase"] = json!(Phase::Disconnecting);
-            snapshot["recovery_required"] = json!(false);
-            self.owned.store(true, Ordering::Release);
-            self.restore_wake.notify_all();
-        }
-        let Some(lock) = crate::netfx::admission::enter(&self.op, Duration::ZERO) else { return Ok(()) };
-        let _operation = self.hold_operation(lock, self.begin_teardown(), None);
-        self.teardown()
+    fn cleanup(&mut self, session: &mut Session) -> Result<(), String> { cleanup(session, || self.uplink_changed()) }
+    fn observe_link(&mut self) -> (Option<String>, u128) {
+        let started = Instant::now();
+        let status = scan::status(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT)).ok();
+        (status.as_deref().and_then(|text| net::key(text, "wpa_state")).map(str::to_owned), started.elapsed().as_millis())
     }
-
-    fn teardown(&self) -> Result<(), String> {
-        self.restore.lock().unwrap_or_else(std::sync::PoisonError::into_inner).disconnect = false;
-        self.set_phase(Phase::Disconnecting);
-        // Off until the owner connects again, restarts included.
-        let cleared = resume::clear(Path::new(JOURNAL));
-        let session = {
-            let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let session = i.session.take();
-            self.publish(&i);
-            session
-        };
-        let result = if let Some(mut s) = session {
-            cleanup(&mut s, || self.uplink_changed())
-        } else {
-            // Mihomo follows only routes a previous agent left and this removed.
-            let routed = routes_journaled(Path::new(JOURNAL));
-            let recovered = self.recover();
-            if routed && !routes_journaled(Path::new(JOURNAL)) {
-                self.uplink_changed();
-            }
-            recovered
-        };
-        let result = result.and(cleared);
-        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        i.error = result.as_ref().err().cloned();
-        self.publish(&i);
-        result
+    fn observe(&mut self, session: &mut Session) -> Observation {
+        let lease = session.dhcp_session.as_deref().and_then(|session| read_lease(session).ok());
+        let helpers = session.supplicant.as_mut().is_some_and(Helper::alive) && session.dhcp.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        let change = session.lease.as_ref().map_or(LeaseChange::Replaced, |installed| lease_change(installed, lease.as_ref()));
+        let resolvers_valid = match change { LeaseChange::Resolvers(ref next) => resolvers_acceptable(next), _ => true };
+        let two = session.selected.as_ref().is_some_and(|network| network.frequency < 3000);
+        let hotspot_off = hotspot::owner_off("wlan2") || (two && hotspot::owner_off("wlan0"));
+        let by_owner = hotspot_off && (hotspot::off_by_owner("wlan2") || (two && hotspot::off_by_owner("wlan0")));
+        Observation { #[cfg(test)] link: None, lease, helpers, resolvers_valid, hotspot_off, by_owner }
     }
-
-    /// Owner action (`power_save`): saved for later connections and applied
-    /// to the current one at once.
-    fn set_power_save(&self, auto_off: bool) -> Result<(), String> {
-        let _operation = self.operation(None)?;
+    fn renew(&mut self, session: &mut Session) { session.renew_lease(); }
+    fn maintain(&mut self, session: &mut Session) -> Result<bool, String> {
+        let lease = session.lease.as_ref().unwrap();
+        let resolvers = if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() };
+        let dns = dns::reconcile(&resolvers);
+        if let Some(Err(error)) = crate::netfx::conntrack::retry() { crate::netlog!("[relay] connection reset retry failed: {error}"); }
+        let guard_due = session.guard.due();
+        let guarded = if guard_due {
+            let _pass = net::Pass::open();
+            let mut result = session.uplink.reconcile();
+            result.extend(session.wireless.lock().unwrap().reconcile_only(firewall_resource));
+            result.extend(session.network.reconcile());
+            result.extend(session.dns.reconcile());
+            result.extend(session.ipv6.reconcile());
+            session.guard.after(&result);
+            crate::net_guard::report("relay", result)
+        } else { Ok(()) };
+        session.dns_error = dns.and(guarded).err();
+        let before = session.ipv6.revision();
+        session.ipv6.tick(guard_due)?;
+        Ok(before != session.ipv6.revision())
+    }
+    fn uplink_changed(&self) { DevicePort::uplink_changed(self); }
+    fn power_save(&mut self, state: &mut State, auto_off: bool) -> Result<(), String> {
         power_save::save(Path::new(JOURNAL), auto_off)?;
-        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = i.session.as_mut().map_or(Ok(()), |s| s.power_save.set(&mut s.network, auto_off));
-        self.publish(&i);
-        result.map_err(|e| format!("Setting saved. {e}"))
+        let result = state.session.as_mut().map_or(Ok(()), |session| session.power_save.set(&mut session.network, auto_off));
+        result.map_err(|error| format!("Setting saved. {error}"))
     }
-
-    /// Owner action: hardware forwarding on or off without a restart. Saved
-    /// for later connections; a connected relay follows at once. A changed
-    /// path resets LAN IPv4 connections, so established and offloaded flows
-    /// move onto it: the reset's actual outcome (`conntrack::Report::json`,
-    /// or a failure that stays pending for the watchdog's retry) when the
-    /// path changed; the console says only what happened.
-    fn set_offload_enabled(&self, on: bool) -> Result<Option<Value>, String> {
-        let _operation = self.operation(None)?;
-        offload::set_enabled(on)?;
-        crate::netlog!("[relay] hardware forwarding switched {}", if on { "on" } else { "off" });
-        let mut i = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(s) = i.session.as_mut() else { return Ok(None) };
+    fn offload(&mut self, state: &mut State, enabled: bool) -> Result<Option<Value>, String> {
+        offload::set_enabled(enabled)?;
+        crate::netlog!("[relay] hardware forwarding switched {}", if enabled { "on" } else { "off" });
+        let Some(session) = state.session.as_mut() else { return Ok(None) };
         let changed_at = Instant::now();
-        let changed = s.offload.sync(&mut s.network);
-        self.publish(&i);
-        drop(i);
+        let changed = session.offload.sync(&mut session.network);
+        self.publish(state);
         match changed {
-            Ok(true) => Ok(Some(
-                match crate::netfx::conntrack::reset_since("relay forwarding path changed", crate::netfx::conntrack::Scope::Lan { v4: true, v6: false }, changed_at) {
-                    Ok(report) => report.json(),
-                    Err(e) => crate::netfx::conntrack::failed_json(&e),
-                },
-            )),
+            Ok(true) => Ok(Some(match crate::netfx::conntrack::reset_since("relay forwarding path changed", crate::netfx::conntrack::Scope::Lan { v4: true, v6: false }, changed_at) {
+                Ok(report) => report.json(), Err(error) => crate::netfx::conntrack::failed_json(&error),
+            })),
             Ok(false) => Ok(None),
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         }
     }
-
-    fn forget(&self, id: &str) -> Result<(), String> {
-        let _operation = self.operation(None)?;
-        saved::forget(id)
-    }
+    fn forget(&mut self, id: &str) -> Result<(), String> { saved::forget(id) }
+    fn clock(&mut self) -> Result<(), String> { crate::network_clock::recheck_wifi() }
 }
 
 /// Seconds before each restore attempt: about 17 minutes in all, for a boot
@@ -1579,11 +1246,11 @@ fn handover(old: &mut Session, channels: &scan::Channels, keep_ipv6: bool, uplin
     if let Err(e) = old.uplink.update(|l| l.relay = None) {
         crate::netlog!("[relay] relay tables not narrowed before releasing routes (the journal removes them): {e}");
     }
-    let routes = old.network.rollback();
+    let routes = old.network.release();
     // Only the resolver follows the lease. Released here, the switch read 1
     // until the next lease and a fw3 reload in that gap let the vendor's
     // DNAT in for good (`portal`); the next session holds both as they are.
-    let dns = old.dns.release(&[resolver_undo()]);
+    let dns = old.dns.withdraw(&[resolver_key()]);
     if std::mem::take(&mut old.routed) {
         uplink_changed();
     }
@@ -1606,8 +1273,8 @@ fn handover(old: &mut Session, channels: &scan::Channels, keep_ipv6: bool, uplin
 /// never roll back (and so remove) the journals that moved.
 fn successor(old: &mut Session, keep_ipv6: bool, journal: &Path) -> Session {
     let mut next = Session::new(journal);
-    next.wireless = std::mem::replace(&mut old.wireless, Transaction::new(journal.join("wireless.json")));
-    next.dns = std::mem::replace(&mut old.dns, Transaction::new(journal.join("dns.json")));
+    next.wireless = Arc::clone(&old.wireless);
+    next.dns = std::mem::replace(&mut old.dns, EffectSet::new("relay", journal.join("dns.json")));
     next.uplink = old.uplink.clone();
     next.ipv6 = if keep_ipv6 {
         std::mem::replace(&mut old.ipv6, ipv6::Upstream::new(next.uplink.clone()))
@@ -1627,8 +1294,8 @@ fn cleanup(s: &mut Session, uplink_changed: impl FnOnce()) -> Result<(), String>
     if let Err(e) = s.uplink.update(|l| l.relay = None) {
         crate::netlog!("[relay] relay tables not narrowed before releasing routes (the journal removes them): {e}");
     }
-    let routes = s.network.rollback();
-    let dns = s.dns.rollback();
+    let routes = s.network.release();
+    let dns = s.dns.release();
     // Rebind the proxy as soon as routes/DNS are released, before hotspot CAC.
     if std::mem::take(&mut s.routed) {
         uplink_changed();
@@ -1644,7 +1311,7 @@ fn cleanup(s: &mut Session, uplink_changed: impl FnOnce()) -> Result<(), String>
         // the journal's link check and restoring the AP channel.
         stop_helper(&mut s.supplicant);
     }
-    let wireless = s.wireless.rollback();
+    let wireless = s.wireless.lock().unwrap().release();
     if wireless.is_ok() {
         s.uplink.forget();
     }
@@ -1658,25 +1325,23 @@ fn cleanup(s: &mut Session, uplink_changed: impl FnOnce()) -> Result<(), String>
 
 /// The `wireless` plan's firewall steps (the upstream INPUT accepts), which
 /// `net_guard` re-checks; its radio steps cannot be re-applied.
-fn firewall_step(cmd: &Cmd) -> bool {
-    matches!(cmd.program.as_str(), "iptables" | "ip6tables")
+fn firewall_resource(resource: &Resource) -> bool {
+    matches!(resource, Resource::LegacyChain(_) | Resource::LegacyHook(_))
 }
 
 /// What must pass the vendor's INPUT rejects from the upstream: established
 /// replies and DHCP offers (IPv6 hooks its own `U60_R6_IN` in here). The
 /// guard's drop is in `uplink`; these chains hold accepts only, so a rule
 /// re-added out of order can neither open nor close anything else.
-fn input_guards() -> Vec<Step> {
-    let mut p = Vec::new();
-    for tool in ["iptables", "ip6tables"] {
-        p.extend(net::chain(tool, "filter", "U60_RELAY_IN"));
-        if tool == "iptables" {
-            p.push(net::rule(tool, "filter", "U60_RELAY_IN", &["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"], false));
-            p.push(net::rule(tool, "filter", "U60_RELAY_IN", &["-p", "udp", "--sport", "67", "--dport", "68", "-j", "ACCEPT"], false));
-        }
-        p.push(net::rule(tool, "filter", "INPUT", &["-i", IFACE, "-j", "U60_RELAY_IN"], true));
-    }
-    p
+pub(crate) fn input_guards() -> Vec<Resource> {
+    vec![Resource::LegacyChain(LegacyChain { tool: LegacyTool::V4, table: "filter".into(), name: "U60_RELAY_IN".into(), rules: vec![
+        words(&["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]),
+        words(&["-p", "udp", "--sport", "67", "--dport", "68", "-j", "ACCEPT"]),
+    ] }), Resource::LegacyHook(LegacyHook { tool: LegacyTool::V4, table: "filter".into(), chain: "INPUT".into(), rule: words(&["-i", IFACE, "-j", "U60_RELAY_IN"]), position: Position::InsertFirst })]
+}
+
+fn words(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).into()).collect()
 }
 
 /// The tables' part for installed routes: the resolver DNS goes to and the
@@ -1687,48 +1352,55 @@ fn relay_layout(l: &Lease, lan: Ipv4Addr, mask: Ipv4Addr) -> uplink::Relay {
 }
 
 /// The `dns` transaction's resolver line (`dns`), which follows the lease.
-fn resolver(l: &Lease) -> Step {
+fn resolver(l: &Lease) -> Resource {
     let dns = l.dns.first().copied().unwrap_or(l.gateway).to_string();
-    Step::new(Cmd::new("@u60-relay-dns", &[&dns]), resolver_undo())
+    Resource::Internal(Internal::new("@u60-relay-dns", vec![dns], vec![]))
 }
 
-fn resolver_undo() -> Cmd {
-    Cmd::new("@u60-relay-dns", &[])
+fn resolver_key() -> Key {
+    Key::Internal("@u60-relay-dns", Cmd::new("@u60-relay-dns", &[]))
 }
 
 /// Addresses, routes, the legacy accepts and MASQUERADE; the policy rule is
 /// last (the caller loads the tables before it). The portal RETURN is not
 /// here: `handover` rolls this plan back, and the RETURN stays with the
 /// switch in `dns` (`portal::web_bypasses`).
-fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) -> Vec<Step> {
+pub(crate) fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) -> Vec<Resource> {
     let address = format!("{}/{prefix}", l.ip);
     let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(l.ip) & u32::from(l.subnet)));
     let lan_net = format!("{}/{}", Ipv4Addr::from(u32::from(lan) & u32::from(mask)), u32::from(mask).count_ones());
-    let gw = l.gateway.to_string();
-    let mut p = vec![net::ip_step("-4", "addr", &[&address, "dev", IFACE])];
-    p.push(net::ip_step("-4", "route", &[&subnet, "dev", IFACE, "scope", "link", "src", &l.ip.to_string(), "table", TABLE]));
+    let mut p = vec![Resource::Addr(Addr { family: Family::V4, device: IFACE.into(), address, broadcast: None, valid_lft: None, preferred_lft: None, noprefixroute: false })];
+    let mut connected = Route::new(Family::V4, RouteType::Unicast, &subnet, TABLE);
+    connected.device = Some(IFACE.into());
+    connected.scope = Some("link".into());
+    connected.source = Some(l.ip.to_string());
+    p.push(Resource::Route(connected));
     // Other RFC1918 subnets can host the hotel's portal/DNS. Only our own
     // management/tailnet/link-local routes fall through to the main tables.
     for dest in crate::netfx::ids::LOCAL_ROUTES_V4.iter().copied().chain([lan_net.as_str()]) {
         if dest != subnet {
-            p.push(net::ip_step("-4", "route", &["throw", dest, "table", TABLE]));
+            p.push(Resource::Route(Route::new(Family::V4, RouteType::Throw, dest, TABLE)));
         }
     }
-    p.push(net::ip_step("-4", "route", &["default", "via", &gw, "dev", IFACE, "table", TABLE]));
+    let mut default = Route::new(Family::V4, RouteType::Unicast, "default", TABLE);
+    default.gateway = Some(l.gateway.to_string());
+    default.device = Some(IFACE.into());
+    p.push(Resource::Route(default));
     // Through the vendor's FORWARD rejects; `uplink` drops the rest first.
-    p.extend(net::chain("iptables", "filter", "U60_RELAY_FWD"));
-    p.push(net::rule("iptables", "filter", "U60_RELAY_FWD", &["-i", "br-lan", "-o", IFACE, "-j", "ACCEPT"], false));
-    p.push(net::rule("iptables", "filter", "U60_RELAY_FWD", &["-i", IFACE, "-o", "br-lan", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"], false));
-    p.push(net::rule("iptables", "filter", "FORWARD", &["-j", "U60_RELAY_FWD"], true));
+    p.push(Resource::LegacyChain(LegacyChain { tool: LegacyTool::V4, table: "filter".into(), name: "U60_RELAY_FWD".into(), rules: vec![
+        words(&["-i", "br-lan", "-o", IFACE, "-j", "ACCEPT"]),
+        words(&["-i", IFACE, "-o", "br-lan", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]),
+    ] }));
+    p.push(Resource::LegacyHook(LegacyHook { tool: LegacyTool::V4, table: "filter".into(), chain: "FORWARD".into(), rule: words(&["-j", "U60_RELAY_FWD"]), position: Position::InsertFirst }));
     // Core/router UDP sockets may retain a previously selected SIM source.
     // Translate only our owned Wi-Fi egress, not cellular or local traffic
     // (it stays in legacy until an nft MASQUERADE is shown to keep hardware
     // forwarding, D11). It also covers router DNS that `uplink` redirects
     // from a socket bound to a SIM source. Its comment is its identity
     // (`owned_rule`): the station's name is one the vendor's files list.
-    p.push(net::rule("iptables", "nat", "POSTROUTING", &["-o", IFACE, "-m", "comment", "--comment", crate::netfx::ids::RELAY_COMMENT, "-j", "MASQUERADE"], true));
+    p.push(Resource::LegacyHook(LegacyHook { tool: LegacyTool::V4, table: "nat".into(), chain: "POSTROUTING".into(), rule: words(&["-o", IFACE, "-m", "comment", "--comment", crate::netfx::ids::RELAY_COMMENT, "-j", "MASQUERADE"]), position: Position::InsertFirst }));
     // Installed last: no downstream traffic switches until NAT/guards exist.
-    p.push(net::ip_step("-4", "rule", &["pref", PREF, "lookup", TABLE]));
+    p.push(Resource::Rule(Rule { family: Family::V4, priority: PREF.parse().unwrap(), table: TABLE.into(), mark: None }));
     p
 }
 
@@ -1977,7 +1649,7 @@ pub fn change(state: &crate::handlers::AppState, action: &str, body: &[u8]) -> (
     let result = match action {
         "scan" => state.wifi_relay.scan(),
         "disconnect" => state.wifi_relay.disconnect(),
-        "clock" => state.wifi_relay.recheck_clock_with(crate::network_clock::recheck_wifi),
+        "clock" => state.wifi_relay.recheck_clock(),
         "power-save" => serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|v| v["auto_off"].as_bool())
@@ -2007,11 +1679,12 @@ fn change_error(relay: &WifiRelay, error: String) -> (u16, Value) {
 mod tests {
     use super::*;
 
-    fn restore_fixture(name: &str) -> (WifiRelay, std::path::PathBuf, Network) {
-        let root = std::env::temp_dir().join(format!("u60-restore-{name}-{}", std::process::id()));
-        let network = Network { id: "restore-test".into(), ssid: "Restore test".into(), frequency: 2412, signal: -40, security: "open", supported: true, bssid: "02:00:00:00:00:01".into() };
-        resume::save(&root, &network, true).unwrap();
-        (WifiRelay::new(Arc::new(Mutex::new(()))), root, network)
+    fn relay_plan(lease: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) -> Vec<Step> {
+        crate::netfx::effect::test_plan(super::relay_plan(lease, prefix, lan, mask))
+    }
+
+    fn input_guards() -> Vec<Step> {
+        crate::netfx::effect::test_plan(super::input_guards())
     }
 
     #[test]
@@ -2040,59 +1713,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_cancel_is_immediate_and_stale_results_cannot_overwrite_owner_state() {
-        let (relay, root, network) = restore_fixture("cancel");
-        let (target, generation) = relay.begin_restore(&root).unwrap();
-        assert_eq!(relay.snapshot.lock().unwrap()["restoring"], network.ssid);
-        relay.cancel_restore();
-        assert!(relay.snapshot.lock().unwrap()["restoring"].is_null());
-        assert!(!relay.wait_restore(generation, Duration::from_secs(300)));
-        // Even if clearing persistent intent fails, this process must stop.
-        assert!(resume::load(&root).is_some());
-        assert_eq!(relay.check_restore(&root, &target, generation).unwrap_err(), RESTORE_CANCELLED);
-        assert!(relay.begin_restore(&root).is_none());
-        // Both production entry points reject old work before touching tools.
-        assert_eq!(relay.scan_for_restore(Some((&target, generation))).unwrap_err(), RESTORE_CANCELLED);
-        assert_eq!(relay.join(&network.id, "", true, Origin::Restore(&target, generation)).unwrap_err(), RESTORE_CANCELLED);
-        relay.inner.lock().unwrap().error = Some("New owner operation".into());
-        relay.finish_restore(generation, Some("Stale restore failure".into()));
-        assert_eq!(relay.inner.lock().unwrap().error.as_deref(), Some("New owner operation"));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn restore_wait_is_woken_by_cancel_instead_of_waiting_five_minutes() {
-        let (relay, root, _) = restore_fixture("wake");
-        let (_, generation) = relay.begin_restore(&root).unwrap();
-        let relay = Arc::new(relay);
-        let (send, receive) = std::sync::mpsc::channel();
-        let waiting = Arc::clone(&relay);
-        let thread = std::thread::spawn(move || {
-            send.send(waiting.wait_restore(generation, Duration::from_secs(300))).unwrap();
-        });
-        relay.cancel_restore();
-        assert!(!receive.recv_timeout(Duration::from_secs(2)).unwrap());
-        thread.join().unwrap();
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn restore_rechecks_changed_target_and_same_target_owner_replacement() {
-        let (relay, root, mut network) = restore_fixture("target");
-        let (target, generation) = relay.begin_restore(&root).unwrap();
-        assert!(relay.check_restore(&root, &target, generation).is_ok());
-        network.ssid = "Another choice".into();
-        resume::save(&root, &network, true).unwrap();
-        assert_eq!(relay.check_restore(&root, &target, generation).unwrap_err(), RESTORE_CANCELLED);
-        network.ssid = target.ssid.clone();
-        relay.cancel_restore();
-        resume::save(&root, &network, true).unwrap();
-        assert_eq!(resume::load(&root), Some(target.clone()));
-        assert_eq!(relay.check_restore(&root, &target, generation).unwrap_err(), RESTORE_CANCELLED);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn restore_intent_io_failures_are_explicit_and_do_not_masquerade_as_cancellation() {
         let root = std::env::temp_dir().join(format!("u60-restore-io-{}", std::process::id()));
         fs::create_dir_all(root.join("resume.json")).unwrap();
@@ -2100,20 +1720,17 @@ mod tests {
         let network = Network { id: "write-fails".into(), ssid: "Restore test".into(), frequency: 2412, signal: -40, security: "open", supported: true, bssid: "02:00:00:00:00:01".into() };
         assert_eq!(resume::save(&root, &network, true).unwrap_err(), "Cannot save the relay to restore after a restart");
         let relay = WifiRelay::new(Arc::new(Mutex::new(())));
-        relay.cancel_restore();
-        assert!(relay.begin_restore(&root).is_none());
+        let generation = relay.shared.cancel_restore();
+        assert!(!relay.shared.generation_matches(generation - 1));
         fs::remove_dir_all(root).unwrap();
     }
 
-
     #[test]
     fn the_upstream_input_guard_is_rechecked_but_radio_steps_are_not() {
-        let guard = input_guards();
-        assert!(guard.iter().all(|s| firewall_step(&s.apply) && s.apply.checkable()), "every guard step can be re-applied");
-        assert!(guard.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["-N", "U60_RELAY_IN"])));
-        for radio in [roam_step("0"), association_step()] {
-            assert!(!firewall_step(&radio.apply));
-        }
+        let guard = super::input_guards();
+        assert!(guard.iter().all(firewall_resource));
+        assert!(matches!(&guard[0], Resource::LegacyChain(chain) if chain.name == "U60_RELAY_IN" && chain.tool == LegacyTool::V4));
+        assert_eq!(guard.len(), 2);
     }
 
     #[test]
@@ -2166,7 +1783,7 @@ mod tests {
         let relay = WifiRelay::new(Arc::new(Mutex::new(())));
         let error = "Cannot verify UTC over Wi-Fi HTTPS; check upstream/portal access";
         assert!(clock.sync_with(false, |_| Err(error.into())).is_err());
-        *relay.snapshot.lock().unwrap() = json!({
+        relay.shared.snapshot.lock().unwrap().value = json!({
             "connected":true,"ssid":"W","address":"192.168.2.124",
             "clock_error":clock.error(),"error":"Unrelated DNS warning"
         });
@@ -2181,39 +1798,8 @@ mod tests {
 
         assert!(clock.sync_with(false, |_| Err("Clock sources disagree".into())).is_err());
         assert_eq!(relay.status_with_clock(&clock)["clock_error"], "Clock sources disagree");
-        relay.snapshot.lock().unwrap()["connected"] = json!(false);
+        relay.shared.snapshot.lock().unwrap().value["connected"] = json!(false);
         assert!(relay.status_with_clock(&clock)["clock_error"].is_null(), "No stale warning while relay is off");
-    }
-
-    #[test]
-    fn clock_recheck_requires_a_stable_connected_relay_without_restarting_it() {
-        let clock = crate::network_clock::WifiClock::new();
-        let relay = WifiRelay::new(Arc::new(Mutex::new(())));
-        assert_eq!(relay.recheck_clock_with(|| panic!("Must not probe while disconnected")).unwrap_err(), "Connect Wi-Fi relay before checking time");
-        {
-            let mut inner = relay.inner.lock().unwrap();
-            let mut session = Session::new(Path::new(JOURNAL));
-            session.selected = Some(Network { id: "clock-test".into(), ssid: "W".into(), frequency: 2412, signal: -40, security: "open", supported: true, bssid: "02:00:00:00:00:01".into() });
-            session.lease = Some(lease_with(&[]));
-            inner.session = Some(session);
-        }
-        relay.settle();
-        let before = relay.snapshot.lock().unwrap().clone();
-        let network = relay.op.lock().unwrap();
-        assert!(relay.recheck_clock_with(|| panic!("Must not race a network operation")).unwrap_err().contains("network operation"));
-        drop(network);
-        for result in [Err("Upstream unavailable".to_owned()), Ok(())] {
-            assert_eq!(relay.recheck_clock_with(|| {
-                assert!(relay.op.try_lock().is_err(), "Keep the current uplink stable");
-                assert!(relay.inner.try_lock().is_ok(), "Do not hold relay state during HTTPS");
-                clock.sync_with(true, |_| {
-                    assert_eq!(relay.status_with_clock(&clock)["ssid"], "W", "Status reads stay responsive");
-                    result.clone()
-                })
-            }), result);
-            assert_eq!(*relay.snapshot.lock().unwrap(), before, "No reconnect, cleanup or route changes");
-            assert_eq!(relay.status_with_clock(&clock)["clock_error"], json!(result.err()));
-        }
     }
 
     #[test]
@@ -2245,22 +1831,6 @@ mod tests {
             .enumerate()
             .map(|(id, (bssid, freq, level, age, flags, ssid))| format!("id={id}\nbssid={bssid}\nfreq={freq}\nlevel={level}\nage={age}\nflags={flags}\nssid={ssid}\n====\n"))
             .collect()
-    }
-
-    #[test]
-    fn invalid_owner_connect_preserves_the_current_recovery_generation() {
-        let relay = WifiRelay::new(Arc::new(Mutex::new(())));
-        {
-            let mut i = relay.inner.lock().unwrap();
-            relay.restore.lock().unwrap().restoring = Some("Working network".into());
-            i.scans = parse_bss(&bss(&[("02:11:22:33:44:55", 5260, -49, 0, "[WPA2-PSK-CCMP][ESS]", "W_Game")]), 0);
-        }
-        assert!(relay.connect_remembered("unknown", "", true, true, false).is_err());
-        let id = relay.inner.lock().unwrap().scans[0].id.clone();
-        assert!(relay.connect_remembered(&id, "short", true, true, false).is_err());
-        let restore = relay.restore.lock().unwrap();
-        assert_eq!(restore.restore_generation, 0);
-        assert_eq!(restore.restoring.as_deref(), Some("Working network"));
     }
 
     #[test]
@@ -2424,9 +1994,9 @@ mod tests {
 
     #[test]
     fn relay_web_traffic_bypasses_vendor_offline_redirect_without_bypassing_filtering() {
-        let p = portal::web_bypasses();
+        let p = crate::netfx::effect::test_plan(portal::web_bypasses());
         for tool in ["iptables", "ip6tables"] {
-            let rule = p.iter().find(|s| s.apply.program == "@u60-relay-portal-return" && s.apply.args == [tool]).expect("missing vendor offline-portal bypass");
+            let rule = p.iter().find(|step| step.apply.program == tool).expect("missing vendor offline-portal bypass");
             assert_eq!(rule.undo.program, tool);
             assert_eq!(&rule.undo.args[..6], &["-w", "2", "-t", "nat", "-D", "redirect_chain"]);
             assert_eq!(&rule.undo.args[6..], &["-i", "br-lan", "-m", "comment", "--comment", "zte-agent-wifi-relay", "-j", "RETURN"]);
@@ -2446,11 +2016,11 @@ mod tests {
         let l = Lease { ip: "10.0.0.2".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.0.0.1".parse().unwrap(), dns: vec!["10.0.0.53".parse().unwrap()] };
         let plan = relay_plan(&l, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
         assert!(!plan.iter().any(|s| s.apply.program.starts_with("@u60-relay-portal") || s.undo.args.iter().any(|a| a == "redirect_chain")));
-        let switch = Step::new(Cmd::new("@u60-relay-portal", &["disable"]), Cmd::new("@u60-relay-portal", &["release"]));
+        let switch = Resource::Internal(Internal::new("@u60-relay-portal", vec!["disable".into()], vec!["release".into()]));
         let mut held = portal::web_bypasses();
         held.push(switch);
-        assert_eq!((resolver(&l).apply, resolver(&l).undo), (Cmd::new("@u60-relay-dns", &["10.0.0.53"]), resolver_undo()));
-        assert!(!held.iter().any(|s| s.undo == resolver_undo()), "the handover's release takes none of it");
+        assert_eq!(resolver(&l).command().unwrap(), Cmd::new("@u60-relay-dns", &["10.0.0.53"]));
+        assert!(!held.iter().any(|resource| resource.key() == resolver_key()), "the handover's release takes none of it");
         // The old session as `handover` leaves it before `successor`.
         let dir = std::env::temp_dir().join(format!("u60-relay-successor-{}", std::process::id()));
         let mut old = Session::new(&dir);
@@ -2462,12 +2032,9 @@ mod tests {
         }
         // The next session's guard puts the RETURN back ahead of a DNAT a
         // reload left (a reload while the switch reads 0 adds none).
-        let dnat = "-A redirect_chain ! -d 192.168.0.1/32 -p tcp -m tcp --dport 80 -m limit --limit 20/sec --limit-burst 40 -j DNAT --to-destination 192.168.0.1";
-        let ours = "-A redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN";
-        let mut device = net::bench::Bench::router();
-        device.list(Cmd::new("iptables", &["-w", "2", "-t", "nat", "-S"]), Ok(net::bench::router("iptables", "nat").replace(ours, &format!("{dnat}\n{ours}"))));
-        let result = next.dns.reconcile_with(|_| true, &mut device);
-        assert_eq!(device.applied, [portal::web_bypass("iptables").apply]);
+        let mut device = crate::netfx::effect::testing::Kernel::portal_late();
+        let result = next.dns.reconcile_with(&mut device, &mut crate::netfx::effect::fake::FakeNft::default());
+        assert_eq!(device.writes.len(), 1);
         assert!(result.restored.len() == 1 && result.failed.is_empty(), "{result:?}");
         let _ = fs::remove_dir_all(dir);
     }
@@ -2510,19 +2077,7 @@ mod tests {
             "192.168.0.1".parse().unwrap(),
             "255.255.255.0".parse().unwrap(),
         );
-        assert!(
-            net::foreign_identity(&plan).is_empty(),
-            "{:?}",
-            net::foreign_identity(&plan)
-        );
-        assert!(net::foreign_identity(&input_guards()).is_empty());
-    }
-
-    #[test]
-    fn status_reads_do_not_wait_for_ipv6_network_effects() {
-        let relay = WifiRelay::new(Arc::new(Mutex::new(())));
-        let _network_work = relay.inner.lock().unwrap();
-        assert_eq!(relay.status()["connected"], false);
+        assert!(plan.iter().chain(&input_guards()).filter(|step| step.undo.program.ends_with("tables") && step.undo.args.contains(&"-D".into())).all(|step| crate::netfx::effect::legacy::owned_rule(&step.undo.args)));
     }
 
     #[test]
@@ -2672,192 +2227,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn admission_and_cancellation_do_not_wait_for_the_tick_state_lock() {
-        let relay = Arc::new(WifiRelay::new(Arc::new(Mutex::new(()))));
-        let tick = relay.inner.lock().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
-        let waiting = Arc::clone(&relay);
-        let worker = std::thread::spawn(move || {
-            let active = waiting.active();
-            let owns = waiting.owns_network();
-            waiting.cancel_restore();
-            send.send((active, owns)).unwrap();
-        });
-        let result = receive.recv_timeout(Duration::from_millis(200));
-        drop(tick);
-        worker.join().unwrap();
-        assert!(!result.unwrap().0);
-    }
-
-    #[test]
-    fn published_phases_do_not_report_journals_as_failed_recovery_during_work() {
-        let relay = WifiRelay::new(Arc::new(Mutex::new(())));
-        let root = std::env::temp_dir().join(format!("u60-relay-phases-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("wireless.json"), b"retained journal").unwrap();
-        let mut inner = relay.inner.lock().unwrap();
-        for phase in [Phase::Scanning, Phase::Connecting, Phase::Active, Phase::Recovering, Phase::Disconnecting] {
-            inner.phase = phase;
-            relay.publish_at(&inner, &root);
-            let status = relay.status();
-            assert_eq!(status["phase"], json!(phase));
-            assert_eq!(status["recovery_required"], false, "{phase:?}");
-        }
-        for phase in [Phase::Idle, Phase::RecoveryPending] {
-            inner.phase = phase;
-            relay.publish_at(&inner, &root);
-            assert_eq!(relay.status()["recovery_required"], true);
-        }
-        fs::remove_file(root.join("wireless.json")).unwrap();
-        power_save::save(&root, false).unwrap();
-        assert_eq!(relay.status()["recovery_required"], true, "GET does not re-read journals");
-        assert_eq!(relay.status()["power_save"]["auto_off"], true, "GET does not re-read settings");
-        relay.publish_at(&inner, &root);
-        assert_eq!(relay.status()["recovery_required"], false);
-        assert_eq!(relay.status()["power_save"]["auto_off"], false);
-        let status = relay.status();
-        for removed in ["experimental", "cellular_fallback", "internet"] {
-            assert!(status.get(removed).is_none(), "unused field {removed}");
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn every_owner_request_stops_waiting_for_an_operation_and_reports_its_phase() {
-        let state = crate::handlers::AppState::new();
-        state.wifi_relay.set_phase(Phase::Disconnecting);
-        state.wifi_relay.inner.lock().unwrap().scans.push(Network { id: "open".into(), ssid: "Open".into(), security: "open", bssid: "02:00:00:00:00:01".into(), frequency: 5180, supported: true, signal: -40 });
-        let operation = state.wifi_relay.op.lock().unwrap();
-        for (action, body) in [
-            ("scan", json!({})),
-            ("connect", json!({"network":"open","confirmed":true})),
-            ("power-save", json!({"auto_off":true})),
-            ("offload", json!({"enabled":true})),
-            ("forget", json!({"id":"unavailable"})),
-            ("clock", json!({})),
-        ] {
-            let started = Instant::now();
-            let (code, reply) = change(&state, action, &serde_json::to_vec(&body).unwrap());
-            assert_eq!(code, 409, "{action}: {reply}");
-            assert_eq!(reply["phase"], "disconnecting", "{action}");
-            assert!(reply["error"].as_str().unwrap().contains("in progress"), "{action}");
-            assert!(started.elapsed() >= crate::netfx::admission::WAIT, "{action}: waited for short work");
-            assert!(started.elapsed() < Duration::from_secs(1), "{action}: bounded wait");
-        }
-        drop(operation);
-    }
-
-    /// The tick holds `inner` over its device calls. A connect checks its
-    /// selection there before anything else: that wait is bounded too, and
-    /// a request that gave up there has cancelled nothing.
-    #[test]
-    fn a_connect_gives_up_on_the_tick_within_the_same_wait_and_cancels_nothing() {
-        let state = crate::handlers::AppState::new();
-        state.wifi_relay.inner.lock().unwrap().scans.push(Network { id: "open".into(), ssid: "Open".into(), security: "open", bssid: "02:00:00:00:00:01".into(), frequency: 5180, supported: true, signal: -40 });
-        let generation = state.wifi_relay.restore.lock().unwrap().restore_generation;
-        let tick = state.wifi_relay.inner.lock().unwrap();
-        let started = Instant::now();
-        let (code, reply) = change(&state, "connect", &serde_json::to_vec(&json!({"network":"open","confirmed":true})).unwrap());
-        assert_eq!(code, 409, "{reply}");
-        assert!(reply["error"].as_str().unwrap().contains("in progress"), "{reply}");
-        assert!(started.elapsed() >= crate::netfx::admission::WAIT && started.elapsed() < Duration::from_secs(1));
-        assert_eq!(state.wifi_relay.restore.lock().unwrap().restore_generation, generation, "no restore was cancelled");
-        drop(tick);
-    }
-
-    #[test]
-    fn disconnect_returns_immediately_during_teardown_and_invalidates_late_success() {
-        let relay = Arc::new(WifiRelay::new(Arc::new(Mutex::new(()))));
-        relay.set_phase(Phase::Disconnecting);
-        let generation = relay.cancel_restore();
-        let operation = relay.op.lock().unwrap();
-        let tick = relay.inner.lock().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
-        let stopping = Arc::clone(&relay);
-        let worker = std::thread::spawn(move || send.send(stopping.disconnect()).unwrap());
-        let result = receive.recv_timeout(Duration::from_millis(200));
-        drop(tick);
-        drop(operation);
-        worker.join().unwrap();
-        assert!(result.unwrap().is_ok());
-        assert!(!relay.generation_matches(generation), "late successes cannot commit");
-        assert!(relay.restore.lock().unwrap().disconnect, "the current holder finishes teardown");
-        assert_eq!(relay.status()["phase"], "disconnecting");
-        assert_eq!(relay.status()["recovery_required"], false);
-    }
-
-    #[tokio::test]
-    async fn four_disconnects_cannot_fill_the_general_lane_behind_teardown() {
-        use crate::httpd::gate::{Gate, Lane};
-        use crate::server::{lane, route, Method};
-        let state = Arc::new(crate::handlers::AppState::new());
-        state.wifi_relay.set_phase(Phase::Disconnecting);
-        let gate = Arc::new(Gate::new(4, 2, Duration::from_millis(200)));
-        let operation = state.wifi_relay.op.lock().unwrap();
-        let mut requests = Vec::new();
-        for _ in 0..4 {
-            let gate = Arc::clone(&gate);
-            let state = Arc::clone(&state);
-            requests.push(tokio::spawn(async move {
-                gate.run(lane(Method::Post, "/api/wifi-relay/disconnect"), move || route(&Method::Post, "/api/wifi-relay/disconnect", &state, b"{}")).await
-            }));
-        }
-        let finished = tokio::time::timeout(Duration::from_secs(1), async {
-            for request in requests { assert_eq!(request.await.unwrap().unwrap().0, 200); }
-            let state = Arc::clone(&state);
-            assert_eq!(gate.run(Lane::General, move || route(&Method::Get, "/api/wifi-relay/status", &state, b"")).await.unwrap().0, 200);
-        }).await;
-        drop(operation);
-        assert!(finished.is_ok(), "General requests complete while teardown still owns op");
-        assert_eq!(gate.available(Lane::General), 4);
-    }
-
-    #[test]
-    fn status_reads_only_memory_while_tick_and_conntrack_reset_are_locked() {
-        let relay = Arc::new(WifiRelay::new(Arc::new(Mutex::new(()))));
-        let tick = relay.inner.lock().unwrap();
-        let operation = relay.op.lock().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
-        let reading = Arc::clone(&relay);
-        let mut result = None;
-        let mut worker = None;
-        crate::netfx::conntrack::while_reset_locked(|| {
-            worker = Some(std::thread::spawn(move || send.send(reading.status()).unwrap()));
-            result = Some(receive.recv_timeout(Duration::from_millis(200)));
-        });
-        drop(tick);
-        drop(operation);
-        worker.unwrap().join().unwrap();
-        assert_eq!(result.unwrap().unwrap()["connected"], false);
-    }
-
-    #[test]
-    fn an_operation_publishes_its_phase_until_the_holder_finishes() {
-        let relay = WifiRelay::new(Arc::new(Mutex::new(())));
-        for phase in [Phase::Scanning, Phase::Connecting, Phase::Recovering, Phase::Disconnecting] {
-            let operation = relay.operation(Some(phase)).unwrap();
-            assert_eq!(relay.status()["phase"], json!(phase));
-            assert_eq!(relay.status()["recovery_required"], false);
-            assert!(relay.op.try_lock().is_err());
-            drop(operation);
-            assert!(matches!(relay.status()["phase"].as_str(), Some("idle" | "recovery_pending")));
-        }
-    }
-
-    #[test]
-    fn the_holder_completes_a_busy_disconnect_before_releasing_the_operation() {
-        let relay = WifiRelay::new(Arc::new(Mutex::new(())));
-        let root = std::env::temp_dir().join(format!("u60-relay-deferred-stop-{}", std::process::id()));
-        relay.inner.lock().unwrap().session = Some(Session::new(&root));
-        let operation = relay.operation(Some(Phase::Scanning)).unwrap();
-        relay.disconnect().unwrap();
-        assert!(relay.restore.lock().unwrap().disconnect);
-        assert!(relay.inner.lock().unwrap().session.is_some());
-        drop(operation);
-        assert!(!relay.restore.lock().unwrap().disconnect);
-        assert!(relay.inner.lock().unwrap().session.is_none());
-        assert!(relay.op.try_lock().is_ok());
-        assert!(!relay.active());
-    }
 }

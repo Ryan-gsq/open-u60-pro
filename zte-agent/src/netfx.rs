@@ -43,8 +43,8 @@ mod tests {
 
 /// I1 (`relay-mihomo-architecture.md` section 4): the relay and Mihomo
     /// write legacy iptables, nftables, addresses, routes, policy rules, kernel
-/// settings and conntrack only through journaled `Transaction` steps and
-/// `netfx` (owned tables, conntrack). A source scan of their non-test code,
+/// settings and conntrack through EffectSet resources, journaled relay
+/// EffectSet steps and netfx. A source scan of their non-test code,
 /// run with every `cargo test`: a direct write fails it. Reads are not
 /// writes. WireGuard and TTL keep their own legacy chains (`ids`) and are
 /// not scanned.
@@ -63,7 +63,6 @@ mod boundary {
         ("wifi_relay/ipv6.rs", "refresh_path", "ip -6 addr change", "refresh only the lifetimes of upstream addresses already held by the IPv6 journal"),
         ("wifi_relay/ipv6.rs", "lan_route", "ip -6 route {action}", "this command factory feeds journaled steps and refreshes their existing finite lifetimes"),
         ("wifi_relay/ipv6.rs", "default_route", "ip -6 route {action}", "this command factory feeds journaled steps and refreshes their existing finite lifetimes"),
-        ("wifi_relay/ipv6.rs", "address_step", "ip -6 addr del", "replace the undo on the Step returned by this address-step factory"),
         ("wifi_relay/offload/neighbours.rs", "retire_steps", "ip -4 neigh replace", "move each non-gateway MAC to a spare IPv4 address and back so IPACM drops its uplink-stealing WAN rule"),
         ("wifi_relay/offload/neighbours.rs", "retire_steps", "ip -4 neigh del", "remove that spare neighbour after IPACM drops the non-gateway MAC's uplink-stealing WAN rule"),
         ("wifi_relay/offload/clients.rs", "stale", "ip -4 neigh change", "set an existing LAN neighbour STALE after association so IPACM restores the band-switched client's LAN route"),
@@ -426,7 +425,7 @@ mod boundary {
                     continue;
                 }
                 let line = text[..scan.tokens[at].at].bytes().filter(|byte| *byte == b'\n').count() + 1;
-                found.push(format!("{file}:{line} ({function}): {command}; use an owner's Transaction Step or netfx effect; intentional exceptions need a function + command and a reason in netfx::boundary::ALLOWED"));
+                found.push(format!("{file}:{line} ({function}): {command}; use an owner's EffectSet resource/step; intentional exceptions need a function + command and a reason in netfx::boundary::ALLOWED"));
             }
         }
         found
@@ -524,7 +523,7 @@ mod boundary {
             let found = violations("case.rs", &source);
             assert_eq!(found.len(), 1, "{source}: {found:?}");
             assert!(found[0].contains("case.rs:2 (f):"), "{found:?}");
-            assert!(found[0].contains(tool) && found[0].contains("Transaction Step"), "{found:?}");
+            assert!(found[0].contains(tool) && found[0].contains("EffectSet resource/step"), "{found:?}");
             assert!(violations("case.rs", &format!("// {source}").replace('\n', "\n// ")).is_empty());
             assert!(violations("case.rs", &format!("/* {source} */")).is_empty());
             assert!(violations("case.rs", &format!("const SOURCE: &str = {source:?};")).is_empty());
@@ -558,6 +557,19 @@ mod boundary {
         ] {
             assert_eq!(violations("case.rs", source).len(), 1, "{source}");
         }
+    }
+
+    #[test]
+    fn effect_sets_accept_descriptions_and_journaled_steps_but_never_direct_execution() {
+        let source = r#"fn f() {
+            effects.declare(vec![Resource::Route(Route::new(Family::V4, RouteType::Local, "default", "60625"))]);
+            effects.step(Step::new(Cmd::new("ip", &["link", "set", "x", "up"]), Cmd::new("ip", &["link", "del", "x"])));
+        }"#;
+        assert!(violations("case.rs", source).is_empty());
+        let rejected = violations("case.rs", &source.replace("&[\"link\", \"set\", \"x\", \"up\"])", "&[\"link\", \"set\", \"x\", \"up\"]).run()"));
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].contains("EffectSet resource/step"));
+        assert_eq!(ALLOWED.len(), 10);
     }
 
     #[test]

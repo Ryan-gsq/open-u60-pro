@@ -20,11 +20,10 @@
 //! check reads both families once (`Nft::list_both`; on the router one
 //! `nft -t list ruleset`), for the marker and the rule counts alike.
 //!
-//! Routes, rules, sysctls and internal steps stay in the owner's
-//! `Transaction`, journaled before they apply. The tables' undo is one
-//! internal step, `@u60-mihomo-nft remove`, which every agent version since
-//! the TPROXY release runs, so a journal stays undoable by the agent an
-//! update may roll back to.
+//! EffectSet journals typed resources before applying them and keeps their
+//! desired state for reconcile for both relay and Mihomo.
+//! NftTables implements a set's NftTable resource and the relay's tables.
+//! Journal undos retain the previous build's command vocabulary.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -33,6 +32,16 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::net_tools::{self as net, Cmd};
+
+pub(crate) mod internal;
+pub(crate) mod legacy;
+mod resources;
+mod set;
+pub(crate) mod shared;
+pub use resources::*;
+pub use set::EffectSet;
+#[cfg(test)]
+pub(crate) use set::tests as testing;
 
 pub const FAMILIES: [&str; 2] = ["ip", "ip6"];
 /// The unhooked chain holding the generation marker.
@@ -87,7 +96,6 @@ pub trait Nft {
     fn list_both(&mut self, name: &str) -> Result<[Option<String>; 2], String> {
         Ok([self.list(FAMILIES[0], name)?, self.list(FAMILIES[1], name)?])
     }
-    #[cfg_attr(not(test), allow(dead_code))]
     fn delete(&mut self, family: &str, name: &str) -> Result<(), String>;
 }
 
@@ -95,6 +103,7 @@ pub struct Device;
 
 impl Nft for Device {
     fn load(&mut self, file: &std::path::Path) -> Result<(), String> {
+        shared::changed();
         let mut command = std::process::Command::new("nft");
         command.arg("-f").arg(file);
         super::exec::run(command, LOAD).map(|_| ())
@@ -116,11 +125,12 @@ impl Nft for Device {
     /// agent's tables). A failing tool fails the whole read, so it is never
     /// taken for a missing table.
     fn list_both(&mut self, name: &str) -> Result<[Option<String>; 2], String> {
-        let ruleset = Cmd::new("nft", &["-t", "list", "ruleset"]).run()?;
+        let ruleset = shared::nft_ruleset(|| Cmd::new("nft", &["-t", "list", "ruleset"]).run())?;
         Ok(FAMILIES.map(|family| table_in(&ruleset, family, name)))
     }
 
     fn delete(&mut self, family: &str, name: &str) -> Result<(), String> {
+        shared::changed();
         Cmd::new("nft", &["delete", "table", family, name]).run().map(|_| ())
     }
 }
@@ -164,6 +174,23 @@ pub struct NftTables {
 }
 
 impl NftTables {
+    pub fn adopt(&mut self, families: [String; 2], nft: &mut (impl Nft + ?Sized)) -> Result<u64, String> {
+        let listings = nft.list_both(self.name)?;
+        if let Some(marker) = self.marker(&listings) {
+            if let Some(number) = marker.strip_prefix(&self.marker_prefix()).and_then(|rest| rest.split_whitespace().next()).and_then(|number| number.parse::<u64>().ok()) {
+                let (expected, text) = batch(self.owner, self.name, number, families.clone())?;
+                if marker == expected && holds_rules(&text, &listings) {
+                    self.generation = number;
+                    self.target = Some(Generation { number, marker, text, digest: Sha256::digest(families.concat()).into() });
+                    self.confirmed = Some(number);
+                    self.error = None;
+                    return Ok(number);
+                }
+            }
+        }
+        self.declare(families, nft)
+    }
+
     pub fn new(owner: &'static str, name: &'static str, file: PathBuf) -> Self {
         Self { owner, name, file, generation: 0, target: None, confirmed: None, error: None }
     }
@@ -255,7 +282,7 @@ impl NftTables {
     /// `Ok(true)` when it loaded.
     pub fn reconcile(&mut self, nft: &mut (impl Nft + ?Sized)) -> Result<bool, String> {
         let Some(target) = self.target.clone() else { return Ok(false) };
-        if self.confirmed == Some(target.number) && self.intact(&target, &nft.list_both(self.name)?) {
+        if self.confirmed == Some(target.number) && self.intact(&target, &nft.list_both(self.name).map_err(|error| format!("not checked: {error}"))?) {
             return Ok(false);
         }
         self.load(nft).map(|_| true)
@@ -266,7 +293,7 @@ impl NftTables {
         self.target.as_ref().is_some_and(|t| self.confirmed == Some(t.number))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -372,6 +399,25 @@ pub mod fake {
 mod tests {
     use super::fake::FakeNft;
     use super::*;
+
+    #[test]
+    fn a_set_journals_the_whole_batch_before_the_first_effect() {
+        let directory = std::env::temp_dir().join(format!("u60-effect-first-{}", std::process::id()));
+        let path = directory.join("journal.json");
+        let mut set = EffectSet::new("test", path.clone());
+        let resources = vec![
+            Resource::Internal(Internal::new("@u60-mihomo-nft", vec!["invalid".into()], vec!["remove".into()])),
+            Resource::Internal(Internal::new("@u60-relay-nft", vec!["invalid".into()], vec!["remove".into()])),
+        ];
+        let error = set.declare(resources).unwrap_err();
+        assert!(error.contains("Invalid Mihomo"), "{error}");
+        let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(journal["undo"], json!([
+            {"program": "@u60-mihomo-nft", "args": ["remove"]},
+            {"program": "@u60-relay-nft", "args": ["remove"]}
+        ]));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn tables(test: &str) -> NftTables {
         let dir = std::env::temp_dir().join(format!("u60-effect-{test}-{}", std::process::id()));

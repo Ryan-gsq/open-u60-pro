@@ -118,7 +118,7 @@ SHA-256 为 `95385816…5c11c0`（4,129,835 字节，2026-11-10 只读查询）�
 
 ### 2. main 表默认路由（中继连接时加，断开时删）
 
-只有配置状态是 `listed`、运行时开关开着、固件指纹相符时才加，并纳入中继的 network Transaction：
+只有配置状态是 `listed`、运行时开关开着、固件指纹相符时才加，路由归中继会话的 `network` set（`EffectSet`）。
 
 ```text
 ip -4 route add unreachable 100.64.0.0/10  metric 60631 table main
@@ -167,7 +167,7 @@ agent 恢复中继后、厂商处于硬件模式时 205 MB 只有 155 个包走�
 `/data/zte-agent-relay/ipacm/off`（重启和重连后仍然有效），状态里是 `offload.enabled`。
 关掉时当前连接立刻改走 CPU，打开时立刻恢复硬件转发，不需要重启路由器，也不重连中继：
 
-- 关（`Runtime::release`）：停止邻居和客户端监听，然后用 `Transaction::release` 只撤掉这部分步骤，
+- 关（`Runtime::release`）：停止邻居和客户端监听，然后用 `EffectSet::withdraw` 撤掉这部分资源，
   按添加的反序删 main 默认路由和 unreachable 守卫（IPACM 失去中继 WAN）。其余中继步骤和日志都保留。
 - 开（`Runtime::sync`）：和连接时一样，加 main 路由、启动监听。
 - 路径变了之后执行 `conntrack -D -f ipv4 -s <LAN 网段>`，让已建立和已卸载的连接按新路径重建，
@@ -292,27 +292,27 @@ ZTE 会从很多地方改写 legacy iptables、sysctl 和路由：fw3 重载、�
 脚本、WAN 事件。以前每样东西各自有检查（例如 `redirect_chain` 每个 tick 查一次），
 现在统一成一处：
 
-- 中继（IPv4 的 network，加上 IPv6 的 setup/network 两个事务）和 Mihomo 都把自己的改动
-  记在 `Transaction` 里。IPv6 只交给这里检查防火墙和 nft 规则（NAT66、转发、DNS）；地址、
+- 中继的 wireless、network、dns、IPv6 setup/network 及 Mihomo 的 network 各对应一个
+  `EffectSet`。IPv6 只交给这里检查防火墙，nft 表归 wireless（含 NAT66、转发、DNS）；地址、
   路由、策略规则和 RA 由 IPv6 自己的 `check_owned` 修复，因为它还要检查冲突（前缀被改、
   DAD 失败、路由或优先级被别人占用会撤掉 IPv6）、等 DAD，并使用租约当前的生存时间
-  （`Transaction::reconcile_only`）。`check_owned` 在中继 tick 里运行，但只在这几种时候：
+  （`EffectSet::reconcile_only`）。`check_owned` 在中继控制器的 tick 里运行，检查时机包括
   `net_guard` 的触发已安静（与下面的检查同一拍）、上次读取失败后的重试、续写生存时间之前，
   以及距上次检查满 15 秒（`ipv6::CHECK_EVERY`）。所以不发厂商触发的删除最晚约 15 秒才发现（车主 2026-11-12 接受）。
-  `apply`/`apply_network` 会把能复查的步骤（iptables 的 `-N/-I/-A`、`ip route/rule/addr add`、
-  `@u60-sysctl`、`@u60-mihomo-nft`、`@u60-relay-steer`、`@u60-relay-power-save`、
-  `@u60-relay-portal-return`）连同撤销一起记进内存里的期望状态，`remove`/`rollback` 时删掉。
-- 一次检查（`Transaction::reconcile`）先读列表、再逐条对照：每个 iptables 表只 `-S` 一次，路由、
+  `declare` 从分类型资源生成期望状态及 undo，整批撤销先持久写盘再应用。
+  `withdraw` 按键撤资源，`release` 释放整份日志，遇错保留剩余项。
+- 一次检查（`EffectSet::reconcile`）先读列表、再逐项对照，每个工具/表只 `-S` 一次，路由、
   策略规则、地址每族各列一次（`net_tools::Listings`）；中继的 tick 用 `net_tools::Pass` 让同一次检查的
-  四个事务共用这些列表。完整检查一次中继从 43 个 `iptables`/`ip` 进程降到 7 个。规则不在预测的
-  `-S` 形式里时才对它单独跑 `-C`（日志 `[net] listed in a form not predicted`）。只有确定不在的才重做：
-  链不存在，或 `-C` 以退出码 1 报不在（`firewall::no_rule`）。B31 的 iptables 1.8.8（legacy，两族）有两种措辞：
+  各个 set 共用这些列表。自有链核对内容和顺序，缺失或不符时整链修复。工具仍以预测外形式列出时，
+  记一次 `[net] listed in a form not predicted` 并保存修复后的读回供下次核对。
+  钩子只由 `-C` 找到时保留并记一次日志，列表确认有重复时归一。确定缺失才补回，
+  例如 `-C` 以退出码 1 报不在（`netfx::effect::legacy::no_rule`）。B31 的 iptables 1.8.8（legacy，两族）有两种措辞：
   目标是 ACCEPT、RETURN 或链不存在时是 "Bad rule (does a matching rule exist in that chain?)"，跳到一条存在的用户链
   （每个挂到 `U60_*` 链的钩子）或目标是 MASQUERADE 时是 "No chain/target/match by that name."；目标链不存在则退出 2（"Couldn't load
   target"），不算答案。批次 1 的第一版只认第一种：开机后厂商的防火墙启动清掉了 IPv6 INPUT 钩子，它的撤销读成
   “查不了”，之后每次中继恢复都以 "Network cleanup paused" 失败，直到装上修复版（2026-11-12，约 15 分钟没有上行）。
   列表或工具本身失败算“查不了”，报出来，留给下一次检查。重做之后，这个列表在本次检查里重新读。
-- 撤销（`Cmd::undo` → `firewall::undo`）删掉自有规则的每一份副本，自有 `U60_*` 链先清空再删除；
+- 撤销（`Cmd::undo` → `netfx::effect::legacy::undo`）删掉自有规则的每一份副本，自有 `U60_*` 链在无外部跳转后清空并删除；
   厂商链从不清空，别人的同样规则只删一次。只有确定的“不在”才算已撤销，工具或锁失败时保留日志。
 - `net_guard` 只决定什么时候查：inotify 监视 6 个 ZTE 脚本和工具的 `IN_OPEN`（`net_guard::WATCHED`）：`fw3`
   （restart 或 flush 会清掉全部 legacy 规则，每次 reload 都运行后面几个脚本）、把 brnf 写成 1 的
@@ -325,16 +325,17 @@ ZTE 会从很多地方改写 legacy iptables、sysctl 和路由：fw3 重载、�
   每次触发后的 3 秒内，每 0.5 秒只读一遍 owner 持有的 `@u60-sysctl`（如 Mihomo 的 brnf=0），
   被改了才写回，而且写之前在同一把锁里确认它仍被同一 owner、同一代次持有；owner 释放时先注销
   再执行撤销，所以释放后的迟到采样不会把运行值写回去（`net_guard::hold/release`）。
-- 每次恢复都会记日志，写明重做了哪些命令：
+- 每次恢复都会记日志，列应用命令或资源描述，例如 `iptables -t nat hook redirect_chain …`，前缀为
   `[guard] relay: restored after another writer removed them: ...`。某一条查不了或重做失败时，
   其余的照常处理；失败写进日志（同样的失败只记一次）并显示在页面上。
-- agent 的 nft 表（Mihomo 的 `u60_mihomo`、中继的 `u60_relay`）都由 `netfx::effect::NftTables`
-  维护：两族放进同一个 `nft -f` 批处理整表替换，并带代次标记；用 `nft -t list table`
+- agent 的 nft 表（Mihomo 的 `u60_mihomo`、中继的 `u60_relay`）由各自 `EffectSet` 中的 `NftTables`
+  维护，两族放进同一个 `nft -f` 批处理整表替换，并带代次标记，用 `nft -t list ruleset`
   （不列出集合元素）读回标记确认，逐条链比对规则数，被清空、删掉一部分或丢了标记的表会按
   目标重新载入。中继的表在 `wifi_relay/uplink.rs` 一处拼装（v5，见 `network-extensions.md`
   的 Firewall layout）：上游防护、转发、IPv6 基线、NAT66 和中继 DNS 的拒绝/改写都在 nft；
-  legacy 只留必须穿过 ZTE 拒绝的放行（`U60_RELAY_IN`、`U60_RELAY_FWD`、`U60_R6_IN`、
-  `U60_R6_FWD`）、门户 RETURN 和 IPv4 MASQUERADE。
+  legacy 只留必须穿过 ZTE 拒绝的放行（IPv4 的 `U60_RELAY_IN`、`U60_RELAY_FWD`，IPv6 的 `U60_R6_IN`、
+  `U60_R6_FWD`）、门户 RETURN 和 IPv4 MASQUERADE。IPv6 INPUT 直接挂 `U60_R6_IN`。
+  INPUT/FORWARD/MASQUERADE 钩子添加时插首位，之后保留厂商后来插到前面的过滤规则（D8）。
 
 **fw3 重载做了什么、谁触发的**（2026-11-12 查明）：每次 fw3 start/restart/reload 都运行 include
 `firewall_init.sh`，它调用的 `firewall_sys_fw.sh`（`:1104-1106`，无条件）和
@@ -347,9 +348,9 @@ brnf 读到 1 约 0.2–0.5 秒，才被上面的采样写回 0。中继连上�
 
 **离线门户的抑制**（`wifi_relay/portal.rs`）：`firewall_redirect.sh` 只在 `zwrt_redirect.redirect.switch` 为 1 时
 写端口 80 的 DNAT（本机去掉 agent 的改动后读到的是 1）。中继会话期间 agent 用一个易失的 uci 改动把它设成 0，
-另在两族 `redirect_chain` 的最前面放一条 RETURN（`@u60-relay-portal-return`，注释 `zte-agent-wifi-relay`）。
-三步都记在会话的 `dns` 事务（`dns.json`）里，和解析器那一行放在一起。5 GHz 之间的交接只释放解析器那一行，
-开关改动和两条 RETURN 原样交给新会话（`successor`），新会话用 `ensure` 重新登记；guard 的核对在同一拍里查
+另在两族 `redirect_chain` 的最前面放一条 RETURN（`LegacyHook` 的 `BeforeVendor`，注释 `zte-agent-wifi-relay`），
+核对时保证只有一份且排在厂商规则前。三项都记在会话的 `dns` set（`dns.json`）里，和解析器那一行放在一起。5 GHz 之间的交接只释放解析器那一行，
+开关改动和两条 RETURN 原样交给新会话（`successor`），新会话用 `declare` 声明；guard 的核对在同一拍里查
 `dns`；agent 重启接管时把两条 RETURN 接进 `dns`；断开时才全部撤掉。
 
 为什么这样做：之前的版本把 RETURN 记在 `network.json`，交接时连同开关改动一起释放、几秒后随新租约再设。

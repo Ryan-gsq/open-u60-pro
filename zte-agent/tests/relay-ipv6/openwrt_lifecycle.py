@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import time
 
-from netns import ip, ns, run
+from shell import ip, ns, run
 
 ROOT = Path("/ow")
 
@@ -55,9 +55,7 @@ def lifecycle():
         ns("upstream", "ip", *args)
     run("sysctl", "-w", "net.ipv6.conf.all.forwarding=1")
     run("sysctl", "-w", "net.ipv6.conf.ath20.accept_ra=0", "net.ipv6.conf.ath20.autoconf=0")
-    ow("ip6tables", "-N", "U60_RELAY_IN")
-    ow("ip6tables", "-A", "U60_RELAY_IN", "-j", "DROP")
-    ow("ip6tables", "-I", "INPUT", "-i", "ath20", "-j", "U60_RELAY_IN")
+    ow("ip6tables", "-A", "INPUT", "-i", "ath20", "-j", "DROP")
     for key, value in [("ra", "server"), ("dhcpv6", "server"), ("ndp", "relay")]:
         ow("uci", "set", f"dhcp.lan.{key}={value}")
     ow("uci", "commit", "dhcp")

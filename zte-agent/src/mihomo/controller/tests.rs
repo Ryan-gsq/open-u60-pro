@@ -70,6 +70,10 @@ struct World {
     reload: Option<Result<u16, String>>,
     verify: Option<String>,
     running_configs: Vec<String>,
+    /// The mode and log level the core reports (none: rule, info).
+    runtime: Option<Value>,
+    /// The mode and log level each `prepare` of the selected profile was given.
+    given: Vec<Option<Value>>,
 }
 
 #[derive(Clone)]
@@ -120,6 +124,9 @@ impl Port for FakePort {
         });
         if let Some(Some(error)) = self.world().prepare.pop_front() {
             return Err(error);
+        }
+        if let Source::Selected { runtime, .. } = source {
+            self.world().given.push(runtime.clone());
         }
         let dns = vec![format!("filter {}", self.world().dns)];
         let routes = self.world().config.map_or_else(routing::Routes::default, |yaml| routing::Routes::from(&serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml).unwrap()));
@@ -232,7 +239,8 @@ impl Port for FakePort {
     }
     fn read_back(&mut self, _: &str) -> Option<(Mode, Selected, Value)> {
         let direct = self.world().selected_direct;
-        Some((Mode::Rule, [("G".to_owned(), if direct { "DIRECT" } else { "P" }.to_owned())].into(), json!({"mode": "rule", "log-level": "info"})))
+        let runtime = self.world().runtime.clone().unwrap_or_else(|| json!({"mode": "rule", "log-level": "info"}));
+        Some((Mode::Rule, [("G".to_owned(), if direct { "DIRECT" } else { "P" }.to_owned())].into(), runtime))
     }
     fn plan(&mut self, _: &routing::Routes, bypass: bool, _: Mode, selected: &Selected, unsettled: &[String]) -> (Bypass, Chain) {
         let direct = bypass && selected.get("G").is_some_and(|g| g == "DIRECT") && unsettled.is_empty();
@@ -927,6 +935,19 @@ fn a_planned_restart_prepares_before_it_holds_and_stops_the_old_core() {
     let events = h.events();
     let at = |e: &str| events.iter().rposition(|x| x == e).unwrap();
     assert!(at("prepare") < at("tables hold") && at("tables hold") < at("stop 2"), "{events:?}");
+}
+
+/// A mode or log level set through the controller is what the next planned
+/// restart starts the core with: a profile edit does not put them back.
+#[test]
+fn a_planned_restart_keeps_the_mode_and_log_level_the_core_reported() {
+    let h = Harness::new(World::default());
+    h.enable(true).unwrap();
+    let set = json!({"mode": "global", "log-level": "debug"});
+    h.port.world().runtime = Some(set.clone());
+    h.write("G", "P").unwrap();
+    h.call(|reply| Message::Config { refresh: false, reply }).unwrap();
+    assert_eq!(h.port.world().given.last(), Some(&Some(set)));
 }
 
 /// Finding 6: refreshing a `domain` rule set changes no kernel plan, so no

@@ -17,7 +17,7 @@
 //! - `nat66` (a valid IPv6 lease, from `ipv6`): its forwarding returns, the
 //!   masquerade and IPv6 DNS.
 //!
-//! Each change replaces both families in one batch (`NftTables`, marker
+//! Each change replaces both families in one set-owned batch (marker
 //! read back); ZTE never touches nftables. The journal entry is the wireless
 //! plan's: `@u60-relay-nft remove ip|ip6`, which every agent since relay DNS
 //! moved to nftables (the TPROXY release) runs.
@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{json, Value};
 
-use crate::net_tools::{self as net, Cmd, Step};
-use crate::netfx::effect::{self, Nft, NftTables, Presence};
+use crate::net_tools as net;
+use crate::netfx::effect::{self, EffectSet, Nft, NftTable, NftTables, Presence, Resource};
 use crate::netfx::ids;
 
 pub(crate) const TABLE: &str = ids::RELAY_NFT;
@@ -196,12 +196,6 @@ pub fn tables(layout: &Layout, mark: Option<u32>) -> Result<[String; 2], String>
     Ok([v4(layout, mark)?, v6(layout, mark)?])
 }
 
-/// The journal entries of the tables (`Shared` loads them): their undo
-/// deletes one family's table.
-pub fn steps() -> Vec<Step> {
-    effect::FAMILIES.iter().map(|family| Step::new(Cmd::new("@u60-relay-nft", &["tables", family]), Cmd::new("@u60-relay-nft", &["remove", family]))).collect()
-}
-
 /// `@u60-relay-nft tables <family>` marks the journal entry; `remove
 /// <family>` deletes that family's table (the undo; also what the previous
 /// agent journaled for its DNS-only tables).
@@ -220,7 +214,7 @@ pub(crate) fn command(args: &[String]) -> Result<(), String> {
 
 struct State {
     file: PathBuf,
-    tables: NftTables,
+    effects: Arc<Mutex<EffectSet>>,
     nft: Box<dyn Nft + Send>,
     /// `None` until the guard is declared and after `forget`.
     layout: Option<Layout>,
@@ -232,13 +226,16 @@ struct State {
 pub struct Shared(Arc<Mutex<State>>);
 
 impl Shared {
-    pub fn new(file: PathBuf) -> Self {
-        Self::with(file, Box::new(effect::Device))
+    pub fn new(file: PathBuf, effects: Arc<Mutex<EffectSet>>) -> Self {
+        Self::with(file, effects, Box::new(effect::Device))
     }
 
-    pub fn with(file: PathBuf, nft: Box<dyn Nft + Send>) -> Self {
-        let tables = NftTables::new("relay", TABLE, file.clone());
-        Self(Arc::new(Mutex::new(State { file, tables, nft, layout: None })))
+    pub fn with(file: PathBuf, effects: Arc<Mutex<EffectSet>>, nft: Box<dyn Nft + Send>) -> Self {
+        Self(Arc::new(Mutex::new(State { file, effects, nft, layout: None })))
+    }
+
+    pub fn resource(&self, families: Option<[String; 2]>) -> Resource {
+        Resource::NftTable(NftTable { owner: "relay", name: TABLE, file: self.state().file.clone(), families })
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -249,8 +246,8 @@ impl Shared {
     /// another program's (or an unjournaled leftover) and is not taken over.
     pub fn claim(&self) -> Result<(), String> {
         let mut s = self.state();
-        let State { tables, nft, .. } = &mut *s;
-        match tables.presence(&mut **nft)? {
+        let tables = NftTables::new("relay", TABLE, s.file.clone());
+        match tables.presence(&mut *s.nft)? {
             Presence::Foreign => Err("The relay's nftables table names are in use by another program; nothing was changed".into()),
             Presence::Absent | Presence::Ours => Ok(()),
         }
@@ -269,12 +266,16 @@ impl Shared {
     /// again when it starts.
     pub fn adopt(&self, relay: Relay) -> Result<(), String> {
         let mut s = self.state();
-        let State { tables, nft, .. } = &mut *s;
-        if tables.presence(&mut **nft)? != Presence::Ours {
+        let tables = NftTables::new("relay", TABLE, s.file.clone());
+        if tables.presence(&mut *s.nft)? != Presence::Ours {
             return Err("The relay's nftables tables are not the previous agent's".into());
         }
         s.layout = Some(Layout { relay: Some(relay), ..Layout::default() });
-        Self::declare(&mut s)
+        Ok(())
+    }
+
+    pub fn finish_adopt(&self) -> Result<(), String> {
+        Self::declare(&mut self.state())
     }
 
     /// Changes what the tables hold and loads them when that differs from
@@ -285,7 +286,7 @@ impl Shared {
         let mut s = self.state();
         let Some(mut next) = s.layout.clone() else { return Ok(()) };
         change(&mut next);
-        if s.layout.as_ref() == Some(&next) && s.tables.confirmed() {
+        if s.layout.as_ref() == Some(&next) && s.effects.lock().unwrap().tables_confirmed(TABLE) {
             return Ok(());
         }
         s.layout = Some(next);
@@ -294,8 +295,8 @@ impl Shared {
 
     fn declare(s: &mut State) -> Result<(), String> {
         let families = tables(s.layout.as_ref().unwrap(), ids::CORE_OUT_MARK)?;
-        let State { tables, nft, .. } = s;
-        tables.declare(families, &mut **nft).map(|_| ())
+        let resource = Resource::NftTable(NftTable { owner: "relay", name: TABLE, file: s.file.clone(), families: Some(families) });
+        s.effects.lock().unwrap().declare_with(vec![resource], false, &mut net::Device, &mut *s.nft)
     }
 
     /// `net_guard`: loads the target again when it is not confirmed or the
@@ -306,12 +307,8 @@ impl Shared {
         if s.layout.is_none() {
             return result;
         }
-        let State { tables, nft, .. } = &mut *s;
-        match tables.reconcile(&mut **nft) {
-            Ok(true) => result.restored.push("relay nftables tables".into()),
-            Ok(false) => {}
-            Err(e) => result.failed.push(e),
-        }
+        let State { effects, nft, .. } = &mut *s;
+        result.extend(effects.lock().unwrap().reconcile_selected(|resource| matches!(resource, Resource::NftTable(_)), &mut net::Device, &mut **nft));
         result
     }
 
@@ -319,13 +316,12 @@ impl Shared {
     pub fn forget(&self) {
         let mut s = self.state();
         s.layout = None;
-        s.tables = NftTables::new("relay", TABLE, s.file.clone());
     }
 
     pub fn status(&self) -> Value {
         let s = self.state();
         let Some(layout) = &s.layout else { return Value::Null };
-        let mut status = s.tables.status();
+        let mut status = s.effects.lock().unwrap().tables_status(TABLE);
         status["parts"] = json!({"guard": true, "relay": layout.relay.is_some(), "ipv6_discovery": layout.discovery, "nat66": layout.nat66.is_some()});
         status
     }
@@ -366,7 +362,8 @@ pub mod tests {
     pub fn shared(test: &str) -> (Shared, Kernel) {
         let dir = std::env::temp_dir().join(format!("u60-uplink-{test}-{}", std::process::id()));
         let kernel = Kernel::default();
-        (Shared::with(dir.join("uplink.nft"), Box::new(kernel.clone())), kernel)
+        let effects = Arc::new(Mutex::new(EffectSet::new("relay", dir.join("wireless.json"))));
+        (Shared::with(dir.join("uplink.nft"), effects, Box::new(kernel.clone())), kernel)
     }
 
     fn relay() -> Relay {
@@ -503,9 +500,12 @@ pub mod tests {
 
     #[test]
     fn the_journal_entries_undo_with_what_the_previous_agent_runs() {
-        let undos: Vec<_> = steps().into_iter().map(|s| (s.undo.program, s.undo.args.join(" "))).collect();
+        let (shared, _) = shared("undos");
+        let resource = shared.resource(None);
+        let mut commands = vec![resource.undo(|_| Ok("1".into())).unwrap()];
+        commands.extend(resource.extra_undos());
+        let undos: Vec<_> = commands.into_iter().map(|command| (command.program, command.args.join(" "))).collect();
         assert_eq!(undos, [("@u60-relay-nft".to_owned(), "remove ip".to_owned()), ("@u60-relay-nft".to_owned(), "remove ip6".to_owned())]);
-        assert!(steps().iter().all(|s| !s.apply.checkable()), "Shared checks the tables, not the journal entry");
     }
 
     /// The session's parts grow and shrink one batch at a time; nothing is
@@ -528,7 +528,7 @@ pub mod tests {
         kernel.0.lock().unwrap().fail.push(("Device tool timed out".into(), false));
         assert!(uplink.update(|l| l.nat66 = None).is_err());
         assert!(kernel.table("ip6").unwrap().contains("masquerade"), "the previous tables stay");
-        assert_eq!(uplink.reconcile().restored, ["relay nftables tables"]);
+        assert_eq!(uplink.reconcile().restored, ["nftables tables u60_relay"]);
         assert!(!kernel.table("ip6").unwrap().contains("masquerade"));
         assert!(uplink.reconcile().restored.is_empty());
         uplink.update(|l| { l.relay = None; l.discovery = false; }).unwrap();
@@ -543,5 +543,31 @@ pub mod tests {
         kernel.0.lock().unwrap().tables.insert(("ip".into(), TABLE.into()), "table ip u60_relay {\n}\n".into());
         assert!(uplink.claim().is_err());
         assert!(kernel.table("ip").unwrap() == "table ip u60_relay {\n}\n");
+    }
+
+    #[test]
+    fn a_same_boot_takeover_reuses_the_complete_relay_table_without_writes() {
+        let (previous, kernel) = shared("takeover");
+        previous.guard().unwrap();
+        previous.update(|layout| {
+            layout.relay = Some(relay());
+            layout.discovery = true;
+            layout.nat66 = Some(nat66(None));
+        }).unwrap();
+        let file = previous.state().file.clone();
+        let journal = file.parent().unwrap().join("wireless.json");
+        let effects = Arc::new(Mutex::new(EffectSet::load("relay", &journal).unwrap()));
+        let next = Shared::with(file.clone(), effects.clone(), Box::new(kernel.clone()));
+        effects.lock().unwrap().declare_with(vec![next.resource(None)], true, &mut net::Device, &mut kernel.clone()).unwrap();
+        let before = kernel.0.lock().unwrap().loads;
+        next.adopt(relay()).unwrap();
+        next.update(|layout| {
+            layout.discovery = true;
+            layout.nat66 = Some(nat66(None));
+        }).unwrap();
+        next.finish_adopt().unwrap();
+        assert_eq!(kernel.0.lock().unwrap().loads, before);
+        assert_eq!(next.status()["target"], next.status()["confirmed"]);
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 }

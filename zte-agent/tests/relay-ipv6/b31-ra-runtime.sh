@@ -9,6 +9,7 @@ test -x "$QA/agent-tests"
 test ! -e "$ROOT"
 test ! -e "/var/run/netns/$R"
 test ! -e "/var/run/netns/$C"
+test -e /var/run/netns || fresh=1
 mkdir -p "$ROOT" "$QA/results"
 cleanup() {
     for n in "$R" "$C"; do
@@ -19,7 +20,14 @@ cleanup() {
         for p in $(ip netns pids "$n" 2>/dev/null || true); do kill -9 "$p" 2>/dev/null || true; done
         ip netns delete "$n" 2>/dev/null || true
     done
-    for d in dev/urandom dev/null proc lib usr sbin bin; do umount "$ROOT/$d" 2>/dev/null || true; done
+    for d in dev/urandom dev/null proc lib usr sbin bin; do
+        grep -q " $ROOT/$d " /proc/mounts || continue
+        umount "$ROOT/$d" 2>/dev/null || { sleep 1; umount "$ROOT/$d" 2>/dev/null; } || umount -l "$ROOT/$d" 2>/dev/null || true
+    done
+    if [ "${fresh:-0}" = 1 ]; then
+        umount /var/run/netns 2>/dev/null || true
+        rmdir /var/run/netns 2>/dev/null || true
+    fi
 }
 trap 'code=$?; trap - EXIT HUP INT TERM; cleanup; exit "$code"' EXIT
 trap 'exit 130' INT

@@ -215,6 +215,8 @@ def topology():
         family = [route.pop(0)] if route[0] == "-6" else []
         sh("ip", *family, "route", "add", *route, ns=ns)
     sh("sysctl", "-qw", "net.ipv4.ip_forward=1", "net.ipv6.conf.all.forwarding=1", ns="router")
+    for tool in ("iptables", "ip6tables"):
+        sh(tool, "-t", "nat", "-N", "redirect_chain", ns="router")
 
 
 def load(name):
@@ -257,11 +259,32 @@ def restore_inputs():
                 if line.startswith("-A U60_"):
                     owned.setdefault(f"{tool} {line.split()[1]}", []).append(line)
     targets = {line.split(" -j ")[-1] for lines in owned.values() for line in lines}
-    report("owned legacy chains hold accepts only", targets <= {"ACCEPT", "U60_R6_IN"} and len(owned) == 5, json.dumps(owned))
+    report("owned legacy chains hold accepts only", targets == {"ACCEPT"} and len(owned) == 4, json.dumps(owned))
     network = next(r for r in inputs if r["plan"] == "network")
     again = sh(network["program"], "--noflush", "--wait", "2", ns="router", check=False, stdin=network["input"])
     rules = [l for l in sh("iptables", "-w", "2", "-S", "U60_RELAY_FWD", ns="router").stdout.splitlines() if l.startswith("-A ")]
     report("an existing chain of that name is neither taken over nor flushed", again.returncode != 0 and len(rules) == 2, again.stderr.strip())
+
+
+def resource_repairs():
+    with open(f"{DATA}/repairs.json") as source:
+        repairs = json.load(source)
+    before = sh("iptables", "-t", "filter", "-S", "INPUT", ns="router").stdout
+    sh("iptables", "-A", "U60_RELAY_FWD", "-j", "RETURN", ns="router")
+    done = sh("iptables-restore", "--noflush", "--wait", "2", ns="router", check=False, stdin=repairs["chain"])
+    rules = sh("iptables", "-S", "U60_RELAY_FWD", ns="router").stdout.splitlines()
+    report("EffectSet replaces the owned chain whole and leaves vendor INPUT intact", done.returncode == 0 and len([line for line in rules if line.startswith("-A ")]) == 2 and before == sh("iptables", "-S", "INPUT", ns="router").stdout)
+    sh("iptables", "-A", "FORWARD", "-j", "U60_RELAY_FWD", ns="router")
+    done = sh("iptables-restore", "--noflush", "--wait", "2", ns="router", check=False, stdin=repairs["hook"])
+    rules = sh("iptables", "-S", "FORWARD", ns="router").stdout.splitlines()
+    report("EffectSet reduces a doubled FORWARD hook to one", done.returncode == 0 and rules.count("-A FORWARD -j U60_RELAY_FWD") == 1)
+    sh("iptables", "-N", "U60_FOREIGN_QA", ns="router")
+    sh("iptables", "-A", "U60_FOREIGN_QA", "-j", "RETURN", ns="router")
+    before = sh("iptables", "-S", "U60_FOREIGN_QA", ns="router").stdout
+    done = sh("iptables-restore", "--noflush", "--wait", "2", ns="router", check=False, stdin="*filter\n-N U60_FOREIGN_QA\n-A U60_FOREIGN_QA -j DROP\nCOMMIT\n")
+    report("a foreign owned-looking chain is refused untouched", done.returncode != 0 and before == sh("iptables", "-S", "U60_FOREIGN_QA", ns="router").stdout)
+    sh("iptables", "-F", "U60_FOREIGN_QA", ns="router")
+    sh("iptables", "-X", "U60_FOREIGN_QA", ns="router")
 
 
 def data_plane():
@@ -350,7 +373,7 @@ def portal():
         moves = json.load(f)
     ours = "-A redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN"
     dnat = "-A redirect_chain -i br-lan -p tcp -m tcp --dport 80 -j DNAT --to-destination 192.168.0.1:8080"
-    sh("iptables", "-w", "2", "-t", "nat", "-N", "redirect_chain", ns="router")
+    sh("iptables", "-w", "2", "-t", "nat", "-F", "redirect_chain", ns="router")
     sh("iptables", "-w", "2", "-t", "nat", "-A", "PREROUTING", "-j", "redirect_chain", ns="router")
     sh("iptables", "-w", "2", "-t", "nat", *dnat.split(), ns="router")
     sh("iptables", "-w", "2", "-t", "nat", *ours.split(), ns="router")
@@ -418,6 +441,7 @@ def main():
     topology()
     tables_load()
     restore_inputs()
+    resource_repairs()
     data_plane()
     portal()
     for agent, label in (("/old-agent", "the previous agent"), ("/new-agent", "this agent")):

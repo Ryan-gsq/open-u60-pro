@@ -8,7 +8,7 @@ import signal
 import subprocess
 import time
 
-from netns import ip, ns, run
+from shell import ip, ns, run
 
 ROOT = Path("/ow")
 

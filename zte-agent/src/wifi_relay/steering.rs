@@ -7,30 +7,24 @@
 
 use std::{fs, path::Path};
 
-use super::{Cmd, Step, IFACE};
+use super::{Internal, Resource, IFACE};
 
 const DOWNSTREAM: &str = "wlan2";
 const BACKLOG: &str = "/proc/sys/net/core/netdev_max_backlog";
 const BACKLOG_FLOOR: u32 = 5000;
 
-pub(super) fn plan() -> Vec<Step> {
+pub(super) fn plan() -> Vec<Resource> {
     let mut plan = Vec::new();
     if let Some(mask) = fs::read_to_string("/proc/interrupts").ok().and_then(|t| spare_cpus(&t)) {
         for iface in [IFACE, DOWNSTREAM] {
             if let Some(old) = rps(iface).filter(|old| *old != mask) {
-                plan.push(Step::new(
-                    Cmd::new("@u60-relay-steer", &["rps", iface, &format!("{mask:x}")]),
-                    Cmd::new("@u60-relay-steer", &["rps", iface, &format!("{old:x}")]),
-                ));
+                plan.push(Resource::Internal(Internal::new("@u60-relay-steer", super::words(&["rps", iface, &format!("{mask:x}")]), super::words(&["rps", iface, &format!("{old:x}")]))));
             }
         }
     }
     if let Some(old) = fs::read_to_string(BACKLOG).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
         if old < BACKLOG_FLOOR {
-            plan.push(Step::new(
-                Cmd::new("@u60-relay-steer", &["backlog", &BACKLOG_FLOOR.to_string()]),
-                Cmd::new("@u60-relay-steer", &["backlog", &old.to_string()]),
-            ));
+            plan.push(Resource::Internal(Internal::new("@u60-relay-steer", super::words(&["backlog", &BACKLOG_FLOOR.to_string()]), super::words(&["backlog", &old.to_string()]))));
         }
     }
     plan
@@ -97,7 +91,7 @@ pub(crate) fn command(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Whether an applied `@u60-relay-steer` still holds (`Transaction::reconcile`).
+/// Whether an applied `@u60-relay-steer` still holds.
 pub(crate) fn present(args: &[String]) -> bool {
     match args {
         [what, iface, mask] if what == "rps" => {

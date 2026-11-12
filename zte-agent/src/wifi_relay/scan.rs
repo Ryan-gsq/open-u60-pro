@@ -82,7 +82,8 @@ pub(super) trait Supplicant {
 
 /// Runs `plan` and returns the supplicant's whole BSS table with the time the
 /// scan took. Entries cached before it are flushed first.
-pub(super) fn run(s: &mut impl Supplicant, plan: &[Vec<u32>]) -> Result<(String, Duration), String> {
+pub(super) fn run(s: &mut impl Supplicant, plan: &[Vec<u32>], check: impl Fn() -> Result<(), String>) -> Result<(String, Duration), String> {
+    check()?;
     let started = Instant::now();
     if s.request("BSS_FLUSH 0")? != "OK" {
         return Err("Wi-Fi scan was refused".into());
@@ -93,14 +94,17 @@ pub(super) fn run(s: &mut impl Supplicant, plan: &[Vec<u32>]) -> Result<(String,
         // 13 channels at 2.4 GHz took 1.9 s with the relay connected.
         let wait = Duration::from_millis(2000 + 400 * freqs.len() as u64);
         for _ in 0..2 {
+            check()?;
             match s.request(&format!("SCAN freq={list}"))?.as_str() {
                 "OK" => {
                     finished += usize::from(s.scan_done(Instant::now() + wait)?);
+                    check()?;
                     break;
                 }
                 // Another scan is running: let it end, then ask once more.
                 "FAIL-BUSY" => {
                     let _ = s.scan_done(Instant::now() + wait);
+                    check()?;
                 }
                 _ => break,
             }
@@ -109,6 +113,7 @@ pub(super) fn run(s: &mut impl Supplicant, plan: &[Vec<u32>]) -> Result<(String,
     if finished == 0 {
         return Err("Wi-Fi scan was refused".into());
     }
+    check()?;
     Ok((table(s)?, started.elapsed()))
 }
 
@@ -323,7 +328,7 @@ mod tests {
     fn trimmed_5ghz_upstreams_are_found_fresh_and_cached_ones_dropped() {
         let mut driver = TrimmingDriver::new();
         driver.busy_once = true;
-        let (table, took) = run(&mut driver, &Channels::parse(CHANNELS).plan()).unwrap();
+        let (table, took) = run(&mut driver, &Channels::parse(CHANNELS).plan(), || Ok(())).unwrap();
         let networks = crate::wifi_relay::parse_bss(&table, took.as_secs() + 1);
         let mut found: Vec<_> = networks.iter().map(|n| (n.frequency, n.ssid.as_str())).collect();
         found.sort();
@@ -334,7 +339,7 @@ mod tests {
         // The old single full-band request: the 5 GHz upstream never appears.
         let mut driver = TrimmingDriver::new();
         let all = Channels::parse(CHANNELS).plan().concat();
-        let (table, took) = run(&mut driver, &[all]).unwrap();
+        let (table, took) = run(&mut driver, &[all], || Ok(())).unwrap();
         let networks = crate::wifi_relay::parse_bss(&table, took.as_secs() + 1);
         assert!(networks.iter().all(|n| n.frequency < 3000), "{:?}", networks.iter().map(|n| n.frequency).collect::<Vec<_>>());
     }
@@ -350,7 +355,7 @@ mod tests {
                 Err("Wi-Fi scan did not finish".into())
             }
         }
-        assert_eq!(run(&mut Refusing, &Channels::parse(CHANNELS).plan()).unwrap_err(), "Wi-Fi scan was refused");
+        assert_eq!(run(&mut Refusing, &Channels::parse(CHANNELS).plan(), || Ok(())).unwrap_err(), "Wi-Fi scan was refused");
     }
 
     fn socket_dir(name: &str) -> PathBuf {

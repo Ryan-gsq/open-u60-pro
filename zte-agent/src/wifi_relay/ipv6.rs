@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 
 use super::{offload, stop_helper, Helper, IFACE, JOURNAL, PREF, ROOT, TABLE};
 use crate::boottime::{BootClock, Clock};
-use crate::net_tools::{self as net, Cmd, Step, Transaction};
+use crate::net_tools::{self as net, Cmd, Step};
+use super::{EffectSet, Resource, Family, Route, RouteType, Rule, Addr, Internal, LegacyChain, LegacyHook, LegacyTool, Position, words};
 
 pub(super) const TAILNET: &str = crate::netfx::ids::TAILNET_V6;
 // A client may keep a previously advertised address after the vendor removes
@@ -324,8 +325,8 @@ fn lease_file(session: &str) -> Option<PathBuf> {
 pub struct Upstream {
     client: Option<Helper>,
     session: Option<String>,
-    setup: Transaction,
-    network: Transaction,
+    setup: EffectSet,
+    network: EffectSet,
     /// The relay's tables: discovery opens the upstream, a lease adds NAT66.
     uplink: super::uplink::Shared,
     installed: Option<Lease>,
@@ -354,8 +355,8 @@ impl Upstream {
         Self {
             client: None,
             session: None,
-            setup: Transaction::new(Path::new(JOURNAL).join("ipv6-setup.json")),
-            network: Transaction::new(Path::new(JOURNAL).join("ipv6-network.json")),
+            setup: EffectSet::new("relay", Path::new(JOURNAL).join("ipv6-setup.json")),
+            network: EffectSet::new("relay", Path::new(JOURNAL).join("ipv6-network.json")),
             uplink,
             installed: None,
             path: None,
@@ -402,8 +403,8 @@ impl Upstream {
         }
         let attempt = (|| {
             capabilities()?;
-            net::reserve("ip6tables", "filter", &["U60_R6_IN"], "-6", TABLE, PREF)?;
-            self.setup.apply_network(setup_plan())?;
+            for step in setup_settings() { self.setup.step(step)?; }
+            self.setup.declare(setup_plan())?;
             // Open the upstream for discovery before the client asks.
             self.uplink.update(|l| l.discovery = true)?;
             let mut nonce = [0u8; 16];
@@ -429,7 +430,7 @@ impl Upstream {
         })();
         if let Err(e) = attempt {
             stop_helper(&mut self.client);
-            self.setup.rollback()?;
+            self.setup.release()?;
             self.close();
             self.phase = "unsupported";
             self.error = Some(e);
@@ -441,7 +442,7 @@ impl Upstream {
     /// A failed load stays the target (`net_guard` retries) and does not stop
     /// the withdrawal: without the routes nothing uses it.
     fn withdraw(&mut self) -> Result<(), String> {
-        self.network.rollback()?;
+        self.network.release()?;
         if let Err(e) = self.uplink.update(|l| l.nat66 = None) {
             crate::netlog!("[relay] IPv6 NAT not yet removed from the relay tables: {e}");
         }
@@ -461,7 +462,7 @@ impl Upstream {
     /// `check_owned`, which also checks for conflicts, waits for DAD and uses
     /// the current lease lifetimes.
     pub fn reconcile(&mut self) -> net::Reconciled {
-        let firewall = |cmd: &Cmd| cmd.program != "ip";
+        let firewall = |resource: &Resource| !matches!(resource, Resource::Route(_) | Resource::Rule(_) | Resource::Addr(_));
         let mut result = self.setup.reconcile_only(firewall);
         result.extend(self.network.reconcile_only(firewall));
         result
@@ -678,7 +679,7 @@ impl Upstream {
             }
             if present.is_none() {
                 self.network
-                    .ensure(address_step(ip, prefix, iface, valid, preferred))
+                    .declare(vec![address_step(ip, prefix, iface, valid, preferred)])
                     .map_err(Fault::Conflict)?;
                 if iface == IFACE {
                     dad.push(text);
@@ -710,17 +711,18 @@ impl Upstream {
         }
         let expected = network_plan(lease, self.lan_prefix.as_ref().unwrap(), &all_sources)
         .into_iter()
-        .filter(|s| s.apply.program == "ip" && s.apply.args.get(1).is_some_and(|v| v == "route"));
+        .filter(|resource| matches!(resource, Resource::Route(_)));
         for step in expected {
-            let (_, destination) = net::route_target(&step.apply.args);
+            let command = step.command().unwrap();
+            let (_, destination) = net::route_target(&command.args);
             let existing: Vec<_> = routes
                 .iter()
                 .filter(|r| r["dst"].as_str() == Some(destination))
                 .collect();
             if existing.is_empty() {
                 // `add`, not `replace`: never overwrite a route racing this read.
-                self.network.ensure(step).map_err(Fault::Conflict)?;
-            } else if existing.iter().any(|r| !route_matches(r, &step.apply)) {
+                self.network.declare(vec![step]).map_err(Fault::Conflict)?;
+            } else if existing.iter().any(|r| !route_matches(r, &command)) {
                 return Err(Fault::Conflict(
                     "An owned IPv6 route changed externally".into(),
                 ));
@@ -729,7 +731,7 @@ impl Upstream {
         match net::plain_policy_rule("-6", PREF, TABLE).map_err(Fault::Unreadable)? {
             net::PolicyRule::Missing => self
                 .network
-                .ensure(net::ip_step("-6", "rule", &["pref", PREF, "lookup", TABLE]))
+                .declare(vec![policy_rule()])
                 .map_err(Fault::Conflict)?,
             net::PolicyRule::Owned => {}
             net::PolicyRule::Foreign | net::PolicyRule::Shared => {
@@ -742,7 +744,6 @@ impl Upstream {
     }
 
     fn configure(&mut self, lease: &Lease, mtu: u32) -> Result<String, String> {
-        net::reserve("ip6tables", "filter", &["U60_R6_FWD"], "-6", TABLE, PREF)?;
         let lan = Cmd::new("ip", &["-j", "-6", "addr", "show", "dev", "br-lan"]).run()?;
         let (lan_prefixes, linklocal) = lan_state(&lan)?;
         let ula = stable_ula()?;
@@ -796,22 +797,22 @@ impl Upstream {
         // policy rule moves LAN traffic.
         let mut plan = network_plan(&dns_lease, &ula, &sources);
         let rule = plan.pop().expect("the policy rule is the plan's last step");
-        self.network.apply_network(plan)?;
+        self.network.declare(plan)?;
         self.uplink.update(|l| l.nat66 = Some(super::uplink::Nat66 { sources: sources.clone(), dns: upstream_dns(&dns_lease) }))?;
-        self.network.apply_network(vec![rule])?;
+        self.network.declare(vec![rule])?;
         let route = Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"]).run()?;
         if !route.contains(&format!("dev {IFACE}")) {
             return Err("IPv6 routing did not select Wi-Fi".into());
         }
         // Advertising is last. Undo withdraws RA before removing NAT/routes.
-        self.network.apply(ra_step(&ula, linklocal, mtu))?;
+        self.network.declare(vec![ra_step(&ula, linklocal, mtu)])?;
         Ok(ula)
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
         stop_helper(&mut self.client);
-        self.network.rollback()?;
-        self.setup.rollback()?;
+        self.network.release()?;
+        self.setup.release()?;
         self.close();
         if self.installed.is_some() {
             self.revision = self.revision.wrapping_add(1);
@@ -839,7 +840,7 @@ impl Upstream {
     /// agent restart (`super::adopt`): its client keeps running and the
     /// addresses, routes, NAT66 and RA stay. The journals are taken over and
     /// the plans re-taken from the lease, the relay ULA and the LAN as they
-    /// are now (`Transaction::adopt`: nothing that holds runs again), so
+    /// are now (`EffectSet::adopt`: nothing that holds runs again), so
     /// `reconcile` and the ticks keep them from here on. `Err` before the
     /// journals are loaded changes nothing; after, the caller stops the
     /// client and rolls IPv6 back from its journals (`recover`).
@@ -864,8 +865,8 @@ impl Upstream {
         let local = Cmd::new("ip", &["-j", "-6", "addr", "show"]).run()?;
         let dns_lease = safe_dns_lease(&live, &sources, &local)?;
         let mtu = ra::advertised_mtu(live.mtu, ra::lan_mtu()?)?;
-        let setup = Transaction::load(&Path::new(JOURNAL).join("ipv6-setup.json"))?;
-        let network = Transaction::load(&Path::new(JOURNAL).join("ipv6-network.json"))?;
+        let setup = EffectSet::load("relay", &Path::new(JOURNAL).join("ipv6-setup.json"))?;
+        let network = EffectSet::load("relay", &Path::new(JOURNAL).join("ipv6-network.json"))?;
         // The tables first: the relay's adoption declared them without NAT66.
         self.uplink.update(|l| {
             l.discovery = true;
@@ -874,13 +875,9 @@ impl Upstream {
         (self.setup, self.network) = (setup, network);
         self.client = Some(Helper::Adopted(client));
         self.session = Some(session.to_owned());
-        for step in setup_plan() {
-            self.setup.adopt(step)?;
-        }
-        for step in network_plan(&dns_lease, &ula, &sources) {
-            self.network.adopt(step)?;
-        }
-        self.network.adopt(ra_step(&ula, linklocal, mtu))?;
+        super::adopt::adopt_resources(&mut self.setup, setup_plan(), &mut net::Device, &mut crate::netfx::effect::Device)?;
+        self.network.adopt(network_plan(&dns_lease, &ula, &sources))?;
+        self.network.adopt(vec![ra_step(&ula, linklocal, mtu)])?;
         self.requested = true;
         self.installed = Some(lease);
         self.path = Some(live);
@@ -936,10 +933,10 @@ fn session_client(args: &[String]) -> bool {
 }
 
 pub fn recover() -> Result<(), String> {
-    Transaction::recover(&Path::new(JOURNAL).join("ipv6-network.json"))?;
+    EffectSet::recover(&Path::new(JOURNAL).join("ipv6-network.json"))?;
     // The separate RA snapshot also covers a crash before applying its journal step.
     ra_restore()?;
-    Transaction::recover(&Path::new(JOURNAL).join("ipv6-setup.json"))?;
+    EffectSet::recover(&Path::new(JOURNAL).join("ipv6-setup.json"))?;
     // Delayed odhcp6c script children may survive their client. Each writes
     // only its own nonce path, never the next session's state.
     if let Ok(entries) = fs::read_dir(ROOT) {
@@ -984,7 +981,7 @@ fn capabilities() -> Result<(), String> {
     Ok(())
 }
 
-fn setup_plan() -> Vec<Step> {
+fn setup_settings() -> Vec<Step> {
     let mut plan = Vec::new();
     for (key, value) in [
         ("accept_ra", "0"),
@@ -1003,23 +1000,21 @@ fn setup_plan() -> Vec<Step> {
             Cmd::new("true", &[]),
         ));
     }
+    plan
+}
+
+pub(crate) fn setup_plan() -> Vec<Resource> {
+    let mut rules = Vec::new();
     // Through the vendor's INPUT reject; the relay's tables open the same
     // traffic (`uplink`, discovery) and drop the rest first.
-    plan.extend(net::chain("ip6tables", "filter", "U60_R6_IN"));
-    plan.push(net::rule(
-        "ip6tables",
-        "filter",
-        "U60_R6_IN",
-        &[
+    rules.push(words(&[
             "-m",
             "conntrack",
             "--ctstate",
             "ESTABLISHED,RELATED",
             "-j",
             "ACCEPT",
-        ],
-        false,
-    ));
+        ]));
     for (kind, source) in [("134", Some("fe80::/10")), ("135", None), ("136", None)] {
         let mut args = vec![
             "-p",
@@ -1035,34 +1030,16 @@ fn setup_plan() -> Vec<Step> {
             args.extend(["-s", source]);
         }
         args.extend(["-j", "ACCEPT"]);
-        plan.push(net::rule("ip6tables", "filter", "U60_R6_IN", &args, false));
+        rules.push(words(&args));
     }
     for kind in ["1", "2", "3", "4"] {
-        plan.push(net::rule(
-            "ip6tables",
-            "filter",
-            "U60_R6_IN",
-            &["-p", "ipv6-icmp", "--icmpv6-type", kind, "-j", "ACCEPT"],
-            false,
-        ));
+        rules.push(words(&["-p", "ipv6-icmp", "--icmpv6-type", kind, "-j", "ACCEPT"]));
     }
-    plan.push(net::rule(
-        "ip6tables",
-        "filter",
-        "U60_R6_IN",
-        &[
+    rules.push(words(&[
             "-p", "udp", "--sport", "547", "--dport", "546", "-j", "ACCEPT",
-        ],
-        false,
-    ));
-    plan.push(net::rule(
-        "ip6tables",
-        "filter",
-        "U60_RELAY_IN",
-        &["-j", "U60_R6_IN"],
-        true,
-    ));
-    plan
+        ]));
+    vec![Resource::LegacyChain(LegacyChain { tool: LegacyTool::V6, table: "filter".into(), name: "U60_R6_IN".into(), rules }),
+        Resource::LegacyHook(LegacyHook { tool: LegacyTool::V6, table: "filter".into(), chain: "INPUT".into(), rule: words(&["-i", IFACE, "-j", "U60_R6_IN"]), position: Position::InsertFirst })]
 }
 
 fn stable_ula() -> Result<String, String> {
@@ -1373,54 +1350,31 @@ fn route_matches(route: &Value, command: &Cmd) -> bool {
         && route["type"].as_str().unwrap_or("unicast") == net::route_target(args).0
 }
 
-fn address_step(ip: Ipv6Addr, prefix: u8, iface: &str, valid: u32, preferred: u32) -> Step {
-    let address = format!("{ip}/{prefix}");
-    let mut step = net::ip_step(
-        "-6",
-        "addr",
-        &[
-            &address,
-            "dev",
-            iface,
-            "valid_lft",
-            &valid.to_string(),
-            "preferred_lft",
-            &preferred.to_string(),
-        ],
-    );
-    if iface == IFACE {
-        step.apply.args.push("noprefixroute".into());
-    }
-    step.undo = Cmd::new("ip", &["-6", "addr", "del", &address, "dev", iface]);
-    step
+fn address_step(ip: Ipv6Addr, prefix: u8, iface: &str, valid: u32, preferred: u32) -> Resource {
+    Resource::Addr(Addr { family: Family::V6, address: format!("{ip}/{prefix}"), device: iface.into(), broadcast: None, valid_lft: Some(valid), preferred_lft: Some(preferred), noprefixroute: iface == IFACE })
 }
 
-fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
+fn policy_rule() -> Resource {
+    Resource::Rule(Rule { family: Family::V6, priority: PREF.parse().unwrap(), table: TABLE.into(), mark: None })
+}
+
+fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Resource> {
     let mut p = Vec::new();
     for a in &l.addresses {
         p.push(address_step(a.address, 128, IFACE, a.valid, a.preferred));
     }
-    let mut dad = Cmd::new("@u60-relay-ipv6-dad", &[]);
-    dad.args = l.addresses.iter().map(|a| a.address.to_string()).collect();
-    p.push(Step::new(dad, Cmd::new("true", &[])));
+    p.push(Resource::Internal(Internal::new("@u60-relay-ipv6-dad", l.addresses.iter().map(|address| address.address.to_string()).collect(), vec![]).with_undo(Cmd::new("true", &[]))));
     let lan_address = Ipv6Addr::from(u128::from(cidr(ula).unwrap().0) + 1);
     p.push(address_step(lan_address, 64, "br-lan", 180, 90));
-    p.push(net::ip_step(
-        "-6",
-        "route",
-        &["fe80::/64", "dev", IFACE, "table", TABLE],
-    ));
+    let mut linklocal = Route::new(Family::V6, RouteType::Unicast, "fe80::/64", TABLE);
+    linklocal.device = Some(IFACE.into());
+    p.push(Resource::Route(linklocal));
     let destinations: Vec<&str> = vec![TAILNET, crate::netfx::ids::LINK_LOCAL_V6, crate::netfx::ids::MULTICAST_V6];
     for source in sources {
-        p.push(Step::new(
-            lan_route(source, "add"),
-            Cmd::new(
-                "ip",
-                &[
-                    "-6", "route", "del", source, "dev", "br-lan", "table", TABLE,
-                ],
-            ),
-        ));
+        let mut route = Route::new(Family::V6, RouteType::Unicast, source, TABLE);
+        route.device = Some("br-lan".into());
+        route.expires = Some(LAN_GRACE as u32);
+        p.push(Resource::Route(route));
     }
     for dest in destinations {
         // Link-local gateways are resolved within this table; destinations
@@ -1428,55 +1382,33 @@ fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
         if dest == "fe80::/10" {
             continue;
         }
-        p.push(net::ip_step(
-            "-6",
-            "route",
-            &["throw", dest, "table", TABLE],
-        ));
+        p.push(Resource::Route(Route::new(Family::V6, RouteType::Throw, dest, TABLE)));
     }
     // SLAAC's A flag does not imply on-link (L). Only explicit no-gateway
     // RA_ROUTES entries authorize neighbor discovery for a global prefix.
     for route in &l.onlink {
-        p.push(onlink_route(route, "add", l.mtu));
+        let mut resource = Route::new(Family::V6, RouteType::Unicast, &prefix(route.address, route.prefix), TABLE);
+        resource.device = Some(IFACE.into());
+        resource.expires = Some(route.valid);
+        resource.mtu = Some(l.mtu);
+        p.push(Resource::Route(resource));
     }
-    p.push(Step::new(
-        default_route(l, "add"),
-        Cmd::new(
-            "ip",
-            &[
-                "-6",
-                "route",
-                "del",
-                "default",
-                "via",
-                &l.routers[0].address.to_string(),
-                "dev",
-                IFACE,
-                "metric",
-                "1024",
-                "table",
-                TABLE,
-            ],
-        ),
-    ));
+    let mut default = Route::new(Family::V6, RouteType::Unicast, "default", TABLE);
+    default.gateway = Some(l.routers[0].address.to_string());
+    default.device = Some(IFACE.into());
+    default.source = Some(l.addresses[0].address.to_string());
+    default.metric = Some(1024);
+    default.mtu = Some(l.mtu);
+    default.expires = Some(l.routers[0].valid.min(l.addresses[0].valid));
+    p.push(Resource::Route(default));
     // The masquerade, the denials and DNS are in the relay's tables
     // (`uplink`, NAT66); legacy keeps what must pass the vendor's FORWARD
     // rejects.
-    p.extend(net::chain("ip6tables", "filter", "U60_R6_FWD"));
+    let mut rules = Vec::new();
     for source in sources {
-        p.push(net::rule(
-            "ip6tables",
-            "filter",
-            "U60_R6_FWD",
-            &["-i", "br-lan", "-o", IFACE, "-s", source, "-j", "ACCEPT"],
-            false,
-        ));
+        rules.push(words(&["-i", "br-lan", "-o", IFACE, "-s", source, "-j", "ACCEPT"]));
     }
-    p.push(net::rule(
-        "ip6tables",
-        "filter",
-        "U60_R6_FWD",
-        &[
+    rules.push(words(&[
             "-i",
             IFACE,
             "-o",
@@ -1487,17 +1419,10 @@ fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
             "ESTABLISHED,RELATED",
             "-j",
             "ACCEPT",
-        ],
-        false,
-    ));
-    p.push(net::rule(
-        "ip6tables",
-        "filter",
-        "FORWARD",
-        &["-j", "U60_R6_FWD"],
-        true,
-    ));
-    p.push(net::ip_step("-6", "rule", &["pref", PREF, "lookup", TABLE]));
+        ]));
+    p.push(Resource::LegacyChain(LegacyChain { tool: LegacyTool::V6, table: "filter".into(), name: "U60_R6_FWD".into(), rules }));
+    p.push(Resource::LegacyHook(LegacyHook { tool: LegacyTool::V6, table: "filter".into(), chain: "FORWARD".into(), rule: words(&["-j", "U60_R6_FWD"]), position: Position::InsertFirst }));
+    p.push(policy_rule());
     p
 }
 
@@ -1521,14 +1446,8 @@ fn reload_ra() -> Result<(), String> {
         .map(|_| ())
 }
 
-fn ra_step(ula: &str, dns: Ipv6Addr, mtu: u32) -> Step {
-    Step::new(
-        Cmd::new(
-            "@u60-relay-ra",
-            &["apply", ula, &dns.to_string(), &mtu.to_string()],
-        ),
-        Cmd::new("@u60-relay-ra", &["restore"]),
-    )
+fn ra_step(ula: &str, dns: Ipv6Addr, mtu: u32) -> Resource {
+    Resource::Internal(Internal::new("@u60-relay-ra", words(&["apply", ula, &dns.to_string(), &mtu.to_string()]), vec!["restore".into()]))
 }
 
 pub fn ra_command(args: &[String]) -> Result<(), String> {
@@ -1566,6 +1485,20 @@ fn maintain_ra() -> Result<(), Fault> {
 mod tests {
     use super::*;
 
+    fn network_plan(lease: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
+        crate::netfx::effect::test_plan(super::network_plan(lease, ula, sources))
+    }
+
+    fn setup_plan() -> Vec<Step> {
+        let mut steps = setup_settings();
+        steps.extend(crate::netfx::effect::test_plan(super::setup_plan()));
+        steps
+    }
+
+    fn ra_step(ula: &str, dns: Ipv6Addr, mtu: u32) -> Step {
+        super::ra_step(ula, dns, mtu).step_with(|_| Ok("1".into())).unwrap()
+    }
+
     #[test]
     fn only_the_relays_own_ipv6_client_is_taken_over() {
         let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
@@ -1594,7 +1527,7 @@ mod tests {
 
     #[test]
     fn kernel_implicit_throw_device_is_not_a_foreign_route() {
-        let throw = net::ip_step("-6", "route", &["throw", "ff00::/8", "table", TABLE]);
+        let throw = Resource::Route(Route::new(Family::V6, RouteType::Throw, "ff00::/8", TABLE)).step_with(|_| Ok("1".into())).unwrap();
         assert!(route_matches(
             &json!({"type":"throw","dst":"ff00::/8","dev":"lo","metric":1024}),
             &throw.apply
@@ -1617,24 +1550,13 @@ mod tests {
             "fd12:3456:789a::/64",
             &["fd12:3456:789a::/64".into()],
         );
-        let vendor = net::rule(
-            "ip6tables",
-            "filter",
-            "OUTPUT",
-            &["-o", "rmnet+", "-j", "REJECT"],
-            true,
-        );
-        assert!(!plan.iter().any(|step| step.undo == vendor.undo));
+        let vendor = Cmd::new("ip6tables", &["-w", "2", "-t", "filter", "-D", "OUTPUT", "-o", "rmnet+", "-j", "REJECT"]);
+        assert!(!plan.iter().any(|step| step.undo == vendor));
         // The cellular OUTPUT reject is the relay baseline's one rule in its
         // tables, not a second legacy chain here.
         assert!(!plan.iter().any(|s| s.apply.args.iter().any(|a| a == "OUTPUT" || a == "REJECT" || a == "DROP" || a == "MASQUERADE")));
         assert_eq!(plan.last().unwrap().apply.args, ["-6", "rule", "add", "pref", PREF, "lookup", TABLE], "the policy rule is last");
-        assert!(
-            net::foreign_identity(&plan).is_empty(),
-            "{:?}",
-            net::foreign_identity(&plan)
-        );
-        assert!(net::foreign_identity(&setup_plan()).is_empty());
+        assert!(plan.iter().chain(&setup_plan()).filter(|step| step.undo.program == "ip6tables" && step.undo.args.contains(&"-D".into())).all(|step| crate::netfx::effect::legacy::owned_rule(&step.undo.args)));
         assert!(!setup_plan().iter().any(|s| s.apply.args.iter().any(|a| a == "DROP")), "the drop is in the tables");
     }
 
@@ -2117,41 +2039,47 @@ mod tests {
     }
 
     #[test]
-    fn export_plans_for_isolated_linux_acceptance() {
-        let Ok(path) = std::env::var("U60_IPV6_QA_PLAN") else {
-            return;
-        };
-        let l = lease();
-        let source = "fd12:3456:789a::/64";
-        let network = network_plan(
-            &l,
-            source,
-            &[source.into(), "2001:db8:2::/64".into()],
-        );
-        let ipv4 = super::super::relay_plan(
-            &super::super::Lease {
-                ip: "10.0.0.2".parse().unwrap(),
-                subnet: "255.255.255.0".parse().unwrap(),
-                gateway: "10.0.0.1".parse().unwrap(),
-                dns: vec!["10.0.0.53".parse().unwrap()],
-            },
-            24,
-            "192.168.0.1".parse().unwrap(),
-            "255.255.255.0".parse().unwrap(),
-        );
-        let mut ula_dns = l.clone();
-        ula_dns.dns = vec!["fd99::53".parse().unwrap()];
-        let network_ula_dns = network_plan(
-            &ula_dns,
-            source,
-            &[source.into(), "2001:db8:2::/64".into()],
-        );
-        net::write_private(Path::new(&path),&serde_json::to_vec_pretty(&json!({"setup":setup_plan(),"network":network,"network_ula_dns":network_ula_dns,"ipv4":ipv4,"mihomo":crate::mihomo::proxy_plan_with(|_| Ok("0".into())).unwrap()})).unwrap()).unwrap();
+    fn relay_resource_plans_have_literal_restore_and_journal_contracts() {
+        use crate::netfx::effect::{fake::FakeNft, testing::Kernel};
+        let directory = std::env::temp_dir().join(format!("u60-resource-plans-{}", std::process::id()));
+        let v4 = super::super::Lease { ip: "10.20.0.7".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.20.0.1".parse().unwrap(), dns: vec![] };
+        let ula = "fd12:3456:789a::/64";
+        let plans = [
+            ("wireless", super::super::input_guards(), vec!["iptables -w 2 -t filter -X U60_RELAY_IN", "iptables -w 2 -t filter -D INPUT -i ath20 -j U60_RELAY_IN"]),
+            ("network", super::super::relay_plan(&v4, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap()), vec![
+                "ip -4 addr del 10.20.0.7/24 dev ath20", "ip -4 route del 10.20.0.0/24 dev ath20 scope link src 10.20.0.7 table 60631",
+                "ip -4 route del throw 100.64.0.0/10 table 60631", "ip -4 route del throw 169.254.0.0/16 table 60631", "ip -4 route del throw 224.0.0.0/4 table 60631", "ip -4 route del throw 192.168.0.0/24 table 60631",
+                "ip -4 route del default via 10.20.0.1 dev ath20 table 60631", "iptables -w 2 -t filter -X U60_RELAY_FWD", "iptables -w 2 -t filter -D FORWARD -j U60_RELAY_FWD", "iptables -w 2 -t nat -D POSTROUTING -o ath20 -m comment --comment zte-agent-wifi-relay -j MASQUERADE", "ip -4 rule del pref 18640 lookup 60631"]),
+            ("ipv6-setup", super::setup_plan(), vec!["ip6tables -w 2 -t filter -X U60_R6_IN", "ip6tables -w 2 -t filter -D INPUT -i ath20 -j U60_R6_IN"]),
+            ("ipv6-network", super::network_plan(&lease(), ula, &[ula.into()]), vec![
+                "ip -6 addr del 2001:db8:1::2/128 dev ath20", "true", "ip -6 addr del fd12:3456:789a::1/64 dev br-lan", "ip -6 route del fe80::/64 dev ath20 table 60631", "ip -6 route del fd12:3456:789a::/64 dev br-lan table 60631", "ip -6 route del throw fd7a:115c:a1e0::/48 table 60631", "ip -6 route del throw ff00::/8 table 60631", "ip -6 route del 2001:db8:1::/64 dev ath20 table 60631", "ip -6 route del default via fe80::1 dev ath20 metric 1024 table 60631", "ip6tables -w 2 -t filter -X U60_R6_FWD", "ip6tables -w 2 -t filter -D FORWARD -j U60_R6_FWD", "ip -6 rule del pref 18640 lookup 60631"]),
+            ("portal", super::super::portal::web_bypasses(), vec!["iptables -w 2 -t nat -D redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN", "ip6tables -w 2 -t nat -D redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN"]),
+            ("offload", super::super::offload::route_plan("10.20.0.1", "10.20.0.0/24"), vec!["ip -4 route del unreachable 100.64.0.0/10 metric 60631 table main", "ip -4 route del unreachable 169.254.0.0/16 metric 60631 table main", "ip -4 route del unreachable 224.0.0.0/4 metric 60631 table main", "ip -4 route del default via 10.20.0.1 dev ath20 metric 60631 table main"]),
+        ];
+        let expected_restores = [
+            "*filter\n-N U60_RELAY_IN\n-A U60_RELAY_IN -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n-A U60_RELAY_IN -p udp -m udp --sport 67 --dport 68 -j ACCEPT\n-I INPUT 1 -i ath20 -j U60_RELAY_IN\nCOMMIT\n",
+            "*filter\n-N U60_RELAY_FWD\n-A U60_RELAY_FWD -i br-lan -o ath20 -j ACCEPT\n-A U60_RELAY_FWD -i ath20 -o br-lan -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n-I FORWARD 1 -j U60_RELAY_FWD\nCOMMIT\n*nat\n-I POSTROUTING 1 -o ath20 -m comment --comment zte-agent-wifi-relay -j MASQUERADE\nCOMMIT\n",
+            "*filter\n-N U60_R6_IN\n-A U60_R6_IN -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n-A U60_R6_IN -s fe80::/10 -p ipv6-icmp -m icmp6 --icmpv6-type 134 -m hl --hl-eq 255 -j ACCEPT\n-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 135 -m hl --hl-eq 255 -j ACCEPT\n-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 136 -m hl --hl-eq 255 -j ACCEPT\n-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 1 -j ACCEPT\n-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 2 -j ACCEPT\n-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 3 -j ACCEPT\n-A U60_R6_IN -p ipv6-icmp -m icmp6 --icmpv6-type 4 -j ACCEPT\n-A U60_R6_IN -p udp -m udp --sport 547 --dport 546 -j ACCEPT\n-I INPUT 1 -i ath20 -j U60_R6_IN\nCOMMIT\n",
+            "*filter\n-N U60_R6_FWD\n-A U60_R6_FWD -s fd12:3456:789a::/64 -i br-lan -o ath20 -j ACCEPT\n-A U60_R6_FWD -i ath20 -o br-lan -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n-I FORWARD 1 -j U60_R6_FWD\nCOMMIT\n",
+            "*nat\n-I redirect_chain 1 -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN\nCOMMIT\n*nat\n-I redirect_chain 1 -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN\nCOMMIT\n",
+            "",
+        ];
+        for ((name, resources, expected), restore) in plans.into_iter().zip(expected_restores) {
+            let mut set = EffectSet::new("relay", directory.join(format!("{name}.json")));
+            let mut kernel = Kernel::empty_router();
+            set.declare_with(resources, false, &mut kernel, &mut FakeNft::default()).unwrap();
+            let journal = set.journal();
+            let undo: Vec<Cmd> = serde_json::from_value(journal["undo"].clone()).unwrap();
+            let lines: Vec<String> = undo.iter().map(|command| format!("{} {}", command.program, command.args.join(" ")).trim().to_owned()).collect();
+            assert_eq!(lines, expected, "{name}");
+            assert_eq!(kernel.writes.iter().map(|(_, input)| input.as_str()).collect::<String>(), restore, "{name}");
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     /// v5 isolated acceptance (`zte-agent/tests/relay-firewall-qa`): the
     /// relay's table batches per layout as `Shared` loads them, the legacy
-    /// restore transactions `Transaction::apply_network` runs, the portal
+    /// restore transactions the sets run, the portal
     /// RETURN moves and this version's journals (boot `BOOT`).
     #[test]
     #[ignore = "writes files for the isolated relay firewall QA; set U60_RELAY_QA"]
@@ -2178,26 +2106,50 @@ mod tests {
         fs::write(dir.join("broken.nft"), broken).unwrap();
         let v4 = super::super::Lease { ip: "10.20.0.7".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.20.0.1".parse().unwrap(), dns: vec!["10.20.0.1".parse().unwrap()] };
         let lan: (std::net::Ipv4Addr, std::net::Ipv4Addr) = ("192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
-        let mut wireless = vec![Step::new(Cmd::new("sysctl", &["-w", "net.ipv6.conf.ath20.disable_ipv6=1"]), Cmd::new("true", &[]))];
-        wireless.extend(super::super::input_guards());
-        wireless.extend(uplink::steps());
+        let mut wireless = super::super::input_guards();
+        wireless.push(Resource::NftTable(crate::netfx::effect::NftTable { owner: "relay", name: uplink::TABLE, file: dir.join("uplink.nft"), families: None }));
         let network = super::super::relay_plan(&v4, 24, lan.0, lan.1);
         // The portal RETURN, journaled with the switch in `dns.json`; the
         // switch and resolver steps need UCI and the vendor's resolv.conf.
         let dns = super::super::portal::web_bypasses();
         let ula = "fd12:3456:789a::/64";
-        let v6 = network_plan(&lease(), ula, &[ula.into()]);
+        let v6 = super::network_plan(&lease(), ula, &[ula.into()]);
         let mut restore = Vec::new();
-        for (name, plan) in [("wireless", &wireless), ("network", &network), ("dns", &dns), ("ipv6-setup", &setup_plan()), ("ipv6-network", &v6)] {
-            for (program, input) in net::firewall::inputs(plan) {
+        let mut kernel = crate::netfx::effect::testing::Kernel::empty_router();
+        for (name, plan) in [("wireless", &wireless), ("network", &network), ("dns", &dns), ("ipv6-setup", &super::setup_plan()), ("ipv6-network", &v6)] {
+            let mut set = EffectSet::new("relay", dir.join(format!("{name}.json")));
+            kernel.writes.clear();
+            set.declare_with(plan.clone(), false, &mut kernel, &mut crate::netfx::effect::fake::FakeNft::default()).unwrap();
+            for (program, input) in &kernel.writes {
                 restore.push(json!({"plan": name, "program": program, "input": input}));
             }
-            let undo: Vec<&Cmd> = plan.iter().map(|s| &s.undo).collect();
-            fs::write(dir.join(format!("{name}.json")), serde_json::to_vec_pretty(&json!({"boot": "BOOT", "undo": undo})).unwrap()).unwrap();
+            fs::write(dir.join(format!("{name}.json")), serde_json::to_vec_pretty(&set.journal()).unwrap()).unwrap();
         }
         fs::write(dir.join("restore.json"), serde_json::to_vec_pretty(&restore).unwrap()).unwrap();
-        let moves = json!({"late": super::super::portal::moves(super::super::portal::Place::Late), "absent": super::super::portal::moves(super::super::portal::Place::Absent)});
+        let mut set = EffectSet::new("relay", dir.join("portal-moves.json"));
+        set.assume(vec![super::super::portal::web_bypass(LegacyTool::V4)]);
+        let mut kernel = crate::netfx::effect::testing::Kernel::portal_late();
+        set.reconcile_with(&mut kernel, &mut crate::netfx::effect::fake::FakeNft::default());
+        let late = kernel.writes.last().unwrap().1.clone();
+        kernel.tables.get_mut(&("iptables".into(), "nat".into())).unwrap().retain(|line| !line.contains("zte-agent"));
+        set.reconcile_with(&mut kernel, &mut crate::netfx::effect::fake::FakeNft::default());
+        let moves = json!({"late": late, "absent": kernel.writes.last().unwrap().1});
         fs::write(dir.join("portal.json"), moves.to_string()).unwrap();
+        let mut repairs = serde_json::Map::new();
+        let mut kernel = crate::netfx::effect::testing::Kernel::empty_router();
+        let resources: Vec<Resource> = network.iter().filter(|resource| matches!(resource, Resource::LegacyChain(_) | Resource::LegacyHook(_))).cloned().collect();
+        let mut set = EffectSet::new("relay", dir.join("repair-qa.json"));
+        set.declare_with(resources, false, &mut kernel, &mut crate::netfx::effect::fake::FakeNft::default()).unwrap();
+        kernel.tables.get_mut(&("iptables".into(), "filter".into())).unwrap().push("-A U60_RELAY_FWD -j RETURN".into());
+        kernel.writes.clear();
+        set.reconcile_with(&mut kernel, &mut crate::netfx::effect::fake::FakeNft::default());
+        repairs.insert("chain".into(), json!(kernel.writes[0].1));
+        kernel.tables.get_mut(&("iptables".into(), "filter".into())).unwrap().push("-A FORWARD -j U60_RELAY_FWD".into());
+        kernel.writes.clear();
+        set.reconcile_with(&mut kernel, &mut crate::netfx::effect::fake::FakeNft::default());
+        repairs.insert("hook".into(), json!(kernel.writes[0].1));
+        fs::write(dir.join("repairs.json"), serde_json::to_vec_pretty(&repairs).unwrap()).unwrap();
+        fs::remove_file(dir.join("repair-qa.json")).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -2238,8 +2190,8 @@ mod tests {
             Cmd::new("@u60-relay-dns", &["192.0.2.53"]),
             Cmd::new("@u60-relay-dns", &[]),
         );
-        let mut dns = Transaction::new(Path::new(JOURNAL).join("dns-qa.json"));
-        dns.apply(dns_step).unwrap();
+        let mut dns = EffectSet::new("relay", Path::new(JOURNAL).join("dns-qa.json"));
+        dns.step(dns_step).unwrap();
         assert!(fs::read_to_string("/tmp/resolv.conf")
             .unwrap()
             .contains("nameserver 192.0.2.53"));
@@ -2249,7 +2201,7 @@ mod tests {
         )
         .unwrap();
         super::super::dns::reconcile(&["192.0.2.53".parse().unwrap()]).unwrap();
-        Transaction::recover(&Path::new(JOURNAL).join("dns-qa.json")).unwrap();
+        EffectSet::recover(&Path::new(JOURNAL).join("dns-qa.json")).unwrap();
         assert_eq!(
             fs::read_to_string("/tmp/resolv.conf").unwrap(),
             "# new vendor DNS\nnameserver 2001:db8:9::54\n"
@@ -2403,7 +2355,8 @@ mod tests {
             .run()
             .unwrap();
 
-        let uplink = super::super::uplink::Shared::new(PathBuf::from("/tmp/u60-ipv6-qa-uplink.nft"));
+        let effects = std::sync::Arc::new(std::sync::Mutex::new(EffectSet::new("relay", PathBuf::from("/tmp/u60-ipv6-qa-wireless.json"))));
+        let uplink = super::super::uplink::Shared::new(PathBuf::from("/tmp/u60-ipv6-qa-uplink.nft"), effects);
         uplink.guard().unwrap();
         let mut upstream = Upstream::new(uplink);
         upstream.start(false).unwrap();
@@ -2549,19 +2502,21 @@ mod tests {
         let rule = [
             "-w",
             "2",
-            "-t",
-            "nat",
             "-C",
-            "U60_R6_DNS",
-            "-d",
-            "fd00:60:1107::1",
+            "U60_R6_FWD",
+            "-i",
+            "br-lan",
+            "-o",
+            IFACE,
+            "-s",
+            "2001:db8:2::/64",
             "-j",
             "ACCEPT",
         ];
         Cmd::new("ip6tables", &rule).run().unwrap();
         let journal = fs::read(Path::new(JOURNAL).join("ipv6-network.json")).unwrap();
         let mut remove = rule;
-        remove[4] = "-D";
+        remove[2] = "-D";
         Cmd::new("ip6tables", &remove).run().unwrap();
         // The repair now comes from the `net_guard` reconcile, not the tick.
         assert!(upstream.reconcile().failed.is_empty());

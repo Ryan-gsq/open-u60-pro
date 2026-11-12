@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use super::{
     decode_ssid, input_guards, lease_change, lease_file, net, network_id, offload, power_save, read_lease, relay_layout,
-    relay_plan, resolvers_acceptable, resume, start_dhcp, steering, uplink, validate_lease, wpa, Cmd, Helper, Lease,
-    LeaseChange, Network, Session, Transaction, IFACE, JOURNAL, ROOT,
+    relay_plan, resolvers_acceptable, resume, start_dhcp, steering, validate_lease, wpa, Cmd, Helper, Lease,
+    LeaseChange, Network, Session, EffectSet, IFACE, JOURNAL, ROOT,
 };
 
 /// How long the new DHCP client may take to renew the address.
@@ -32,7 +32,7 @@ const RENEW_WAIT: Duration = Duration::from_secs(10);
 pub(super) fn adopt(target: &resume::Resume, lan_ip: Ipv4Addr, lan_mask: Ipv4Addr) -> Result<Session, String> {
     let root = Path::new(JOURNAL);
     for name in ["wireless.json", "network.json", "dns.json"] {
-        if !Transaction::current(&root.join(name)) {
+        if !EffectSet::current(&root.join(name)) {
             return Err(format!("no {name} of this boot"));
         }
     }
@@ -58,6 +58,7 @@ pub(super) fn adopt(target: &resume::Resume, lan_ip: Ipv4Addr, lan_mask: Ipv4Add
     // IPv6 right after the tables: its NAT66 goes back into them at once.
     let taken = take_over(&mut session, &installed, prefix, lan_ip, lan_mask)
         .and_then(|()| take_over_ipv6(&mut session, client, target.ipv6))
+        .and_then(|()| session.uplink.finish_adopt())
         .and_then(|()| renew(&mut session, &installed, prefix));
     match taken {
         Ok(()) => {
@@ -83,33 +84,31 @@ pub(super) fn adopt(target: &resume::Resume, lan_ip: Ipv4Addr, lan_mask: Ipv4Add
     }
 }
 
-/// Re-takes the journaled steps (`Transaction::adopt`: nothing that still
+/// Re-takes the journaled resources (`EffectSet::adopt`: nothing that still
 /// holds runs again).
 fn take_over(session: &mut Session, installed: &Lease, prefix: u32, lan_ip: Ipv4Addr, lan_mask: Ipv4Addr) -> Result<(), String> {
     let root = Path::new(JOURNAL);
-    session.wireless = Transaction::load(&root.join("wireless.json"))?;
+    *session.wireless.lock().unwrap() = EffectSet::load("relay", &root.join("wireless.json"))?;
     let mut guards = input_guards();
-    guards.extend(uplink::steps());
-    for step in guards {
-        session.wireless.adopt(step)?;
-    }
-    session.network = Transaction::load(&root.join("network.json"))?;
-    for step in relay_plan(installed, prefix, lan_ip, lan_mask) {
-        session.network.adopt(step)?;
-    }
+    guards.push(session.uplink.resource(None));
+    adopt_resources(&mut session.wireless.lock().unwrap(), guards, &mut net::Device, &mut crate::netfx::effect::Device)?;
+    session.network = EffectSet::load("relay", &root.join("network.json"))?;
+    session.network.adopt(relay_plan(installed, prefix, lan_ip, lan_mask))?;
     session.routed = true;
     for step in steering::plan() {
-        if let Err(e) = session.network.adopt(step) {
+        if let Err(e) = session.network.adopt(vec![step]) {
             crate::netlog!("[relay] receive steering not applied: {e}");
         }
     }
-    session.dns = Transaction::load(&root.join("dns.json"))?;
-    for step in super::portal::web_bypasses() {
-        session.dns.adopt(step)?;
-    }
-    session.dns.adopt(super::resolver(installed))?;
+    session.dns = EffectSet::load("relay", &root.join("dns.json"))?;
+    session.dns.adopt(super::portal::web_bypasses())?;
+    session.dns.adopt(vec![super::resolver(installed)])?;
     // The previous tables keep working until here; IPv6 adds its part next.
     session.uplink.adopt(relay_layout(installed, lan_ip, lan_mask))
+}
+
+pub(crate) fn adopt_resources(set: &mut EffectSet, resources: Vec<super::Resource>, probe: &mut impl net::Probe, nft: &mut impl crate::netfx::effect::Nft) -> Result<(), String> {
+    set.declare_with(resources, true, probe, nft)
 }
 
 /// A new DHCP client renews the same address (the old one died with the
@@ -137,7 +136,7 @@ fn renew(session: &mut Session, installed: &Lease, prefix: u32) -> Result<(), St
 /// when it does not match) rolled back and started again.
 fn take_over_ipv6(session: &mut Session, client: Option<(offload::Record, String)>, requested: bool) -> Result<(), String> {
     if let Some((client, id)) = client {
-        let current = ["ipv6-setup.json", "ipv6-network.json"].iter().all(|name| Transaction::current(&Path::new(JOURNAL).join(name)));
+        let current = ["ipv6-setup.json", "ipv6-network.json"].iter().all(|name| EffectSet::current(&Path::new(JOURNAL).join(name)));
         let adopted = if current { session.ipv6.adopt(client, &id) } else { Err("no IPv6 journals of this boot".into()) };
         match adopted {
             Ok(()) => return Ok(()),

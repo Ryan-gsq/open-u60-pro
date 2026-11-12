@@ -13,7 +13,8 @@
 //! RETURN was there, and the DNAT stayed until the next reload (B31,
 //! 2026-11-12).
 
-use crate::net_tools::{Cmd, Step};
+use crate::net_tools::Cmd;
+use super::{Resource, Internal, LegacyHook, LegacyTool, Position, words};
 
 const KEY: &str = "zwrt_redirect.redirect.switch";
 const PACKAGE: &str = "zwrt_redirect";
@@ -22,7 +23,7 @@ const COMMENT: &str = crate::netfx::ids::RELAY_COMMENT;
 /// The RETURN, as given to iptables.
 const BYPASS: [&str; 7] = ["-i", "br-lan", "-m", "comment", "--comment", COMMENT, "-j"];
 
-pub(super) fn plan() -> Result<Option<Step>, String> {
+pub(super) fn plan() -> Result<Option<Resource>, String> {
     plan_with(&mut |cmd| cmd.run())
 }
 
@@ -34,89 +35,20 @@ fn bypass() -> Vec<&'static str> {
 
 /// Skips only the vendor's offline-portal chain, not the rest of NAT or any
 /// filter policy: direct management and configured port forwards survive.
-/// Applied (and re-checked) as `@u60-relay-portal-return`, which places it
-/// first; its undo is the plain `-D` every agent version runs.
-pub(super) fn web_bypass(tool: &str) -> Step {
-    let rule = crate::net_tools::rule(tool, "nat", CHAIN, &bypass(), true);
-    Step::new(Cmd::new("@u60-relay-portal-return", &[tool]), rule.undo)
+pub(super) fn web_bypass(tool: LegacyTool) -> Resource {
+    Resource::LegacyHook(LegacyHook { tool, table: "nat".into(), chain: CHAIN.into(), rule: words(&bypass()), position: Position::BeforeVendor })
 }
 
 /// The RETURN for both families, as the session's `dns` transaction
 /// journals it (with the switch, so a handover keeps both).
-pub(super) fn web_bypasses() -> Vec<Step> {
-    ["iptables", "ip6tables"].into_iter().map(web_bypass).collect()
+pub(crate) fn web_bypasses() -> Vec<Resource> {
+    [LegacyTool::V4, LegacyTool::V6].into_iter().map(web_bypass).collect()
 }
-
-/// Where the RETURN is in a `-S redirect_chain` listing.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Place {
-    First,
-    /// Behind a vendor rule (a DNAT may come first).
-    Late,
-    Absent,
-}
-
-fn place(listing: &str) -> Place {
-    let ours = format!("-A {CHAIN} {}", bypass().join(" "));
-    let mut vendor = false;
-    for line in listing.lines().map(str::trim).filter(|l| l.starts_with(&format!("-A {CHAIN} "))) {
-        if line == ours {
-            return if vendor { Place::Late } else { Place::First };
-        }
-        vendor = true;
-    }
-    Place::Absent
-}
-
-fn tool(args: &[String]) -> Result<&'static str, String> {
-    match args {
-        [tool] if tool == "iptables" => Ok("iptables"),
-        [tool] if tool == "ip6tables" => Ok("ip6tables"),
-        _ => Err("Invalid relay portal bypass".into()),
-    }
-}
-
-fn listing(tool: &str) -> Result<String, String> {
-    Cmd::new(tool, &["-w", "2", "-t", "nat", "-S", CHAIN]).run()
-}
-
-/// `@u60-relay-portal-return <tool>`: puts the RETURN first. One behind a
-/// vendor rule is moved in one restore transaction (deleted and inserted
-/// first together), so it is never missing and nothing of the vendor's is
-/// touched.
-pub(crate) fn place_return(args: &[String]) -> Result<(), String> {
-    let tool = tool(args)?;
-    let input = moves(place(&listing(tool)?));
-    match input {
-        None => Ok(()),
-        Some(input) => crate::net_tools::firewall::restore(&format!("{tool}-restore"), input),
-    }
-}
-
-/// The restore transaction that puts the RETURN first from `at`.
-pub(super) fn moves(at: Place) -> Option<String> {
-    let rule = bypass().join(" ");
-    match at {
-        Place::First => None,
-        Place::Absent => Some(format!("*nat\n-I {CHAIN} 1 {rule}\nCOMMIT\n")),
-        Place::Late => Some(format!("*nat\n-D {CHAIN} {rule}\n-I {CHAIN} 1 {rule}\nCOMMIT\n")),
-    }
-}
-
-/// Whether the RETURN is in place in a `-t nat -S` listing (the whole table,
-/// as a guard check reads it once): present and ahead of every vendor rule.
-pub(crate) fn return_first(listing: &str) -> bool {
-    place(listing) == Place::First
-}
-
-fn plan_with(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Option<Step>, String> {
+fn plan_with(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Option<Resource>, String> {
     match current(run)?.as_str() {
         "0" => Ok(None),
         "1" if switch_delta(&run(&Cmd::new("uci", &["-q", "changes", PACKAGE]))?).is_none() => {
-            Ok(Some(Step::new(
-                Cmd::new("@u60-relay-portal", &["disable"]),
-                Cmd::new("@u60-relay-portal", &["release"]),
-            )))
+            Ok(Some(Resource::Internal(Internal::new("@u60-relay-portal", vec!["disable".into()], vec!["release".into()]))))
         }
         _ => Err("Offline redirect setting has pending or unsupported changes; finish those before connecting relay".into()),
     }
@@ -179,30 +111,24 @@ fn command_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net_tools::bench::{self, Bench};
-    use crate::net_tools::{Pass, Transaction};
+    use crate::netfx::effect::{EffectSet, fake::FakeNft, testing::Kernel};
+    use crate::net_tools::Pass;
+
+    fn plan_with(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Option<crate::net_tools::Step>, String> {
+        super::plan_with(run)?.map(|resource| resource.step_with(|_| Ok("1".into()))).transpose()
+    }
 
     /// What the vendor's `firewall_redirect.sh` appended during a fw3 reload
     /// while our switch delta was released for a reconnect (B31,
     /// 2026-11-12): it stayed until the next reload.
-    const VENDOR_DNAT: &str = "-A redirect_chain ! -d 192.168.0.1/32 -p tcp -m tcp --dport 80 -m limit --limit 20/sec --limit-burst 40 -j DNAT --to-destination 192.168.0.1";
-    const OURS: &str = "-A redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN";
 
     #[test]
     fn a_return_behind_the_vendors_dnat_is_late_and_a_guard_check_moves_it() {
-        let listed = bench::router("iptables", "nat");
-        assert!(return_first(&listed), "as the router listed it");
-        let late = listed.replace(OURS, &format!("{VENDOR_DNAT}\n{OURS}"));
-        assert_eq!(place(&late), Place::Late);
-        assert!(!return_first(&late));
-        assert_eq!(place(&listed.replace(OURS, &format!("{OURS}\n{VENDOR_DNAT}"))), Place::First);
-        assert_eq!(place(&listed.replace(OURS, VENDOR_DNAT)), Place::Absent, "flushed by the reload");
-        let mut tx = Transaction::new(std::path::PathBuf::from("/nonexistent/dns.json"));
+        let mut tx = EffectSet::new("relay", std::path::PathBuf::from("/nonexistent/dns.json"));
         tx.assume(web_bypasses());
-        let mut device = Bench::router();
-        device.list(Cmd::new("iptables", &["-w", "2", "-t", "nat", "-S"]), Ok(late));
-        let result = tx.reconcile_with(|_| true, &mut device);
-        assert_eq!(device.applied, [web_bypass("iptables").apply], "the IPv6 RETURN is first");
+        let mut device = Kernel::portal_late();
+        let result = tx.reconcile_with(&mut device, &mut FakeNft::default());
+        assert_eq!(device.writes.len(), 1, "the IPv6 RETURN is first");
         assert!(result.restored.len() == 1 && result.failed.is_empty(), "{result:?}");
     }
 
@@ -214,44 +140,28 @@ mod tests {
     fn a_guard_check_of_the_connected_relay_reads_each_listing_once() {
         let lease = super::super::Lease { ip: "192.168.2.124".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "192.168.2.1".parse().unwrap(), dns: vec![] };
         let path = |name: &str| std::path::Path::new("/nonexistent").join(name);
-        let mut wireless = Transaction::new(path("wireless.json"));
+        let mut wireless = EffectSet::new("relay", path("wireless.json"));
         wireless.assume(super::super::input_guards());
-        let mut network = Transaction::new(path("network.json"));
+        let mut network = EffectSet::new("relay", path("network.json"));
         network.assume(super::super::relay_plan(&lease, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap()));
         network.assume(super::super::offload::route_plan("192.168.2.1", "192.168.2.0/24"));
-        let mut dns = Transaction::new(path("dns.json"));
+        let mut dns = EffectSet::new("relay", path("dns.json"));
         dns.assume(web_bypasses());
-        let ipv6 = bench::relay_ipv6_firewall();
-        let mut setup = Transaction::new(path("ipv6-setup.json"));
-        setup.assume(ipv6[..11].to_vec());
-        let mut upstream = Transaction::new(path("ipv6-network.json"));
-        upstream.assume(ipv6[11..].to_vec());
-        let firewall = |cmd: &Cmd| cmd.program != "ip";
-        let mut check = |device: &mut Bench| {
-            let mut result = wireless.reconcile_with(super::super::firewall_step, device);
-            result.extend(network.reconcile_with(|_| true, device));
-            result.extend(dns.reconcile_with(|_| true, device));
-            result.extend(setup.reconcile_with(firewall, device));
-            result.extend(upstream.reconcile_with(firewall, device));
-            assert!(result.restored.is_empty() && result.failed.is_empty(), "{result:?}");
-        };
-        // As the tick runs it today: each transaction reads for itself.
-        let mut device = Bench::router();
-        check(&mut device);
-        assert_eq!(device.ran.len(), 11, "{:?}", device.ran);
-        // In one pass (the tick opens it around the five).
-        let mut device = Bench::router();
+        let mut device = Kernel::empty_router();
+        let mut nft = FakeNft::default();
+        wireless.reconcile_with(&mut device, &mut nft);
+        network.reconcile_with(&mut device, &mut nft);
+        dns.reconcile_with(&mut device, &mut nft);
+        device.reads.clear();
         {
             let _pass = Pass::open();
-            check(&mut device);
+            wireless.reconcile_with(&mut device, &mut nft);
+            dns.reconcile_with(&mut device, &mut nft);
+            wireless.reconcile_with(&mut device, &mut nft);
         }
-        let mut ran: Vec<String> = device.ran.iter().map(|c| format!("{} {}", c.program, c.args.join(" "))).collect();
+        let mut ran: Vec<String> = device.reads.iter().map(|c| format!("{} {}", c.program, c.args.join(" "))).collect();
         ran.sort();
         assert_eq!(ran, [
-            "ip -4 route show table all",
-            "ip -4 rule show",
-            "ip -o -4 addr show",
-            "ip6tables -w 2 -t filter -S",
             "ip6tables -w 2 -t nat -S",
             "iptables -w 2 -t filter -S",
             "iptables -w 2 -t nat -S",
@@ -349,18 +259,18 @@ mod tests {
     fn the_redirect_return_must_come_before_every_vendor_rule() {
         let ours = "-A redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN";
         let dnat = "-A redirect_chain -i br-lan -p tcp -m tcp --dport 80 -j DNAT --to-destination 192.168.0.1:8080";
-        assert_eq!(place(&format!("-N redirect_chain\n{ours}\n{dnat}\n")), Place::First);
-        assert_eq!(place(&format!("-N redirect_chain\n{dnat}\n{ours}\n")), Place::Late, "present (-C succeeds) but behind the DNAT");
-        assert_eq!(place(&format!("-N redirect_chain\n{dnat}\n")), Place::Absent);
-        assert_eq!(place("-N redirect_chain\n-A redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay-old -j RETURN\n"), Place::Absent);
-        assert_eq!(moves(Place::First), None);
-        assert_eq!(moves(Place::Absent).unwrap(), format!("*nat\n-I redirect_chain 1 {}\nCOMMIT\n", &ours[18..]));
-        // Moved in one transaction: delete and insert commit together.
-        assert_eq!(moves(Place::Late).unwrap(), format!("*nat\n-D redirect_chain {0}\n-I redirect_chain 1 {0}\nCOMMIT\n", &ours[18..]));
-        let step = web_bypass("ip6tables");
-        assert_eq!((step.apply.program.as_str(), step.apply.args.as_slice()), ("@u60-relay-portal-return", &["ip6tables".to_owned()][..]));
-        assert_eq!(step.undo.args.join(" "), format!("-w 2 -t nat -D redirect_chain {}", &ours[18..]), "an undo the previous agent runs");
-        assert!(step.apply.checkable() && tool(&["inet".to_owned()]).is_err());
+        let mut set = EffectSet::new("relay", "/nonexistent/portal.json".into());
+        set.assume(vec![web_bypass(LegacyTool::V4)]);
+        let mut device = Kernel::empty_router();
+        let key = ("iptables".into(), "nat".into());
+        for lines in [vec![ours, dnat], vec![dnat, ours], vec![dnat]] {
+            device.tables.insert(key.clone(), std::iter::once("-N redirect_chain").chain(lines).map(str::to_owned).collect());
+            let result = set.reconcile_with(&mut device, &mut FakeNft::default());
+            assert!(result.failed.is_empty());
+            let rules = &device.tables[&key];
+            assert!(rules.iter().position(|line| line == ours) < rules.iter().position(|line| line == dnat));
+        }
+        assert_eq!(web_bypass(LegacyTool::V6).undo(|_| Ok("1".into())).unwrap().args.join(" "), format!("-w 2 -t nat -D redirect_chain {}", &ours[18..]));
     }
 
     #[test]

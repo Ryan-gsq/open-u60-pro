@@ -7,95 +7,18 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::time::Duration;
 
-use super::{Cmd, Probe, Step};
+use crate::net_tools::{Cmd, Probe};
 
-fn token(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-.:/,+=![]".contains(&b))
-}
-
-fn entry(cmd: &Cmd) -> Option<(&str, &str, String)> {
-    let program = match cmd.program.as_str() {
-        "iptables" => "iptables-restore",
-        "ip6tables" => "ip6tables-restore",
-        _ => return None,
-    };
-    let a = &cmd.args;
-    if a.len() < 6 || a[..3] != ["-w", "2", "-t"] || !a.iter().all(|s| token(s)) {
-        return None;
-    }
-    let table = a[3].as_str();
-    if !["filter", "nat", "mangle"].contains(&table) {
-        return None;
-    }
-    let owned = a[5].starts_with("U60_");
-    match a[4].as_str() {
-        "-N" if owned && a.len() == 6 => Some((program, table, format!("-N {}", a[5]))),
-        "-A" | "-I"
-            if owned
-                || [
-                    "INPUT",
-                    "OUTPUT",
-                    "FORWARD",
-                    "PREROUTING",
-                    "POSTROUTING",
-                    "redirect_chain",
-                ]
-                .contains(&a[5].as_str()) =>
-        {
-            Some((program, table, a[4..].join(" ")))
+pub(crate) fn append(input: &mut String, current: &str, table: &str, lines: &[String]) {
+    if table != current {
+        if !current.is_empty() {
+            input.push_str("COMMIT\n");
         }
-        _ => None,
+        input.push_str(&format!("*{table}\n"));
     }
-}
-
-#[derive(Debug)]
-pub(super) struct Batch {
-    program: String,
-    input: String,
-    pub(super) count: usize,
-}
-
-impl Batch {
-    pub(super) fn collect(steps: &[Step]) -> Option<Self> {
-        let (program, _, _) = entry(&steps.first()?.apply)?;
-        let mut input = String::new();
-        let mut current = "";
-        let mut count = 0;
-        for step in steps {
-            let Some((next, table, line)) = entry(&step.apply) else {
-                break;
-            };
-            if next != program || input.len() + line.len() > 128 * 1024 {
-                break;
-            }
-            if table != current {
-                if !current.is_empty() {
-                    input.push_str("COMMIT\n");
-                }
-                input.push('*');
-                input.push_str(table);
-                input.push('\n');
-                current = table;
-            }
-            input.push_str(&line);
-            input.push('\n');
-            count += 1;
-        }
-        if count == 0 {
-            return None;
-        }
-        input.push_str("COMMIT\n");
-        Some(Self {
-            program: program.into(),
-            input,
-            count,
-        })
-    }
-
-    pub(super) fn run(self) -> Result<(), String> {
-        restore(&self.program, self.input)
+    for line in lines {
+        input.push_str(line);
+        input.push('\n');
     }
 }
 
@@ -104,7 +27,7 @@ impl Batch {
 pub(crate) fn restore(program: &str, input: String) -> Result<(), String> {
     let mut command = Command::new(program);
     command.args(["--noflush", "--wait", "2"]);
-    super::run_input(command, Duration::from_secs(8), input.into_bytes()).map(|_| ())
+    crate::net_tools::run_input(command, Duration::from_secs(8), input.into_bytes()).map(|_| ())
 }
 
 /// What legacy iptables writes to standard error, with exit code 1, when a
@@ -119,13 +42,13 @@ pub(crate) fn restore(program: &str, input: String) -> Result<(), String> {
 const NO_RULE: [&str; 2] = ["does a matching rule exist in that chain", "No chain/target/match by that name"];
 
 /// Whether a check's or delete's exit says the rule is not there.
-pub(super) fn no_rule((code, error): &(i32, String)) -> bool {
+pub(crate) fn no_rule((code, error): &(i32, String)) -> bool {
     *code == 1 && NO_RULE.iter().any(|text| error.contains(text))
 }
 
 /// Whether a `-S` listing of a table has `chain` (a built-in one is listed
 /// with its policy, `-P`).
-pub(super) fn has_chain(listing: &str, chain: &str) -> bool {
+pub(crate) fn has_chain(listing: &str, chain: &str) -> bool {
     listing.lines().any(|line| {
         line == format!("-N {chain}")
             || line.strip_prefix("-P ").and_then(|rest| rest.strip_prefix(chain)).is_some_and(|rest| rest.starts_with(' '))
@@ -133,11 +56,11 @@ pub(super) fn has_chain(listing: &str, chain: &str) -> bool {
 }
 
 /// Whether a rule (`-D`/`-A` arguments) is the agent's by the identity
-/// `Transaction::apply_network` relies on: it sits in an owned `U60_*`
+/// journaled resources rely on: it sits in an owned `U60_*`
 /// chain, jumps to one, or carries our comment. The relay's station name
 /// is no identity (the vendor's IPACM configuration lists it too). Another
 /// writer's identical rule fails all three.
-pub(super) fn owned_rule(args: &[String]) -> bool {
+pub(crate) fn owned_rule(args: &[String]) -> bool {
     let Some(at) = args.iter().position(|a| matches!(a.as_str(), "-D" | "-A" | "-I")) else {
         return false;
     };
@@ -161,7 +84,7 @@ const COPIES: usize = 32;
 /// (`no_rule`, a listing without the chain) counts as already removed: a
 /// crash may come between journaling and applying a step, but a tool or
 /// lock failure is no evidence of absence, so the journal is kept.
-pub(super) fn undo(cmd: &Cmd, probe: &mut impl Probe) -> Result<(), String> {
+pub(crate) fn undo(cmd: &Cmd, probe: &mut impl Probe) -> Result<(), String> {
     let args = &cmd.args;
     let table = args.windows(2).find(|w| w[0] == "-t").map_or("filter", |w| w[1].as_str());
     let listing = Cmd::new(&cmd.program, &["-w", "2", "-t", table, "-S"]);
@@ -225,19 +148,7 @@ pub(super) fn undo(cmd: &Cmd, probe: &mut impl Probe) -> Result<(), String> {
 /// and `_` is quoted. Only what the agent's rules use is known; a different
 /// rule never gets the same line, so a prediction that is wrong costs one
 /// `-C`, never a wrong answer.
-pub(super) fn listed_rule(cmd: &Cmd) -> Option<String> {
-    let v6 = match cmd.program.as_str() {
-        "iptables" => false,
-        "ip6tables" => true,
-        _ => return None,
-    };
-    let args = &cmd.args;
-    let at = args.iter().position(|a| matches!(a.as_str(), "-A" | "-I"))?;
-    let chain = args.get(at + 1)?;
-    let mut rest = &args[at + 2..];
-    if args[at] == "-I" && rest.first().is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit())) {
-        rest = &rest[1..];
-    }
+pub(crate) fn listed(v6: bool, chain: &str, rest: &[String]) -> Option<String> {
     // -s -d -i -o -p, as the tool prints them.
     let mut head: [Option<String>; 5] = Default::default();
     let mut matches: Vec<(&'static str, Vec<(&str, String)>)> = Vec::new();
@@ -431,28 +342,29 @@ fn saved_string(value: &str) -> Option<String> {
     Some(quoted)
 }
 
-/// The restore transactions `Transaction::apply_network` runs for `steps`
-/// (program, input), skipping the steps between them: isolated acceptance.
-#[cfg(test)]
-pub(crate) fn inputs(steps: &[Step]) -> Vec<(String, String)> {
-    let (mut out, mut at) = (Vec::new(), 0);
-    while at < steps.len() {
-        match Batch::collect(&steps[at..]) {
-            Some(batch) => {
-                at += batch.count;
-                out.push((batch.program, batch.input));
-            }
-            None => at += 1,
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net_tools::bench::{LOCKED, NO_RULE};
-    use crate::net_tools::rule;
+    const LOCKED: (i32, &str) = (4, "Another app is currently holding the xtables lock.");
+    const NO_RULE: (i32, &str) = (1, "Bad rule (does a matching rule exist in that chain?).");
+
+    #[test]
+    fn listed_forms_follow_the_tools_normalisation_and_never_match_another_rule() {
+        let rule = |v6, name: &str, args: &[&str]| listed(v6, name, &args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>());
+        assert_eq!(rule(false, "X", &["-p", "tcp", "--dport", "53", "-j", "ACCEPT"]).unwrap(), "-A X -p tcp -m tcp --dport 53 -j ACCEPT");
+        assert_eq!(rule(false, "X", &["-p", "udp", "--dport", "68", "--sport", "67", "-j", "ACCEPT"]).unwrap(), "-A X -p udp -m udp --sport 67 --dport 68 -j ACCEPT");
+        assert_eq!(rule(false, "X", &["-d", "192.168.0.1", "-o", "ath20", "-s", "10.1.2.3/8", "-j", "DROP"]).unwrap(), "-A X -s 10.0.0.0/8 -d 192.168.0.1/32 -o ath20 -j DROP");
+        assert_eq!(rule(false, "X", &["-m", "comment", "--comment", "a b\"c", "-j", "RETURN"]).unwrap(), "-A X -m comment --comment \"a b\\\"c\" -j RETURN");
+        for (input, expected) in [("FD1B:f7f5:d006:0::5/64", "fd1b:f7f5:d006::/64"), ("2001:db8::1", "2001:db8::1/128"), ("0:0:1:0:0:2:3:4", "0:0:1::2:3:4/128")] {
+            assert_eq!(rule(true, "X", &["-s", input, "-j", "ACCEPT"]).unwrap(), format!("-A X -s {expected} -j ACCEPT"));
+        }
+        assert!(rule(false, "X", &["-j", "REJECT"]).is_none());
+        assert!(rule(false, "X", &["!", "-d", "192.168.0.1/32", "-j", "ACCEPT"]).is_none());
+        let full = rule(false, "U60_RELAY_FWD", &["-i", "ath20", "-o", "br-lan", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]).unwrap();
+        let tcp = rule(false, "U60_RELAY_FWD", &["-i", "ath20", "-o", "br-lan", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]).unwrap();
+        assert_ne!(full, tcp);
+        assert_ne!(rule(false, "X", &["-p", "udp", "--sport", "67", "--dport", "68", "-j", "ACCEPT"]), rule(false, "X", &["-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT"]));
+    }
 
     /// iptables as far as an undo sees it: per table, chains holding their
     /// rules as argument text; scripted lock failures by call number.
@@ -553,20 +465,23 @@ mod tests {
     const DHCP: &str = "-p udp --sport 67 --dport 68 -j ACCEPT";
     const RETURN: &str = "-i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN";
 
-    fn args(text: &str) -> Vec<&str> {
-        text.split(' ').collect()
-    }
-
     /// The undos of the relay's upstream INPUT accepts and portal RETURN as
     /// its plans journal them, plus a rule without our identity, newest first.
     fn journal() -> Vec<Cmd> {
-        let mut plan = super::super::chain("iptables", "filter", "U60_RELAY_IN");
-        plan.push(rule("iptables", "filter", "U60_RELAY_IN", &args(ESTABLISHED), false));
-        plan.push(rule("iptables", "filter", "U60_RELAY_IN", &args(DHCP), false));
-        plan.push(rule("iptables", "filter", "INPUT", &args(HOOK), true));
-        plan.push(rule("iptables", "nat", "redirect_chain", &args(RETURN), true));
-        plan.push(rule("iptables", "filter", "OUTPUT", &["-o", "rmnet+", "-j", "REJECT"], true));
-        plan.into_iter().rev().map(|s| s.undo).collect()
+        vec![
+            deletion("filter", "OUTPUT", "-o rmnet+ -j REJECT"),
+            deletion("nat", "redirect_chain", RETURN),
+            deletion("filter", "INPUT", HOOK),
+            deletion("filter", "U60_RELAY_IN", DHCP),
+            deletion("filter", "U60_RELAY_IN", ESTABLISHED),
+            Cmd::new("iptables", &["-w", "2", "-t", "filter", "-X", "U60_RELAY_IN"]),
+        ]
+    }
+
+    fn deletion(table: &str, chain: &str, rule: &str) -> Cmd {
+        let mut args = vec!["-w", "2", "-t", table, "-D", chain];
+        args.extend(rule.split(' '));
+        Cmd::new("iptables", &args)
     }
 
     #[test]
@@ -604,7 +519,7 @@ mod tests {
     fn an_interface_name_is_no_identity() {
         const OURS: &str = "-o ath20 -m comment --comment zte-agent-wifi-relay -j MASQUERADE";
         const BARE: &str = "-o ath20 -j MASQUERADE";
-        let masquerade = |spec: &str| rule("iptables", "nat", "POSTROUTING", &args(spec), true).undo;
+        let masquerade = |spec: &str| deletion("nat", "POSTROUTING", spec);
         assert!(owned_rule(&masquerade(OURS).args));
         assert!(!owned_rule(&masquerade(BARE).args), "the station's name alone is not ours");
         let mut kernel = Kernel::default();
@@ -617,7 +532,7 @@ mod tests {
 
     #[test]
     fn a_lock_during_cleanup_keeps_the_step_until_the_answer_is_definite() {
-        let hook = rule("iptables", "filter", "INPUT", &args(HOOK), true).undo;
+        let hook = deletion("filter", "INPUT", HOOK);
         let mut kernel = Kernel::default();
         kernel.chain("filter", "INPUT", &[HOOK, VENDOR_LO, HOOK]);
         kernel.chain("filter", "U60_RELAY_IN", &[]);
@@ -700,35 +615,13 @@ mod tests {
 
     #[test]
     fn restore_preserves_tables_insert_positions_and_effect_barriers() {
-        let mut plan = super::super::chain("iptables", "filter", "U60_TEST");
-        plan.push(super::super::rule(
-            "iptables",
-            "filter",
-            "INPUT",
-            &["-j", "U60_TEST"],
-            true,
-        ));
-        plan.extend(super::super::chain("iptables", "nat", "U60_DNS"));
-        plan.push(Step::new(
-            Cmd::new("ip", &["-4", "rule", "add"]),
-            Cmd::new("true", &[]),
-        ));
-        plan.extend(super::super::chain("iptables", "mangle", "U60_LATER"));
-        let batch = Batch::collect(&plan).unwrap();
-        assert_eq!(batch.count, 3);
+        let mut input = String::new();
+        append(&mut input, "", "filter", &["-N U60_TEST".into(), "-I INPUT 1 -j U60_TEST".into()]);
+        append(&mut input, "filter", "nat", &["-N U60_DNS".into()]);
+        input.push_str("COMMIT\n");
         assert_eq!(
-            batch.input,
+            input,
             "*filter\n-N U60_TEST\n-I INPUT 1 -j U60_TEST\nCOMMIT\n*nat\n-N U60_DNS\nCOMMIT\n"
         );
-        for cmd in [
-            Cmd::new("iptables", &["-F"]),
-            Cmd::new("iptables", &["-w", "2", "-t", "filter", "-N", "vendor"]),
-            Cmd::new(
-                "iptables",
-                &["-w", "2", "-t", "filter", "-A", "U60_TEST", "\nCOMMIT"],
-            ),
-        ] {
-            assert!(entry(&cmd).is_none());
-        }
     }
 }

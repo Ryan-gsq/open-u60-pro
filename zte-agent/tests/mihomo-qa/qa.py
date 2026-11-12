@@ -186,6 +186,19 @@ def topology():
     for family, everything in (("-4", "default"), ("-6", "::/0")):
         sh("ip", family, "route", "add", "local", everything, "dev", "lo", "table", "60625", ns="router")
         sh("ip", family, "rule", "add", "pref", "18620", "fwmark", "0x700/0xff00", "lookup", "60625", ns="router")
+    for ns, gateway, link in (("client", "fd00:1::1", "c0"), ("router", "2001:db8::10", "wan0")):
+        def solicit():
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as probe:
+                probe.sendto(b"ready", (gateway, 9))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            in_ns(ns, solicit)
+            neighbor = sh("ip", "-6", "neigh", "show", "to", gateway, "dev", link, ns=ns).stdout
+            if "lladdr" in neighbor:
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("IPv6 fixture gateway did not resolve")
 
 
 def tables_and_data_plane():
@@ -201,7 +214,8 @@ def tables_and_data_plane():
     core = [serve("router", socket.AF_INET, "0.0.0.0", 17894, "core", True), serve("router", socket.AF_INET6, "::", 17894, "core6", True)]
     report("hold: IPv4 goes to the core", ask("client", "198.51.100.10", 80) == "core:hi")
     report("hold: a would-be DIRECT range goes to the core", ask("client", "203.0.113.10", 80) == "core:hi")
-    report("hold: IPv6 goes to the core", ask("client", "2001:db8::10", 80) == "core6:hi")
+    answer = ask("client", "2001:db8::10", 80)
+    report("hold: IPv6 goes to the core", answer == "core6:hi", answer)
     for stop in core:
         stop.set()
     time.sleep(0.5)
@@ -271,6 +285,18 @@ def engage(boot):
     in_ns("router", lambda: [open(f"/proc/sys/net/ipv4/{key}", "w").write("1000") for key in original])
     with open(f"{DATA}/journal.json") as f:
         journal = json.load(f)
+    expected = [
+        {"program": "@u60-sysctl", "args": [key, "{" + key + "}"]}
+        for key in ("tcp_pacing_ss_ratio", "tcp_pacing_ca_ratio", "bridge-nf-call-iptables", "bridge-nf-call-ip6tables")
+    ]
+    for family, destination in (("-4", "default"), ("-6", "::/0")):
+        expected.extend([
+            {"program": "ip", "args": [family, "route", "del", "local", destination, "dev", "lo", "table", "60625"]},
+            {"program": "ip", "args": [family, "rule", "del", "pref", "18620", "fwmark", "0x700/0xff00", "lookup", "60625"]},
+        ])
+    expected.append({"program": "@u60-mihomo-nft", "args": ["remove"]})
+    if journal["undo"] != expected:
+        raise RuntimeError("EffectSet start journal differs from ef58bd4")
     undo = []
     for cmd in journal["undo"]:
         if cmd["program"] == "@u60-sysctl":

@@ -20,8 +20,8 @@ use serde_json::{json, Value};
 use serde_yaml_ng::{Mapping, Value as Yaml};
 use sha2::{Digest, Sha256};
 
-use crate::net_tools::{self as net, Cmd, NetworkLock, Step, Transaction};
-use crate::netfx::effect::{self, NftTables, Presence};
+use crate::net_tools::{self as net, Cmd, NetworkLock};
+use crate::netfx::effect::{self, EffectSet, Family, NftTable, NftTables, Presence, Resource, Route, RouteType, Rule, Sysctl};
 use crate::netfx::ids;
 
 pub mod control;
@@ -207,7 +207,7 @@ impl Mihomo {
 
     /// `network-recover`: rolls back what a previous process left.
     pub fn recover(&self) -> Result<(), String> {
-        Transaction::recover(&self.journal())
+        EffectSet::recover(&self.journal())
     }
 
     /// Starts the controller and tells it the agent started (it adopts this
@@ -497,21 +497,15 @@ impl Mihomo {
 }
 
 /// The controller's device side: the core's files and process, the network
-/// effects (`Transaction` for kernel settings and policy routes, `NftTables`
-/// for the tables), the controller API, conntrack and the egress.
+/// effects, the controller API, conntrack and the egress.
 struct DevicePort {
     m: Arc<Mihomo>,
     local: String,
     lan: Option<std::net::Ipv4Addr>,
-    effects: Option<Effects>,
+    effects: Option<EffectSet>,
     guard: crate::net_guard::Cursor,
     /// Rule-set files the last plan read.
     sources: Vec<routing::Source>,
-}
-
-struct Effects {
-    tx: Transaction,
-    tables: NftTables,
 }
 
 impl DevicePort {
@@ -523,15 +517,14 @@ impl DevicePort {
         NftTables::new("mihomo", NFT_TABLE, self.m.root.join(NFT_FILE))
     }
 
-    /// Kernel settings and policy routes, with the original values `old` gives.
-    fn steps(old: impl Fn(&str) -> Result<String, String>) -> Result<Vec<Step>, String> {
-        proxy_plan_with(old)
+    fn table(&self, families: Option<[String; 2]>) -> Resource {
+        Resource::NftTable(NftTable { owner: "mihomo", name: NFT_TABLE, file: self.m.root.join(NFT_FILE), families })
     }
 }
 
 impl controller::Port for DevicePort {
     fn adoptable(&mut self) -> bool {
-        Transaction::current(&self.m.journal()) && self.owned_tables().presence(&mut effect::Device).is_ok_and(|p| p == Presence::Ours)
+        EffectSet::current(&self.m.journal()) && self.owned_tables().presence(&mut effect::Device).is_ok_and(|p| p == Presence::Ours)
     }
 
     fn recover(&mut self) -> Result<(), String> {
@@ -647,9 +640,6 @@ impl controller::Port for DevicePort {
     fn engage(&mut self, how: Engage) -> Result<(), String> {
         match how {
             Engage::Fresh => {
-                for family in ["-4", "-6"] {
-                    net::reserve("iptables", "mangle", &[], family, TABLE, PREF)?;
-                }
                 let tables = self.owned_tables();
                 match tables.presence(&mut effect::Device)? {
                     Presence::Absent => {}
@@ -661,63 +651,53 @@ impl controller::Port for DevicePort {
                 }
                 // The tables' undo goes last in the journal, so it runs
                 // first: interception stops before routes and settings go.
-                let mut steps = DevicePort::steps(net::sysctl_read)?;
-                steps.push(tables_step());
-                let mut tx = Transaction::new(self.m.journal());
-                if let Err(e) = tx.apply_network(steps) {
-                    return Err(tx.rollback().err().unwrap_or(e));
+                let mut resources = proxy_resources();
+                resources.push(self.table(None));
+                let mut effects = EffectSet::new("mihomo", self.m.journal());
+                if let Err(error) = effects.declare(resources) {
+                    if let Err(cleanup) = effects.release() {
+                        self.effects = Some(effects);
+                        return Err(cleanup);
+                    }
+                    return Err(error);
                 }
-                self.effects = Some(Effects { tx, tables });
+                self.effects = Some(effects);
                 Ok(())
             }
             Engage::FromBackoff => {
                 let effects = self.effects.as_mut().ok_or("Mihomo owns nothing to start from")?;
-                effects.tx.apply_network(DevicePort::steps(net::sysctl_read)?)
+                effects.declare(proxy_resources())
             }
             Engage::Adopt => {
-                let mut tx = Transaction::load(&self.m.journal())?;
-                // The original values a previous agent journaled, never ours.
-                let original = |key: &str| tx.journaled("@u60-sysctl", key).and_then(|u| u.args.get(1).cloned()).map_or_else(|| net::sysctl_read(key), Ok);
-                let mut steps = DevicePort::steps(original)?;
-                steps.push(tables_step());
-                for step in steps {
-                    tx.adopt(step)?;
-                }
-                self.effects = Some(Effects { tx, tables: self.owned_tables() });
-                Ok(())
+                let mut resources = proxy_resources();
+                resources.push(self.table(None));
+                self.effects = Some(EffectSet::load("mihomo", &self.m.journal())?);
+                self.effects.as_mut().unwrap().adopt(resources)
             }
         }
     }
 
     fn tables(&mut self, shape: intercept::Shape) -> Result<(), String> {
+        let table = self.table(Some(intercept::tables(shape)));
         let effects = self.effects.as_mut().ok_or("Mihomo owns no tables")?;
-        effects.tables.declare(intercept::tables(shape), &mut effect::Device).map(|_| ())
+        effects.declare(vec![table])
     }
 
     fn tables_status(&mut self) -> Value {
-        self.effects.as_ref().map_or(Value::Null, |e| e.tables.status())
+        self.effects.as_ref().map_or(Value::Null, |effects| effects.tables_status(NFT_TABLE))
     }
 
     fn direct(&mut self) -> Result<(), String> {
+        let table = self.table(Some(intercept::tables(intercept::Shape::FakeReject)));
         let Some(effects) = self.effects.as_mut() else { return Ok(()) };
-        effects.tables.declare(intercept::tables(intercept::Shape::FakeReject), &mut effect::Device)?;
-        let undos: Vec<Cmd> = DevicePort::steps(|_| Ok(String::new()))?
-            .into_iter()
-            .filter(|s| s.undo.program != "@u60-sysctl")
-            .map(|s| s.undo)
-            .collect();
-        // Kernel settings are released by key: their undo holds the original value.
-        let settings: Vec<Cmd> = ["tcp_pacing_ss_ratio", "tcp_pacing_ca_ratio", "bridge-nf-call-iptables", "bridge-nf-call-ip6tables"]
-            .iter()
-            .filter_map(|key| effects.tx.journaled("@u60-sysctl", key).cloned())
-            .collect();
-        effects.tx.release(&[settings, undos].concat())
+        effects.declare(vec![table])?;
+        effects.withdraw(&proxy_resources().iter().map(Resource::key).collect::<Vec<_>>())
     }
 
     fn release_all(&mut self) -> Result<(), String> {
         match self.effects.as_mut() {
             Some(effects) => {
-                effects.tx.rollback()?;
+                effects.release()?;
                 self.effects = None;
                 Ok(())
             }
@@ -827,13 +807,8 @@ impl controller::Port for DevicePort {
 
     fn reconcile(&mut self) -> controller::Guarded {
         let Some(effects) = self.effects.as_mut() else { return controller::Guarded { result: Ok(()), confirmed: false } };
-        let mut result = effects.tx.reconcile();
-        match effects.tables.reconcile(&mut effect::Device) {
-            Ok(true) => result.restored.push("nftables tables".into()),
-            Ok(false) => {}
-            Err(e) => result.failed.push(e),
-        }
-        let confirmed = effects.tables.confirmed();
+        let result = effects.reconcile();
+        let confirmed = effects.tables_confirmed(NFT_TABLE);
         self.guard.after(&result);
         controller::Guarded { result: crate::net_guard::report("mihomo", result), confirmed }
     }
@@ -926,12 +901,6 @@ fn lan_address() -> Result<std::net::Ipv4Addr, String> {
             })
         })
         .ok_or_else(|| "Cannot read the LAN address for the dashboard management name".into())
-}
-
-/// The journal step for the tables (`NftTables` loads them): its undo is the
-/// one every agent version since the TPROXY release runs.
-fn tables_step() -> Step {
-    Step::new(Cmd::new("@u60-mihomo-nft", &["tables"]), Cmd::new("@u60-mihomo-nft", &["remove"]))
 }
 
 /// Checks UTC over the relay (`network_clock::sync_wifi`: TLS nodes need a
@@ -1347,24 +1316,26 @@ fn clear_egress_overrides(value: &mut Yaml) {
 }
 
 /// The kernel settings and policy routes a running core needs, in apply
-/// order; `old` reads a setting's original value (restored on release).
-pub fn proxy_plan_with(old: impl Fn(&str) -> Result<String, String>) -> Result<Vec<Step>, String> {
-    let mut steps = Vec::new();
+/// order. EffectSet captures each setting's original value on first hold.
+fn proxy_resources() -> Vec<Resource> {
+    let mut resources = Vec::new();
     // The core's TCP towards the LAN leaves through qcacld, which leaves TSQ
     // at ~1 ms of data: one connection ran at ~60 instead of ~230 Mbit/s.
     for key in ["tcp_pacing_ss_ratio", "tcp_pacing_ca_ratio"] {
-        steps.push(net::sysctl_step(key, "1000", &old(key)?)?);
+        resources.push(Resource::Sysctl(Sysctl { key: key.into(), value: "1000".into() }));
     }
     // TPROXY loses its socket on the bridge-netfilter path (iptables and nft
     // alike); LAN-to-LAN filtering such as guest isolation pauses meanwhile.
     for key in ["bridge-nf-call-iptables", "bridge-nf-call-ip6tables"] {
-        steps.push(net::sysctl_step(key, "0", &old(key)?)?);
+        resources.push(Resource::Sysctl(Sysctl { key: key.into(), value: "0".into() }));
     }
-    for (family, all) in [("-4", "default"), ("-6", "::/0")] {
-        steps.push(net::ip_step(family, "route", &["local", all, "dev", "lo", "table", TABLE]));
-        steps.push(net::ip_step(family, "rule", &["pref", PREF, "fwmark", MARK, "lookup", TABLE]));
+    for (family, all) in [(Family::V4, "default"), (Family::V6, "::/0")] {
+        let mut route = Route::new(family, RouteType::Local, all, TABLE);
+        route.device = Some("lo".into());
+        resources.push(Resource::Route(route));
+        resources.push(Resource::Rule(Rule { family, priority: PREF.parse().unwrap(), table: TABLE.into(), mark: Some(MARK.into()) }));
     }
-    Ok(steps)
+    resources
 }
 
 /// One controller read (the core's secret never leaves the router).
@@ -1456,6 +1427,47 @@ pub fn change(state: &crate::handlers::AppState, action: &str, body: &[u8]) -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource_steps(original: impl Fn(&str) -> Result<String, String>) -> Result<Vec<net::Step>, String> {
+        let mut resources = proxy_resources();
+        resources.push(Resource::NftTable(NftTable { owner: "mihomo", name: NFT_TABLE, file: PathBuf::from(NFT_FILE), families: None }));
+        resources.iter().map(|resource| resource.step_with(&original)).collect()
+    }
+
+    fn write_start_journal(path: &Path, original: impl Fn(&str) -> Result<String, String>) {
+        struct StartupProbe<Read>(Read);
+        impl<Read: Fn(&str) -> Result<String, String>> net::Probe for StartupProbe<Read> {
+            fn list(&mut self, _: &Cmd) -> Result<String, String> { Ok(String::new()) }
+            fn status(&mut self, _: &Cmd) -> Result<(i32, String), String> { unreachable!() }
+            fn apply(&mut self, _: &Cmd) -> Result<(), String> { Ok(()) }
+            fn sysctl(&mut self, key: &str) -> Result<String, String> { (self.0)(key) }
+        }
+        let mut resources = proxy_resources();
+        resources.push(Resource::NftTable(NftTable { owner: "mihomo", name: NFT_TABLE, file: path.with_extension("nft"), families: None }));
+        EffectSet::new("mihomo", path.into()).declare_with(resources, false, &mut StartupProbe(original), &mut effect::fake::FakeNft::default()).unwrap();
+        crate::net_guard::release(&path.to_string_lossy(), None);
+    }
+
+    #[test]
+    fn the_typed_start_journal_is_identical_to_ef58bd4() {
+        let expected = vec![
+            Cmd::new("@u60-sysctl", &["tcp_pacing_ss_ratio", "1"]),
+            Cmd::new("@u60-sysctl", &["tcp_pacing_ca_ratio", "1"]),
+            Cmd::new("@u60-sysctl", &["bridge-nf-call-iptables", "1"]),
+            Cmd::new("@u60-sysctl", &["bridge-nf-call-ip6tables", "1"]),
+            Cmd::new("ip", &["-4", "route", "del", "local", "default", "dev", "lo", "table", "60625"]),
+            Cmd::new("ip", &["-4", "rule", "del", "pref", "18620", "fwmark", "0x700/0xff00", "lookup", "60625"]),
+            Cmd::new("ip", &["-6", "route", "del", "local", "::/0", "dev", "lo", "table", "60625"]),
+            Cmd::new("ip", &["-6", "rule", "del", "pref", "18620", "fwmark", "0x700/0xff00", "lookup", "60625"]),
+            Cmd::new("@u60-mihomo-nft", &["remove"]),
+        ];
+        let directory = std::env::temp_dir().join(format!("u60-start-journal-{}", std::process::id()));
+        let path = directory.join("network.json");
+        write_start_journal(&path, |_| Ok("1".into()));
+        let written: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["undo"], serde_json::to_value(expected).unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn a_validation_is_remembered_for_this_boot_only() {
@@ -1620,8 +1632,7 @@ mod tests {
     #[test]
     fn every_journaled_undo_is_one_the_previous_agent_runs() {
         const HEAD_SYSCTL: [&str; 4] = ["tcp_pacing_ss_ratio", "tcp_pacing_ca_ratio", "bridge-nf-call-iptables", "bridge-nf-call-ip6tables"];
-        let mut undos: Vec<Cmd> = proxy_plan_with(|_| Ok("1".into())).unwrap().into_iter().map(|s| s.undo).collect();
-        undos.push(tables_step().undo);
+        let undos: Vec<Cmd> = resource_steps(|_| Ok("1".into())).unwrap().into_iter().map(|step| step.undo).collect();
         for undo in &undos {
             let args: Vec<&str> = undo.args.iter().map(String::as_str).collect();
             let known = match (undo.program.as_str(), args.as_slice()) {
@@ -1675,13 +1686,14 @@ mod tests {
         let [v4, _] = intercept::tables(intercept::Shape::Hold);
         let (_, broken) = effect::batch("mihomo", NFT_TABLE, 99, [v4, "table ip6 u60_mihomo {\n\tchain x {\n\t\tnot a rule\n\t}\n}\n".into()]).unwrap();
         fs::write(dir.join("broken.nft"), broken).unwrap();
-        // The journal as `Transaction` writes it (the container fills in its
+        // The journal as EffectSet writes it (the container fills in its
         // boot id and the original kernel values); bridge-netfilter keys are
         // left out where the container has no bridge sysctls.
-        let mut steps = proxy_plan_with(|key| Ok(format!("{{{key}}}"))).unwrap();
-        steps.push(tables_step());
-        let undo: Vec<&Cmd> = steps.iter().map(|s| &s.undo).collect();
-        fs::write(dir.join("journal.json"), serde_json::to_vec_pretty(&json!({"boot": "{boot}", "undo": undo})).unwrap()).unwrap();
+        let path = dir.join("journal.json");
+        write_start_journal(&path, |key| Ok(format!("{{{key}}}")));
+        let mut journal: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        journal["boot"] = json!("{boot}");
+        fs::write(path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1729,11 +1741,8 @@ mod tests {
         m.recover().unwrap();
         assert!(clean(), "recovered after a crash while running");
         // Cut short after each step: the journal holds every undo first.
-        let mut steps = proxy_plan_with(net::sysctl_read).unwrap();
-        steps.push(tables_step());
+        let steps = resource_steps(net::sysctl_read).unwrap();
         for applied in 0..=steps.len() {
-            let mut tx = Transaction::new(m.journal());
-            tx.apply_network(Vec::new()).unwrap();
             let journal = json!({"boot": net::boot_id(), "undo": steps.iter().map(|s| &s.undo).collect::<Vec<_>>()});
             net::write_private(&m.journal(), &serde_json::to_vec(&journal).unwrap()).unwrap();
             for step in &steps[..applied] {
@@ -1847,7 +1856,7 @@ mod tests {
 
     #[test]
     fn transparent_plan_tunes_the_kernel_and_restores_the_values_it_found() {
-        let steps = proxy_plan_with(|key| Ok(format!("old-{key}"))).unwrap();
+        let steps = resource_steps(|key| Ok(format!("old-{key}"))).unwrap();
         for (key, value) in [
             ("tcp_pacing_ss_ratio", "1000"),
             ("tcp_pacing_ca_ratio", "1000"),
@@ -1871,9 +1880,10 @@ mod tests {
                 && s.apply.args.windows(2).any(|w| w == ["fwmark", MARK])));
         }
         assert!(steps.iter().all(|s| !s.apply.args.iter().any(|a| a == "-F" || a == "flush")));
-        assert!(proxy_plan_with(|_| Err("unreadable".into())).is_err());
+        assert!(resource_steps(|_| Err("unreadable".into())).is_err());
         // The tables' undo is what every agent since the TPROXY release runs.
-        assert_eq!((tables_step().undo.program.as_str(), tables_step().undo.args.as_slice()), ("@u60-mihomo-nft", &["remove".to_owned()][..]));
+        let undo = &steps.last().unwrap().undo;
+        assert_eq!((undo.program.as_str(), undo.args.as_slice()), ("@u60-mihomo-nft", &["remove".to_owned()][..]));
         assert!(nft_command(&["tables".into()]).is_ok() && nft_command(&["bogus".into()]).is_err());
     }
 
@@ -2023,222 +2033,5 @@ hosts: {interface-name: 192.0.2.1}
         assert!(v["proxy-providers"]["Hotel"]["override"]["override-expr"].is_null());
         assert_eq!(v["hosts"]["interface-name"].as_str(), Some("192.0.2.1"));
         assert_eq!(v["profile"]["store-selected"].as_bool(), Some(true));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "Uses real netfilter/core; only the disposable Linux QA runner"]
-    fn isolated_real_core_uplink_transitions() {
-        assert_eq!(std::env::var("U60_CORE_ISOLATED_QA").as_deref(), Ok("1"));
-        assert!(Path::new("/u60-ipv6-qa-disposable").exists());
-        let root = PathBuf::from(std::env::var_os("U60_CORE_QA_ROOT").unwrap());
-        let m = Arc::new(Mihomo::at(root, Arc::new(Mutex::new(()))));
-        m.start("test.home.arpa".into());
-        let source = "proxies: [{name: TestDirect, type: direct, udp: true, interface-name: rmnet_data0}]\nproxy-groups: [{name: SelectTest, type: select, proxies: [DIRECT, TestDirect]}]\nrules: ['MATCH,SelectTest']\ndns: {nameserver: [1.1.1.1]}\n";
-        m.configure(source).unwrap();
-        for tcp in [true, false] {
-            let listener = tcp.then(|| std::net::TcpListener::bind("0.0.0.0:1053").unwrap());
-            let datagram = (!tcp).then(|| std::net::UdpSocket::bind("0.0.0.0:1053").unwrap());
-            assert!(m.enable("test.home.arpa").is_err());
-            assert!(
-                !m.owns_network(),
-                "occupied DNS must never leave interception"
-            );
-            drop((listener, datagram));
-        }
-        m.enable("test.home.arpa").unwrap();
-        assert!(
-            download::ready(),
-            "Unauthenticated proxy requests must be rejected"
-        );
-        {
-            use base64::Engine;
-            use std::io::{Read, Write};
-            let mut stream = std::net::TcpStream::connect(download::PROXY).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let auth = base64::engine::general_purpose::STANDARD.encode(format!(
-                "{}:{}",
-                download::USER,
-                m.secret().unwrap()
-            ));
-            stream.write_all(format!("CONNECT 203.0.113.1:45679 HTTP/1.1\r\nHost: 203.0.113.1:45679\r\nProxy-Authorization: Basic {auth}\r\n\r\n").as_bytes()).unwrap();
-            let mut headers = Vec::new();
-            while !headers.ends_with(b"\r\n\r\n") {
-                let mut b = [0u8];
-                stream.read_exact(&mut b).unwrap();
-                headers.push(b[0]);
-                assert!(headers.len() < 4096);
-            }
-            assert!(headers.starts_with(b"HTTP/1.1 200"));
-            stream.write_all(b"test").unwrap();
-            let mut echoed = [0u8; 8];
-            stream.read_exact(&mut echoed).unwrap();
-            assert_eq!(&echoed, b"10.9.0.2");
-        }
-        let profiles = m.profile_status().unwrap();
-        let original = profiles["selected"].as_str().unwrap().to_owned();
-        let request = |v| serde_json::from_value::<profiles::Request>(v).unwrap();
-        assert!(m
-            .profiles_change(request(json!({"action":"delete","id":original})))
-            .is_err());
-        assert!(m.running());
-        m.profiles_change(request(
-            json!({"action":"add","name":"Switch QA","yaml":source}),
-        ))
-        .unwrap();
-        let alternate = m.profile_status().unwrap()["profiles"][1]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        m.profiles_change(request(json!({"action":"select","id":alternate})))
-            .unwrap();
-        assert!(m.running());
-        m.profiles_change(request(json!({"action":"extensions","extensions":{
-            "merge_enabled":true,"merge":"prepend-rules: ['DOMAIN,merge.test,DIRECT']",
-            "script_enabled":true,"script":"function main(c,n){c.rules.unshift('DOMAIN,script.test,DIRECT');return c;}"
-        }}))).unwrap();
-        assert!(m.running());
-        let compiled: Yaml =
-            serde_yaml_ng::from_str(&fs::read_to_string(m.root.join("config.yaml")).unwrap())
-                .unwrap();
-        assert_eq!(compiled["rules"][0], "DOMAIN,script.test,DIRECT");
-        assert_eq!(compiled["rules"][1], "DOMAIN,merge.test,DIRECT");
-        m.profiles_change(request(json!({"action":"select","id":original})))
-            .unwrap();
-        let agent = ureq::Agent::config_builder()
-            .proxy(None)
-            .timeout_global(Some(Duration::from_secs(2)))
-            .build()
-            .new_agent();
-        for (group, selection) in [("SelectTest", "TestDirect"), ("GLOBAL", "SelectTest")] {
-            agent
-                .put(&format!("http://{CONTROLLER}/proxies/{group}"))
-                .header("Authorization", &format!("Bearer {}", m.secret().unwrap()))
-                .send_json(json!({"name":selection}))
-                .unwrap();
-        }
-        agent
-            .patch(&format!("http://{CONTROLLER}/configs"))
-            .header("Authorization", &format!("Bearer {}", m.secret().unwrap()))
-            .send_json(json!({"mode":"global","log-level":"debug"}))
-            .unwrap();
-        // The same restart is used by manual/scheduled profile refresh and
-        // global extension edits. Neither may reset the dashboard's mode.
-        m.profiles_change(request(json!({"action":"extensions","extensions":{
-            "merge_enabled":true,"merge":"prepend-rules: ['DOMAIN,refresh.test,DIRECT']",
-            "script_enabled":false
-        }})))
-        .unwrap();
-        let refreshed: Yaml =
-            serde_yaml_ng::from_str(&fs::read_to_string(m.root.join("config.yaml")).unwrap())
-                .unwrap();
-        assert_eq!(refreshed["mode"].as_str(), Some("global"));
-        assert_eq!(refreshed["log-level"].as_str(), Some("debug"));
-        std::thread::sleep(Duration::from_secs(1));
-        let generation = m.snapshot().generation;
-        // Duplicate notifications keep the core (the controller compares the egress).
-        m.uplink_changed();
-        m.uplink_changed();
-        std::thread::sleep(Duration::from_secs(2));
-        assert_eq!(m.snapshot().generation, generation);
-        net::write_private(Path::new("/qa-state/cell-ready"), b"1").unwrap();
-        for (request, done) in [
-            ("wifi", "wifi-ready"),
-            ("v6", "v6-ready"),
-            ("cell", "cell-again"),
-            ("wifi2", "wifi2-ready"),
-            ("offline", "offline-ready"),
-            ("wifi3", "wifi3-ready"),
-            ("stalled", "stalled-ready"),
-        ] {
-            for _ in 0..600 {
-                if Path::new(&format!("/qa-state/{request}")).exists() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            assert!(
-                Path::new(&format!("/qa-state/{request}")).exists(),
-                "timed out at {request}"
-            );
-            if request == "stalled" {
-                let pid = m.snapshot().core_pid.unwrap();
-                assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
-            }
-            let generation = m.snapshot().generation;
-            m.uplink_changed();
-            // The controller restarts the core for the new egress.
-            for _ in 0..300 {
-                let s = m.snapshot();
-                if s.generation > generation && s.phase == Phase::Running {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            assert!(m.snapshot().generation > generation, "restarted at {request}");
-            let config: Yaml =
-                serde_yaml_ng::from_str(&fs::read_to_string(m.root.join("config.yaml")).unwrap())
-                    .unwrap();
-            assert_eq!(
-                config["interface-name"].as_str(),
-                if matches!(request, "cell" | "offline" | "stalled") {
-                    None
-                } else {
-                    Some("ath20")
-                }
-            );
-            assert_eq!(
-                config["hosts"]["test.home.arpa"].as_str(),
-                Some("192.168.0.1")
-            );
-            assert_eq!(config["mode"].as_str(), Some("global"));
-            assert_eq!(config["log-level"].as_str(), Some("debug"));
-            // The core exposes its controller/listeners before updateProfile
-            // restores selectors. Observe bounded convergence, without writing
-            // a selection again (which would conceal lost persisted state).
-            let observed = Instant::now();
-            let mut first = None;
-            let proxies: Value = loop {
-                let proxies: Value = agent
-                    .get(&format!("http://{CONTROLLER}/proxies"))
-                    .header("Authorization", &format!("Bearer {}", m.secret().unwrap()))
-                    .call()
-                    .unwrap()
-                    .body_mut()
-                    .read_json()
-                    .unwrap();
-                first.get_or_insert_with(|| {
-                    (
-                        proxies["proxies"]["SelectTest"]["now"].clone(),
-                        proxies["proxies"]["GLOBAL"]["now"].clone(),
-                    )
-                });
-                if (proxies["proxies"]["SelectTest"]["now"] == "TestDirect"
-                    && proxies["proxies"]["GLOBAL"]["now"] == "SelectTest")
-                    || observed.elapsed() >= Duration::from_secs(3)
-                {
-                    break proxies;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            };
-            crate::netlog!(
-                "[qa] selectors stage={request} first={first:?} settled_ms={}",
-                observed.elapsed().as_millis()
-            );
-            assert_eq!(proxies["proxies"]["SelectTest"]["now"], "TestDirect");
-            assert_eq!(proxies["proxies"]["GLOBAL"]["now"], "SelectTest");
-            net::write_private(Path::new(&format!("/qa-state/{done}")), b"1").unwrap();
-        }
-        for _ in 0..600 {
-            if Path::new("/qa-state/finish").exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(Path::new("/qa-state/finish").exists());
-        m.disable().unwrap();
-        assert!(!m.owns_network());
     }
 }

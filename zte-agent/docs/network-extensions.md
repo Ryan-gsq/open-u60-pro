@@ -240,8 +240,8 @@ database or subscription is embedded in the Rust binary.
   old values on stop; LAN-to-LAN filtering such as guest isolation pauses
   meanwhile. `tcp_pacing_ss_ratio`/`tcp_pacing_ca_ratio` are 1000 while it runs
   (200/120 restored): qcacld leaves TSQ at about 1 ms of data, which held one
-  core-to-LAN TCP connection at about 60-70 Mbit/s. Both are `@u60-sysctl`
-  steps in the start transaction; ZTE resets brnf after relay connects and on
+  core-to-LAN TCP connection at about 60-70 Mbit/s. The settings are `Sysctl`
+  resources in Mihomo's `EffectSet`, with `@u60-sysctl` undo commands. ZTE resets brnf after relay connects and on
   `fw3 reload`, and `net_guard` sets it back (read every 0.5 s for 3 s after
   each ZTE trigger; see the relay's firewall layout). See
   `docs/research/2026-11-08-mihomo-tproxy-single-flow.md`.
@@ -410,7 +410,7 @@ database or subscription is embedded in the Rust binary.
   by `net_guard` (`relay-hw-offload.md`, section 5); the tables are compared with
   their generation marker and rule counts and reloaded whole.
 
-The tables are `netfx::effect::NftTables`: both families are replaced whole in
+The owner's `EffectSet` holds `netfx::effect::NftTables`, replacing both families in
 one `nft -f` batch (stale sets go with them) carrying a generation marker, a rule
 comment in the unhooked chain `state`. The marker read back with `nft -t` (no set
 elements, so a large GeoIP set never meets an output limit) decides whether the
@@ -424,17 +424,18 @@ agent runs (`@u60-sysctl`, `ip ... del`, `@u60-mihomo-nft remove`, tables last
 in, first out); `tests/mihomo-qa` checks that the previous agent's
 `network-recover` undoes it completely.
 
-Generated network plans journal every undo with one durable write before any
-effect. Supported contiguous firewall runs use `iptables-restore` or
-`ip6tables-restore --noflush --wait 2`; route and radio operations retain their
-ordering barriers. Chain creation uses exclusive `-N`, never a declaration that
-could flush an existing chain. A later table/family failure may leave earlier
+`EffectSet::declare` journals every undo with one durable write before applying
+the batch. Consecutive legacy resources of one tool use `iptables-restore` or
+`ip6tables-restore --noflush --wait 2`, with route and radio ordering barriers.
+First acquisition uses exclusive `-N` and refuses an existing foreign chain.
+An already owned chain is replaced whole using `:NAME - [0:0]` and its ordered
+rules in one restore transaction. A later table/family failure may leave earlier
 COMMITs applied: the same individual undo records recover that partial state.
 A failed restore is never retried blindly as individual commands. Because an
 interrupted plan also runs the undo of steps that never ran, no such undo may
 match another writer's identical rule: a rule in a chain the agent does not own
-jumps to an owned `U60_*` chain or matches only the agent's own interfaces or
-comment (the relay's denials, the cellular IPv6 rejects among them, are rules
+jumps to an owned `U60_*` chain or carries a `zte-agent*` comment
+(the relay's denials, the cellular IPv6 rejects among them, are rules
 in its own nftables tables, not in legacy chains; a unit test checks every
 prejournaled plan). File fsync is
 retained; this is not a claim that runtime network journals survive power loss
@@ -670,10 +671,10 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   vendor option). The existing DHCP service and management names remain in use.
   Owned, LAN-scoped `RETURN` rules bypass only the vendor `redirect_chain` in
   IPv4/IPv6 NAT; other NAT/filter rules are not skipped. The switch delta and
-  both RETURNs are journaled in the session's `dns` transaction (`dns.json`,
+  both RETURNs are journaled in the session's `dns` set (`dns.json`,
   `portal::web_bypasses`), so a handover between 5 GHz upstreams releases only
   the resolver line and passes the suppression to the next session as it is
-  (`successor`; the new session re-takes it with `ensure`, an adoption after
+  (`successor`, the new session declares it through `EffectSet`, an adoption after
   an agent restart takes the RETURNs into `dns`). A build before 2026-11-12
   kept the RETURNs in `network.json` and released the switch during a
   handover; a fw3 reload in that gap let the vendor's port-80 DNAT in until
@@ -756,13 +757,13 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   Loss/expiry withdraws owned IPv6 forwarding; missing IPv6 does not stop an
   otherwise working IPv4 relay. Lifetime-only renewals update owned addresses
   and the route without tearing down NAT/RA. Changed addressing rebuilds the
-  owned IPv6 transaction. The owned addresses, routes, policy rules and the
+  owned IPv6 network set. The owned addresses, routes, policy rules and the
   runtime RA overlay of an unchanged path are checked on the tick after a
   settled `net_guard` trigger, on the next tick after a failed read, before a
   lifetime refresh, and otherwise every 15 s (`ipv6::CHECK_EVERY`): an object
   removed by something that fires no vendor trigger is noticed within 15 s
-  (owner accepted, 2026-11-12; each check spawns four read-only tools under the
-  session lock). Missing owned effects are repaired
+  (owner accepted, 2026-11-12, the controller runs the read-only checks through
+  its device port). Missing owned effects are repaired
   without changing the upstream revision, including a route table emptied by
   another writer (it then no longer exists). A failed inspection read keeps the
   path for up to three ticks before IPv6 is withdrawn; a conflicting owned
@@ -787,8 +788,9 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   The longer-term state/ownership design and release gates are documented in
   [relay-cellular-recovery-plan.md](relay-cellular-recovery-plan.md); those
   coordinator/dependency-group changes are a plan, not already deployed code.
-- The active-only watchdog waits 3 seconds between checks; network-lock waits
-  and device commands add to the observed interval. An incomplete association
+- The `relay` controller schedules a check every 3 seconds while a session has
+  a selected network. Queued work and device commands add to the observed interval.
+  Settled guard triggers queue a check, coalesced during long operations. An incomplete association
   gets a 12-second CLOCK_BOOTTIME grace period from its first failed observation,
   provided both helpers and the original lease remain valid and the hotspot is
   still on. Recovery clears the timer; an expired grace period, lost helper or
@@ -799,7 +801,7 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   is asked to renew (at most every 30 s): a roam onto another network with the
   same SSID then loses its lease and tears the relay down instead of keeping a
   stale address. Status exposes the association state and elapsed
-  recovery time; logs add the reason, command time and lock wait without credentials;
+  recovery time, with logs recording the reason and query time;
   **cellular fallback may consume SIM data**. There is no internet-down probe
   and no reconnect after a dropped link while the agent runs; after an agent
   restart or a reboot it attempts only the saved eligible connection (see
@@ -820,7 +822,7 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
 tables, `ip`/`ip6 u60_relay`, in one place (`relay-mihomo-architecture.md`
 section 4.3); `ipv6` only adds its parts while it has them. Every change
 replaces both families in one `nft -f` batch whose generation marker is read
-back (`netfx::effect::NftTables`); a table of that name without the agent's
+back (the wireless `EffectSet` holds `NftTables`); a table of that name without the agent's
 marker is never taken over. The filter chains run at `filter - 1`, just ahead
 of ZTE's legacy rules, so a drop there is final whatever ZTE inserts first;
 a return only leaves these chains, and ZTE's rules still apply after them.
@@ -832,13 +834,17 @@ a return only leaves these chains, and ZTE's rules still apply after them.
 | Routes | From before the policy rule until the routes are released (the tables shrink back to the guard first) | IPv4 FORWARD: `br-lan → ath20` and established replies return before the drops. IPv6 FORWARD from `br-lan`: `rmnet*` rejected first, then `fc00::/7`, `fe80::/10`, `ff00::/8` return, the rest rejected. One IPv6 OUTPUT reject to `rmnet*`, covering IPv6 off, a lost lease and a withdrawn NAT66. IPv4 DNS chains. |
 | NAT66 | A valid IPv6 lease, from before its policy rule | Approved LAN sources to `ath20` and established replies return (ahead of the upstream drops); the masquerade; IPv6 DNS chains. |
 
-Legacy iptables keeps only what must pass ZTE's DROP/REJECT: `U60_RELAY_IN`
-(established replies, DHCP offers, IPv6's `U60_R6_IN`), `U60_RELAY_FWD` (two
-rules: LAN to upstream, and established/related replies back),
-`U60_R6_FWD`, the portal `RETURN` and the IPv4 MASQUERADE (an nft masquerade
-must first be shown to keep IPA forwarding, D11). These chains hold accepts
-only, so a rule ZTE removed and the guard re-added at the end can neither open
-nor close anything else. The former `U60_RELAY_V6`, `U60_RELAY_OUT`,
+Legacy iptables keeps the accepts needed to pass ZTE's DROP/REJECT. IPv4 has
+`U60_RELAY_IN` for established replies and DHCP offers, and `U60_RELAY_FWD`
+for LAN to upstream and established/related replies. IPv6 has `U60_R6_IN`
+hooked directly from INPUT with `-i ath20`, and `U60_R6_FWD`. The portal
+`RETURN` and IPv4 MASQUERADE also stay in legacy (D11 gates moving MASQUERADE).
+`EffectSet` repairs owned chains whole and reduces duplicate hooks to one.
+INPUT/FORWARD/MASQUERADE hooks are inserted first when added or repaired,
+then leave later vendor filters ahead of them (D8). Only portal RETURNs
+continually enforce their position before vendor rules. An upgraded live
+session retains the former IPv6 `U60_RELAY_IN` until teardown.
+The former `U60_RELAY_V6`, `U60_RELAY_OUT`,
 `U60_R6_OUT` and `U60_R6_NAT` are gone; the previous agent's journals still
 name them and remain undoable. This version's tables are journaled once, in
 the wireless plan, as `@u60-relay-nft remove ip|ip6`, which the previous
@@ -846,7 +852,7 @@ agent runs too (`tests/relay-firewall-qa`).
 
 An owned legacy rule is identified by its chain or target (`U60_*`) or by a
 `zte-agent*` comment, which every rule in a vendor chain without a jump to one
-carries (the portal RETURN, the MASQUERADE); `firewall::owned_rule`. The
+carries (the portal RETURN, the MASQUERADE), checked by `netfx::effect::legacy::owned_rule`. The
 station's name is no identity, since the vendor's IPACM file lists `ath20`
 too. Two MASQUERADE rules that match the station must never exist together:
 on B31 the first does not end the chain for every packet, and the second
@@ -868,14 +874,14 @@ holds (`@u60-sysctl`, such as Mihomo's `bridge-nf-call-ip(6)tables=0`) every
 an owner's release unregisters the setting before its undo runs. The watched
 scripts and events are `net_guard::WATCHED` and `EVENTS`.
 
-A check reads each iptables table once (`-S`) and routes, rules and addresses
-once per family (`net_tools::Listings`; the relay's four transactions share
-one set through `net_tools::Pass`), and compares every owned step with them:
-a full relay check runs 7 `iptables`/`ip` processes where it ran 43. A rule
-missing from its predicted listed form gets its own `-C`; only a definite
-absence is re-applied: the chain is gone, or `-C` exits 1 with one of the two
+A check reads each tool/table once (`-S`) and routes, rules and addresses
+once per family, shared by the relay's sets through `net_tools::Pass`.
+Repairs invalidate the listings. Owned chains are compared and replaced whole.
+A hook missing from its predicted listed form gets its own `-C`, and a hook
+found only that way is kept and logged once. Definite absence permits re-adding
+it, for example when `-C` exits 1 with one of the two
 wordings B31's iptables 1.8.8 (legacy, both families) uses for a missing
-rule (`firewall::no_rule`): "Bad rule (does a matching rule exist in that
+rule (`netfx::effect::legacy::no_rule`), "Bad rule (does a matching rule exist in that
 chain?)" when the rule's target is ACCEPT or RETURN or its chain is missing,
 "No chain/target/match by that name." when it jumps to a user chain that
 exists (every hook into a `U60_*` chain) or targets MASQUERADE. A missing target chain exits 2 and proves
@@ -885,9 +891,10 @@ the vendor's firewall start had flushed the IPv6 INPUT hook, its undo read as
 until the fixed build was installed (2026-11-12, about 15 minutes without an
 uplink).
 A listing or tool failure is reported as "not checked" and left to the next
-check, so a rule that is there is never added twice. Undo removes every copy
-of an owned rule and empties an owned `U60_*` chain before deleting it; a
-vendor chain is never emptied.
+check. Confirmed duplicate hooks are reduced to one. Undo removes every copy
+of an owned rule and empties an owned `U60_*` chain once external jumps are gone,
+before deleting it. Repair logs name commands or resources such as
+`iptables -t nat hook redirect_chain …`.
 
 The firewall reload that follows a relay connect is the agent's own: IPv6's
 `ubus call network.interface.lan set_data` (`wifi_relay/ipv6/ra.rs`) makes
@@ -930,7 +937,7 @@ The shared network lock is only held to check and register an operation
 ubus, a Wi-Fi reload, a config write or a CAC. A relay operation the owner
 starts (scan, connect, its settings) registers itself and is refused while a
 router setting change is being applied; a disconnect always registers. The relay
-serializes its own operations and its 3 s watch on a private lock. Hotspot,
+serializes its own operations and its 3 s checks on the `relay` controller thread. Hotspot,
 guest Wi-Fi, LAN, USB and vendor firewall changes wait at most 3 s for a relay
 operation in progress (then 409 "in progress"), refuse at once while the relay
 or Mihomo owns the network (409 with the reason), and otherwise hold their own
@@ -1051,15 +1058,15 @@ choice offers **Disconnect & clear restart choice**, even after restoration has
 stopped. When cleanup is needed, the existing cleanup button performs both jobs
 rather than showing duplicate stop controls.
 
-Owner Connect validates the scan selection before cancelling pending restoration,
-then waits within the admission/operation budget. The selection check takes
-`inner`, which the 3 s watch holds over its device calls; that wait counts in the
-same 3 s, and a Connect that gives up there has cancelled nothing (unit-tested,
-not provoked on the router). Disconnect marks cancellation immediately; when an operation
-is running it returns acceptance without waiting for teardown, and that operation's
-owner finishes cleanup before releasing `op`. Otherwise the request performs the
-teardown itself and waits for the hotspot to return. Switching Clash off cancels
-its pending restoration.
+Owner Connect validates the published scan selection, cancels pending restoration,
+then takes admission and queues the request to `relay` within the same 3 s budget.
+Validation takes only the snapshot lock. A request abandoned before starting is
+skipped by the controller. Disconnect marks cancellation immediately, returning
+acceptance during work. The controller tears down before processing the next
+message or publishing the cancelled result. An idle caller waits for the
+controller to finish teardown, including the hotspot's return. Restore retries
+use controller timers so other requests can run between attempts. Switching
+Clash off cancels its pending restoration.
 If the initial core start failed, one more bounded restore sequence (up to four
 attempts) after relay success rechecks the saved enabled choice and this process's
 owner-cancellation flag, so an owner Off is not undone. A dropped link is not
@@ -1124,13 +1131,13 @@ and restore after agent start; actual scan/join steps show their own phases.
 and no pending disconnect. The constant top-level `experimental`,
 `cellular_fallback` and `internet` fields are removed; `ipv6.internet` remains.
 Restart choice, journals, offload configuration/switch, power-save intent and
-saved networks are computed at publish time. GET does not read files or wait
-for `op`, `inner` or conntrack deletion; reset history has its own short lock.
+saved networks are computed at publish time. GET reads the published snapshot
+and reset history under short locks while controller/device work continues.
 
 All six owner actions (scan, connect, power-save, offload, forget and clock)
-wait at most `admission::WAIT` (3 s) for admission plus `op` together; this is
-separate from the HTTP gate and the device operation itself. If `op` remains
-busy, they return HTTP 409 with
+wait at most `admission::WAIT` (3 s) for admission and the controller to start
+them. Once started they wait for the result. Requests that time out before
+starting are abandoned and return HTTP 409 with
 `{"ok":false,"error":"A network operation is in progress (<phase>); retry after it finishes","phase":…}`.
 Vendor-write/reload conflicts also return 409 with their own reason; other relay
 operation errors remain 503. The offload, power-save and forget rows above use
@@ -1189,10 +1196,11 @@ acceptance claim; source changes alone do not extend these results.
 - The OpenWrt lifecycle tests use the VM's kernel, not B31's kernel/driver. The
   OpenWrt chroot has no procd; odhcpd reload signals the real daemon directly,
   and the lifecycle test stubs dnsmasq restart only. Separate actual-core tests
-  now run on a real Linux bridge and in B31 namespaces, followed by physical
-  Relay/Hysteria2 TCP/UDP dual-stack testing. See
-  [relay-ipv6-validation.md](relay-ipv6-validation.md) for evidence and runnable
-  [test instructions](../tests/relay-ipv6/README.md).
+  ran on a real Linux bridge and in B31 namespaces, followed by physical
+  Relay/Hysteria2 TCP/UDP dual-stack testing (those runners and the
+  namespace rule-plan runner above were removed on 2026-11-12). See
+  [relay-ipv6-validation.md](relay-ipv6-validation.md) for evidence and the
+  [instructions](../tests/relay-ipv6/README.md) for the lifecycle and RA runners.
 - `git diff --check` passes; no iOS, Android or public-site changes.
 - Standards and Spec reviews, fixes and the remaining acceptance gap are
   recorded in [network-integration-review.md](network-integration-review.md).
@@ -1246,8 +1254,8 @@ Relay status reads the latest shared clock result, not the connect-time copy:
 a later successful core-start check clears an earlier warning on the next page
 refresh. While a warning is present, **Recheck time** performs a fresh check
 with success/error feedback, without reconnecting Wi-Fi or restarting Clash.
-The check runs on the blocking Slow lane, serialized with network changes;
-status reads remain responsive. Each new relay connection also checks afresh.
+The Slow-lane request queues Clock to the `relay` controller and waits for its
+result. Status reads the snapshot meanwhile. Each new relay connection also checks afresh.
 A Mihomo core start on the relay starts that check on a thread of its own
 (`mihomo-clock`, one at a time) and does not wait for it: a failing check took
 4-16 s inside a planned restart's or an adoption's blackout. A passed check is
@@ -1610,10 +1618,11 @@ reconnection after teardown, or guarantee every B31 roam/rekey fits this window.
 A completed recovery requests one DHCP renew (spaced at least 30 s apart, as
 BusyBox udhcpc deconfigures on a second renew signal while one is pending).
 The API exposes association state and recovery duration; logs use only whitelisted
-states, teardown reasons and query/lock timing, never tool output or credentials.
+states, teardown reasons and query timing, with `lock_ms` removed in batch 5.
 
 Unchanged IPv6 leases retain the 15-second limit on redundant lifetime writes.
-RA ownership and owned address/route existence are checked on each active tick.
+RA ownership and owned address/route existence are checked after a settled guard
+trigger, on a failed read's next tick, before lifetime refresh, or every 15 seconds.
 Missing objects are added using their existing undo records; conflicting routes
 are not replaced. An emptied route table counts as all routes missing. A failed
 inspection read (netifd, `ip`, or a chain snapshot) is retried on the next two

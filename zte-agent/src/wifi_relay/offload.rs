@@ -27,7 +27,7 @@ use std::{fs, net::Ipv4Addr, path::Path};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::{net, Cmd, Step, Transaction, IFACE};
+use super::{net, Cmd, Resource, Key, EffectSet, Route, RouteType, Family, IFACE};
 
 /// IPACM's interface table, which IPACM read at boot and the agent reads
 /// now. QCMAP rewrites it at runtime (B31's running file, read 2026-11-11,
@@ -134,8 +134,8 @@ trait IpacmPort {
     /// `Err(why)` unless this is the firmware the workarounds were verified on.
     fn fingerprint(&mut self) -> Result<(), String>;
     fn monitors(&mut self, gateway: Ipv4Addr) -> Vec<monitor::Monitor>;
-    fn apply_network(&mut self, tx: &mut Transaction, plan: Vec<Step>) -> Result<(), String>;
-    fn release(&mut self, tx: &mut Transaction, undos: &[Cmd]) -> Result<(), String>;
+    fn declare(&mut self, tx: &mut EffectSet, plan: Vec<Resource>) -> Result<(), String>;
+    fn release(&mut self, tx: &mut EffectSet, keys: &[Key]) -> Result<(), String>;
 }
 
 /// The router.
@@ -159,11 +159,11 @@ impl IpacmPort for Device {
     fn monitors(&mut self, gateway: Ipv4Addr) -> Vec<monitor::Monitor> {
         vec![neighbours::watch(gateway), clients::watch()]
     }
-    fn apply_network(&mut self, tx: &mut Transaction, plan: Vec<Step>) -> Result<(), String> {
-        tx.apply_network(plan)
+    fn declare(&mut self, tx: &mut EffectSet, plan: Vec<Resource>) -> Result<(), String> {
+        tx.declare(plan)
     }
-    fn release(&mut self, tx: &mut Transaction, undos: &[Cmd]) -> Result<(), String> {
-        tx.release(undos)
+    fn release(&mut self, tx: &mut EffectSet, keys: &[Key]) -> Result<(), String> {
+        tx.withdraw(keys)
     }
 }
 
@@ -184,11 +184,11 @@ impl IpacmPort for Adopting {
     fn monitors(&mut self, gateway: Ipv4Addr) -> Vec<monitor::Monitor> {
         Device.monitors(gateway)
     }
-    fn apply_network(&mut self, tx: &mut Transaction, plan: Vec<Step>) -> Result<(), String> {
-        plan.into_iter().try_for_each(|step| tx.adopt(step))
+    fn declare(&mut self, tx: &mut EffectSet, plan: Vec<Resource>) -> Result<(), String> {
+        tx.adopt(plan)
     }
-    fn release(&mut self, tx: &mut Transaction, undos: &[Cmd]) -> Result<(), String> {
-        Device.release(tx, undos)
+    fn release(&mut self, tx: &mut EffectSet, keys: &[Key]) -> Result<(), String> {
+        Device.release(tx, keys)
     }
 }
 
@@ -211,7 +211,7 @@ pub(super) struct Runtime {
     monitors: Vec<monitor::Monitor>,
     /// Undo commands of the `main` route steps added to the session's plan,
     /// for `release`.
-    applied: Vec<Cmd>,
+    applied: Vec<Key>,
     /// The session's gateway and subnet, to add the route again later.
     uplink: Option<(Ipv4Addr, String)>,
 }
@@ -222,7 +222,7 @@ impl Runtime {
     }
 
     /// Called with the session's network plan applied.
-    pub(super) fn start(tx: &mut Transaction, gateway: Ipv4Addr, subnet: String) -> Self {
+    pub(super) fn start(tx: &mut EffectSet, gateway: Ipv4Addr, subnet: String) -> Self {
         Self::start_with(&mut Device, tx, gateway, subnet)
     }
 
@@ -232,11 +232,11 @@ impl Runtime {
     /// build that still switched IPACM's mode keeps that step's undo until
     /// the session ends; `Cmd::undo` then skips it as unknown, so IPACM
     /// stays in whatever mode it is in.
-    pub(super) fn adopt(tx: &mut Transaction, gateway: Ipv4Addr, subnet: String) -> Self {
+    pub(super) fn adopt(tx: &mut EffectSet, gateway: Ipv4Addr, subnet: String) -> Self {
         Self::start_with(&mut Adopting, tx, gateway, subnet)
     }
 
-    fn start_with(port: &mut impl IpacmPort, tx: &mut Transaction, gateway: Ipv4Addr, subnet: String) -> Self {
+    fn start_with(port: &mut impl IpacmPort, tx: &mut EffectSet, gateway: Ipv4Addr, subnet: String) -> Self {
         let mut runtime = Self::off();
         runtime.uplink = Some((gateway, subnet));
         if let Err(e) = runtime.sync_with(port, tx) {
@@ -247,11 +247,11 @@ impl Runtime {
 
     /// Follows the owner's switch on a live session. `Ok(true)` when the
     /// path changed (the caller resets LAN IPv4 connections onto it).
-    pub(super) fn sync(&mut self, tx: &mut Transaction) -> Result<bool, String> {
+    pub(super) fn sync(&mut self, tx: &mut EffectSet) -> Result<bool, String> {
         self.sync_with(&mut Device, tx)
     }
 
-    fn sync_with(&mut self, port: &mut impl IpacmPort, tx: &mut Transaction) -> Result<bool, String> {
+    fn sync_with(&mut self, port: &mut impl IpacmPort, tx: &mut EffectSet) -> Result<bool, String> {
         let config = port.config();
         let wanted = config == Config::Listed && port.enabled() && self.uplink.is_some();
         match (wanted, self.state) {
@@ -277,15 +277,15 @@ impl Runtime {
 
     /// Off → Routed, or Off with the reason. A route that fails is taken
     /// back first: the snapshot never says Off while the route may hold.
-    fn add(&mut self, port: &mut impl IpacmPort, tx: &mut Transaction) -> Result<bool, String> {
+    fn add(&mut self, port: &mut impl IpacmPort, tx: &mut EffectSet) -> Result<bool, String> {
         if let Err(why) = port.fingerprint() {
             self.reason = Some(why);
             return Ok(false);
         }
         let Some((gateway, subnet)) = self.uplink.clone() else { return Ok(false) };
         let plan = route_plan(&gateway.to_string(), &subnet);
-        self.applied.extend(plan.iter().map(|s| s.undo.clone()));
-        if let Err(e) = port.apply_network(tx, plan) {
+        self.applied.extend(plan.iter().map(Resource::key));
+        if let Err(e) = port.declare(tx, plan) {
             self.release(port, tx)?;
             self.state = State::Off;
             self.reason = Some(format!("Hardware forwarding route was not added: {e}"));
@@ -299,7 +299,7 @@ impl Runtime {
 
     /// Routed → Releasing → (the caller's next state): the monitors stop and
     /// the `main` route goes (IPACM's relay WAN is down). The session goes on.
-    fn release(&mut self, port: &mut impl IpacmPort, tx: &mut Transaction) -> Result<(), String> {
+    fn release(&mut self, port: &mut impl IpacmPort, tx: &mut EffectSet) -> Result<(), String> {
         self.state = State::Releasing;
         self.monitors.clear();
         let applied = std::mem::take(&mut self.applied);
@@ -324,19 +324,32 @@ impl Runtime {
 
 /// `main` default through the relay plus its unreachable guards, for a plan
 /// that already has the relay table. Only with the station listed.
-pub(super) fn route_plan(gateway: &str, subnet: &str) -> Vec<Step> {
-    let mut plan: Vec<Step> = GUARDED
+pub(super) fn route_plan(gateway: &str, subnet: &str) -> Vec<Resource> {
+    let mut plan: Vec<Resource> = GUARDED
         .iter()
         .filter(|dest| **dest != subnet)
-        .map(|dest| net::ip_step("-4", "route", &["unreachable", dest, "metric", METRIC, "table", "main"]))
+        .map(|dest| {
+            let mut route = Route::new(Family::V4, RouteType::Unreachable, dest, "main");
+            route.metric = Some(METRIC.parse().unwrap());
+            Resource::Route(route)
+        })
         .collect();
-    plan.push(net::ip_step("-4", "route", &["default", "via", gateway, "dev", IFACE, "metric", METRIC, "table", "main"]));
+    let mut route = Route::new(Family::V4, RouteType::Unicast, "default", "main");
+    route.gateway = Some(gateway.into());
+    route.device = Some(IFACE.into());
+    route.metric = Some(METRIC.parse().unwrap());
+    plan.push(Resource::Route(route));
     plan
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_tools::Step;
+
+    fn route_plan(gateway: &str, subnet: &str) -> Vec<Step> {
+        crate::netfx::effect::test_plan(super::route_plan(gateway, subnet))
+    }
 
     /// B31's factory configuration around the station's entry, as it is
     /// indented there (`factory_IPACM_cfg.xml`, read 2026-11-12).
@@ -400,17 +413,17 @@ mod tests {
             self.log.push("monitors".into());
             Vec::new()
         }
-        fn apply_network(&mut self, _: &mut Transaction, plan: Vec<Step>) -> Result<(), String> {
+        fn declare(&mut self, _: &mut EffectSet, plan: Vec<Resource>) -> Result<(), String> {
             self.log.push(format!("routes {}", plan.len()));
             if self.route_fails { Err("RTNETLINK answers: Network is unreachable".into()) } else { Ok(()) }
         }
-        fn release(&mut self, _: &mut Transaction, undos: &[Cmd]) -> Result<(), String> {
+        fn release(&mut self, _: &mut EffectSet, undos: &[Key]) -> Result<(), String> {
             if self.release_fails {
                 return Err("Network cleanup paused".into());
             }
-            // Newest first, as `Transaction::release` runs them.
-            for undo in undos.iter().rev() {
-                self.log.push(format!("undo {} {}", undo.program, undo.args.first().map(String::as_str).unwrap_or("")));
+            // Newest first, as the set withdraws them.
+            for _ in undos.iter().rev() {
+                self.log.push("undo ip -4".into());
             }
             Ok(())
         }
@@ -418,8 +431,8 @@ mod tests {
 
     const GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 2, 1);
 
-    fn session(fake: &mut Fake) -> (Runtime, Transaction) {
-        let mut tx = Transaction::new(std::env::temp_dir().join("u60-ipa-fake-never-written.json"));
+    fn session(fake: &mut Fake) -> (Runtime, EffectSet) {
+        let mut tx = EffectSet::new("relay", std::env::temp_dir().join("u60-ipa-fake-never-written.json"));
         let runtime = Runtime::start_with(fake, &mut tx, GATEWAY, "192.168.2.0/24".into());
         (runtime, tx)
     }

@@ -2,8 +2,8 @@
 //! ZTE's own (owner decision 63, `zte-agent/docs/relay-hw-offload.md`).
 //! ZTE rewrites legacy iptables, sysctls and routes from many paths: firewall
 //! reloads (`fw3`), Wi-Fi/QoS/speed-limit scripts and WAN events. Each
-//! owner (relay, Mihomo) keeps its changes in a `Transaction`, which can
-//! re-check and re-apply them (`Transaction::reconcile`); this module only
+//! owner keeps its changes in an EffectSet,
+//! which re-checks and re-applies them; this module only
 //! decides when: shortly after a ZTE script runs (inotify `IN_OPEN`, every
 //! launcher opens the file) or a firmware event (`ubus listen`), and once a
 //! minute as a fallback. Nothing runs while no owner holds changes.
@@ -95,7 +95,7 @@ impl Cursor {
     }
 }
 
-/// A kernel setting an owner holds (`@u60-sysctl`, kept by `Transaction`).
+/// A kernel setting an owner's journal holds (`@u60-sysctl`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Held {
     owner: String,

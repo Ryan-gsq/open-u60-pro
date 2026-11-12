@@ -3,9 +3,9 @@
 Disposable checks for `relay-mihomo-refactor-plan.md` v5 that need a real
 Linux kernel, real `nft` and legacy `iptables` (as on B31), but no router:
 the exact batches the agent loads, exported from the production generators
-(`uplink::tables` through `NftTables`' batch, the legacy restore
-transactions of `Transaction::apply_network`, the portal RETURN moves and
-this version's journals), on four network namespaces (`client` on `br-lan`,
+(`uplink::tables` through the set's `NftTables` batch, the restore inputs
+and journals actually written by `EffectSet`, whole-chain/hook repairs and
+portal RETURN moves), on four network namespaces (`client` on `br-lan`,
 `upstream` on `ath20`, `cell` on `rmnet_data0`, `router` between them).
 **Never run this on the U60, a host or a shared container**: it creates
 namespaces, replaces the container's `iptables*` with the legacy build and
@@ -25,7 +25,9 @@ docker run --rm --privileged --network none \
   u60-relay-ipv6-qa:local python3 /qa/qa.py
 ```
 
-What it checks:
+The final batch 5 run passed 39/39 checks in isolated Linux, using the
+`ef58bd4` build as the previous agent (`measurements/b5-final/summary.txt`
+beside the handoff). The checks cover the following cases.
 
 - Each layout (guard, IPv6 discovery, routes, NAT66 with and without an
   upstream resolver) passes `nft -c`, loads as one two-family batch and its
@@ -34,6 +36,9 @@ What it checks:
 - The legacy restore transactions apply with `iptables-restore --noflush
   --wait 2` to the owned chains, which hold accepts only; applying one again
   fails without taking over or flushing the existing chain.
+- A damaged owned chain is replaced whole, restoring its content and order.
+  A doubled FORWARD hook becomes one copy. A foreign `U60_*` chain is
+  refused with its contents intact.
 - Guard: the upstream reaches no router port (IPv4, IPv6) except DHCP
   67 -> 68; nothing is forwarded through the upstream; IPv6 stays closed
   until discovery.

@@ -1,6 +1,6 @@
 //! The core's nftables tables (`ip`/`ip6 u60_mihomo`) for each controller
 //! state (`relay-mihomo-architecture.md` sections 5.2 and 5.3), replaced
-//! whole through `netfx::effect::NftTables`.
+//! whole through the owner's EffectSet NftTable resource.
 //!
 //! LAN TCP/UDP goes to the core by TPROXY except DNS (redirected to its
 //! listener), the router's own addresses and private ranges; fake-ip
@@ -41,7 +41,7 @@ pub(super) enum Shape<'a> {
     FakeReject,
 }
 
-/// Both families' definitions for `NftTables::declare`.
+/// Both families' definitions for the owner's NftTable resource.
 pub(super) fn tables(shape: Shape) -> [String; 2] {
     FAMILIES.map(|family| family_table(family, shape))
 }

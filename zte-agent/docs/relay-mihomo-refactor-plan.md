@@ -49,7 +49,7 @@ reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-tes
 
 实现 `EffectSet` 及内部效果注册（S1、S2）；串行 Mihomo 控制器、退避、启动和保留拦截的重启（M1、M3、U3）；纯规则规划、两族整表替换、差集与实际重置（M4–M6、D10）；出口去抖（M9、D7）、桥接写排序及 503（M11）、保留 `no-resolve`（M12）。在 v4 迁移中继前，既有中继仍通过同一入口发布出口观测。此版 DNS 过滤变化可走受保护的重启，不以热重载尚未交付为由撤拦截。
 
-> 2026-11-12 注：`EffectSet` 没有实现，车主决定暂不做；效果层实际是 `net_tools::Transaction` 加 `netfx::effect::NftTables`（[架构规范](relay-mihomo-architecture.md)“规定了但未实现”）。
+> 2026-11-12 批次 5 注：`EffectSet` 已实现，资源分类型声明，自有 legacy 链整链核对/替换，钩子查恰一份。门户 RETURN 持续排在厂商规则前，其他钩子保留厂商后来插入的前置过滤（D8）。旧版撤新日志已在隔离 Linux 验证，新版撤旧日志/接管有主机和真机证据，范围见[批次 5](relay-mihomo-implementation.md#batch-5)。
 
 **四项发布阻断：**
 
@@ -78,7 +78,7 @@ reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-tes
 
 **交付。** 中继会话、取消和开机恢复串行；3 s 观测与决策分开，DNS/resolv 只由 uplink 声明（R1、R3、R6、N7）。实际装过/撤过路由才发布新出口，单纯换 DHCP DNS 也更新下载器；核心不运行时同样可用。实施按操作区分的 Admission 与异步 reload 的占用期，取消不被占满的 Slow lane 拦在门外。`IpacmPort`、显式状态、有效吞吐核验、固件指纹和 UI 归属在此版完成（H1–H5）。
 
-> 2026-11-12 注：中继控制器线程没有实现（车主决定暂不做），仍由 tick 与调用线程经 `op` 串行。批次 4 已完成阶段快照、车主请求对准入和 `op` 合计最多 3 s 的等待及操作中接受断开；锁序现在是 `op` → `inner` → `restore` → `snapshot`，状态只读内存。Connect 前置选择校验等 `inner` 的时间也计入这 3 s。IPA 的 HW 模式切换、车主限制和“有效吞吐核验”（回程计数、重新挂载）已删除，模式交给路由器的工作模式（[硬件转发](relay-hw-offload.md)）。下面 IPA 矩阵中的“车主限制”“原模式”“回程计数”“Software/Engaging”各项随之不再适用。IPACM 配置的安装也已删除：站点改名 `ath20`，原厂配置已列着它，所以“首次安装需重启”“同 boot 再装”“移除”和配置写入的各项同样不再适用。
+> 2026-11-12 批次 5 注：中继控制器线程已实现。车主请求取得准入后排入 `relay`，准入与开始执行共用 3 s 等待，放弃的请求随后跳过。Connect 从发布的扫描快照校验，断开由控制器拆除，工作中立即接受，空闲时等待拆完。设备工作经 `controller::Port`，恢复等待用定时器，锁序为取消单元 → 请求开始握手 → 快照。出口快照和 IPv6 自己的端口仍待实现。IPA 的 HW 模式切换、车主限制和“有效吞吐核验”（回程计数、重新挂载）已删除，模式交给路由器的工作模式（[硬件转发](relay-hw-offload.md)）。下面 IPA 矩阵中的“车主限制”“原模式”“回程计数”“Software/Engaging”各项随之不再适用。IPACM 配置的安装也已删除，站点 `ath20` 已在原厂配置里，“首次安装需重启”“同 boot 再装”“移除”和配置写入各项同样不再适用。最终版的真实 LAN 客户端硬件转发未测，见[批次 5](relay-mihomo-implementation.md#batch-5)。
 
 **发布阻断：** 在 wireless 撤销阻塞最长 CAC 的同时，触发另一个 owner 的 sysctl 修复和核心退出。guard 须跳过忙 set 并核对 Mihomo；退出检测目标 2 s 内，之后遵守自己的退避。不能只证明两个控制器线程都活着。模拟迟到的核对，不得在释放 brnf 之后又写回运行值。
 
