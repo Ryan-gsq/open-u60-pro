@@ -716,10 +716,12 @@ impl controller::Port for DevicePort {
             let rule = plan.pop().expect("the policy rule is the plan's last step");
             session.network.declare(plan)?;
             // LAN web traffic skips the vendor's offline redirect before the
-            // policy rule moves it; a handed-over session holds the RETURN.
+            // policy rule moves it (the RETURN and the kernel redirect); a
+            // handed-over session holds both.
             for step in portal::web_bypasses() {
                 session.dns.declare(vec![step])?;
             }
+            session.dns.declare(portal::web_redirect(&session.dns))?;
             session.uplink.update(|l| l.relay = Some(relay_layout(&lease, lan_ip, lan_mask)))?;
             session.network.declare(vec![rule])?;
             session.routed = true;
@@ -2019,6 +2021,7 @@ mod tests {
         let switch = Resource::Internal(Internal::new("@u60-relay-portal", vec!["disable".into()], vec!["release".into()]));
         let mut held = portal::web_bypasses();
         held.push(switch);
+        held.push(Resource::Sysctl(crate::netfx::effect::Sysctl { key: "httpredirect_cmd".into(), value: "1".into() }));
         assert_eq!(resolver(&l).command().unwrap(), Cmd::new("@u60-relay-dns", &["10.0.0.53"]));
         assert!(!held.iter().any(|resource| resource.key() == resolver_key()), "the handover's release takes none of it");
         // The old session as `handover` leaves it before `successor`.
@@ -2026,7 +2029,7 @@ mod tests {
         let mut old = Session::new(&dir);
         old.dns.assume(held);
         let mut next = successor(&mut old, false, &dir);
-        for (program, first) in [("iptables", "-w"), ("ip6tables", "-w"), ("@u60-relay-portal", "release")] {
+        for (program, first) in [("iptables", "-w"), ("ip6tables", "-w"), ("@u60-relay-portal", "release"), ("@u60-sysctl", "httpredirect_cmd")] {
             assert!(next.dns.journaled(program, first).is_some(), "{program}: the next session's to undo");
             assert!(old.dns.journaled(program, first).is_none(), "{program}: nothing left to release with the old session");
         }

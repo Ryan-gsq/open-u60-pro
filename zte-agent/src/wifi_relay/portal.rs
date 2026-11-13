@@ -12,8 +12,19 @@
 //! that gap, `firewall_redirect.sh` appended its port-80 DNAT while no
 //! RETURN was there, and the DNAT stayed until the next reload (B31,
 //! 2026-11-12).
+//!
+//! Below iptables, the vendor's kernel module `zte_http_redirect` answers a
+//! browser's (by User-Agent) port-80 request from `br-lan` itself with a 302
+//! to its offline page. `zte_topsw_redirect` sets it
+//! (`/sys/zte_genl/httpredirect_cmd`) only at its start and on a WAN event,
+//! reading the switch then: with no cellular WAN, 4 (`no_connect`) or 0x13
+//! while the switch reads 1, 1 (closed) otherwise. Started before the agent,
+//! it kept 4 for a whole session (B31, 2026-11-14). A session that finds
+//! either value holds 1 as a kernel setting in the same `dns` transaction
+//! (its original journaled, given back at release).
 
 use crate::net_tools::Cmd;
+use crate::netfx::effect::{EffectSet, Sysctl};
 use super::{Resource, Internal, LegacyHook, LegacyTool, Position, words};
 
 const KEY: &str = "zwrt_redirect.redirect.switch";
@@ -22,6 +33,10 @@ const CHAIN: &str = "redirect_chain";
 const COMMENT: &str = crate::netfx::ids::RELAY_COMMENT;
 /// The RETURN, as given to iptables.
 const BYPASS: [&str; 7] = ["-i", "br-lan", "-m", "comment", "--comment", COMMENT, "-j"];
+/// The kernel redirect's setting, its offline values and the one closing it.
+const REDIRECT: &str = "httpredirect_cmd";
+const OFFLINE: [&str; 2] = ["4", "19"];
+const CLOSED: &str = "1";
 
 pub(super) fn plan() -> Result<Option<Resource>, String> {
     plan_with(&mut |cmd| cmd.run())
@@ -44,6 +59,23 @@ pub(super) fn web_bypass(tool: LegacyTool) -> Resource {
 pub(crate) fn web_bypasses() -> Vec<Resource> {
     [LegacyTool::V4, LegacyTool::V6].into_iter().map(web_bypass).collect()
 }
+
+/// The kernel redirect held closed when `dns` already holds it (a handover
+/// or an adopted session) or it reads an offline value now; nothing on a
+/// firmware without it.
+pub(crate) fn web_redirect(dns: &EffectSet) -> Vec<Resource> {
+    web_redirect_with(dns, crate::net_tools::sysctl_read)
+}
+
+fn web_redirect_with(dns: &EffectSet, read: impl FnOnce(&str) -> Result<String, String>) -> Vec<Resource> {
+    let held = dns.journaled("@u60-sysctl", REDIRECT).is_some();
+    if held || read(REDIRECT).is_ok_and(|value| OFFLINE.contains(&value.as_str())) {
+        vec![Resource::Sysctl(Sysctl { key: REDIRECT.into(), value: CLOSED.into() })]
+    } else {
+        Vec::new()
+    }
+}
+
 fn plan_with(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Option<Resource>, String> {
     match current(run)?.as_str() {
         "0" => Ok(None),
@@ -253,6 +285,42 @@ mod tests {
         assert_eq!(fw.restarts(), 1, "nothing restarted across the handovers");
         command_with(&step.undo.args, &mut |cmd| fw.run(cmd)).unwrap();
         assert_eq!((fw.restarts(), fw.serving_redirect, fw.delta.as_deref()), (2, true, None));
+    }
+
+    /// B31 without cellular data (2026-11-14): the vendor had set its kernel
+    /// redirect to 4 before the agent started and nothing set it again. The
+    /// session holds it closed from either offline value, a check sets a
+    /// vendor rewrite back, release gives back the first original, and a
+    /// handover or an adoption (journaled) holds it whatever it reads.
+    #[test]
+    fn the_kernel_redirect_is_held_closed_from_an_offline_value_and_given_back_at_release() {
+        let unheld = EffectSet::new("relay", "/nonexistent/dns.json".into());
+        for other in [Ok("1".to_owned()), Ok("0".into()), Ok("7".into()), Err("no zte_genl".to_owned())] {
+            assert!(web_redirect_with(&unheld, |_| other.clone()).is_empty(), "{other:?}");
+        }
+        let dir = std::env::temp_dir().join(format!("u60-portal-redirect-{}", std::process::id()));
+        let path = dir.join("dns.json");
+        for offline in OFFLINE {
+            let mut dns = EffectSet::new("relay", path.clone());
+            let mut kernel = Kernel::default();
+            let mut nft = FakeNft::default();
+            kernel.settings.insert(REDIRECT.into(), offline.into());
+            dns.declare_with(web_redirect_with(&dns, |_| Ok(offline.into())), false, &mut kernel, &mut nft).unwrap();
+            assert_eq!(kernel.settings[REDIRECT], CLOSED);
+            kernel.settings.insert(REDIRECT.into(), offline.into());
+            let result = dns.reconcile_with(&mut kernel, &mut nft);
+            assert!(result.restored.len() == 1 && result.failed.is_empty(), "{result:?}");
+            assert_eq!(kernel.settings[REDIRECT], CLOSED);
+            assert_eq!(web_redirect_with(&dns, |_| Ok(CLOSED.into())).len(), 1, "held, so taken again");
+            let mut adopted = EffectSet::load("relay", &path).unwrap();
+            let redirect = web_redirect_with(&adopted, |_| Err("unread".into()));
+            adopted.declare_with(redirect, true, &mut kernel, &mut nft).unwrap();
+            for set in [&dns, &adopted] {
+                assert_eq!(set.journaled("@u60-sysctl", REDIRECT), Some(&Cmd::new("@u60-sysctl", &[REDIRECT, offline])));
+            }
+            crate::net_guard::release(&path.to_string_lossy(), None);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

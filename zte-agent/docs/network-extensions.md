@@ -675,7 +675,14 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   `portal::web_bypasses`), so a handover between 5 GHz upstreams releases only
   the resolver line and passes the suppression to the next session as it is
   (`successor`, the new session declares it through `EffectSet`, an adoption after
-  an agent restart takes the RETURNs into `dns`). A build before 2026-11-12
+  an agent restart takes the RETURNs into `dns`). Below iptables, the vendor
+  kernel module `zte_http_redirect` answers a
+  browser's (by User-Agent) port-80 request with a 302 to the offline page
+  while `/sys/zte_genl/httpredirect_cmd` reads 4 or 0x13 (`zte_topsw_redirect`
+  sets it only at its start and on a WAN event); a session that finds either
+  value holds 1 as a kernel setting in the same `dns` set and writes the
+  original back at disconnect (`portal::web_redirect`,
+  `relay-hw-offload.md` section 5). A build before 2026-11-12
   kept the RETURNs in `network.json` and released the switch during a
   handover; a fw3 reload in that gap let the vendor's port-80 DNAT in until
   the next reload. Measured with the current build (2026-11-12,

@@ -134,6 +134,7 @@ pub(crate) fn sysctl_path(key: &str) -> Option<&'static str> {
         "tcp_pacing_ca_ratio" => "/proc/sys/net/ipv4/tcp_pacing_ca_ratio",
         "bridge-nf-call-iptables" => "/proc/sys/net/bridge/bridge-nf-call-iptables",
         "bridge-nf-call-ip6tables" => "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
+        "httpredirect_cmd" => "/sys/zte_genl/httpredirect_cmd",
         _ => return None,
     })
 }

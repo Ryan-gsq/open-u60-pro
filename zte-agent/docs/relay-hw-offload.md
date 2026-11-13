@@ -319,10 +319,12 @@ ZTE 会从很多地方改写 legacy iptables、sysctl 和路由：fw3 重载、�
   `firewall_sys_fw.sh`、`wifi_isolate_and_second_ssid_access_control.sh` 和 `mwan_speedlimit.sh`、清空
   `redirect_chain` 的 `firewall_redirect.sh` 和 `firewall_multi_wan_redirect.sh`。2026-11-12 之前监视 18 个；
   去掉的 12 个只动厂商自己的链，或者只是上面几个的调用者，监视它们只会多查。订阅 ubus 事件
-  `zwrt_wlan`、`zwrt_router.msg`、`network.interface`；
+  `zwrt_wlan`、`zwrt_router.msg`、`network.interface`、`router_event_wan_connect_status`（厂商在它之后
+  改写内核 HTTP 跳转，见第 5 节）；
   触发后安静 2 秒再查（到点直接唤醒中继和 Mihomo，不等它们下一个 tick）；某次检查真的补回了
   东西，5 秒后再查一次；没有触发时每 60 秒兜底一次。没有任何 owner 时什么都不跑。
-  每次触发后的 3 秒内，每 0.5 秒只读一遍 owner 持有的 `@u60-sysctl`（如 Mihomo 的 brnf=0），
+  每次触发后的 3 秒内，每 0.5 秒只读一遍 owner 持有的 `@u60-sysctl`（如 Mihomo 的 brnf=0、中继的
+  `httpredirect_cmd=1`），
   被改了才写回，而且写之前在同一把锁里确认它仍被同一 owner、同一代次持有；owner 释放时先注销
   再执行撤销，所以释放后的迟到采样不会把运行值写回去（`net_guard::hold/release`）。
 - 每次恢复都会记日志，列应用命令或资源描述，例如 `iptables -t nat hook redirect_chain …`，前缀为
@@ -362,6 +364,23 @@ brnf 读到 1 约 0.2–0.5 秒，才被上面的采样写回 0。中继连上�
 每次后面都有防火墙重载；开关始终读 0，`redirect_chain` 里从没出现厂商规则，dnsmasq 的两个主进程没有变；
 每次清空后链里约 4 秒是空的，然后 RETURN 回到第一条。之后 `network.json` 不再提 `redirect_chain`，`dns.json`
 里有两条撤销。RETURN 和“排在所有厂商规则之前”的维护仍保留：开关一旦读到 1，厂商的 DNAT 就会出现。
+
+**内核 HTTP 跳转**（2026-11-14 查明）：iptables 之下还有厂商内核模块 `zte_http_redirect`。它在 `br-lan` 上
+看到浏览器（按 User-Agent：Windows、Macintosh、iPhone、Android）发往 80 端口的请求，就自己回
+`HTTP/1.0 302` 到 `192.168.0.1/index.html?no_connect?zteRurl=…`；curl 默认的 UA 不受影响，所以要用浏览器 UA 测。
+状态在 `/sys/zte_genl/httpredirect_cmd`，由 `zte_topsw_redirect` 只在它启动时和 `router_event_wan_connect_status`
+事件时设置：所有 WAN（蜂窝）都没连上时，开关为 1 写 4（`no_connect`）或 0x13，否则写 1（关闭；0 是跳一次
+配置的域名后内核自己改成 1）。B31 开机 34 s 时这个进程就启动了，那时开关还是 1、SIM 没有数据，于是写了 4；
+agent 81 s 时才把开关设成 0，之后没有 WAN 事件，4 留了整个会话，浏览器打开任何 http 网站都跳到登录页。
+现在会话读到 4 或 0x13 时，或者 `dns` 已经持有它（交接、重启接管），就把它当内核设置持有为 1
+（`Sysctl` `httpredirect_cmd`，`portal::web_redirect`），原值和 RETURN、开关一起记在 `dns.json`，断开时写回原值；
+guard 照常采样和兜底核对。厂商在 WAN 已连上的分支不写这个值，所以写回的 4 和不改时一样，留到它下一次判断。
+
+设备实测（2026-11-14，B31，SIM 无数据，中继 `W_Game`）：部署后新 agent 用 734 ms 接管旧会话，值 4→1，
+浏览器 UA 访问 http 站点从 302 变成 200；手工写 4 后打开一个被监视的脚本，0.5 s 内写回
+（`kernel settings set back 0 ms after a trigger: httpredirect_cmd 4 -> 1`）；不触发时 50 s 后由兜底核对写回
+（`relay: restored after another writer removed them: @u60-sysctl httpredirect_cmd 1`）。断开时写回原值只有单元测试：
+开发机的网络经过这台路由器，没有断开中继。
 
 实测到的 ZTE 改写（2026-11-08）：中继每次连上之后，ZTE 都会把
 `bridge-nf-call-ip(6)tables` 改回 1，并清空 nat 表的 `redirect_chain`（中继放在里面的

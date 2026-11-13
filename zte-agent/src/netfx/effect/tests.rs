@@ -12,7 +12,7 @@ pub(crate) struct Kernel {
     error: Option<String>,
     check_error: Option<(i32, String)>,
     stop_before_effect: Option<PathBuf>,
-    settings: BTreeMap<String, String>,
+    pub settings: BTreeMap<String, String>,
     ip: BTreeMap<String, String>,
     undo_error: bool,
     normalize: bool,

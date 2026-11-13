@@ -40,6 +40,7 @@ Notable changes to OpenU60 (the `zte-agent` for the ZTE U60 Pro, and the iOS, An
 
 ### Fixed
 
+- Browsers on the relay no longer land on the router's login page (`192.168.0.1/index.html?no_connect…`) when the SIM has no data. ZTE's kernel module `zte_http_redirect` answered every browser HTTP request with that redirect, set before the agent started and never cleared. A relay session now holds it closed as a kernel setting in its `dns` journal, the guard sets it back after a ZTE rewrite, and a disconnect gives back the original value.
 - The relay no longer shows "Recovery required" while scanning, connecting, recovering or disconnecting; it reports it only after work stops with journals left. Repeated Disconnect requests no longer fill the General lane behind teardown and cause status requests to return 503. Router response measurements and unit-test scope are recorded in [implementation batch 4](zte-agent/docs/relay-mihomo-implementation.md#batch-4).
 - An agent restart no longer drops the Wi-Fi relay: the new agent takes over the connection the previous one left (association, lease, routes, IPv6), so IPv4 does not stop and the proxy is back in about 7 s instead of about 84 s.
 - A relay switch restarts Mihomo once instead of three times: losing the uplink restarts nothing, and IPv6 added later to the same interface keeps the core running. The last four validated configurations are reused for the rest of the boot.

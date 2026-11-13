@@ -102,6 +102,8 @@ fn take_over(session: &mut Session, installed: &Lease, prefix: u32, lan_ip: Ipv4
     }
     session.dns = EffectSet::load("relay", &root.join("dns.json"))?;
     session.dns.adopt(super::portal::web_bypasses())?;
+    let redirect = super::portal::web_redirect(&session.dns);
+    session.dns.adopt(redirect)?;
     session.dns.adopt(vec![super::resolver(installed)])?;
     // The previous tables keep working until here; IPv6 adds its part next.
     session.uplink.adopt(relay_layout(installed, lan_ip, lan_mask))

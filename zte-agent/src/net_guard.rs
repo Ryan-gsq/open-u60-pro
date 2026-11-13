@@ -19,8 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// Firmware events after which ZTE may rewrite rules, routes or sysctls.
-pub const EVENTS: &[&str] = &["zwrt_wlan", "zwrt_router.msg", "network.interface"];
+/// Firmware events after which ZTE may rewrite rules, routes or kernel
+/// settings (`zte_topsw_redirect` sets its kernel HTTP redirect on a WAN
+/// event, `wifi_relay::portal`).
+pub const EVENTS: &[&str] = &["zwrt_wlan", "zwrt_router.msg", "network.interface", "router_event_wan_connect_status"];
 /// The scripts and tools that write what an owner holds (B31, read from
 /// the vendor's scripts, 2026-11-11): `fw3` (a restart or flush removes
 /// every legacy rule; every reload runs the next two and the isolation
