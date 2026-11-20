@@ -99,12 +99,12 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     await page.getByRole('button',{name:'Recheck time'}).click();await said('#relay-status .action-status','Time verified');await page.locator('.relay-clock').waitFor({state:'hidden'});
     assert.equal(await page.locator('#relay-password').inputValue(),'','the password is cleared after a successful connect');
 
-    // A restore in progress is the only thing that polls.
+    // Restore completion arrives on the route-scoped dashboard stream.
     status={...off,restoring:'Hotel Guest',autostart:true,networks:scan,saved_networks:saved};restoringPolls=0;
     await page.getByRole('button',{name:'Read current status'}).click();await said('#relay-status .relay-state','RECONNECTING');
     assert.match(await text('#relay-status h3'),/Hotel Guest/);assert.equal(await page.getByRole('button',{name:'Stop reconnecting'}).isVisible(),true);
-    await page.waitForFunction(()=>true);await page.waitForTimeout(5600);assert.ok(restoringPolls>=2,`a pending restore refreshes itself (${restoringPolls})`);
-    status={...off,networks:scan,saved_networks:saved};await page.waitForTimeout(5300);await said('#relay-status .relay-state','RELAY OFF');
+    await page.waitForTimeout(5200);assert.equal(restoringPolls,1,'only the explicit read requested status');
+    status={...off,networks:scan,saved_networks:saved};fixture.patch({relay_status:{ok:true,data:status}});await said('#relay-status .relay-state','RELAY OFF');
     const quiet=fixture.requests.length;await page.waitForTimeout(1200);assert.equal(fixture.requests.length,quiet,'polling stops once the restore ends');
 
     // A request that never answers is reported as uncertain, then the state is re-read.
@@ -118,6 +118,6 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth),true,`${theme} ${width}px has no horizontal overflow`);
     }
     assert.deepEqual(errors,[]);
-    console.log('Passed: relay states, scan list, password checks, connect/disconnect, saved networks, restore polling, uncertain requests and responsive themes.');
+    console.log('Passed: relay states, scan list, password checks, connect/disconnect, saved networks, restore SSE, uncertain requests and responsive themes.');
   }finally{await browser.close();await fixture.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

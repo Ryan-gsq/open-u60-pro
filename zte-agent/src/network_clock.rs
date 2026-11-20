@@ -97,7 +97,9 @@ fn sync_wifi_with(fresh: bool) -> Result<(), String> {
     if cfg!(test) {
         return Ok(());
     }
-    WIFI.sync_with(fresh, sync)
+    let result = WIFI.sync_with(fresh, sync);
+    crate::events::touch(crate::events::Topic::Relay);
+    result
 }
 
 fn sync(last: &mut Option<(u64, Instant)>) -> Result<(), String> {

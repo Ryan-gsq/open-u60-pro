@@ -594,6 +594,11 @@ fn doh_cache_clear(state: &AppState) -> (u16, Value) {
 }
 
 
+pub(crate) fn encoded_route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> Encoded {
+    if *method == Method::Get && path == "/api/wifi-relay/status" { return state.wifi_relay.encoded_status(); }
+    encode(route(method, path, state, body))
+}
+
 pub fn route(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u16, Value) {
     let reply = route_inner(method,path,state,body);
     if reply.0 < 300 && matches!(method,Method::Put|Method::Post|Method::Delete) && path != "/api/auth/login" {

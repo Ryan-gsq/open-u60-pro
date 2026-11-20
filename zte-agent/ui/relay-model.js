@@ -60,7 +60,7 @@
   }
 
   // What the router's own filters and hardware forwarding cover (D8).
-  const scope = 'The router’s parental control and URL filter do not apply to devices using the relay: relayed traffic is accepted ahead of them, and hardware-forwarded connections skip the router’s filtering altogether. Only relayed IPv4 can be hardware forwarded; IPv6 (NAT66) and traffic through Clash use the CPU.';
+  const scope = 'The router’s parental control and URL filter do not apply to devices using the relay: relayed traffic is accepted ahead of them, and hardware-forwarded connections skip the router’s filtering altogether. Only relayed IPv4 can be hardware forwarded; IPv6 (NAT66) and traffic through Mihomo use the CPU.';
 
   const savedNote = entry => entry.security === 'open' ? 'Open network; no password needed' : entry.remembered ? 'Password remembered; leave it empty when connecting' : 'Password not saved; enter it when connecting';
 

@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 use super::{reload_ra, Fault, JOURNAL};
 use crate::net_tools::{self as net, boot_id, Cmd};
 
-const STATE: &str = "ra-runtime.json";
+const STATE: &str = super::super::journals::RA;
 const OWNER: &str = "u60_relay_ra";
 
 #[derive(Serialize, Deserialize)]

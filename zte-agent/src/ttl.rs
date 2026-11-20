@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -236,103 +235,35 @@ pub fn config_set(manager: &TtlManager, body: &[u8]) -> (u16, Value) {
 }
 
 fn apply(config: Config) -> Result<(), String> {
-    if config.enabled {
-        ensure_family("iptables", "TTL", "--ttl-set", config.ipv4_ttl)?;
-        ensure_family("ip6tables", "HL", "--hl-set", config.ipv6_hop_limit)
-    } else {
-        clear_family("iptables")?;
-        clear_family("ip6tables")
+    use crate::netfx::effect::{hooked_chain, EffectSet, LegacyTool};
+    let mut plan = Vec::new();
+    for (tool, target, option, value) in [(LegacyTool::V4, "TTL", "--ttl-set", config.ipv4_ttl), (LegacyTool::V6, "HL", "--hl-set", config.ipv6_hop_limit)] {
+        let rule = ["-o", WAN_INTERFACE, "-j", target, option, &value.to_string()].map(String::from).to_vec();
+        plan.extend(hooked_chain(tool, "mangle", "POSTROUTING", CHAIN, vec![rule]));
     }
-}
-
-fn ensure_family(program: &str, target: &str, set_option: &str, value: u8) -> Result<(), String> {
-    if !succeeds(program, &["-w", "2", "-t", "mangle", "-S", CHAIN]) {
-        run_required(program, &["-w", "2", "-t", "mangle", "-N", CHAIN])?;
-    }
-    run_required(program, &["-w", "2", "-t", "mangle", "-F", CHAIN])?;
-    let value = value.to_string();
-    run_required(
-        program,
-        &[
-            "-w",
-            "2",
-            "-t",
-            "mangle",
-            "-A",
-            CHAIN,
-            "-o",
-            WAN_INTERFACE,
-            "-j",
-            target,
-            set_option,
-            &value,
-        ],
-    )?;
-    if !succeeds(
-        program,
-        &["-w", "2", "-t", "mangle", "-C", "POSTROUTING", "-j", CHAIN],
-    ) {
-        run_required(
-            program,
-            &[
-                "-w",
-                "2",
-                "-t",
-                "mangle",
-                "-I",
-                "POSTROUTING",
-                "1",
-                "-j",
-                CHAIN,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn clear_family(program: &str) -> Result<(), String> {
-    if !succeeds(program, &["-w", "2", "-t", "mangle", "-S", CHAIN]) {
-        return Ok(());
-    }
-    if succeeds(
-        program,
-        &["-w", "2", "-t", "mangle", "-C", "POSTROUTING", "-j", CHAIN],
-    ) {
-        run_required(
-            program,
-            &["-w", "2", "-t", "mangle", "-D", "POSTROUTING", "-j", CHAIN],
-        )?;
-    }
-    run_required(program, &["-w", "2", "-t", "mangle", "-F", CHAIN])?;
-    run_required(program, &["-w", "2", "-t", "mangle", "-X", CHAIN])
-}
-
-fn succeeds(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn run_required(program: &str, args: &[&str]) -> Result<(), String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|error| format!("run {program}: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if detail.is_empty() {
-        Err(format!("{program} exited with {}", output.status))
-    } else {
-        Err(format!("{program}: {detail}"))
-    }
+    let mut set = EffectSet::legacy_feature("ttl", Path::new("/data/zte-agent-ttl/network.json"), &plan)?;
+    if config.enabled { set.declare(plan) } else { set.release() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a disposable Linux network namespace with legacy iptables"]
+    fn isolated_feature_ttl_ownership() {
+        assert_eq!(std::env::var("U60_ISOLATED_FEATURES").as_deref(), Ok("1"));
+        let config = Config { enabled: true, ipv4_ttl: 65, ipv6_hop_limit: 67 };
+        apply(config).unwrap();
+        apply(config).unwrap();
+        for tool in ["iptables", "ip6tables"] {
+            let rules = crate::net_tools::Cmd::new(tool, &["-t", "mangle", "-S", "POSTROUTING"]).run().unwrap();
+            assert_eq!(rules.lines().filter(|l| l.ends_with(CHAIN)).count(), 1);
+        }
+        apply(Config::default()).unwrap();
+        assert!(!Path::new("/data/zte-agent-ttl/network.json").exists());
+    }
 
     #[test]
     fn defaults_are_disabled_and_use_standard_hop_values() {

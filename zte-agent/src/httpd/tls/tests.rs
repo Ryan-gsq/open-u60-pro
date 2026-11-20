@@ -434,7 +434,7 @@ fn actual_mihomo_bridge_checks_auth_origin_redacts_configs_and_upgrades_over_tls
     let world = World::new("https-mihomo-bridge");
     let root = world.dir().join("mihomo-test");
     let s = start_with_state(world, 8, || |_: SocketAddr, _: &tokio::net::TcpStream| true, |state| {
-        state.mihomo = Arc::new(crate::mihomo::Mihomo::for_bridge(root, Arc::clone(&state.network_lock), "private-mock-core-key".into()));
+        state.mihomo = Arc::new(crate::mihomo::Mihomo::for_bridge(root, "private-mock-core-key".into()));
     });
     let addr = on(&s);
     let cfg = client(&s.tls.ca_der().unwrap(), &[&rustls::version::TLS13]);

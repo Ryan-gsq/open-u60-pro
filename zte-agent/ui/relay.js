@@ -51,7 +51,7 @@
     return {label, input};
   }
   const remember = choice('remember', 'Remember this network’s password after a successful connection.', true);
-  const ipv6 = choice('ipv6', 'Use upstream IPv6 for Clash and enable LAN NAT66 when available (experimental). Without usable upstream IPv6 the relay stays IPv4-only.', true);
+  const ipv6 = choice('ipv6', 'Use upstream IPv6 for Mihomo and enable LAN NAT66 when available (experimental). Without usable upstream IPv6 the relay stays IPv4-only.', true);
   const connectActions = el('div', 'form-actions'), connect = button('Connect to Wi-Fi', null, 'primary');
   connect.type = 'submit';
   connectActions.append(connect);
@@ -77,7 +77,7 @@
   ]) notes.append(el('p', 'field-help', text));
 
   // ── State ───────────────────────────────────────────────────────────────
-  let current = null, loading = false, attempted = false, busy = false, selectedId = '', lastLoad = 0, pollTimer = 0, settleTimer = 0;
+  let current = null, loading = false, attempted = false, busy = false, selectedId = '', lastLoad = 0, settleTimer = 0;
   let loadId = 0, settleId = 0;
   const onRoute = () => OpenU60Navigation.current.key === route;
   const dirty = () => password.value !== '';
@@ -162,11 +162,6 @@
   function draw() { drawStatus(); drawNetworks(); drawSaved(); }
 
   // ── Loading ─────────────────────────────────────────────────────────────
-  function schedulePoll() {
-    clearTimeout(pollTimer);
-    // Only a restore in progress changes by itself; an idle page never polls.
-    if (R.view(current).restoring && onRoute() && !document.hidden) pollTimer = setTimeout(() => load(true), 5000);
-  }
   async function load(quiet = false) {
     if (loading || API.locked || !API.connected) return;
     const epoch = UI.epoch, id = ++loadId;
@@ -175,7 +170,7 @@
     try { const data = await request('/api/wifi-relay/status'); if (UI.current(epoch) && id === loadId) current = data; } catch (error) { failure = `Relay status unavailable. ${error.message}`; }
     finally {
       if (!UI.current(epoch) || id !== loadId) return;
-      loading = false; draw(); schedulePoll();
+      loading = false; draw();
       if (failure) say(statusText, failure, true);
       else if (!quiet) say(statusText, '');
     }
@@ -189,7 +184,7 @@
     let attempts = 0;
     const tick = async () => {
       if (!live() || !API.connected) return;
-      try { const data = await request('/api/wifi-relay/status'); if (!live()) return; current = data; draw(); schedulePoll(); say(statusText, 'Router state re-read after the interrupted request.'); return; } catch { /* keep waiting */ }
+      try { const data = await request('/api/wifi-relay/status'); if (!live()) return; current = data; draw(); say(statusText, 'Router state re-read after the interrupted request.'); return; } catch { /* keep waiting */ }
       if (live() && ++attempts < 8) settleTimer = setTimeout(tick, 6000);
     };
     settleTimer = setTimeout(tick, 6000);
@@ -215,7 +210,7 @@
         }
       } finally {
         busy = false;
-        if (live()) { draw(); schedulePoll(); }
+        if (live()) { draw(); }
       }
     });
   }
@@ -256,16 +251,22 @@
   }
   window.addEventListener('focus', refreshVisible);
   window.addEventListener('pageshow', refreshVisible);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { refreshVisible(); schedulePoll(); } });
-  window.addEventListener('dashboard:navigate', () => { clearTimeout(pollTimer); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { refreshVisible(); } });
 
   UI.track({
     route,
+    sync(readings) {
+      const sample = readings.relay_status;
+      if (!onRoute() || API.locked || busy || !sample?.ok) return;
+      if (loading) { loadId++; loading = false; }
+      current = sample.data; attempted = true;
+      draw();
+    },
     get loaded() { return attempted; },
     get dirty() { return dirty(); },
     load,
     clear() {
-      clearTimeout(pollTimer); clearTimeout(settleTimer);
+      clearTimeout(settleTimer);
       loadId++; settleId++;
       current = null; attempted = false; loading = false; busy = false; selectedId = '';
       password.value = ''; remember.input.checked = ipv6.input.checked = true;

@@ -1253,6 +1253,10 @@ pub fn download_api(state: &crate::handlers::AppState) -> (u16, Value) {
     mutate(state, || state.ota.download())
 }
 
+pub(crate) fn slot_change_pending() -> bool {
+    Paths::system().pending.try_exists().unwrap_or(true)
+}
+
 pub fn install_api(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Value) {
     if !confirmed(body) {
         return (
@@ -1273,7 +1277,7 @@ pub fn install_api(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Valu
             json!({"ok":false,"error":format!("update deferred: {reason}"),"data":{"install_readiness":readiness}}),
         );
     }
-    mutate(state, || state.ota.install())
+    mutate(state, || state.mihomo.before_slot_change(|| state.ota.install()))
 }
 
 pub fn rollback_api(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Value) {
@@ -1289,7 +1293,7 @@ pub fn rollback_api(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Val
             json!({"ok":false,"error":format!("rollback deferred during {reason}")}),
         );
     }
-    mutate(state, || state.ota.rollback())
+    mutate(state, || state.mihomo.before_slot_change(|| state.ota.rollback()))
 }
 
 fn mutate(

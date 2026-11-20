@@ -524,6 +524,9 @@ impl<P: Port> Controller<P> {
         if self.phase == Phase::Off {
             snapshot.bypass = None;
         }
+        drop(snapshot);
+        crate::events::touch(crate::events::Topic::Mihomo);
+        crate::events::touch(crate::events::Topic::Relay);
     }
 
     fn set_bypass(&mut self, bypass: Bypass) {
@@ -558,8 +561,7 @@ impl<P: Port> Controller<P> {
                     Phase::Running if refresh => self.refresh(),
                     Phase::Running => self.restart("the profile changed", Restart::Profile),
                     Phase::Backoff => self.start(false),
-                    _ if refresh => self.prepare(&Source::Selected { local: self.local.clone(), runtime: None }, false).map(|_| ()),
-                    _ => Ok(()),
+                    _ => self.prepare(&Source::Selected { local: self.local.clone(), runtime: None }, false).map(|_| ()),
                 };
                 self.publish();
                 let _ = reply.send(result);
@@ -1151,16 +1153,15 @@ impl<P: Port> Controller<P> {
     /// pending included (I4).
     fn follow(&mut self, why: &str, unsettled: &[String], change: impl FnOnce(&mut P)) -> Result<(), String> {
         let Some(run) = self.run.as_ref() else { return Err("Mihomo is off".into()) };
-        if run.may_return() {
-            let narrowed = if unsettled.is_empty() {
-                self.load(Shape::Hold, Bypass::None(format!("Following {why}")), true)
-            } else {
-                let (routes, enabled, mode, selected) = (run.prepared.routes.clone(), run.prepared.bypass, run.mode, run.selected.clone());
-                let (bypass, tight) = self.port.plan(&routes, enabled, mode, &selected, unsettled);
+        use super::follow::{plan, Before};
+        match plan(run.may_return(), unsettled) {
+            Before::Keep => Ok(()),
+            Before::Hold => self.load(Shape::Hold, Bypass::None(format!("Following {why}")), true),
+            Before::ExcludeProviders => {
+                let (bypass, tight) = self.port.plan(&run.prepared.routes, run.prepared.bypass, run.mode, &run.selected, unsettled);
                 self.load(Shape::Full(&tight), bypass, true)
-            };
-            narrowed.map_err(|e| format!("Nothing was changed: the bypass could not be narrowed first ({e})"))?;
-        }
+            }
+        }.map_err(|e| format!("Nothing was changed: the bypass could not be narrowed first ({e})"))?;
         change(&mut self.port);
         self.widen(why);
         Ok(())
@@ -1362,7 +1363,8 @@ impl<P: Port> Controller<P> {
         if follow {
             let current = self.run.as_ref().map(|r| (r.mode, r.selected.clone(), r.prepared.secret.clone()));
             if let Some((mode, selected, secret)) = current {
-                let differs = sources || self.port.read_back(&secret).is_none_or(|(m, s, _)| m != mode || s != selected);
+                let observed = if sources { None } else { self.port.read_back(&secret) };
+                let differs = super::follow::decide(sources, (mode, &selected), observed.as_ref().map(|(m, s, _)| (*m, s)));
                 if differs {
                     changed = true;
                     crate::netlog!("[mihomo] the core's mode, a group or a rule set changed outside the controller; following it");

@@ -134,45 +134,54 @@ fn field_into<'a>(r: &mut impl Read, bytes: &'a mut Vec<u8>) -> Result<Option<(u
 fn geoip_v4(r: &mut impl Read, wanted: &[String]) -> Result<HashMap<String, Vec<(Ipv4Addr, u8)>>, String> {
     let mut lists: HashMap<String, Vec<(Ipv4Addr, u8)>> = HashMap::new();
     let mut buffer = Vec::new();
-    let mut offsets = Vec::new();
+    let mut decoded = Vec::new();
     while let Some((number, payload)) = field_into(r, &mut buffer)? {
         let (1, Some(entry)) = (number, payload) else { continue };
+        decoded.clear();
         let mut fields = entry;
-        let mut code = None;
-        offsets.clear();
+        let mut selected = None;
+        let mut skipped = false;
         while let Some((number, payload)) = cidr_field(&mut fields, MAX_ENTRY)? {
             match (number, payload) {
-                (1, Field::Bytes(name)) => code = Some(String::from_utf8_lossy(name).to_ascii_uppercase()),
-                (2, Field::Bytes(bytes)) => {
-                    let end = entry.len() - fields.len();
-                    offsets.push(end - bytes.len()..end);
-                }
+                (1, Field::Bytes(name)) => selected = wanted.iter().find(|code| name.eq_ignore_ascii_case(code.as_bytes())),
+                (2, Field::Bytes(bytes)) if selected.is_some() => { if let Some(range) = ipv4_range(bytes)? { decoded.push(range); } }
+                (2, Field::Bytes(_)) => skipped = true,
                 _ => {}
             }
         }
-        let Some(code) = code.filter(|c| wanted.contains(c)) else { continue };
-        let ranges = lists.entry(code).or_default();
-        for offset in &offsets {
-            let mut cidr = &entry[offset.clone()];
-            let (mut ip, mut prefix) = (None, 0u64);
-            while let Some((number, payload)) = cidr_field(&mut cidr, u64::MAX)? {
-                match (number, payload) {
-                    (1, Field::Bytes(bytes)) => ip = <[u8; 4]>::try_from(bytes).ok(),
-                    (2, Field::Value(value)) => prefix = value,
-                    _ => {}
+        let Some(code) = selected else { continue };
+        let ranges = lists.entry(code.clone()).or_default();
+        if skipped {
+            // Protobuf permits the country to follow its CIDRs, or to occur
+            // twice (last value wins). Replay only these exceptional entries.
+            let mut fields = entry;
+            while let Some((number, payload)) = cidr_field(&mut fields, MAX_ENTRY)? {
+                if let (2, Field::Bytes(bytes)) = (number, payload) {
+                    if let Some(range) = ipv4_range(bytes)? { ranges.push(range); }
                 }
             }
-            if let Some(ip) = ip.filter(|_| prefix <= 32) {
-                let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
-                ranges.push((Ipv4Addr::from(u32::from_be_bytes(ip) & mask), prefix as u8));
-            }
-        }
+        } else { ranges.append(&mut decoded); }
     }
     for ranges in lists.values_mut() {
         ranges.sort_unstable();
         ranges.dedup();
     }
     Ok(lists)
+}
+
+fn ipv4_range(mut bytes: &[u8]) -> Result<Option<(Ipv4Addr, u8)>, String> {
+    let (mut ip, mut prefix) = (None, 0u64);
+    while let Some(field) = cidr_field(&mut bytes, u64::MAX)? {
+        match field {
+            (1, Field::Bytes(bytes)) => ip = <[u8; 4]>::try_from(bytes).ok(),
+            (2, Field::Value(value)) => prefix = value,
+            _ => {}
+        }
+    }
+    Ok(ip.filter(|_| prefix <= 32).map(|ip| {
+        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+        (Ipv4Addr::from(u32::from_be_bytes(ip) & mask), prefix as u8)
+    }))
 }
 
 enum Field<'a> {

@@ -20,7 +20,8 @@ use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use super::monitor::Monitor;
-use super::{Cmd, IFACE};
+use super::IFACE;
+use crate::netfx::neighbours::Change;
 
 /// RFC 5737 TEST-NET-1: never a host upstream, and off-link, so the kernel
 /// never sends through the brief entry. Not link-local: IPACM ignores those.
@@ -98,21 +99,12 @@ impl Retirer {
 /// IPACM sees the MAC move to `SPARE`, which drops its rules, then back to its
 /// own address as a REACHABLE event. The kernel reports nothing for an entry
 /// already in that state, hence `stale` first.
-fn retire_steps(n: &Neighbour) -> [Cmd; 4] {
-    let (spare, own) = (SPARE.to_string(), n.ip.to_string());
-    let entry = |ip: &str, state: &str| {
-        Cmd::new("ip", &["-4", "neigh", "replace", ip, "lladdr", &n.mac, "nud", state, "dev", IFACE])
-    };
-    [
-        entry(&spare, "reachable"),
-        Cmd::new("ip", &["-4", "neigh", "del", &spare, "dev", IFACE]),
-        entry(&own, "stale"),
-        entry(&own, "reachable"),
-    ]
+fn retire_steps(ip: Ipv4Addr) -> [(Change, Ipv4Addr); 4] {
+    [(Change::ReplaceReachable, SPARE), (Change::Delete, SPARE), (Change::ReplaceStale, ip), (Change::ReplaceReachable, ip)]
 }
 
 fn retire(n: &Neighbour) -> Result<(), String> {
-    retire_steps(n).iter().try_for_each(|cmd| cmd.run().map(|_| ()))
+    retire_steps(n.ip).into_iter().try_for_each(|(change, ip)| change.apply(IFACE, ip, &n.mac))
 }
 
 fn handle(retirer: &mut Retirer, line: &str, mut retire: impl FnMut(&Neighbour) -> Result<(), String>) {
@@ -203,16 +195,8 @@ mod tests {
 
     #[test]
     fn the_mac_moves_to_the_spare_address_and_back_as_a_reachable_event() {
-        let steps: Vec<String> = retire_steps(&seen("192.168.2.77", HOST)).iter().map(|c| format!("{} {}", c.program, c.args.join(" "))).collect();
-        assert_eq!(
-            steps,
-            [
-                format!("ip -4 neigh replace 192.0.2.1 lladdr {HOST} nud reachable dev ath20"),
-                "ip -4 neigh del 192.0.2.1 dev ath20".to_owned(),
-                format!("ip -4 neigh replace 192.168.2.77 lladdr {HOST} nud stale dev ath20"),
-                format!("ip -4 neigh replace 192.168.2.77 lladdr {HOST} nud reachable dev ath20"),
-            ]
-        );
+        let ip = "192.168.2.77".parse().unwrap();
+        assert_eq!(retire_steps(ip), [(Change::ReplaceReachable, SPARE), (Change::Delete, SPARE), (Change::ReplaceStale, ip), (Change::ReplaceReachable, ip)]);
         assert!(SPARE.is_documentation() && !SPARE.is_link_local());
     }
 

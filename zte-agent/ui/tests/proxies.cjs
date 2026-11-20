@@ -11,9 +11,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
   let state=listing();
   const fixture=await start(({method,url,body},reply,fail)=>{
     if(!url.startsWith('/api/mihomo/'))return false;
-    if(method==='GET'&&url==='/api/mihomo/proxies'){running?reply(state):fail('Clash is off',409);return true;}
+    if(method==='GET'&&url==='/api/mihomo/proxies'){running?reply(state):fail('Mihomo is off',409);return true;}
     if(method!=='POST')return false;
-    if(!running){fail('Clash is off',409);return true;}
+    if(!running){fail('Mihomo is off',409);return true;}
     if(url==='/api/mihomo/dashboard'){reply({url:'/ui/mihomo/dashboard/#/proxies'});return true;}
     if(url==='/api/mihomo/mode'){if(modeFails){fail(modeFails,503);return true;}state.mode=body.mode;reply({mode:body.mode});return true;}
     if(url==='/api/mihomo/proxies/select'){if(selectFails){fail(selectFails,503);return true;}state.groups.find(g=>g.name===body.group).now=body.name;reply({group:body.group,now:body.name});return true;}
@@ -27,11 +27,11 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
   const confirm=async label=>{await page.locator('.confirm-dialog').getByRole('button',{name:label,exact:true}).click();await page.locator('.confirm-dialog').waitFor({state:'hidden'});};
   const group=name=>page.locator(`.proxy-group[data-group="${name}"]`);
   try{
-    // Clash is off: say so, point to where it starts, and change nothing.
-    await page.goto(`${fixture.url}/#network/proxies`);await said('#proxies-groups','Clash is off');
-    assert.equal(await page.getByRole('button',{name:'Open Zashboard',exact:true}).isHidden(),true,'nothing to open while Clash is off');
-    assert.equal(await page.getByRole('button',{name:'Open Clash / Mihomo'}).isVisible(),true);assert.equal(await page.locator('#proxies-mode-select').isDisabled(),true);assert.equal(posts().length,0);
-    await page.getByRole('button',{name:'Open Clash / Mihomo'}).click();await page.waitForFunction(()=>location.hash==='#network/mihomo');
+    // Mihomo is off: say so, point to where it starts, and change nothing.
+    await page.goto(`${fixture.url}/#network/proxies`);await said('#proxies-groups','Mihomo is off');
+    assert.equal(await page.getByRole('button',{name:'Open Zashboard',exact:true}).isHidden(),true,'nothing to open while Mihomo is off');
+    assert.equal(await page.getByRole('button',{name:'Open Mihomo'}).isVisible(),true);assert.equal(await page.locator('#proxies-mode-select').isDisabled(),true);assert.equal(posts().length,0);
+    await page.getByRole('button',{name:'Open Mihomo'}).click();await page.waitForFunction(()=>location.hash==='#network/mihomo');
     await page.goto(`${fixture.url}/#network/proxies`);
 
     // Running: groups, the current node and the last measured delays.
@@ -39,8 +39,8 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     assert.equal(await page.getByRole('button',{name:'Open Zashboard',exact:true}).isVisible(),true);
     const [pane]=await Promise.all([page.waitForEvent('popup'),page.getByRole('button',{name:'Open Zashboard',exact:true}).click()]);
     await pane.waitForURL(`${fixture.url}/ui/mihomo/dashboard/#/proxies`);await said('#proxies-mode .action-status','Zashboard is open in a new tab');await pane.close();
-    assert.equal(await page.locator('.proxy-group').count(),3);assert.equal(await page.getByRole('button',{name:'Open Clash / Mihomo'}).isHidden(),true);
-    assert.match(await group('Auto').textContent(),/Chosen automatically by Clash/);assert.equal(await group('Auto').locator('select').count(),0);
+    assert.equal(await page.locator('.proxy-group').count(),3);assert.equal(await page.getByRole('button',{name:'Open Mihomo'}).isHidden(),true);
+    assert.match(await group('Auto').textContent(),/Chosen automatically by Mihomo/);assert.equal(await group('Auto').locator('select').count(),0);
     assert.match(await group('Proxy').textContent(),/Now: Auto → HK 01/);assert.match(await group('Proxy').locator('.proxy-delay').textContent(),/88 ms/);
     assert.equal(await group('Proxy').locator('select').inputValue(),'Auto');
     assert.deepEqual(await group('Proxy').locator('option').allTextContents(),['Auto','HK 01 · 88 ms','US 02 <i>x</i> · Timeout','JP 03 · 640 ms','DIRECT · Untested']);
@@ -78,14 +78,14 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     await page.locator('#proxies-search').fill('direct');assert.equal(await page.locator('.proxy-group').count(),2);
     await page.locator('#proxies-search').fill('nothing like this');assert.match(await text('#proxies-groups'),/No group or node matches/);await page.locator('#proxies-search').fill('');
 
-    // Clash turned off meanwhile: the page says so instead of failing quietly.
-    running=false;await page.locator('#proxies-mode-select').selectOption('rule');await confirm('Change mode');await said('#proxies-groups','Clash is off');
+    // Mihomo turned off meanwhile: the page says so instead of failing quietly.
+    running=false;await page.locator('#proxies-mode-select').selectOption('rule');await confirm('Change mode');await said('#proxies-groups','Mihomo is off');
 
     for(const theme of ['light','dark'])for(const width of [320,390,820,1440]){
       await page.setViewportSize({width,height:1400});await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth),true,`${theme} ${width}px has no horizontal overflow`);
     }
     assert.deepEqual(errors,[]);
-    console.log('Passed: proxy groups, node choice with rollback, bounded delay tests, routing mode, filtering, Clash-off handling and responsive themes.');
+    console.log('Passed: proxy groups, node choice with rollback, bounded delay tests, routing mode, filtering, Mihomo-off handling and responsive themes.');
   }finally{await browser.close();await fixture.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

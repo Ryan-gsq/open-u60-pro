@@ -298,7 +298,7 @@ impl Shared {
     fn declare(s: &mut State) -> Result<(), String> {
         let families = tables(s.layout.as_ref().unwrap(), ids::CORE_OUT_MARK)?;
         let resource = Resource::NftTable(NftTable { owner: "relay", name: TABLE, file: s.file.clone(), families: Some(families) });
-        s.effects.lock().unwrap().declare_with(vec![resource], false, &mut net::Device, &mut *s.nft)
+        s.effects.lock().unwrap().declare_with(vec![resource], &mut net::Device, &mut *s.nft)
     }
 
     /// `net_guard`: loads the target again when it is not confirmed or the
@@ -473,7 +473,7 @@ pub mod tests {
         assert!(without.contains("chain dns_out {\n\t\ttype filter hook output priority filter - 1; policy accept;"));
     }
 
-    /// M13: only once a free mark is verified on the device; off until then.
+    /// B31 confirms the dedicated socket mark in both output chains.
     #[test]
     fn the_cores_marked_dns_keeps_its_destination_only_with_a_verified_mark() {
         assert_eq!(ids::CORE_OUT_MARK, Some(0x0100_0000));
@@ -560,7 +560,7 @@ pub mod tests {
         let journal = file.parent().unwrap().join("wireless.json");
         let effects = Arc::new(Mutex::new(EffectSet::load("relay", &journal).unwrap()));
         let next = Shared::with(file.clone(), effects.clone(), Box::new(kernel.clone()));
-        effects.lock().unwrap().declare_with(vec![next.resource(None)], true, &mut net::Device, &mut kernel.clone()).unwrap();
+        effects.lock().unwrap().declare_with(vec![next.resource(None)], &mut net::Device, &mut kernel.clone()).unwrap();
         let before = kernel.0.lock().unwrap().loads;
         next.adopt(relay()).unwrap();
         next.update(|layout| {

@@ -85,7 +85,8 @@ def serve(ns, family, address, port, label):
                 conn.settimeout(3)
                 try:
                     line = conn.recv(256).decode().strip()
-                    conn.sendall(f"{label}:{peer[0]}:{line}\n".encode())
+                    name = label + "-original" if conn.getsockname()[0] in ("203.0.113.53", "2001:db8:53::8") else label
+                    conn.sendall(f"{name}:{peer[0]}:{line}\n".encode())
                 except OSError:
                     pass
         server.close()
@@ -133,12 +134,14 @@ def send_udp(ns, family, source_port, address, port):
     in_ns(ns, run)
 
 
-def ask(ns, address, port, source=None, timeout=1.5):
+def ask(ns, address, port, source=None, timeout=1.5, mark=None):
     """`<answer>`, `timeout`, `refused`/`reset`/`error: …` and how long it took."""
     def run():
         family = socket.AF_INET6 if ":" in address else socket.AF_INET
         conn = socket.socket(family, socket.SOCK_STREAM)
         conn.settimeout(timeout)
+        if mark is not None:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)
         if source:
             conn.bind((source, 0))
         started = time.monotonic()
@@ -191,7 +194,7 @@ def topology():
         ("client", "c0", ["192.168.0.23/24", "fd12:3456:789a::23/64", "fd99::23/64"]),
         ("router", "br-lan", ["192.168.0.1/24", "fd12:3456:789a::1/64", "fd99::1/64"]),
         ("router", "ath20", ["10.20.0.7/24", "2001:db8:20::7/64"]),
-        ("upstream", "u0", ["10.20.0.1/24", "2001:db8:20::1/64"]),
+        ("upstream", "u0", ["10.20.0.1/24", "2001:db8:20::1/64", "203.0.113.53/32", "2001:db8:53::8/128"]),
         ("router", "rmnet_data0", ["100.100.0.2/24", "2001:db8:c::2/64"]),
         ("cell", "m0", ["100.100.0.1/24", "2001:db8:c::1/64"]),
     )
@@ -339,6 +342,12 @@ def data_plane():
     report("relay: the router's own DNS goes to the Wi-Fi resolver", got[0].startswith("hoteldns:"), got)
 
     load("full")
+    for address in ("203.0.113.53", "2001:db8:53::8"):
+        marked = ask("router", address, 53, mark=0x01000000)
+        portal = ask("router", address, 53, mark=8880)
+        report(f"{address}: marked core DNS reaches original destination", "-original:" in marked[0], marked)
+        report(f"{address}: portal mark alone still redirects", portal[0].startswith("hoteldns") and "-original" not in portal[0], portal)
+
     got = ask("client", "2001:db8:20::1", 80, source="fd12:3456:789a::23")
     report("NAT66: an approved LAN source reaches the upstream as the relay address", got[0] == "up6:2001:db8:20::7:hi", got)
     got = ask("client", "2001:db8:20::1", 80, source="fd99::23")

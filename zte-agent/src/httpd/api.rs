@@ -164,7 +164,7 @@ pub async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
             // Serialising (and dropping the Value) also happens on the pool.
             gated(
                 ctx.gate
-                    .run(lane, move || server::encode(server::route(&method, &path, &app, &body)))
+                    .run(lane, move || server::encoded_route(&method, &path, &app, &body))
                     .await,
             )
         }

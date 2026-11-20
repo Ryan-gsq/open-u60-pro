@@ -23,7 +23,7 @@ const MODES: [&str; 3] = ["rule", "global", "direct"];
 type Failure = (u16, String);
 
 fn off() -> Failure {
-    (409, "Clash is off".into())
+    (409, "Mihomo is off".into())
 }
 
 fn finish(result: Result<Value, Failure>) -> (u16, Value) {
@@ -399,7 +399,7 @@ mod tests {
             delay(&state, br#"{"name":"DIRECT"}"#),
             mode(&state, br#"{"mode":"global"}"#),
         ] {
-            assert_eq!((status, body["error"].as_str()), (409, Some("Clash is off")));
+            assert_eq!((status, body["error"].as_str()), (409, Some("Mihomo is off")));
         }
         assert_eq!(select(&state, b"nope").0, 400);
         assert_eq!(select(&state, br#"{"group":"","name":"x"}"#).0, 400);

@@ -15,18 +15,22 @@
 //! entry is confirmed again without interrupting the client (B31, 2026-11-09).
 //! IPACM skips the event for a client it already knows at that address.
 
-use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::monitor::{Alive, Monitor};
-use super::Cmd;
+use crate::netfx::neighbours::Change;
 
 const LAN: &str = "br-lan";
 /// After an association: IPACM registers the client from the driver's event,
 /// and the client usually renews DHCP and ARP meanwhile.
 const SETTLE: Duration = Duration::from_secs(5);
+const COOLDOWN: Duration = Duration::from_secs(12);
+
+fn trailing_join(joined: Instant, started: Instant, earliest: Instant) -> Option<Instant> {
+    (joined > started).then(|| earliest.max(joined + SETTLE))
+}
 
 /// One relay session's hotspot station watch (`iw event`); at its start every
 /// client is announced, since the relay's connection moved them between bands.
@@ -43,14 +47,18 @@ pub(super) fn watch() -> Monitor {
                 crate::system::spawn_named("relay-lan-arp", move || {
                     let mut due = now + SETTLE;
                     while alive.wait(due.saturating_duration_since(Instant::now())) {
+                        let started = Instant::now();
+                        let settled = pending.lock().unwrap()[&mac] + SETTLE;
+                        if started < settled { due = settled; continue; }
                         announce(Some(&mac));
-                        let sent = Instant::now();
-                        due = sent + Duration::from_secs(12);
-                        if !alive.wait(due - sent) { break; }
+                        let earliest = Instant::now() + COOLDOWN;
+                        if !alive.wait(earliest.saturating_duration_since(Instant::now())) { break; }
                         let mut pending = pending.lock().unwrap();
                         let last = pending[&mac];
-                        if last <= sent { pending.remove(&mac); break; }
-                        due = due.max(last + SETTLE);
+                        match trailing_join(last, started, earliest) {
+                            Some(next) => due = next,
+                            None => { pending.remove(&mac); break; }
+                        }
                     }
                 });
             }
@@ -72,21 +80,6 @@ fn joined(line: &str) -> Option<String> {
     (iface.starts_with("wlan") && valid_mac(&mac)).then_some(mac)
 }
 
-/// A REACHABLE IPv4 entry of `ip -4 neigh show dev br-lan`. Other states
-/// need nothing: the kernel reports the next change itself.
-#[cfg(test)]
-fn reachable(line: &str) -> Option<(Ipv4Addr, String)> {
-    let words: Vec<&str> = line.split_whitespace().collect();
-    let ip = words.first()?.parse().ok()?;
-    let mac = words.windows(2).find(|w| w[0] == "lladdr")?[1].to_ascii_lowercase();
-    (words.last() == Some(&"REACHABLE") && valid_mac(&mac)).then_some((ip, mac))
-}
-
-/// `change` never creates an entry the kernel has not learnt.
-fn stale(ip: Ipv4Addr, mac: &str) -> Cmd {
-    Cmd::new("ip", &["-4", "neigh", "change", &ip.to_string(), "dev", LAN, "lladdr", mac, "nud", "stale"])
-}
-
 /// Sets the REACHABLE entries of `mac` (all clients when `None`) STALE.
 fn announce(mac: Option<&str>) {
     let table = match crate::netfx::neighbours::list(LAN) {
@@ -96,7 +89,7 @@ fn announce(mac: Option<&str>) {
     for (ip, client) in table.into_iter().filter(|e| e.reachable && mac.is_none_or(|mac| mac == e.mac)).map(|e| (e.ip, e.mac)) {
         // The MAC's last 2 octets only, as device lists show them.
         let tail = &client[12..];
-        match stale(ip, &client).run() {
+        match Change::ChangeStale.apply(LAN, ip, &client) {
             Ok(_) => crate::netlog!("[relay] LAN client {ip} (MAC ..:{tail}) announced to IPACM again"),
             Err(e) => crate::netlog!("[relay] cannot announce LAN client {ip} (MAC ..:{tail}) to IPACM: {e}"),
         }
@@ -108,6 +101,15 @@ mod tests {
     use super::*;
 
     const MAC: &str = "3a:01:42:84:11:82";
+
+    #[test]
+    fn repeated_associations_have_one_trailing_announcement_after_cooldown() {
+        let start = Instant::now();
+        let earliest = start + COOLDOWN;
+        assert_eq!(trailing_join(start, start, earliest), None);
+        assert_eq!(trailing_join(start + Duration::from_secs(1), start, earliest), Some(earliest));
+        assert_eq!(trailing_join(earliest, start, earliest), Some(earliest + SETTLE));
+    }
 
     #[test]
     fn only_stations_joining_a_hotspot_interface_count() {
@@ -124,13 +126,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_reachable_ipv4_entries_are_set_stale_and_never_created() {
-        assert_eq!(reachable("192.168.0.124 lladdr 3A:01:42:84:11:82 REACHABLE "), Some(("192.168.0.124".parse().unwrap(), MAC.to_owned())));
-        for line in ["192.168.0.89 lladdr c2:fe:8d:00:00:01 STALE", "192.168.0.89 lladdr c2:fe:8d:00:00:01 DELAY", "192.168.0.60 FAILED", "192.168.0.7 lladdr 00:00:00:00:00:00 REACHABLE", ""] {
-            assert_eq!(reachable(line), None, "{line:?}");
-        }
-        let cmd = stale("192.168.0.124".parse().unwrap(), MAC);
-        assert_eq!(format!("{} {}", cmd.program, cmd.args.join(" ")), format!("ip -4 neigh change 192.168.0.124 dev br-lan lladdr {MAC} nud stale"));
-    }
+
 }

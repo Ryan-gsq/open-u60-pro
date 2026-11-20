@@ -11,7 +11,7 @@
 /// the vendor's Wi-Fi off waits for every such interface to disappear.
 pub const RELAY_IFACE: &str = "ath20";
 /// The comment on the relay's legacy rules in chains it does not own and
-/// without a jump to one (the portal RETURN, the IPv4 MASQUERADE): their
+/// without a jump to one (the portal RETURN and the old IPv4 MASQUERADE undo): their
 /// identity, since the station's name is one the vendor's files also list.
 pub const RELAY_COMMENT: &str = "zte-agent-wifi-relay";
 

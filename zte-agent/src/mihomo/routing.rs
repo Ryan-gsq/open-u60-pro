@@ -689,7 +689,22 @@ impl Routes {
                 kind if domain_kind(kind) => out.push(format!("{kind},{},{action}", rule.payload)),
                 "RULE-SET" => match self.providers.get(&rule.payload) {
                     Some(p) if p.behavior == "ipcidr" => {}
-                    Some(p) if p.inline.is_some() => out.push(format!("RULE-SET,{},{action}", rule.payload)),
+                    Some(p) if p.kind == "inline" && p.behavior == "classical" => {
+                        // The DNS matcher sees no transport metadata. A TCP-only
+                        // block still reserves its domains for all DNS clients.
+                        for line in p.inline.as_deref().unwrap_or_default() {
+                            let member = parse(line, false);
+                            match member.kind.as_str() {
+                                kind if domain_kind(kind) => out.push(format!("{kind},{},{action}", member.payload)),
+                                "AND" | "OR" if !fixed => {
+                                    if !self.domain_leaves(&member, 0, out) { return "fake-ip"; }
+                                }
+                                "NOT" | "SUB-RULE" | "RULE-SET" if !fixed => return "fake-ip",
+                                _ => {}
+                            }
+                        }
+                    }
+                    Some(p) if p.kind == "inline" && p.behavior == "domain" => out.push(format!("RULE-SET,{},{action}", rule.payload)),
                     // Refreshed sets lose and gain names: fake what they hold;
                     // one that may gain any name ends the real addresses.
                     Some(_) if fixed => out.push(format!("RULE-SET,{},fake-ip", rule.payload)),
@@ -1368,6 +1383,13 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
                 assert_eq!(filter[guard + 1], "GEOSITE,CN,real-ip");
             }
         }
+    }
+
+    #[test]
+    fn a_fixed_classical_blocklist_reserves_overlaps_before_cn_direct() {
+        let config = "rule-providers: {Ads: {type: inline, behavior: classical, payload: ['AND,((DOMAIN-SUFFIX,ads.cn),(NETWORK,TCP))']}}\nrules: ['RULE-SET,Ads,REJECT','GEOSITE,CN,DIRECT','GEOIP,CN,DIRECT','MATCH,P']";
+        let filter = Routes::from(&serde_yaml_ng::from_str(config).unwrap()).dns(true);
+        assert!(filter.windows(2).any(|w| w == ["DOMAIN-SUFFIX,ads.cn,fake-ip", "GEOSITE,CN,real-ip"]));
     }
 
     /// Q3: a domain a group sends somewhere is fake whatever the group's

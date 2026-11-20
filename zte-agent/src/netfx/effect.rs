@@ -44,6 +44,19 @@ pub use set::EffectSet;
 pub(crate) use set::tests as testing;
 
 pub const FAMILIES: [&str; 2] = ["ip", "ip6"];
+/// Fallback after the kernel successfully created the CLI smoke-test device
+/// but could not read it back through the WireGuard API.
+pub fn remove_diagnostic_link(interface: &str) -> Result<(), String> {
+    crate::net_tools::Cmd::new("ip", &["link", "del", "dev", interface]).run().map(|_| ())
+}
+
+/// A feature's complete private chain followed by its single jump from a
+/// vendor chain. The inverse order removes the jump before the chain.
+pub fn hooked_chain(tool: LegacyTool, table: &str, parent: &str, name: &str, rules: Vec<Vec<String>>) -> [Resource; 2] {
+    [Resource::LegacyChain(LegacyChain { tool, table: table.into(), name: name.into(), rules }),
+     Resource::LegacyHook(LegacyHook { tool, table: table.into(), chain: parent.into(), rule: vec!["-j".into(), name.into()], position: Position::InsertFirst })]
+}
+
 /// The unhooked chain holding the generation marker.
 const STATE: &str = "state";
 /// A batch with large sets (GeoIP ranges) takes a while on the router.
@@ -221,9 +234,9 @@ impl NftTables {
     /// target is not loaded again while the kernel is read to hold it.
     pub fn declare(&mut self, families: [String; 2], nft: &mut (impl Nft + ?Sized)) -> Result<u64, String> {
         let digest: [u8; 32] = Sha256::digest(families.concat()).into();
-        if let Some(target) = self.target.clone().filter(|t| t.digest == digest && self.confirmed == Some(t.number)) {
+        if let Some(target) = self.target.as_ref().filter(|t| t.digest == digest && self.confirmed == Some(t.number)) {
             // An unreadable kernel proves nothing: load it as a new generation.
-            if nft.list_both(self.name).is_ok_and(|listings| self.intact(&target, &listings)) {
+            if nft.list_both(self.name).is_ok_and(|listings| self.intact(target, &listings)) {
                 self.error = None;
                 return Ok(target.number);
             }
@@ -235,7 +248,7 @@ impl NftTables {
     }
 
     fn load(&mut self, nft: &mut (impl Nft + ?Sized)) -> Result<u64, String> {
-        let target = self.target.clone().ok_or("Nothing to load")?;
+        let target = self.target.as_ref().ok_or("Nothing to load")?;
         let loaded = net::write_private(&self.file, target.text.as_bytes()).and_then(|()| nft.load(&self.file));
         // A tool that failed or timed out may still have committed: the
         // marker decides, never the exit code alone.
@@ -281,8 +294,8 @@ impl NftTables {
     /// tables lost their marker or a rule (one read of both families).
     /// `Ok(true)` when it loaded.
     pub fn reconcile(&mut self, nft: &mut (impl Nft + ?Sized)) -> Result<bool, String> {
-        let Some(target) = self.target.clone() else { return Ok(false) };
-        if self.confirmed == Some(target.number) && self.intact(&target, &nft.list_both(self.name).map_err(|error| format!("not checked: {error}"))?) {
+        let Some(target) = self.target.as_ref() else { return Ok(false) };
+        if self.confirmed == Some(target.number) && self.intact(target, &nft.list_both(self.name).map_err(|error| format!("not checked: {error}"))?) {
             return Ok(false);
         }
         self.load(nft).map(|_| true)

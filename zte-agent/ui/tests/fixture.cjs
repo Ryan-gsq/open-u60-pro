@@ -33,6 +33,7 @@ async function start(api){
   const heartbeat=setInterval(()=>{for(const res of streams)res.write(': heartbeat\n\n');},1000);
   return {
     requests,
+    patch(readings){for(const stream of streams)stream.write(`event: patch\ndata: ${JSON.stringify({readings})}\n\n`);},
     url:`http://127.0.0.1:${server.address().port}`,
     count:(method,url)=>requests.filter(r=>r.method===method&&r.url===url).length,
     async close(){clearInterval(heartbeat);for(const stream of streams)stream.destroy();server.closeAllConnections();server.close();}

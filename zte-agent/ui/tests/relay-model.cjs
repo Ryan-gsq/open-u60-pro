@@ -52,7 +52,7 @@ assert.deepEqual(R.connectRequest({id:'abc',password:'',remember:false,ipv6:fals
 assert.equal(R.connectRequest({id:'abc'}).ipv6,true);
 
 // D8: what the router's filters and hardware forwarding cover.
-assert.match(R.scope,/parental control and URL filter do not apply to devices using the relay/);assert.match(R.scope,/IPv6 \(NAT66\) and traffic through Clash use the CPU/);
+assert.match(R.scope,/parental control and URL filter do not apply to devices using the relay/);assert.match(R.scope,/IPv6 \(NAT66\) and traffic through Mihomo use the CPU/);
 
 // Saved-network notes and the consent wording.
 assert.equal(R.savedNote({security:'open'}),'Open network; no password needed');

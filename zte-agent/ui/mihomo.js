@@ -17,7 +17,7 @@
       const target = M.dashboardTarget(await request('/api/mihomo/dashboard', {...json('POST', {}), timeoutMs: 15000}));
       if (!UI.current(epoch)) { if (tab) tab.close(); return; }
       if (!target) throw new Error('The router returned an unexpected dashboard address');
-      if (tab) { tab.location.href = target; say(node, 'Zashboard is open in a new tab. It connects to Clash by itself.'); return; }
+      if (tab) { tab.location.href = target; say(node, 'Zashboard is open in a new tab. It connects to Mihomo by itself.'); return; }
       say(node, 'Your browser blocked the new tab. ');
       const link = el('a', '', 'Open Zashboard');
       link.href = target; link.target = '_blank'; link.rel = 'noopener';
@@ -25,15 +25,15 @@
     } catch (error) {
       if (tab) tab.close();
       if (!UI.current(epoch)) return;
-      say(node, error.status === 409 ? 'Clash is off. Start it first.' : `Zashboard could not be opened. ${error.message}`, true);
+      say(node, error.status === 409 ? 'Mihomo is off. Start it first.' : `Zashboard could not be opened. ${error.message}`, true);
     } finally { if (UI.current(epoch)) trigger.disabled = false; }
   }
   M.openDashboard = openDashboard;
 
   // ── Status ──────────────────────────────────────────────────────────────
-  const statusPanel = UI.panel(route, 'mihomo-status', 'Clash / Mihomo', 'Experimental LAN TCP/UDP, IPv4/IPv6 interception through the pinned Mihomo core. Node UDP support and IPv6 exit reachability still apply. No subscription or paid node is included.');
+  const statusPanel = UI.panel(route, 'mihomo-status', 'Mihomo', 'Experimental LAN TCP/UDP, IPv4/IPv6 interception through the pinned Mihomo core. Node UDP support and IPv6 exit reachability still apply. No subscription or paid node is included.');
   statusPanel.classList.add('mihomo-panel');
-  const hero = el('div', 'mihomo-hero'), glyph = el('div', 'mihomo-glyph'), copy = el('div'), title = el('h3', '', 'Clash is off'), detail = el('p', ''), chip = el('span', 'mihomo-state', 'OFF');
+  const hero = el('div', 'mihomo-hero'), glyph = el('div', 'mihomo-glyph'), copy = el('div'), title = el('h3', '', 'Mihomo is off'), detail = el('p', ''), chip = el('span', 'mihomo-state', 'OFF');
   glyph.append(el('i'));
   copy.append(el('span', 'eyebrow', 'TRANSPARENT PROXY'), title, detail);
   hero.append(glyph, copy, chip);
@@ -41,7 +41,7 @@
   const problem = el('p', 'relay-problem');
   problem.setAttribute('role', 'alert');
   problem.hidden = true;
-  const actions = el('div', 'form-actions'), toggle = button('Start Clash', toggleCore, 'primary'), install = button('Install Mihomo core', installCore),
+  const actions = el('div', 'form-actions'), toggle = button('Start Mihomo', toggleCore, 'primary'), install = button('Install Mihomo core', installCore),
     cleanup = button('Retry proxy cleanup', () => stopCore('cleanup')), clearStart = button('Stop automatic start & keep off', () => stopCore('autostart')), refresh = button('Read current status', () => load());
   const zashboard = button('Open Zashboard', () => openDashboard(statusText, zashboard));
   actions.append(toggle, zashboard, install, cleanup, clearStart, refresh);
@@ -50,7 +50,7 @@
   statusPanel.append(hero, facts, problem, actions, hint, statusText);
 
   // ── Profiles ────────────────────────────────────────────────────────────
-  const profilePanel = UI.panel(route, 'mihomo-profiles', 'Configuration profiles', 'Switching or editing the active profile briefly reconnects Clash. An invalid download, Merge or Script keeps the previous configuration. Downloads use Clash when it runs, otherwise the current uplink; cellular data is never turned on.');
+  const profilePanel = UI.panel(route, 'mihomo-profiles', 'Configuration profiles', 'Switching or editing the active profile briefly reconnects Mihomo. An invalid download, Merge or Script keeps the previous configuration. Downloads use Mihomo when it runs, otherwise the current uplink; cellular data is never turned on.');
   const profileBar = el('div', 'form-actions'), addProfile = button('Add configuration', () => openEditor('add'), 'primary');
   profileBar.append(addProfile);
   const profileList = el('div', 'mihomo-profile-list');
@@ -77,7 +77,7 @@
   fileInput.type = 'file'; fileInput.id = 'mihomo-profile-file'; fileInput.accept = '.yaml,.yml,.txt,text/yaml,text/plain';
   const urlField = field('Subscription URL', urlInput, 'HTTPS only, without a username, password or #fragment. The URL is stored on the router with owner-only permissions and shown only when you edit this profile.');
   const intervalField = field('Update schedule', intervalInput, 'Scheduled updates run in the background and keep the old copy if a download or validation fails.');
-  const yamlField = field('Clash YAML', yamlInput);
+  const yamlField = field('Mihomo YAML', yamlInput);
   const yamlHelp = el('small', 'field-help', 'Up to 512 KiB. Credentials in the YAML stay on the router and are never shown again.');
   const fileField = field('Or choose a YAML file', fileInput);
   yamlField.append(yamlHelp);
@@ -196,7 +196,7 @@
     let failure = '';
     const [state, list] = await Promise.allSettled([request('/api/mihomo/status'), request('/api/mihomo/profiles')]);
     if (!UI.current(epoch) || id !== loadId) return;
-    if (state.status === 'fulfilled') status = state.value; else failure = `Clash status unavailable. ${state.reason.message}`;
+    if (state.status === 'fulfilled') status = state.value; else failure = `Mihomo status unavailable. ${state.reason.message}`;
     if (list.status === 'fulfilled') { library = list.value; libraryError = ''; } else libraryError = `Profile library unavailable. ${list.reason.message}`;
     loading = false; draw();
     if (failure) say(statusText, failure, true); else if (!quiet) say(statusText, '');
@@ -229,22 +229,22 @@
     const view = M.view(status);
     if (!view.running && !view.canStart) return;
     const [heading, text, label] = view.running
-      ? ['Stop Clash?', 'Interception is removed and traffic returns to direct routing immediately. Automatic start is cleared.', 'Stop Clash']
-      : ['Start Clash?', 'LAN TCP/UDP traffic (IPv4 and IPv6) is routed through the Mihomo core. Connections may briefly reset. Turning Clash off returns to direct routing; it is not a kill switch.', 'Start Clash'];
+      ? ['Stop Mihomo?', 'Interception is removed and traffic returns to direct routing immediately. Automatic start is cleared.', 'Stop Mihomo']
+      : ['Start Mihomo?', 'LAN TCP/UDP traffic (IPv4 and IPv6) is routed through the Mihomo core. Connections may briefly reset. Turning Mihomo off returns to direct routing; it is not a kill switch.', 'Start Mihomo'];
     if (!await confirm(heading, text, {label, destructive: view.running})) return;
-    await act(statusText, 'POST', '/api/mihomo/switch', {enabled: !view.running}, {timeoutMs: 3 * MINUTE, working: view.running ? 'Stopping Clash…' : 'Starting Clash. Validating the configuration and the interception first…', done: view.running ? 'Clash is off.' : 'Clash is running.'});
+    await act(statusText, 'POST', '/api/mihomo/switch', {enabled: !view.running}, {timeoutMs: 3 * MINUTE, working: view.running ? 'Stopping Mihomo…' : 'Starting Mihomo. Validating the configuration and the interception first…', done: view.running ? 'Mihomo is off.' : 'Mihomo is running.'});
   }
   async function stopCore(kind) {
     const [heading, text, label] = kind === 'cleanup'
       ? ['Retry proxy cleanup?', 'Remove the remaining proxy network changes. This also clears automatic start.', 'Retry cleanup']
-      : ['Keep Clash off?', 'Cancel any pending restoration and clear the saved restart choice. Clash stays off after future restarts.', 'Keep off'];
+      : ['Keep Mihomo off?', 'Cancel any pending restoration and clear the saved restart choice. Mihomo stays off after future restarts.', 'Keep off'];
     if (!await confirm(heading, text, {label, destructive: true})) return;
-    await act(statusText, 'POST', '/api/mihomo/switch', {enabled: false}, {timeoutMs: 3 * MINUTE, working: 'Working…', done: kind === 'cleanup' ? 'Cleanup finished.' : 'Clash stays off; automatic start cleared.'});
+    await act(statusText, 'POST', '/api/mihomo/switch', {enabled: false}, {timeoutMs: 3 * MINUTE, working: 'Working…', done: kind === 'cleanup' ? 'Cleanup finished.' : 'Mihomo stays off; automatic start cleared.'});
   }
   async function installCore() {
     const view = M.view(status);
     if (!await confirm(view.installed ? 'Reinstall the pinned core?' : 'Install the Mihomo core?', 'Downloads about 22 MB from pinned official releases, verifies their SHA-256 and saves them under /data/zte-agent-mihomo. This may use cellular data. It does not start the proxy.', {label: view.installed ? 'Reinstall' : 'Install'})) return;
-    await act(statusText, 'POST', '/api/mihomo/install', {}, {timeoutMs: 10 * MINUTE, working: 'Downloading and verifying. This can take several minutes…', done: 'Core installed. Add a configuration profile, then start Clash.'});
+    await act(statusText, 'POST', '/api/mihomo/install', {}, {timeoutMs: 10 * MINUTE, working: 'Downloading and verifying. This can take several minutes…', done: 'Core installed. Add a configuration profile, then start Mihomo.'});
   }
 
   // ── Profile editor ──────────────────────────────────────────────────────
@@ -326,7 +326,7 @@
     const draft = {merge: mergeInput.value, script: scriptInput.value, merge_enabled: mergeOn.input.checked, script_enabled: scriptOn.input.checked};
     const issue = M.extensionsProblem(draft);
     if (issue) { say(extText, issue, true); return; }
-    if (!await confirm('Save Merge & Script?', `Every profile is re-validated with these settings. ${status?.running ? 'Clash briefly reconnects if the active configuration changes. ' : ''}If any profile fails, nothing changes.`, {label: 'Validate all & save'})) return;
+    if (!await confirm('Save Merge & Script?', `Every profile is re-validated with these settings. ${status?.running ? 'Mihomo briefly reconnects if the active configuration changes. ' : ''}If any profile fails, nothing changes.`, {label: 'Validate all & save'})) return;
     await act(extText, 'POST', '/api/mihomo/profiles', M.extensionsRequest(draft), {timeoutMs: 5 * MINUTE, working: 'Validating every profile…', done: 'Global Merge & Script saved and applied.', after: closeExtensions});
   });
 
@@ -340,6 +340,14 @@
 
   UI.track({
     route,
+    sync(readings) {
+      const sample = readings.mihomo_status;
+      if (!onRoute() || API.locked || busy || !sample?.ok) return;
+      if (loading) { loadId++; loading = false; }
+      status = sample.data.status; attempted = true;
+      if (sample.data.library) { library = sample.data.library; libraryError = ''; }
+      draw();
+    },
     get loaded() { return attempted; },
     get dirty() { return dirty(); },
     load,

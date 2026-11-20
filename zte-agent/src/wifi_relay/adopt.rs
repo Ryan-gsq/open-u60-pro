@@ -31,7 +31,7 @@ const RENEW_WAIT: Duration = Duration::from_secs(10);
 /// The session the previous agent left, taken over as it is.
 pub(super) fn adopt(target: &resume::Resume, lan_ip: Ipv4Addr, lan_mask: Ipv4Addr) -> Result<Session, String> {
     let root = Path::new(JOURNAL);
-    for name in ["wireless.json", "network.json", "dns.json"] {
+    for name in [super::journals::WIRELESS, super::journals::NETWORK, super::journals::DNS] {
         if !EffectSet::current(&root.join(name)) {
             return Err(format!("no {name} of this boot"));
         }
@@ -87,35 +87,31 @@ pub(super) fn adopt(target: &resume::Resume, lan_ip: Ipv4Addr, lan_mask: Ipv4Add
 /// holds runs again).
 fn take_over(session: &mut Session, installed: &Lease, prefix: u32, lan_ip: Ipv4Addr, lan_mask: Ipv4Addr) -> Result<(), String> {
     let root = Path::new(JOURNAL);
-    *session.wireless.lock().unwrap() = EffectSet::load("relay", &root.join("wireless.json"))?;
+    *session.wireless.lock().unwrap() = EffectSet::load("relay", &root.join(super::journals::WIRELESS))?;
     let mut guards = input_guards();
     guards.push(session.uplink.resource(None));
-    adopt_resources(&mut session.wireless.lock().unwrap(), guards, &mut net::Device, &mut crate::netfx::effect::Device)?;
-    session.network = EffectSet::load("relay", &root.join("network.json"))?;
+    session.wireless.lock().unwrap().declare(guards)?;
+    session.network = EffectSet::load("relay", &root.join(super::journals::NETWORK))?;
     // Remove precisely the old tagged rule before any declaration of nat4.
     let legacy_nat = super::LegacyHook {
         tool: super::LegacyTool::V4, table: "nat".into(), chain: "POSTROUTING".into(), position: super::Position::InsertFirst,
         rule: super::words(&["-o", IFACE, "-m", "comment", "--comment", crate::netfx::ids::RELAY_COMMENT, "-j", "MASQUERADE"]),
     };
     session.network.retire_legacy_hook(legacy_nat)?;
-    session.network.adopt(relay_plan(installed, prefix, lan_ip, lan_mask))?;
+    session.network.declare(relay_plan(installed, prefix, lan_ip, lan_mask))?;
     session.routed = true;
     for step in steering::plan() {
-        if let Err(e) = session.network.adopt(vec![step]) {
+        if let Err(e) = session.network.declare(vec![step]) {
             crate::netlog!("[relay] receive steering not applied: {e}");
         }
     }
-    session.dns = EffectSet::load("relay", &root.join("dns.json"))?;
-    session.dns.adopt(super::portal::web_bypasses())?;
+    session.dns = EffectSet::load("relay", &root.join(super::journals::DNS))?;
+    session.dns.declare(super::portal::web_bypasses())?;
     let redirect = super::portal::web_redirect(&session.dns);
-    session.dns.adopt(redirect)?;
-    session.dns.adopt(vec![super::resolver(installed)])?;
+    session.dns.declare(redirect)?;
+    session.dns.declare(vec![super::resolver(installed)])?;
     // The previous tables keep working until here; IPv6 adds its part next.
     session.uplink.adopt(relay_layout(installed, lan_ip, lan_mask))
-}
-
-pub(crate) fn adopt_resources(set: &mut EffectSet, resources: Vec<super::Resource>, probe: &mut impl net::Probe, nft: &mut impl crate::netfx::effect::Nft) -> Result<(), String> {
-    set.declare_with(resources, true, probe, nft)
 }
 
 /// A new DHCP client renews the same address (the old one died with the
@@ -135,7 +131,7 @@ fn renew(session: &mut Session, installed: &Lease, prefix: u32) -> Result<(), St
         let _ = session.power_save.set(&mut session.network, true);
     }
     let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(installed.ip) & u32::from(installed.subnet)));
-    session.offload = offload::Runtime::adopt(&mut session.network, installed.gateway, subnet);
+    session.offload = offload::Runtime::start(&mut session.network, installed.gateway, subnet);
     Ok(())
 }
 
@@ -143,7 +139,7 @@ fn renew(session: &mut Session, installed: &Lease, prefix: u32) -> Result<(), St
 /// when it does not match) rolled back and started again.
 fn take_over_ipv6(session: &mut Session, client: Option<(offload::Record, String)>, requested: bool) -> Result<(), String> {
     if let Some((client, id)) = client {
-        let current = ["ipv6-setup.json", "ipv6-network.json"].iter().all(|name| EffectSet::current(&Path::new(JOURNAL).join(name)));
+        let current = [super::journals::V6_SETUP, super::journals::V6_NETWORK].iter().all(|name| EffectSet::current(&Path::new(JOURNAL).join(name)));
         let adopted = if current { session.ipv6.adopt(client, &id) } else { Err("no IPv6 journals of this boot".into()) };
         match adopted {
             Ok(()) => return Ok(()),

@@ -90,7 +90,7 @@ impl Download {
             let response = client.get(url.clone()).timeout(remaining)
                 .header("User-Agent", format!("clash.meta/{}", super::VERSION))
                 .header("Accept", "*/*").send().map_err(|_| if self.secret.is_some() {
-                    "Download through Clash failed; check the selected node. No direct fallback was attempted"
+                    "Download through Mihomo failed; check the selected node. No direct fallback was attempted"
                 } else { "Direct HTTPS download failed; check upstream DNS and Internet access" })?;
             if response.status().is_redirection() {
                 let target = response

@@ -50,7 +50,7 @@ fn restore() -> Cmd {
 /// Whether `cmd` is this step's undo, which never pauses a cleanup: the
 /// interface is deleted right after, or is already gone.
 pub(crate) fn is_restore(cmd: &Cmd) -> bool {
-    *cmd == restore()
+    cmd.program == "iw" && cmd.args == ["dev", IFACE, "set", "power_save", "on"]
 }
 
 /// This connection: whether the step is applied, or why it failed.

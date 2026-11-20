@@ -144,12 +144,12 @@ fn stop_helper(helper: &mut Option<Helper>) {
 impl Session {
     /// A session journaled under `journal`, before anything is applied.
     fn new(journal: &Path) -> Self {
-        let wireless = Arc::new(Mutex::new(EffectSet::new("relay", journal.join("wireless.json"))));
+        let wireless = Arc::new(Mutex::new(EffectSet::new("relay", journal.join(journals::WIRELESS))));
         let uplink = uplink::Shared::new(journal.join("uplink.nft"), Arc::clone(&wireless));
         Session {
             wireless,
-            network: EffectSet::new("relay", journal.join("network.json")),
-            dns: EffectSet::new("relay", journal.join("dns.json")),
+            network: EffectSet::new("relay", journal.join(journals::NETWORK)),
+            dns: EffectSet::new("relay", journal.join(journals::DNS)),
             ipv6: ipv6::Upstream::new(uplink.clone()),
             uplink,
             dns_error: None,
@@ -205,7 +205,7 @@ struct Cancel {
 }
 
 struct Snapshot {
-    value: Value,
+    value: Arc<Value>,
     scans: Vec<Network>,
 }
 
@@ -221,7 +221,7 @@ impl Shared {
     fn new() -> Self {
         Self {
             cancel: Mutex::new(Cancel::default()),
-            snapshot: Mutex::new(Snapshot { value: snapshot(&State::default(), BootClock.now()), scans: Vec::new() }),
+            snapshot: Mutex::new(Snapshot { value: Arc::new(snapshot(&State::default(), BootClock.now())), scans: Vec::new() }),
             active: AtomicBool::new(false),
             owned: AtomicBool::new(false),
             tick_pending: AtomicBool::new(false),
@@ -246,15 +246,18 @@ impl Shared {
         let mut cancel = self.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cancel.restore_generation = cancel.restore_generation.wrapping_add(1);
         cancel.restoring = None;
-        self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).value["restoring"] = Value::Null;
+        Arc::make_mut(&mut self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).value)["restoring"] = Value::Null;
+        crate::events::touch(crate::events::Topic::Relay);
         cancel.restore_generation
     }
 
     fn phase(&self, phase: Phase) {
         let cancel = self.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut snapshot = self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        snapshot.value["phase"] = json!(if cancel.disconnect { Phase::Disconnecting } else { phase });
-        snapshot.value["recovery_required"] = json!(false);
+        Arc::make_mut(&mut snapshot.value)["phase"] = json!(if cancel.disconnect { Phase::Disconnecting } else { phase });
+        Arc::make_mut(&mut snapshot.value)["recovery_required"] = json!(false);
+        drop(snapshot);
+        crate::events::touch(crate::events::Topic::Relay);
     }
 
     fn in_progress(&self) -> String {
@@ -268,7 +271,12 @@ impl Shared {
         value["recovery_required"] = json!(pending && matches!(state.phase, Phase::Idle | Phase::RecoveryPending) && !cancel.disconnect);
         self.active.store(state.session.as_ref().is_some_and(|session| session.selected.is_some()), Ordering::Release);
         self.owned.store(state.session.is_some() || pending || cancel.disconnect, Ordering::Release);
-        *self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Snapshot { value, scans: state.scans.clone() };
+        let mut snapshot = self.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = *snapshot.value != value;
+        if changed { snapshot.value = Arc::new(value); }
+        snapshot.scans.clone_from(&state.scans);
+        drop(snapshot);
+        if changed { crate::events::touch(crate::events::Topic::Relay); }
     }
 }
 
@@ -282,6 +290,21 @@ impl Cancellation {
     fn check(&self) -> Result<(), String> {
         if self.shared.generation_matches(self.generation) { Ok(()) } else { Err(RESTORE_CANCELLED.into()) }
     }
+}
+
+type Fields<'a> = std::collections::BTreeMap<&'a String, &'a Value>;
+
+#[derive(Serialize)]
+struct StatusView<'a> {
+    #[serde(flatten)] fields: Fields<'a>,
+    clock_error: Option<String>,
+    offload: OffloadView<'a>,
+    connection_resets: Value,
+}
+#[derive(Serialize)]
+struct OffloadView<'a> {
+    #[serde(flatten)] fields: Fields<'a>,
+    ipv4_through_mihomo: &'static str,
 }
 
 pub struct WifiRelay {
@@ -338,11 +361,28 @@ impl WifiRelay {
 
     pub fn status(&self) -> Value { self.status_with_clock(&crate::network_clock::WIFI) }
     fn status_with_clock(&self, clock: &crate::network_clock::WifiClock) -> Value {
-        let mut value = self.shared.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).value.clone();
-        value["clock_error"] = if value["connected"] == true { json!(clock.error()) } else { Value::Null };
-        value["offload"]["ipv4_through_mihomo"] = json!(self.mihomo.as_ref().map_or("none", |core| core.ipv4_share()));
-        value["connection_resets"] = crate::netfx::conntrack::history();
-        value
+        self.with_status(clock, |view| serde_json::to_value(view).expect("relay status is JSON"))
+    }
+
+    // The fast HTTP path serializes directly from the published scan list and
+    // saved networks. Only the small top-level maps contain borrowed fields.
+    fn with_status<R>(&self, clock: &crate::network_clock::WifiClock, read: impl FnOnce(StatusView<'_>) -> R) -> R {
+        let base = Arc::clone(&self.shared.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).value);
+        let fields = base.as_object().into_iter().flatten().filter(|(k,_)| !matches!(k.as_str(), "offload" | "clock_error" | "connection_resets")).collect();
+        let offload = base["offload"].as_object().into_iter().flatten().filter(|(k,_)| k.as_str() != "ipv4_through_mihomo").collect();
+        read(StatusView {
+            fields, clock_error: if base["connected"] == true { clock.error() } else { None },
+            connection_resets: crate::netfx::conntrack::history(),
+            offload: OffloadView { fields: offload, ipv4_through_mihomo: self.mihomo.as_ref().map_or("none", |core| core.ipv4_share()) },
+        })
+    }
+
+    pub(crate) fn encoded_status(&self) -> crate::server::Encoded {
+        self.with_status(&crate::network_clock::WIFI, |data| {
+            #[derive(Serialize)]
+            struct Response<'a> { ok: bool, data: StatusView<'a> }
+            crate::server::Encoded { status: 200, body: serde_json::to_vec(&Response { ok: true, data }).expect("relay status is JSON"), retry_after: None }
+        })
     }
 
     pub fn recover(&self) -> Result<(), String> {
@@ -371,9 +411,11 @@ impl WifiRelay {
             cancel.restoring = None;
             cancel.disconnect = !cancel.tearing_down;
             let mut snapshot = self.shared.snapshot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            snapshot.value["restoring"] = Value::Null;
-            snapshot.value["phase"] = json!(Phase::Disconnecting);
-            snapshot.value["recovery_required"] = json!(false);
+            Arc::make_mut(&mut snapshot.value)["restoring"] = Value::Null;
+            Arc::make_mut(&mut snapshot.value)["phase"] = json!(Phase::Disconnecting);
+            Arc::make_mut(&mut snapshot.value)["recovery_required"] = json!(false);
+            drop(snapshot);
+            crate::events::touch(crate::events::Topic::Relay);
             self.shared.owned.store(true, Ordering::Release);
             if cancel.working { None } else {
                 cancel.working = true;
@@ -428,12 +470,12 @@ impl DevicePort {
     pub fn recover(&self) -> Result<(), String> {
         stop_strays(&[])?;
         let ipv6 = ipv6::recover();
-        let ipv4 = EffectSet::recover(&Path::new(JOURNAL).join("network.json"));
-        let dns = EffectSet::recover(&Path::new(JOURNAL).join("dns.json"));
+        let ipv4 = EffectSet::recover(&Path::new(JOURNAL).join(journals::NETWORK));
+        let dns = EffectSet::recover(&Path::new(JOURNAL).join(journals::DNS));
         // Preserve the interface while failed IPv6 recovery still owns it,
         // but never strand IPv4 on an already disconnected STA.
         ipv6.and(ipv4)?;
-        let wireless = EffectSet::recover(&Path::new(JOURNAL).join("wireless.json"));
+        let wireless = EffectSet::recover(&Path::new(JOURNAL).join(journals::WIRELESS));
         if let Ok(entries) = fs::read_dir(ROOT) {
             for entry in entries.flatten() {
                 if entry.file_name().to_str().is_some_and(|name| name.strip_prefix("ipv4-lease-")
@@ -657,21 +699,15 @@ impl controller::Port for DevicePort {
         let mut handed = None;
         if let Some(mut old) = old {
             let five = |n: Option<&Network>| n.is_some_and(|n| n.frequency > 5000);
-            if five(old.selected.as_ref()) && five(Some(&selected)) {
-                // The same access point again: IPv6 (its client, addresses,
-                // routes, NAT66 and the LAN's RA) goes over as it is.
-                let same_bss = old.selected.as_ref().is_some_and(|n| n.bssid == selected.bssid);
-                let keep_ipv6 = ipv6 && same_bss && old.ipv6.configured();
+            let keep_ipv6 = ipv6 && old.selected.as_ref().is_some_and(|n| n.bssid == selected.bssid) && old.ipv6.configured();
+            let transferred = if five(old.selected.as_ref()) && five(Some(&selected)) {
                 match handover(&mut old, &channels, keep_ipv6, || self.uplink_changed()) {
-                    Ok(next) => handed = Some((next, keep_ipv6)),
-                    Err(e) => crate::netlog!("[relay] station not handed over ({e}); tearing the old connection down"),
+                    Ok(()) => true,
+                    Err(e) => { crate::netlog!("[relay] station not handed over ({e}); tearing the old connection down"); false }
                 }
-            }
-            if handed.is_none() {
-                if let Err(e) = cleanup(&mut old, || self.uplink_changed()) {
-                    return Err(e);
-                }
-            }
+            } else { false };
+            if transferred { handed = Some((successor(old, keep_ipv6), keep_ipv6)); }
+            else { cleanup(&mut old, || self.uplink_changed())?; }
         }
         let kept = handed.is_some();
         let ipv6_kept = handed.as_ref().is_some_and(|(_, ipv6)| *ipv6);
@@ -1036,22 +1072,21 @@ fn radio_phy() -> Result<String, String> {
         .ok_or_else(|| "Cannot identify the active Wi-Fi PHY".into())
 }
 
-/// Whether a journal holds relay routes (IPv4 or IPv6) still to undo.
+mod journals {
+    pub const WIRELESS: &str = "wireless.json";
+    pub const NETWORK: &str = "network.json";
+    pub const DNS: &str = "dns.json";
+    pub const V6_SETUP: &str = "ipv6-setup.json";
+    pub const V6_NETWORK: &str = "ipv6-network.json";
+    pub const RA: &str = "ra-runtime.json";
+}
+
 fn routes_journaled(root: &Path) -> bool {
-    ["network.json", "ipv6-network.json"].iter().any(|name| root.join(name).exists())
+    [journals::NETWORK, journals::V6_NETWORK].iter().any(|name| root.join(name).exists())
 }
 
 fn recovery_pending(root: &Path) -> bool {
-    [
-        "network.json",
-        "wireless.json",
-        "dns.json",
-        "ipv6-setup.json",
-        "ipv6-network.json",
-        "ra-runtime.json",
-    ]
-    .iter()
-    .any(|name| root.join(name).exists())
+    [journals::NETWORK, journals::WIRELESS, journals::DNS, journals::V6_SETUP, journals::V6_NETWORK, journals::RA].iter().any(|name| root.join(name).exists())
 }
 
 /// Where a monitor of `offload` records its process id (`stop_strays`).
@@ -1252,7 +1287,7 @@ pub(crate) fn restore_roam(mode: &str) -> Result<(), String> {
 /// IPv6 stays as it is and goes to the next session too; the station keeps
 /// its addresses and routes across the reassociation. `Err` leaves `old`
 /// for `cleanup` to finish.
-fn handover(old: &mut Session, channels: &scan::Channels, keep_ipv6: bool, uplink_changed: impl FnOnce()) -> Result<Session, String> {
+fn handover(old: &mut Session, channels: &scan::Channels, keep_ipv6: bool, uplink_changed: impl FnOnce()) -> Result<(), String> {
     if crate::netfx::admission::held(crate::netfx::admission::VENDOR_WIFI_RELOAD) {
         return Err("Wi-Fi is still applying its new settings".into());
     }
@@ -1281,28 +1316,19 @@ fn handover(old: &mut Session, channels: &scan::Channels, keep_ipv6: bool, uplin
     }
     wpa("disconnect", &[]).and_then(expect_ok)?;
     hotspot::restage(channels)?;
-    let next = successor(old, keep_ipv6, Path::new(JOURNAL));
     crate::netlog!("[relay] station handed over to the next upstream{}; the hotspot waits on its staging channel", if keep_ipv6 { " with its IPv6" } else { "" });
-    Ok(next)
+    Ok(())
 }
 
-/// The next session of a handover. From here the station and the hotspot
-/// journal (`wireless`), the tables, the supplicant, IPv6 when kept and
-/// what the handover left of `dns` (the offline-redirect suppression) are
-/// its own; `old` is dropped, never cleaned up, and its empty replacements
-/// never roll back (and so remove) the journals that moved.
-fn successor(old: &mut Session, keep_ipv6: bool, journal: &Path) -> Session {
-    let mut next = Session::new(journal);
-    next.wireless = Arc::clone(&old.wireless);
-    next.dns = std::mem::replace(&mut old.dns, EffectSet::new("relay", journal.join("dns.json")));
-    next.uplink = old.uplink.clone();
-    next.ipv6 = if keep_ipv6 {
-        std::mem::replace(&mut old.ipv6, ipv6::Upstream::new(next.uplink.clone()))
-    } else {
-        ipv6::Upstream::new(next.uplink.clone())
-    };
-    next.supplicant = old.supplicant.take();
-    next
+/// Routes and the DHCP client have been withdrawn. Move the still-owned
+/// guard, DNS journal and supplicant together, resetting lease-specific state.
+fn successor(old: Session, keep_ipv6: bool) -> Session {
+    Session {
+        ipv6: if keep_ipv6 { old.ipv6 } else { ipv6::Upstream::new(old.uplink.clone()) },
+        selected: None, lease: None, dns_error: None, renewed: None,
+        association: Association::default(), guard: Default::default(),
+        offload: offload::Runtime::off(), power_save: Default::default(), ..old
+    }
 }
 
 /// Tears the session down. `uplink_changed` runs only when the session had
@@ -1645,7 +1671,9 @@ fn dhcp_callback_at(root: &Path, event: &str, env: impl Fn(&str) -> Option<Strin
 }
 
 pub fn status(state: &crate::handlers::AppState) -> (u16, Value) {
-    (200, json!({"ok":true,"data":state.wifi_relay.status()}))
+    let mut response = json!({"ok":true});
+    response["data"] = state.wifi_relay.status();
+    (200, response)
 }
 
 pub fn change(state: &crate::handlers::AppState, action: &str, body: &[u8]) -> (u16, Value) {
@@ -1802,10 +1830,10 @@ mod tests {
         let relay = WifiRelay::new(Arc::new(crate::netfx::admission::Gate::new()));
         let error = "Cannot verify UTC over Wi-Fi HTTPS; check upstream/portal access";
         assert!(clock.sync_with(false, |_| Err(error.into())).is_err());
-        relay.shared.snapshot.lock().unwrap().value = json!({
+        relay.shared.snapshot.lock().unwrap().value = Arc::new(json!({
             "connected":true,"ssid":"W","address":"192.168.2.124",
             "clock_error":clock.error(),"error":"Unrelated DNS warning"
-        });
+        }));
         assert_eq!(relay.status_with_clock(&clock)["clock_error"], error);
 
         clock.sync_with(false, |_| Ok(())).unwrap();
@@ -1817,7 +1845,7 @@ mod tests {
 
         assert!(clock.sync_with(false, |_| Err("Clock sources disagree".into())).is_err());
         assert_eq!(relay.status_with_clock(&clock)["clock_error"], "Clock sources disagree");
-        relay.shared.snapshot.lock().unwrap().value["connected"] = json!(false);
+        Arc::make_mut(&mut relay.shared.snapshot.lock().unwrap().value)["connected"] = json!(false);
         assert!(relay.status_with_clock(&clock)["clock_error"].is_null(), "No stale warning while relay is off");
     }
 
@@ -2045,10 +2073,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("u60-relay-successor-{}", std::process::id()));
         let mut old = Session::new(&dir);
         old.dns.assume(held);
-        let mut next = successor(&mut old, false, &dir);
+        let mut next = successor(old, false);
         for (program, first) in [("iptables", "-w"), ("ip6tables", "-w"), ("@u60-relay-portal", "release"), ("@u60-sysctl", "httpredirect_cmd")] {
             assert!(next.dns.journaled(program, first).is_some(), "{program}: the next session's to undo");
-            assert!(old.dns.journaled(program, first).is_none(), "{program}: nothing left to release with the old session");
         }
         // The next session's guard puts the RETURN back ahead of a DNAT a
         // reload left (a reload while the switch reads 0 adds none).

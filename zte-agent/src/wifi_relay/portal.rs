@@ -306,7 +306,7 @@ mod tests {
             let mut kernel = Kernel::default();
             let mut nft = FakeNft::default();
             kernel.settings.insert(REDIRECT.into(), offline.into());
-            dns.declare_with(web_redirect_with(&dns, |_| Ok(offline.into())), false, &mut kernel, &mut nft).unwrap();
+            dns.declare_with(web_redirect_with(&dns, |_| Ok(offline.into())), &mut kernel, &mut nft).unwrap();
             assert_eq!(kernel.settings[REDIRECT], CLOSED);
             kernel.settings.insert(REDIRECT.into(), offline.into());
             let result = dns.reconcile_with(&mut kernel, &mut nft);
@@ -315,7 +315,7 @@ mod tests {
             assert_eq!(web_redirect_with(&dns, |_| Ok(CLOSED.into())).len(), 1, "held, so taken again");
             let mut adopted = EffectSet::load("relay", &path).unwrap();
             let redirect = web_redirect_with(&adopted, |_| Err("unread".into()));
-            adopted.declare_with(redirect, true, &mut kernel, &mut nft).unwrap();
+            adopted.declare_with(redirect, &mut kernel, &mut nft).unwrap();
             for set in [&dns, &adopted] {
                 assert_eq!(set.journaled("@u60-sysctl", REDIRECT), Some(&Cmd::new("@u60-sysctl", &[REDIRECT, offline])));
             }

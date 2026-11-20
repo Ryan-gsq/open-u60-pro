@@ -117,16 +117,6 @@ fn checksum(text: &[u8], filename: &str) -> Result<String, String> {
     Ok(fields[0].to_ascii_lowercase())
 }
 
-pub(super) fn prepare(
-    root: &Path,
-    config: &str,
-    download: &super::download::Download,
-) -> Result<(), String> {
-    let config: Value =
-        serde_yaml_ng::from_str(config).map_err(|_| "Invalid managed configuration")?;
-    prepare_assets(root, &required(&config), download)
-}
-
 pub(super) fn prepare_assets(root: &Path, assets: &[Asset], download: &super::download::Download) -> Result<(), String> {
     prepare_with(root, assets, |url, max| {
         download.bytes(url, max, std::time::Duration::from_secs(60))

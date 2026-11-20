@@ -41,18 +41,18 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
   try{
     // Nothing is installed: the page says what comes first and starts no work.
     await page.goto(`${fixture.url}/#network/mihomo`);await said('#mihomo-status .mihomo-state','OFF');
-    assert.match(await text('#mihomo-status h3'),/Clash is off/);assert.match(await text('#mihomo-status'),/Install the pinned Mihomo core first/);
-    assert.equal(await button('Start Clash').isDisabled(),true);assert.match(await text('#mihomo-status'),/Install the core first\./);
-    assert.equal(await button('Open Zashboard').isHidden(),true,'no dashboard while Clash is off');
+    assert.match(await text('#mihomo-status h3'),/Mihomo is off/);assert.match(await text('#mihomo-status'),/Install the pinned Mihomo core first/);
+    assert.equal(await button('Start Mihomo').isDisabled(),true);assert.match(await text('#mihomo-status'),/Install the core first\./);
+    assert.equal(await button('Open Zashboard').isHidden(),true,'no dashboard while Mihomo is off');
     assert.equal(await button('Add configuration').isDisabled(),true);assert.match(await text('#mihomo-profiles'),/Install the Mihomo core to add configuration profiles/);
     assert.match(await text('#mihomo-status .mihomo-facts'),/Not installed/);assert.equal(posts().length,0,'opening the page must not start work');
-    const idle=fixture.requests.length;await page.waitForTimeout(1200);assert.equal(fixture.requests.length,idle,'an idle Clash page does not poll');
+    const idle=fixture.requests.length;await page.waitForTimeout(1200);assert.equal(fixture.requests.length,idle,'an idle Mihomo page does not poll');
 
     // Install is an explicit, confirmed download.
     await button('Install Mihomo core').click();assert.match(await text('.confirm-dialog'),/22 MB/);assert.match(await text('.confirm-dialog'),/cellular data/);await confirm('Install');
     await said('#mihomo-status .action-status','Core installed');assert.equal(last().url,'/api/mihomo/install');
     assert.match(await text('#mihomo-status .mihomo-facts'),/Installed · 1\.19\.33/);assert.equal(await button('Reinstall pinned core').isVisible(),true);
-    assert.equal(await button('Start Clash').isDisabled(),true);assert.match(await text('#mihomo-status'),/Add a configuration profile first/);
+    assert.equal(await button('Start Mihomo').isDisabled(),true);assert.match(await text('#mihomo-status'),/Add a configuration profile first/);
 
     // The profile form validates before anything is sent.
     await button('Add configuration').click();assert.equal(await page.locator('#mihomo-profile-url').isVisible(),true);assert.equal(await page.locator('#mihomo-profile-yaml').isHidden(),true);
@@ -66,7 +66,7 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     assert.equal(await page.locator('.mihomo-editor').first().isHidden(),true,'the form closes after saving');
     const card=page.locator('.mihomo-profile:has-text("Home")');assert.match(await card.textContent(),/Subscription · Every day/);assert.match(await card.textContent(),/Selected/);
     assert.doesNotMatch(await page.content(),/very-private-token/,'the subscription URL is not in the page until the editor is opened');
-    assert.equal(await button('Start Clash').isDisabled(),false,'a selected profile makes Clash startable');
+    assert.equal(await button('Start Mihomo').isDisabled(),false,'a selected profile makes Mihomo startable');
 
     // A pasted or imported YAML profile; oversized files are refused in the browser.
     await button('Add configuration').click();await page.locator('#mihomo-profile-name').fill('Pasted');await page.locator('#mihomo-profile-type').selectOption('local');
@@ -87,9 +87,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     await button('Validate & save changes').click();await confirm('Save profile');await said('#mihomo-profiles .action-status','Profile saved');assert.equal(last().body.yaml,'');
 
     // Start: confirmed, then every profile action warns about the reconnect.
-    await button('Start Clash').click();assert.match(await text('.confirm-dialog'),/not a kill switch/);await confirm('Start Clash');
+    await button('Start Mihomo').click();assert.match(await text('.confirm-dialog'),/not a kill switch/);await confirm('Start Mihomo');
     await said('#mihomo-status .mihomo-state','RUNNING');assert.deepEqual(last().body,{enabled:true});
-    assert.match(await text('#mihomo-status h3'),/Clash is running/);assert.equal(await page.getByRole('button',{name:/Install|Reinstall/}).count(),0,'no install while running');
+    assert.match(await text('#mihomo-status h3'),/Mihomo is running/);assert.equal(await page.getByRole('button',{name:/Install|Reinstall/}).count(),0,'no install while running');
     assert.match(await text('#mihomo-status .mihomo-facts'),/Automatic start enabled/);
 
     // Zashboard opens in its own tab and the console stays where it was.
@@ -101,9 +101,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     const blankClosed=async()=>{const gone=new Promise(resolve=>page.once('popup',popup=>popup.isClosed()?resolve():popup.once('close',resolve)));await button('Open Zashboard').click();await gone;};
     await blankClosed();
     await said('#mihomo-status .action-status','unexpected dashboard address');assert.equal(await page.locator('#mihomo-status .action-status').getAttribute('data-error'),'true');
-    dashboard=()=>({url:'/ui/mihomo/dashboard/#/proxies'});dashboardFails=['Clash is off',409];
+    dashboard=()=>({url:'/ui/mihomo/dashboard/#/proxies'});dashboardFails=['Mihomo is off',409];
     await blankClosed();
-    await said('#mihomo-status .action-status','Clash is off. Start it first.');dashboardFails=null;
+    await said('#mihomo-status .action-status','Mihomo is off. Start it first.');dashboardFails=null;
     await page.evaluate(()=>{window.__open=window.open;window.open=()=>null;});
     await button('Open Zashboard').click();await said('#mihomo-status .action-status','blocked the new tab');
     const link=page.locator('#mihomo-status .action-status a');assert.deepEqual(await link.evaluate(a=>[a.getAttribute('href'),a.target,a.rel]),['/ui/mihomo/dashboard/#/proxies','_blank','noopener']);
@@ -116,9 +116,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
 
     assert.equal(await button('Open Zashboard').isVisible(),true);
     // A refusal from the router is shown as it is.
-    switchFails='Mihomo reserved firewall chains are occupied';await button('Stop Clash').click();await confirm('Stop Clash');
+    switchFails='Mihomo reserved firewall chains are occupied';await button('Stop Mihomo').click();await confirm('Stop Mihomo');
     await said('#mihomo-status .action-status','chains are occupied');assert.equal(await page.locator('#mihomo-status .action-status').getAttribute('data-error'),'true');switchFails=null;
-    await button('Stop Clash').click();await confirm('Stop Clash');await said('#mihomo-status .mihomo-state','OFF');
+    await button('Stop Mihomo').click();await confirm('Stop Mihomo');await said('#mihomo-status .mihomo-state','OFF');
 
     // Global Merge & Script load on demand and validate every profile on save.
     assert.equal(fixture.requests.filter(r=>r.url==='/api/mihomo/extensions').length,0,'private extension content is not fetched until requested');
@@ -131,7 +131,7 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     status={...status,running:false,autostart:true,recovery_required:false};await page.getByRole('button',{name:'Read current status'}).click();
     await button('Stop automatic start & keep off').waitFor({state:'visible'});await button('Stop automatic start & keep off').click();await confirm('Keep off');await said('#mihomo-status .action-status','automatic start cleared');
     status={...status,running:false,autostart:true,recovery_required:true,error:'Network cleanup paused: busy'};await page.getByRole('button',{name:'Read current status'}).click();
-    await said('#mihomo-status .mihomo-state','RECOVERY REQUIRED');assert.equal(await button('Retry proxy cleanup').isVisible(),true);assert.equal(await page.getByRole('button',{name:/Start Clash/}).isHidden(),true);
+    await said('#mihomo-status .mihomo-state','RECOVERY REQUIRED');assert.equal(await button('Retry proxy cleanup').isVisible(),true);assert.equal(await page.getByRole('button',{name:/Start Mihomo/}).isHidden(),true);
     assert.match(await text('#mihomo-status .relay-problem'),/cleanup paused/);assert.equal(await button('Add configuration').isDisabled(),true);
 
     for(const theme of ['light','dark'])for(const width of [320,390,820,1440]){
@@ -139,6 +139,6 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth),true,`${theme} ${width}px has no horizontal overflow`);
     }
     assert.deepEqual(errors,[]);
-    console.log('Passed: Clash install and start, profile validation/add/edit/select/update/delete, private editors on demand, extensions, Zashboard in its own tab, recovery actions, no idle polling and responsive themes.');
+    console.log('Passed: Mihomo install and start, profile validation/add/edit/select/update/delete, private editors on demand, extensions, Zashboard in its own tab, recovery actions, no idle polling and responsive themes.');
   }finally{await browser.close();await fixture.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

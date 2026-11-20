@@ -1,5 +1,4 @@
-//! Private profile library. One atomic manifest is the source of truth for
-//! originals, processed configs, extensions and selection; no multi-file commit.
+//! Private, immutable profile bodies and one atomic selection/metadata index.
 
 use std::fs;
 use std::io::Read;
@@ -10,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{geodata, managed_config, net, transform, Mihomo, MAX_CONFIG};
+use super::{geodata, net, transform, Mihomo, MAX_CONFIG};
 use transform::Extensions;
 
 const MAX_PROFILES: usize = 16;
@@ -22,7 +21,7 @@ const INTERVALS: &[u64] = &[0, 1, 6, 12, 24, 72, 168];
 pub(super) type LibraryStamp = (u64, Option<SystemTime>, u64);
 
 #[derive(Clone, Deserialize, Serialize)]
-struct Profile {
+struct Profile<T = String> {
     id: String,
     name: String,
     url: Option<String>,
@@ -30,15 +29,35 @@ struct Profile {
     updated: u64,
     attempted: u64,
     error: Option<String>,
-    source: String,
-    compiled: String,
+    source: T,
+    compiled: T,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
-struct Library {
+struct Library<T = String> {
     selected: Option<String>,
     extensions: Extensions,
-    profiles: Vec<Profile>,
+    profiles: Vec<Profile<T>>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+enum BodyRef { Inline(String), Blob { sha256: String } }
+impl Default for BodyRef { fn default() -> Self { Self::Inline(String::new()) } }
+
+fn blob_key(key: &str) -> bool { key.len() == 64 && key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
+fn hash(text: &str) -> String { use sha2::Digest; format!("{:x}", sha2::Sha256::digest(text.as_bytes())) }
+fn sync_dir(dir: &std::path::Path) -> Result<(), String> { fs::File::open(dir).and_then(|dir| dir.sync_all()).map_err(|e| e.to_string()) }
+
+impl<T> Library<T> {
+    fn map_bodies<U>(self, mut map: impl FnMut(T) -> Result<U, String>) -> Result<Library<U>, String> {
+        let mut profiles = Vec::with_capacity(self.profiles.len());
+        for p in self.profiles {
+            profiles.push(Profile { id: p.id, name: p.name, url: p.url, interval_hours: p.interval_hours, updated: p.updated, attempted: p.attempted,
+                error: p.error, source: map(p.source)?, compiled: map(p.compiled)? });
+        }
+        Ok(Library { selected: self.selected, extensions: self.extensions, profiles })
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -80,48 +99,130 @@ impl Mihomo {
         fetch(url, &self.downloader())
     }
 
-    fn library_path(&self) -> std::path::PathBuf {
-        self.root.join("profiles.json")
+    fn library_path(&self) -> std::path::PathBuf { self.root.join("profiles.json") }
+
+    fn read_index(&self) -> Result<Library<BodyRef>, String> {
+        let file = match fs::File::open(self.library_path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Library::default()),
+            Err(_) => return Err("Cannot read profile library".into()),
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_LIBRARY + 1).read_to_end(&mut bytes).map_err(|_| "Cannot read profile library")?;
+        if bytes.len() as u64 > MAX_LIBRARY { return Err("Profile library exceeds its size limit".into()); }
+        let library: Library<BodyRef> = serde_json::from_slice(&bytes).map_err(|_| "Profile library is damaged; restore its backup before changing profiles")?;
+        if library.profiles.len() > MAX_PROFILES || library.selected.as_ref().is_some_and(|id| !library.profiles.iter().any(|p| &p.id == id)) {
+            return Err("Invalid profile selection".into());
+        }
+        Ok(library)
+    }
+
+    fn blob_text(&self, body: BodyRef) -> Result<String, String> {
+        match body {
+            BodyRef::Inline(text) if text.len() <= MAX_CONFIG => Ok(text),
+            BodyRef::Blob { sha256 } if blob_key(&sha256) => {
+                let mut text = String::new();
+                fs::File::open(self.root.join("profile-bodies").join(&sha256)).and_then(|f| f.take(MAX_CONFIG as u64 + 1).read_to_string(&mut text))
+                    .map_err(|_| "Cannot read profile contents")?;
+                if text.len() > MAX_CONFIG || hash(&text) != sha256 { return Err("Profile contents failed verification".into()); }
+                Ok(text)
+            }
+            _ => Err("Invalid profile contents".into()),
+        }
     }
 
     fn load_library(&self) -> Result<Library, String> {
-        let path = self.library_path();
-        match fs::File::open(path) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take(MAX_LIBRARY + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|_| "Cannot read profile library")?;
-                if bytes.len() as u64 > MAX_LIBRARY {
-                    return Err("Profile library exceeds its size limit".into());
-                }
-                let library: Library = serde_json::from_slice(&bytes).map_err(|_| {
-                    "Profile library is damaged; restore its backup before changing profiles"
-                })?;
-                if library.profiles.len() > MAX_PROFILES
-                    || library
-                        .selected
-                        .as_ref()
-                        .is_some_and(|id| !library.profiles.iter().any(|p| &p.id == id))
-                {
-                    return Err("Invalid profile selection".into());
-                }
-                Ok(library)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Library::default()),
-            Err(_) => Err("Cannot read profile library".into()),
-        }
+        let _storage = self.profile_storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.read_index()?.map_bodies(|body| self.blob_text(body))
     }
 
     fn save_library(&self, library: &Library) -> Result<(), String> {
-        let bytes = serde_json::to_vec(library).map_err(|_| "Cannot encode profile library")?;
-        if bytes.len() as u64 > MAX_LIBRARY {
-            return Err("Profile library is full".into());
-        }
-        net::write_private(&self.library_path(), &bytes)
-            .map_err(|_| "Cannot save private profile library".to_owned())?;
+        let _storage = self.profile_storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if crate::ota::slot_change_pending() { return self.save_inline(library); }
+        let dir = self.root.join("profile-bodies");
+        net::private_dir(&dir)?;
+        let mut live = std::collections::HashSet::new();
+        let mut wrote = false;
+        let mut size = 0u64;
+        let index = library.clone().map_bodies(|text| {
+            size += text.len() as u64;
+            if text.len() > MAX_CONFIG || size > MAX_LIBRARY { return Err("Profile library is full".into()); }
+            let sha256 = hash(&text);
+            let path = dir.join(&sha256);
+            if live.insert(sha256.clone()) && !path.try_exists().map_err(|e| e.to_string())? {
+                net::write_private(&path, text.as_bytes())?;
+                wrote = true;
+            }
+            Ok(BodyRef::Blob { sha256 })
+        })?;
+        if wrote { sync_dir(&dir)?; }
+        self.write_index(&index, size, true)
+    }
+
+    /// Caller serializes readers opening blobs with the index commit and GC.
+    fn write_index(&self, index: &Library<BodyRef>, payload: u64, collect: bool) -> Result<(), String> {
+        let bytes = serde_json::to_vec(index).map_err(|_| "Cannot encode profile library")?;
+        if payload + bytes.len() as u64 > MAX_LIBRARY { return Err("Profile library is full".into()); }
+        net::write_private(&self.library_path(), &bytes).map_err(|_| "Cannot save private profile library")?;
         self.library_revision.fetch_add(1, Ordering::AcqRel);
+        if collect && sync_dir(&self.root).is_ok() {
+            let live: std::collections::HashSet<&str> = index.profiles.iter().flat_map(|p| [&p.source, &p.compiled]).filter_map(|body| match body {
+                BodyRef::Blob { sha256 } => Some(sha256.as_str()), BodyRef::Inline(_) => None,
+            }).collect();
+            for entry in fs::read_dir(self.root.join("profile-bodies")).into_iter().flatten().flatten() {
+                if entry.file_name().to_str().is_some_and(|name| blob_key(name) && !live.contains(name)) { let _ = fs::remove_file(entry.path()); }
+            }
+        }
         Ok(())
+    }
+
+    fn change_metadata(&self, request: &Request) -> Result<(), String> {
+        let _operation = self.operation.try_lock().map_err(|_| "A Mihomo operation is in progress")?;
+        let storage = self.profile_storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut index = self.read_index()?;
+        let delete = request.action == "delete";
+        if delete {
+            if index.selected.as_ref() == Some(&request.id) {
+                if self.running() { return Err("Turn off Mihomo or select another profile before deleting the active one".into()); }
+                index.selected = None;
+            }
+            let position = index.profiles.iter().position(|p| p.id == request.id).ok_or("Unknown profile")?;
+            index.profiles.remove(position);
+        } else {
+            interval(request.interval_hours)?;
+            let profile = index.profiles.iter_mut().find(|p| p.id == request.id && p.url.is_some()).ok_or("Select a subscription profile")?;
+            profile.interval_hours = request.interval_hours;
+            profile.attempted = now();
+        }
+        if index.profiles.iter().any(|p| matches!(p.source, BodyRef::Inline(_)) || matches!(p.compiled, BodyRef::Inline(_))) || crate::ota::slot_change_pending() {
+            let library = index.map_bodies(|b| self.blob_text(b))?;
+            drop(storage);
+            self.save_library(&library)?;
+        } else {
+            self.write_index(&index, 0, delete)?;
+        }
+        self.wake_profiles();
+        Ok(())
+    }
+
+    // An old A/B slot understands only the inline format. At a slot change
+    // publish it atomically, under the same lock as a profile edit. A trial
+    // keeps it readable until the supervisor removes the pending marker.
+    pub(crate) fn before_slot_change<T>(&self, change: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _profiles = self.profile_operation.try_lock().map_err(|_| "A profile operation is in progress")?;
+        if self.library_path().try_exists().map_err(|e| e.to_string())? {
+            let library = self.load_library()?;
+            self.save_inline(&library)?;
+        }
+        change()
+    }
+
+    fn save_inline(&self, library: &Library) -> Result<(), String> {
+        let data = serde_json::to_vec(library).map_err(|e| e.to_string())?;
+        if data.len() as u64 > MAX_LIBRARY { return Err("Profile library is full".into()); }
+        net::write_private(&self.library_path(), &data)?;
+        self.library_revision.fetch_add(1, Ordering::AcqRel);
+        sync_dir(&self.root)
     }
 
     fn library_stamp(&self) -> LibraryStamp {
@@ -132,10 +233,10 @@ impl Mihomo {
     }
 
     pub(super) fn selected_source(&self) -> Result<String, String> {
-        let library = self.load_library()?;
-        selected(&library)
-            .map(|p| p.compiled.clone())
-            .ok_or_else(|| "Select a validated Mihomo profile first".into())
+        let _storage = self.profile_storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let library = self.read_index()?;
+        let profile = library.profiles.into_iter().find(|p| Some(&p.id) == library.selected.as_ref()).ok_or("Select a validated Mihomo profile first")?;
+        self.blob_text(profile.compiled)
     }
 
     pub fn profile_status(&self) -> Result<Value, String> {
@@ -152,7 +253,7 @@ impl Mihomo {
                 return Ok(value.clone());
             }
         }
-        let library = self.load_library()?;
+        let library = self.read_index()?;
         let value =
             json!({"selected": library.selected, "profiles":library.profiles.iter().map(|p| json!({
             "id":p.id,"name":p.name,"remote":p.url.is_some(),"interval_hours":p.interval_hours,
@@ -169,7 +270,7 @@ impl Mihomo {
 
     /// Explicit authenticated editor only; not a status/list response.
     pub fn profile_editor(&self, id: &str) -> Result<Value, String> {
-        let library = self.load_library()?;
+        let library = self.read_index()?;
         let p = library
             .profiles
             .iter()
@@ -181,22 +282,15 @@ impl Mihomo {
 
     /// Private authenticated editor only; scripts never enter status responses.
     pub fn extensions_editor(&self) -> Result<Value, String> {
-        serde_json::to_value(self.load_library()?.extensions)
+        serde_json::to_value(self.read_index()?.extensions)
             .map_err(|_| "Cannot read global extensions".into())
     }
 
-    fn validate_profile(&self, source: &str) -> Result<(), String> {
-        if !self.root.join("mihomo").is_file() {
-            return Err("Install Mihomo first".into());
-        }
-        let config = managed_config(source, "validation-only")?;
-        geodata::prepare(&self.root, &config, &self.downloader())?;
-        // The profile mutex also excludes installation. Do not hold the core
-        // lifecycle mutex here: relay loss must be able to restart the core.
-        net::write_private(&self.root.join("check.yaml"), config.as_bytes())?;
-        let result = self.check_with("check.yaml", self.running());
-        let _ = fs::remove_file(self.root.join("check.yaml"));
-        result
+    pub(super) fn validate_profile(&self, source: &str) -> Result<(), String> {
+        if !self.root.join("mihomo").is_file() { return Err("Install Mihomo first".into()); }
+        let (mapping, _) = super::managed_mapping(source, "validation-only", None, true)?;
+        let config = serde_yaml_ng::to_string(&mapping).map_err(|_| "Cannot encode Mihomo configuration")?;
+        self.validate_candidate("check.yaml", &config, "validation-only", &geodata::required(&mapping), self.running())
     }
 
     fn refresh_source(&self, profile: &mut Profile, extensions: &Extensions, source: String, selected: bool) -> Result<(), String> {
@@ -218,6 +312,7 @@ impl Mihomo {
             .profile_operation
             .try_lock()
             .map_err(|_| "A profile operation is in progress")?;
+        if matches!(request.action.as_str(), "schedule" | "delete") { return self.change_metadata(&request); }
         let old = self.load_library()?;
         let mut next = old.clone();
         match request.action.as_str() {
@@ -229,7 +324,6 @@ impl Mihomo {
                     .map(|p| p.name.as_str())
                     .unwrap_or("Pasted configuration");
                 let compiled = transform::compile(&request.yaml, name, &next.extensions)?;
-                self.validate_profile(&compiled)?;
                 if let Some(id) = &next.selected {
                     let profile = next.profiles.iter_mut().find(|p| &p.id == id).unwrap();
                     profile.source = request.yaml;
@@ -302,7 +396,7 @@ impl Mihomo {
                     request.yaml
                 };
                 let compiled = transform::compile(&source, name, &next.extensions)?;
-                self.validate_profile(&compiled)?;
+                if next.selected.is_some() && !(editing && next.selected.as_ref() == Some(&request.id)) { self.validate_profile(&compiled)?; }
                 let mut random = [0u8; 8];
                 getrandom::getrandom(&mut random).map_err(|_| "Cannot create profile ID")?;
                 let id = random
@@ -340,7 +434,6 @@ impl Mihomo {
                     .iter()
                     .find(|p| p.id == request.id)
                     .ok_or("Unknown profile")?;
-                self.validate_profile(&profile.compiled)?;
                 next.selected = Some(profile.id.clone());
             }
             "refresh" => {
@@ -367,30 +460,6 @@ impl Mihomo {
                     return Err(e);
                 }
             }
-            "schedule" => {
-                interval(request.interval_hours)?;
-                let profile = next
-                    .profiles
-                    .iter_mut()
-                    .find(|p| p.id == request.id && p.url.is_some())
-                    .ok_or("Select a subscription profile")?;
-                profile.interval_hours = request.interval_hours;
-                profile.attempted = now();
-            }
-            "delete" => {
-                if next.selected.as_deref() == Some(&request.id) {
-                    if self.running() {
-                        return Err("Turn off Clash or select another profile before deleting the active one".into());
-                    }
-                    next.selected = None;
-                }
-                let index = next
-                    .profiles
-                    .iter()
-                    .position(|p| p.id == request.id)
-                    .ok_or("Unknown profile")?;
-                next.profiles.remove(index);
-            }
             "extensions" => {
                 request.extensions.validate()?;
                 let mut extensions = request.extensions;
@@ -405,7 +474,7 @@ impl Mihomo {
                 for profile in &mut next.profiles {
                     profile.compiled =
                         transform::compile(&profile.source, &profile.name, &extensions)?;
-                    self.validate_profile(&profile.compiled)?;
+                    if next.selected.as_ref() != Some(&profile.id) { self.validate_profile(&profile.compiled)?; }
                 }
                 if next.profiles.is_empty() {
                     return Err("Add a profile before validating global extensions".into());
@@ -444,15 +513,15 @@ impl Mihomo {
                 .map_err(|_| "A Mihomo operation is in progress")?;
             if (require_off || (old.selected.is_some() && next.selected.is_none())) && self.running() {
                 return Err(
-                    "Turn off Clash or select another profile before changing the active one".into(),
+                    "Turn off Mihomo or select another profile before changing the active one".into(),
                 );
             }
             self.save_library(next)?;
         }
         let changed = old.selected != next.selected
             || selected(old).map(|p| &p.compiled) != selected(next).map(|p| &p.compiled);
-        if changed {
-            if let Err(error) = self.config_changed(refresh) {
+        if let Some(current) = selected(next).filter(|_| changed) {
+            if let Err(error) = self.config_changed(refresh, &current.compiled) {
                 // Keep the previous selection and processed config together.
                 self.save_library(old)?;
                 return Err(if self.running() {
@@ -472,6 +541,7 @@ impl Mihomo {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *revision = revision.wrapping_add(1);
         self.profile_wake.notify_all();
+        crate::events::touch(crate::events::Topic::Mihomo);
     }
 
     pub fn start_profiles(self: &Arc<Self>) {
@@ -481,7 +551,7 @@ impl Mihomo {
                 .profile_revision
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let due = this.load_library().map(|l| {
+            let due = this.read_index().map(|l| {
                 l.profiles
                     .into_iter()
                     .filter_map(|p| {
@@ -535,7 +605,7 @@ impl Mihomo {
     }
 }
 
-fn due_in(profile: &Profile, now: u64) -> u64 {
+fn due_in<T>(profile: &Profile<T>, now: u64) -> u64 {
     let interval = if profile.error.is_some() {
         3600
     } else {
@@ -656,9 +726,35 @@ mod tests {
     }
 
     #[test]
+    fn inline_library_migrates_atomically_and_round_trips_for_an_old_slot() {
+        let root = std::env::temp_dir().join(format!("u60-profile-migration-{}", std::process::id()));
+        let m = Mihomo::at(root.clone());
+        let text = "rules: ['MATCH,DIRECT']";
+        let original = seed(&m, text);
+        m.save_inline(&original).unwrap();
+        assert_eq!(m.selected_source().unwrap(), text);
+        let mut next = m.load_library().unwrap();
+        next.profiles[0].attempted += 1;
+        m.save_library(&next).unwrap();
+        let index = fs::read_to_string(m.library_path()).unwrap();
+        assert!(!index.contains(text));
+        assert_eq!(fs::read_dir(root.join("profile-bodies")).unwrap().count(), 1);
+        m.before_slot_change(|| {
+            let legacy: Library = serde_json::from_slice(&fs::read(m.library_path()).unwrap()).unwrap();
+            assert_eq!(legacy.profiles[0].compiled, text);
+            Ok(())
+        }).unwrap();
+        m.save_library(&next).unwrap();
+        fs::remove_file(root.join("profile-bodies").join(hash(text))).unwrap();
+        assert!(m.selected_source().is_err());
+        assert_eq!(fs::read_to_string(m.library_path()).unwrap(), index);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn metadata_has_no_subscription_or_node_credentials() {
         let dir = std::env::temp_dir().join(format!("u60-profiles-{}", std::process::id()));
-        let mihomo = Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()));
+        let mihomo = Mihomo::at(dir.clone());
         let mut library = seed(&mihomo, "secret: private-node\nrules: ['MATCH,DIRECT']");
         library.profiles[0].url = Some("https://example.com/?token=private-url".into());
         library.extensions.merge = "secret: private-extension-secret".into();
@@ -681,7 +777,7 @@ mod tests {
     #[test]
     fn status_is_parsed_once_per_change_of_the_library() {
         let dir = std::env::temp_dir().join(format!("u60-status-cache-{}", std::process::id()));
-        let mihomo = Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()));
+        let mihomo = Mihomo::at(dir.clone());
         seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let first = mihomo.profile_status().unwrap();
         assert_eq!(first["selected"], "seed");
@@ -707,7 +803,7 @@ mod tests {
     #[test]
     fn identical_refresh_only_updates_metadata_without_compilation_or_validation() {
         let dir = std::env::temp_dir().join(format!("u60-refresh-identical-{}", std::process::id()));
-        let mihomo = Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()));
+        let mihomo = Mihomo::at(dir.clone());
         let mut library = seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let profile = &mut library.profiles[0];
         profile.compiled = "previous compiled text".into();
@@ -725,7 +821,7 @@ mod tests {
     fn changed_selected_refresh_is_validated_by_the_controller_and_failed_commit_restores_library() {
         use super::super::controller::{Message, Phase};
         let dir = std::env::temp_dir().join(format!("u60-refresh-commit-{}", std::process::id()));
-        let mihomo = Mihomo::for_bridge(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()), "s".into());
+        let mihomo = Mihomo::for_bridge(dir.clone(), "s".into());
         let old = seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let mut next = old.clone();
         mihomo.refresh_source(&mut next.profiles[0], &next.extensions, "rules: ['MATCH,REJECT']".into(), true).unwrap();
@@ -745,7 +841,7 @@ mod tests {
 
     #[test]
     fn refresh_failure_retries_hourly_not_in_a_busy_loop() {
-        let p = Profile {
+        let p: Profile = Profile {
             id: "x".into(),
             name: "x".into(),
             url: None,
@@ -767,7 +863,6 @@ mod tests {
             std::env::temp_dir().join(format!("u60-profile-start-race-{}", std::process::id()));
         let mihomo = Mihomo::for_bridge(
             dir.clone(),
-            Arc::new(crate::netfx::admission::Gate::new()),
             "test-secret".into(),
         );
         let old = seed(&mihomo, "rules: ['MATCH,DIRECT']");
@@ -789,7 +884,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("u60-library-transaction-{}", std::process::id()));
-        let mihomo = Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()));
+        let mihomo = Mihomo::at(dir.clone());
         net::write_private(&dir.join("mihomo"), b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(dir.join("mihomo"), fs::Permissions::from_mode(0o700)).unwrap();
         let request = |v: Value| serde_json::from_value::<Request>(v).unwrap();

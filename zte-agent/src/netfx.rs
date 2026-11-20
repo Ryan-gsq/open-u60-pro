@@ -47,8 +47,7 @@ mod tests {
 /// settings and conntrack through EffectSet resources, journaled relay
 /// EffectSet steps and netfx. A source scan of their non-test code,
 /// run with every `cargo test`: a direct write fails it. Reads are not
-/// writes. WireGuard and TTL keep their own legacy chains (`ids`) and are
-/// not scanned.
+/// writes. WireGuard and TTL use their exact reserved legacy chain names (`ids`).
 #[cfg(test)]
 mod boundary {
     use std::path::{Path, PathBuf};
@@ -62,9 +61,6 @@ mod boundary {
         ("wifi_relay/ipv6.rs", "refresh_path", "ip -6 addr change", "refresh only the lifetimes of upstream addresses already held by the IPv6 journal"),
         ("wifi_relay/ipv6.rs", "lan_route", "ip -6 route {action}", "this command factory feeds journaled steps and refreshes their existing finite lifetimes"),
         ("wifi_relay/ipv6.rs", "default_route", "ip -6 route {action}", "this command factory feeds journaled steps and refreshes their existing finite lifetimes"),
-        ("wifi_relay/offload/neighbours.rs", "retire_steps", "ip -4 neigh replace", "move each non-gateway MAC to a spare IPv4 address and back so IPACM drops its uplink-stealing WAN rule"),
-        ("wifi_relay/offload/neighbours.rs", "retire_steps", "ip -4 neigh del", "remove that spare neighbour after IPACM drops the non-gateway MAC's uplink-stealing WAN rule"),
-        ("wifi_relay/offload/clients.rs", "stale", "ip -4 neigh change", "set an existing LAN neighbour STALE after association so IPACM restores the band-switched client's LAN route"),
     ];
 
     #[derive(Debug)]
@@ -444,7 +440,7 @@ mod boundary {
     #[test]
     fn the_relay_and_mihomo_write_network_state_only_through_netfx() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = vec![src.join("wifi_relay.rs"), src.join("mihomo.rs")];
+        let mut files = vec![src.join("wifi_relay.rs"), src.join("mihomo.rs"), src.join("wireguard.rs"), src.join("ttl.rs")];
         sources(&src.join("wifi_relay"), &mut files);
         sources(&src.join("mihomo"), &mut files);
         assert!(files.len() > 20, "{files:?}");
@@ -568,7 +564,7 @@ mod boundary {
         let rejected = violations("case.rs", &source.replace("&[\"link\", \"set\", \"x\", \"up\"])", "&[\"link\", \"set\", \"x\", \"up\"]).run()"));
         assert_eq!(rejected.len(), 1);
         assert!(rejected[0].contains("EffectSet resource/step"));
-        assert_eq!(ALLOWED.len(), 8);
+        assert_eq!(ALLOWED.len(), 5);
     }
 
     #[test]
@@ -601,15 +597,6 @@ mod boundary {
             format!("// fn refresh_path()\n{}", permitted.replace("refresh_path", "other")),
         ] {
             assert_eq!(violations("wifi_relay/ipv6.rs", &source).len(), 1, "{source}");
-        }
-        for (file, function, verb) in [
-            ("wifi_relay/offload/neighbours.rs", "retire_steps", "replace"),
-            ("wifi_relay/offload/neighbours.rs", "retire_steps", "del"),
-            ("wifi_relay/offload/clients.rs", "stale", "change"),
-        ] {
-            let source = format!("fn {function}() {{ Cmd::new(\"ip\", &[\"-4\", \"neigh\", \"{verb}\", \"192.0.2.1\"]); }}");
-            assert!(violations(file, &source).is_empty(), "{source}");
-            assert_eq!(violations(file, &source.replace(function, "other")).len(), 1);
         }
         for args in [r#"["link", "set", "dev", IFACE, "address", &mac]"#, r#"["link", "set", "dev", IFACE, "up"]"#] {
             let source = format!("fn prepare() {{ Cmd::new(\"ip\", &{args}); }}");

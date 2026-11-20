@@ -55,6 +55,46 @@ impl EffectSet {
         Self { owner, path, undo: Vec::new(), held: Vec::new(), #[cfg(test)] journal_writes: std::cell::Cell::new(0) }
     }
 
+    /// Import only the three named chains shipped by the original TTL and
+    /// WireGuard managers. A similarly named chain or unexpected rule cannot
+    /// become ours merely because it occupies a reserved name.
+    pub fn legacy_feature(owner: &'static str, path: &Path, resources: &[Resource]) -> Result<Self, String> {
+        Self::legacy_feature_with(owner, path, resources, &mut net::Device)
+    }
+
+    fn legacy_feature_with(owner: &'static str, path: &Path, resources: &[Resource], probe: &mut impl Probe) -> Result<Self, String> {
+        if path.try_exists().map_err(|e| e.to_string())? {
+            if Self::current(path) { return Self::load(owner, path); }
+            Self::recover_with(path, probe)?;
+        }
+        let mut set = Self::new(owner, path.into());
+        let mut listings = Listings::default();
+        for resource in resources {
+            validate(resource, owner)?;
+            let exists = match resource {
+                Resource::LegacyChain(c) => {
+                    if !firewall::feature_chain(owner, &c.name) { return Err("Unknown feature chain".into()); }
+                    let listed = listings.get(legacy_listing(c.tool, &c.table), probe)?;
+                    let actual = chain_rules(listed, &c.name);
+                    let expected = chain_lines(c, true)?;
+                    let known = |rule: &String| expected[1..].contains(rule) || (owner == "ttl" && expected[1..].iter().any(|template|
+                        template.rsplit_once(' ').zip(rule.rsplit_once(' ')).is_some_and(|((prefix, _), (found, value))| prefix == found && value.parse::<u8>().is_ok_and(|v| v > 0))));
+                    if !actual.iter().all(known) { return Err(format!("Unexpected rules in {}", c.name)); }
+                    firewall::has_chain(listed, &c.name)
+                }
+                Resource::LegacyHook(h) => {
+                    if !h.target().is_some_and(|name| firewall::feature_chain(owner, name)) { return Err("Unknown feature hook".into()); }
+                    let line = hook_line(h)?;
+                    listings.get(legacy_listing(h.tool, &h.table), probe)?.lines().any(|rule| rule == line)
+                }
+                _ => return Err("Expected a legacy firewall plan".into()),
+            };
+            if exists { set.undo.push(resource.undo(|_| unreachable!())?); }
+        }
+        if !set.undo.is_empty() { set.save()?; }
+        Ok(set)
+    }
+
     pub fn current(path: &Path) -> bool {
         Self::read(path).is_ok_and(|journal| journal.boot == net::boot_id())
     }
@@ -98,14 +138,10 @@ impl EffectSet {
     }
 
     pub fn declare(&mut self, resources: Vec<Resource>) -> Result<(), String> {
-        self.declare_with(resources, false, &mut net::Device, &mut Device)
+        self.declare_with(resources, &mut net::Device, &mut Device)
     }
 
-    pub fn adopt(&mut self, resources: Vec<Resource>) -> Result<(), String> {
-        self.declare_with(resources, true, &mut net::Device, &mut Device)
-    }
-
-    pub(crate) fn declare_with(&mut self, resources: Vec<Resource>, adopting: bool, probe: &mut impl Probe, nft: &mut (impl Nft + ?Sized)) -> Result<(), String> {
+    pub(crate) fn declare_with(&mut self, resources: Vec<Resource>, probe: &mut impl Probe, nft: &mut (impl Nft + ?Sized)) -> Result<(), String> {
         if resources.is_empty() {
             return Ok(());
         }
@@ -114,14 +150,18 @@ impl EffectSet {
         for resource in resources {
             validate(&resource, self.owner)?;
             let key = resource.key();
-            if prepared.iter().any(|(previous, _, _): &(Resource, Cmd, bool)| previous.key() == key) {
+            if prepared.iter().any(|(previous, _, _, _): &(Resource, Cmd, bool, bool)| previous.key() == key) {
                 return Err("A network batch declares the same resource twice".into());
             }
             let held = self.held.iter().find(|held| held.resource.key() == key);
             let undo = resource.undo(|key| {
                 self.journaled("@u60-sysctl", key).and_then(|undo| undo.args.get(1)).cloned().map_or_else(|| probe.sysctl(key), Ok)
             })?;
-            let owned = held.is_some() || (adopting && self.undo.contains(&undo));
+            // Only an exact journal entry proves a previous generation owned
+            // the resource. A no-op undo (DAD, optional discovery) is shared
+            // by many steps and cannot establish identity.
+            let adopted = held.is_none() && undo.program != "true" && self.undo.contains(&undo);
+            let owned = held.is_some() || adopted;
             if !owned {
                 let table_held = match &resource {
                     Resource::Route(route) => self.held.iter().any(|held| matches!(&held.resource, Resource::Route(previous) if previous.family == route.family && shared::route_table(&previous.table) == shared::route_table(&route.table))),
@@ -131,7 +171,7 @@ impl EffectSet {
             }
             if let Resource::LegacyHook(hook) = &resource {
                 if let Some(target) = hook.target() {
-                    let pending = prepared.iter().any(|(resource, _, _)| matches!(resource, Resource::LegacyChain(chain) if chain.tool == hook.tool && chain.table == hook.table && chain.name == target));
+                    let pending = prepared.iter().any(|(resource, _, _, _)| matches!(resource, Resource::LegacyChain(chain) if chain.tool == hook.tool && chain.table == hook.table && chain.name == target));
                     if !pending && !firewall::has_chain(listings.get(legacy_listing(hook.tool, &hook.table), probe)?, target) {
                         return Err("The legacy hook's target chain is missing".into());
                     }
@@ -140,9 +180,9 @@ impl EffectSet {
             if held.is_some_and(|held| held.withdrawing) {
                 return Err("Network cleanup is pending".into());
             }
-            prepared.push((resource, undo, owned));
+            prepared.push((resource, undo, owned, adopted));
         }
-        for (resource, undo, _) in &prepared {
+        for (resource, undo, _, _) in &prepared {
             if !self.undo.contains(undo) {
                 self.undo.push(undo.clone());
             }
@@ -153,7 +193,7 @@ impl EffectSet {
         self.save()?;
         net::changed();
         let mut indices = Vec::new();
-        for (resource, undo, owned) in prepared {
+        for (resource, undo, owned, adopted) in prepared {
             let previous = self.held.iter().find(|held| held.resource.key() == resource.key())
                 .filter(|held| held.undo != undo)
                 .map(|held| held.undo.clone());
@@ -178,10 +218,10 @@ impl EffectSet {
                     self.held.len() - 1
                 }
             };
-            indices.push((index, owned));
+            indices.push((index, owned, adopted));
         }
         let mut pending = Restore::default();
-        for (index, owned) in indices {
+        for (index, owned, adopted) in indices {
             if !self.held[index].obsolete.is_empty() {
                 pending.run(probe)?;
                 self.clear_obsolete(index, probe)?;
@@ -194,7 +234,7 @@ impl EffectSet {
             let held = &mut self.held[index];
             let imperative = matches!(&held.resource, Resource::Internal(internal) if super::internal::handler(internal.name).is_some_and(|handler| handler.check.is_none()));
             let pending_target = matches!(&held.resource, Resource::LegacyHook(hook) if hook.target().is_some_and(|target| pending.input.contains(&format!("-N {target}\n"))));
-            let repair = if (adopting || owned) && !(imperative && !adopting) && !pending_target {
+            let repair = if owned && (!imperative || adopted) && !pending_target {
                 repair(&held.resource, &mut listings, probe)?
             } else {
                 initial(&held.resource)?
@@ -413,13 +453,13 @@ fn validate(resource: &Resource, owner: &str) -> Result<(), String> {
     match resource {
         Resource::NftTable(table) if table.owner != owner => return Err("The nftables table has another owner".into()),
         Resource::LegacyChain(chain) => {
-            if !chain.name.starts_with("U60_") || !safe(&chain.name) || !safe(&chain.table) {
+            if !(chain.name.starts_with("U60_") || firewall::feature_chain(owner, &chain.name)) || !safe(&chain.name) || !safe(&chain.table) {
                 return Err("Invalid owned legacy chain".into());
             }
             chain_lines(chain, false)?;
         }
         Resource::LegacyHook(hook) => {
-            let owned = hook.rule.windows(2).any(|pair| (pair[0] == "-j" && pair[1].starts_with("U60_")) || (pair[0] == "--comment" && pair[1].starts_with("zte-agent")));
+            let owned = hook.rule.windows(2).any(|pair| (pair[0] == "-j" && (pair[1].starts_with("U60_") || firewall::feature_chain(owner, &pair[1]))) || (pair[0] == "--comment" && pair[1].starts_with("zte-agent")));
             if !owned || !safe(&hook.chain) || !safe(&hook.table) {
                 return Err("A legacy hook needs an owned identity".into());
             }
@@ -537,7 +577,7 @@ fn repair(resource: &Resource, listings: &mut Listings, probe: &mut impl Probe) 
             let prefix = format!("-A {} ", hook.chain);
             let rules: Vec<&str> = text.lines().filter(|line| line.starts_with(&prefix)).collect();
             let copies: Vec<usize> = rules.iter().enumerate().filter_map(|(index, line)| (*line == desired).then_some(index)).collect();
-            let missing_target = hook.rule.windows(2).any(|pair| pair[0] == "-j" && pair[1].starts_with("U60_") && !firewall::has_chain(text, &pair[1]));
+            let missing_target = hook.rule.windows(2).any(|pair| pair[0] == "-j" && firewall::owned_chain(&pair[1]) && !firewall::has_chain(text, &pair[1]));
             if missing_target { return Err("The legacy hook's target chain is missing".into()); }
             if copies.is_empty() && firewall::has_chain(text, &hook.chain) && !missing_target {
                 let status = probe.status(&hook.command("-C", None))?;

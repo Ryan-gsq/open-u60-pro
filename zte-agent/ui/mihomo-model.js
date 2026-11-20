@@ -10,7 +10,7 @@
     const running = data.running === true, recovery = data.recovery_required === true, installed = data.installed === true, configured = data.configured === true, autostart = data.autostart === true;
     const key = running ? 'running' : recovery ? 'recovery' : 'off';
     const chip = {running: 'RUNNING', recovery: 'RECOVERY REQUIRED', off: 'OFF'}[key];
-    const title = running ? 'Clash is running' : recovery ? 'Cleanup required' : 'Clash is off';
+    const title = running ? 'Mihomo is running' : recovery ? 'Cleanup required' : 'Mihomo is off';
     const detail = running
       ? 'LAN traffic is intercepted by Mihomo over a private TUN. Turning it off returns to direct routing; it is not a kill switch.'
       : recovery ? 'Some proxy network changes remain. Retry cleanup before starting or reinstalling. This also clears automatic start.'
@@ -18,7 +18,7 @@
     const canStart = running || (!recovery && installed && configured);
     return {
       key, chip, title, detail, running, recovery, installed, configured, autostart, canStart,
-      toggleLabel: running ? 'Stop Clash' : 'Start Clash',
+      toggleLabel: running ? 'Stop Mihomo' : 'Start Mihomo',
       toggleHint: running || canStart ? '' : recovery ? 'Retry cleanup first.' : !installed ? 'Install the core first.' : 'Add a configuration profile first.',
       showInstall: !running && !recovery,
       installLabel: installed ? 'Reinstall pinned core' : 'Install Mihomo core',
@@ -76,13 +76,13 @@
   const scheduleRequest = (id, hours) => ({action: 'schedule', id, interval_hours: Number(hours) || 0});
 
   function confirmation(action, profile, running) {
-    const name = profile?.name || 'this profile', reconnect = running ? ' Clash briefly reconnects.' : '';
+    const name = profile?.name || 'this profile', reconnect = running ? ' Mihomo briefly reconnects.' : '';
     return {
       select: [`Use ${name}?`, `It becomes the active configuration after it validates.${reconnect}`, 'Use profile'],
       refresh: [`Update ${name}?`, `The subscription is downloaded and validated before it replaces the saved copy. A failed download keeps the old one.${reconnect}`, 'Update now'],
       edit: [`Save ${name}?`, `The configuration is validated first; an invalid one is rejected and the saved profile stays.${reconnect}`, 'Save profile'],
-      add: [`Add ${name}?`, 'The configuration is downloaded or checked first and saved only if it validates. A subscription download uses Clash when it runs, otherwise the current uplink; cellular data is never turned on.', 'Add profile'],
-      delete: [`Delete ${name}?`, 'The saved source and subscription URL are removed. Turn Clash off or select another profile before deleting the running one.', 'Delete profile']
+      add: [`Add ${name}?`, 'The configuration is downloaded or checked first and saved only if it validates. A subscription download uses Mihomo when it runs, otherwise the current uplink; cellular data is never turned on.', 'Add profile'],
+      delete: [`Delete ${name}?`, 'The saved source and subscription URL are removed. Turn Mihomo off or select another profile before deleting the running one.', 'Delete profile']
     }[action];
   }
 

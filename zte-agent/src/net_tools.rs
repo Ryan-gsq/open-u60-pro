@@ -80,6 +80,7 @@ impl Cmd {
     }
 
     pub(crate) fn undo(&self) -> Result<(), String> {
+        if self.program == "ip" && self.args == ["link", "del", "dev", "wg-u60"] && !Path::new("/sys/class/net/wg-u60").try_exists().map_err(|e| e.to_string())? { return Ok(()); }
         if self.program == "ip" && self.args.len() == 7 && self.args[1..4] == ["rule", "del", "pref"] && self.args[5] == "lookup" {
             match plain_policy_rule(&self.args[0], &self.args[4], &self.args[6])? {
                 PolicyRule::Owned => {}
@@ -87,15 +88,17 @@ impl Cmd {
                 PolicyRule::Shared => return Err("Policy priority is shared; cleanup paused".into()),
             }
         }
+        // Firmware can turn off the hotspot during an undo. Check again on
+        // command failure below, so the owner's switch always wins that race.
         if crate::wifi_relay::hotspot::skip_undo(self) { return Ok(()); }
-        if crate::wifi_relay::power_save::is_restore(self) {
-            if let Err(error) = self.run() { crate::netlog!("[relay] upstream Wi-Fi power save not restored: {error}"); }
-            return Ok(());
-        }
         if matches!(self.program.as_str(), "iptables" | "ip6tables") && self.args.iter().any(|arg| arg == "-D" || arg == "-X") {
             return legacy::undo(self, &mut Device);
         }
         let error = match self.run() { Ok(_) => return Ok(()), Err(error) => error };
+        if crate::wifi_relay::power_save::is_restore(self) {
+            crate::netlog!("[relay] upstream Wi-Fi power save not restored: {error}");
+            return Ok(());
+        }
         if error.starts_with(UNKNOWN_STEP) {
             crate::netlog!("[net] skipped an undo this agent version does not know: {} {}", self.program, self.args.join(" "));
             return Ok(());

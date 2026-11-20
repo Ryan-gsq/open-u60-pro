@@ -107,7 +107,7 @@ fn main() {
     }
     if args.get(1).map(String::as_str) == Some("network-recover") {
         let lock = Arc::new(crate::netfx::admission::Gate::new());
-        let result = mihomo::Mihomo::new(Arc::clone(&lock)).recover()
+        let result = mihomo::Mihomo::new().recover()
             .and_then(|_| wifi_relay::WifiRelay::new(lock).recover());
         if let Err(e) = result { eprintln!("{e}"); std::process::exit(1); }
         return;
@@ -265,11 +265,7 @@ fn restore_network(state: &Arc<AppState>) {
         state.wifi_relay.recover_idle();
         state.mihomo.restore(state.tls.name());
         state.wifi_relay.restore();
-        // Offline validation may have exhausted the first core attempts. Retry
-        // on the usable uplink, still gated by the latest owner choice.
-        if state.wifi_relay.active() {
-            state.mihomo.restore(state.tls.name());
-        }
+
     });
 }
 

@@ -27,7 +27,7 @@ use std::{fs, net::Ipv4Addr, path::Path};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::{net, Cmd, Resource, Key, EffectSet, Route, RouteType, Family, IFACE};
+use super::{net, Resource, Key, EffectSet, Route, RouteType, Family, IFACE};
 
 /// IPACM's interface table, which IPACM read at boot and the agent reads
 /// now. QCMAP rewrites it at runtime (B31's running file, read 2026-11-11,
@@ -60,11 +60,19 @@ pub(crate) enum Config {
 
 /// Reads the file; never writes it.
 pub(crate) fn config() -> Config {
-    match fs::read_to_string(CONFIG) {
-        Ok(text) if listed(&text) => Config::Listed,
-        Ok(_) => Config::NotListed,
-        Err(_) => Config::Unavailable,
-    }
+    use crate::netfx::files::Stamp;
+    use std::io::Read;
+    static CACHE: std::sync::Mutex<Option<(Stamp, Config)>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(mut file) = fs::File::open(CONFIG) else { return Config::Unavailable };
+    let Ok(meta) = file.metadata() else { return Config::Unavailable };
+    let stamp = Stamp::of(&meta);
+    if let Some((_, result)) = cache.as_ref().filter(|(s, _)| *s == stamp) { return *result; }
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err() || file.metadata().ok().map(|m| Stamp::of(&m)) != Some(stamp) { return Config::Unavailable; }
+    let result = if listed(&text) { Config::Listed } else { Config::NotListed };
+    *cache = Some((stamp, result));
+    result
 }
 
 /// Whether an `<Iface>` element names the station with the vendor's Wi-Fi
@@ -178,31 +186,6 @@ impl IpacmPort for Device {
     }
 }
 
-/// The router, for a `main` route the previous agent added in a session
-/// this one adopts (`Runtime::adopt`): the journaled steps are re-taken.
-struct Adopting;
-
-impl IpacmPort for Adopting {
-    fn config(&mut self) -> Config {
-        Device.config()
-    }
-    fn enabled(&mut self) -> bool {
-        Device.enabled()
-    }
-    fn fingerprint(&mut self) -> Result<(), String> {
-        Device.fingerprint()
-    }
-    fn monitors(&mut self, gateway: Ipv4Addr) -> Vec<monitor::Monitor> {
-        Device.monitors(gateway)
-    }
-    fn declare(&mut self, tx: &mut EffectSet, plan: Vec<Resource>) -> Result<(), String> {
-        tx.adopt(plan)
-    }
-    fn release(&mut self, tx: &mut EffectSet, keys: &[Key]) -> Result<(), String> {
-        Device.release(tx, keys)
-    }
-}
-
 /// `Err(why)` unless the firmware and IPACM are the ones verified (B31).
 fn fingerprint(version: &str, ipacm_sha256: Option<&str>) -> Result<(), String> {
     if version != FIRMWARE {
@@ -235,16 +218,6 @@ impl Runtime {
     /// Called with the session's network plan applied.
     pub(super) fn start(tx: &mut EffectSet, gateway: Ipv4Addr, subnet: String) -> Self {
         Self::start_with(&mut Device, tx, gateway, subnet)
-    }
-
-    /// The previous agent's `main` route, taken over with its session
-    /// (`wifi_relay::adopt`): its journaled steps are re-taken, not run
-    /// again, and new monitors replace the stopped ones. A journal of a
-    /// build that still switched IPACM's mode keeps that step's undo until
-    /// the session ends; `Cmd::undo` then skips it as unknown, so IPACM
-    /// stays in whatever mode it is in.
-    pub(super) fn adopt(tx: &mut EffectSet, gateway: Ipv4Addr, subnet: String) -> Self {
-        Self::start_with(&mut Adopting, tx, gateway, subnet)
     }
 
     fn start_with(port: &mut impl IpacmPort, tx: &mut EffectSet, gateway: Ipv4Addr, subnet: String) -> Self {

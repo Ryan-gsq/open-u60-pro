@@ -236,7 +236,7 @@ pub enum Key {
 impl Resource {
     pub(crate) fn extra_undos(&self) -> Vec<Cmd> {
         match self {
-            Self::NftTable(table) if table.owner == "relay" => vec![Cmd::new("@u60-relay-nft", &["remove", "ip6"])],
+            Self::NftTable(table) => table.removals().ok().and_then(|(_, extra)| extra).into_iter().collect(),
             _ => Vec::new(),
         }
     }
@@ -275,11 +275,7 @@ impl Resource {
 
     pub(crate) fn undo(&self, original: impl FnOnce(&str) -> Result<String, String>) -> Result<Cmd, String> {
         Ok(match self {
-            Self::NftTable(table) => match (table.owner, table.name) {
-                ("mihomo", "u60_mihomo") => Cmd::new("@u60-mihomo-nft", &["remove"]),
-                ("relay", "u60_relay") => Cmd::new("@u60-relay-nft", &["remove", "ip"]),
-                _ => return Err("Unknown owned nftables table".into()),
-            },
+            Self::NftTable(table) => table.removals()?.0,
             Self::LegacyChain(chain) => Cmd::new(chain.tool.program(), &["-w", "2", "-t", &chain.table, "-X", &chain.name]),
             Self::LegacyHook(hook) => hook.command("-D", None),
             Self::Route(route) => route.command("del"),
@@ -326,9 +322,20 @@ pub(crate) fn test_plan(resources: Vec<Resource>) -> Vec<Step> {
     steps
 }
 
+impl NftTable {
+    /// Journal commands understood by the first release that owned these tables.
+    fn removals(&self) -> Result<(Cmd, Option<Cmd>), String> {
+        match (self.owner, self.name) {
+            ("mihomo", crate::netfx::ids::MIHOMO_NFT) => Ok((Cmd::new("@u60-mihomo-nft", &["remove"]), None)),
+            ("relay", crate::netfx::ids::RELAY_NFT) => Ok((Cmd::new("@u60-relay-nft", &["remove", "ip"]), Some(Cmd::new("@u60-relay-nft", &["remove", "ip6"])))),
+            _ => Err("Unknown owned nftables table".into()),
+        }
+    }
+}
+
 impl LegacyHook {
     pub(super) fn target(&self) -> Option<&str> {
-        self.rule.windows(2).find(|pair| pair[0] == "-j" && pair[1].starts_with("U60_")).map(|pair| pair[1].as_str())
+        self.rule.windows(2).find(|pair| pair[0] == "-j" && super::legacy::owned_chain(&pair[1])).map(|pair| pair[1].as_str())
     }
 
     pub(super) fn command(&self, action: &str, position: Option<usize>) -> Cmd {

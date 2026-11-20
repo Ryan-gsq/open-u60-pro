@@ -192,11 +192,29 @@ fn hook() -> Resource {
 }
 
 #[test]
+fn ttl_import_preserves_foreign_rules_and_adopts_the_previous_value() {
+    let fixture = set("ttl-import");
+    let tool = LegacyTool::V4;
+    let name = crate::netfx::ids::TTL_CHAIN;
+    let plan = crate::netfx::effect::hooked_chain(tool,"mangle","POSTROUTING",name,vec![["-o","rmnet_data0","-j","TTL","--ttl-set","65"].map(String::from).to_vec()]);
+    let mut kernel = Kernel::default();
+    let key = ("iptables".into(), "mangle".into());
+    kernel.tables.insert(key.clone(),vec![format!("-N {name}"),format!("-A POSTROUTING -j {name}"),format!("-A {name} -j DROP")]);
+    assert!(EffectSet::legacy_feature_with("ttl", &fixture.path, &plan, &mut kernel).is_err());
+    assert!(!fixture.path.exists());
+    kernel.tables.get_mut(&key).unwrap()[2] = format!("-A {name} -o rmnet_data0 -j TTL --ttl-set 64");
+    let mut imported = EffectSet::legacy_feature_with("ttl", &fixture.path, &plan, &mut kernel).unwrap();
+    assert_eq!(imported.undo.len(),2);
+    imported.declare_with(plan.to_vec(),&mut kernel,&mut FakeNft::default()).unwrap();
+    assert!(kernel.tables[&key].contains(&format!("-A {name} -o rmnet_data0 -j TTL --ttl-set 65")));
+}
+
+#[test]
 fn interrupted_before_first_effect_recovers_without_touching_vendor_rules() {
     let mut set = set("interrupted");
     let mut kernel = Kernel::seeded();
     kernel.stop_before_effect = Some(set.path.clone());
-    assert!(set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut FakeNft::default()).is_err());
+    assert!(set.declare_with(vec![chain(), hook()], &mut kernel, &mut FakeNft::default()).is_err());
     assert!(kernel.writes.is_empty());
     EffectSet::recover_with(&set.path, &mut kernel).unwrap();
     assert_eq!(kernel.lines(), &["-P INPUT ACCEPT", "-A INPUT -j DROP"]);
@@ -209,7 +227,7 @@ fn an_unheld_chain_is_refused_before_it_can_be_journaled() {
     let mut kernel = Kernel::seeded();
     kernel.lines_mut().extend(["-N U60_TEST".into(), "-A U60_TEST -j DROP".into()]);
     let before = kernel.tables.clone();
-    assert!(set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut FakeNft::default()).is_err());
+    assert!(set.declare_with(vec![chain(), hook()], &mut kernel, &mut FakeNft::default()).is_err());
     assert_eq!(kernel.tables, before);
     assert!(set.undo.is_empty() && kernel.writes.is_empty());
 }
@@ -219,7 +237,7 @@ fn a_chain_replacement_and_each_content_fault_use_one_owned_chain_transaction() 
     let mut set = set("chain");
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
-    set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain(), hook()], &mut kernel, &mut nft).unwrap();
     assert_eq!(kernel.writes.len(), 1, "consecutive legacy resources batch together");
     for broken in [vec!["-j DROP"], vec!["-j ACCEPT", "-j RETURN", "-j RETURN"], vec!["-j ACCEPT"], vec!["-j RETURN", "-j ACCEPT"]] {
         kernel.lines_mut().retain(|line| !line.starts_with("-A U60_TEST "));
@@ -232,7 +250,7 @@ fn a_chain_replacement_and_each_content_fault_use_one_owned_chain_transaction() 
     let Resource::LegacyChain(mut replacement) = chain() else { unreachable!() };
     replacement.rules = vec![vec!["-j".into(), "DROP".into()]];
     kernel.writes.clear();
-    set.declare_with(vec![Resource::LegacyChain(replacement)], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![Resource::LegacyChain(replacement)], &mut kernel, &mut nft).unwrap();
     assert_eq!(kernel.writes.len(), 1);
     assert_eq!(set.undo.len(), 2, "replacement never adds another chain undo");
     assert!(kernel.lines().contains(&"-A INPUT -j DROP".into()));
@@ -244,7 +262,7 @@ fn hooks_are_added_deduplicated_and_moved_without_deleting_a_vendor_rule() {
     let mut set = set("hook");
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
-    set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain(), hook()], &mut kernel, &mut nft).unwrap();
     let wanted = "-A INPUT -j U60_TEST".to_owned();
     for copies in [0, 2, 1] {
         kernel.lines_mut().retain(|line| line != &wanted);
@@ -268,7 +286,7 @@ fn failed_listing_lock_and_unknown_errors_wait_for_a_definite_check() {
     let mut set = set("checks");
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
-    set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain(), hook()], &mut kernel, &mut nft).unwrap();
     for error in [None, Some((4, "xtables lock".into())), Some((1, "unknown failure".into()))] {
         kernel.lines_mut().retain(|line| line != "-A INPUT -j U60_TEST");
         kernel.writes.clear();
@@ -289,13 +307,13 @@ fn withdrawing_uses_journal_reverse_order_and_never_reapplies_released_resources
     let mut set = set("withdraw");
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
-    set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain(), hook()], &mut kernel, &mut nft).unwrap();
     set.withdraw_with(&[hook().key()], &mut kernel).unwrap();
     assert_eq!(set.undo.len(), 1);
     kernel.writes.clear();
     assert!(set.reconcile_with(&mut kernel, &mut nft).restored.is_empty());
     assert!(kernel.writes.is_empty());
-    set.declare_with(vec![hook()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![hook()], &mut kernel, &mut nft).unwrap();
     kernel.undos.clear();
     set.withdraw_with(&[hook().key(), chain().key()], &mut kernel).unwrap();
     assert_eq!(kernel.undos.iter().map(|command| command.args[4].as_str()).collect::<Vec<_>>(), ["-D", "-X"]);
@@ -308,8 +326,8 @@ fn several_sets_share_a_pass_and_writes_and_pass_end_invalidate_it() {
     let mut second = set("pass-second");
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
-    first.declare_with(vec![chain()], false, &mut kernel, &mut nft).unwrap();
-    second.declare_with(vec![hook()], false, &mut kernel, &mut nft).unwrap();
+    first.declare_with(vec![chain()], &mut kernel, &mut nft).unwrap();
+    second.declare_with(vec![hook()], &mut kernel, &mut nft).unwrap();
     kernel.reads.clear();
     {
         let _pass = net::Pass::open();
@@ -330,7 +348,7 @@ fn cleanup_failure_preserves_the_remaining_journal_and_disables_repair() {
     let mut set = set("cleanup");
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
-    set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain(), hook()], &mut kernel, &mut nft).unwrap();
     kernel.undo_error = true;
     assert!(set.release_with(&mut kernel).unwrap_err().starts_with("Network cleanup paused:"));
     assert_eq!(EffectSet::read(&set.path).unwrap().undo.len(), 2);
@@ -365,7 +383,7 @@ fn every_typed_resource_writes_only_the_previous_builds_undo_vocabulary() {
         assert_eq!(&resource.undo(|_| Ok("1".into())).unwrap(), expected);
     }
     let mut journaled = set("vocabulary");
-    journaled.declare_with(resources, false, &mut Kernel::seeded(), &mut FakeNft::default()).unwrap();
+    journaled.declare_with(resources, &mut Kernel::seeded(), &mut FakeNft::default()).unwrap();
     assert_eq!(EffectSet::read(&journaled.path).unwrap().undo, expected);
     journaled.release_with(&mut Kernel::seeded()).unwrap();
     let mut set = set("unknown-undo");
@@ -381,12 +399,12 @@ fn sysctl_replacement_keeps_the_first_original_and_adoption_restores_only_missin
     let mut kernel = Kernel::default();
     let mut nft = FakeNft::default();
     let setting = |value: &str| Resource::Sysctl(Sysctl { key: "tcp_pacing_ss_ratio".into(), value: value.into() });
-    set.declare_with(vec![setting("1000")], false, &mut kernel, &mut nft).unwrap();
-    set.declare_with(vec![setting("900")], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![setting("1000")], &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![setting("900")], &mut kernel, &mut nft).unwrap();
     assert_eq!(set.undo, [Cmd::new("@u60-sysctl", &["tcp_pacing_ss_ratio", "1"])]);
     let mut adopted = EffectSet::load("mihomo", &set.path).unwrap();
     kernel.commands.clear();
-    adopted.declare_with(vec![setting("900")], true, &mut kernel, &mut nft).unwrap();
+    adopted.declare_with(vec![setting("900")], &mut kernel, &mut nft).unwrap();
     assert!(kernel.commands.is_empty());
     kernel.settings.insert("tcp_pacing_ss_ratio".into(), "1".into());
     assert_eq!(adopted.reconcile_with(&mut kernel, &mut nft).restored.len(), 1);
@@ -404,7 +422,7 @@ fn routes_use_metric_gateway_and_device_and_rules_refuse_a_foreign_priority() {
     route.metric = Some(60631);
     let rule = Rule { family: Family::V4, priority: 18640, table: "60631".into(), mark: None };
     let address = Addr { family: Family::V4, device: "ath20".into(), address: "192.0.2.2/24".into(), broadcast: Some("192.0.2.255".into()), valid_lft: None, preferred_lft: None, noprefixroute: false };
-    set.declare_with(vec![Resource::Route(route), Resource::Rule(rule), Resource::Addr(address)], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![Resource::Route(route), Resource::Rule(rule), Resource::Addr(address)], &mut kernel, &mut nft).unwrap();
     kernel.ip.insert("-4 route show table all".into(), "default via 192.0.2.1 dev ath20 metric 60631".into());
     kernel.ip.insert("-4 rule show".into(), "18640: from all lookup 60631".into());
     kernel.ip.insert("-o -4 addr show".into(), "33: ath20 inet 192.0.2.2/24 scope global".into());
@@ -426,7 +444,7 @@ fn insert_first_hook_keeps_a_vendor_rule_added_above_it() {
         let mut nft = FakeNft::default();
         let Resource::LegacyHook(mut hook) = hook() else { unreachable!() };
         hook.position = position;
-        set.declare_with(vec![chain(), Resource::LegacyHook(hook)], false, &mut kernel, &mut nft).unwrap();
+        set.declare_with(vec![chain(), Resource::LegacyHook(hook)], &mut kernel, &mut nft).unwrap();
         kernel.lines_mut().insert(1, "-A INPUT -j REJECT".into());
         kernel.writes.clear();
         assert!(set.reconcile_with(&mut kernel, &mut nft).restored.is_empty());
@@ -456,8 +474,8 @@ fn an_owned_route_or_rule_can_be_replaced_under_its_typed_key() {
     first.gateway = Some("192.0.2.1".into());
     let mut next = first.clone();
     next.gateway = Some("192.0.2.3".into());
-    set.declare_with(vec![Resource::Route(first.clone())], false, &mut kernel, &mut nft).unwrap();
-    set.declare_with(vec![Resource::Route(next.clone())], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![Resource::Route(first.clone())], &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![Resource::Route(next.clone())], &mut kernel, &mut nft).unwrap();
     assert_eq!(kernel.undos, [first.command("del")]);
     assert_eq!(kernel.commands.last(), Some(&next.command("add")));
     set.release_with(&mut kernel).unwrap();
@@ -486,21 +504,21 @@ fn a_held_table_allows_later_routes_in_its_batch_and_nft_targets_survive_failed_
     let mut kernel = Kernel::default();
     let mut nft = FakeNft::default();
     let first = Resource::Route(Route::new(Family::V4, RouteType::Throw, "192.0.2.0/24", "60631"));
-    set.declare_with(vec![first], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![first], &mut kernel, &mut nft).unwrap();
     kernel.ip.insert("-4 route show table all".into(), "throw 192.0.2.0/24 table 60631".into());
     let next = Resource::Route(Route::new(Family::V4, RouteType::Unreachable, "198.51.100.0/24", "60631"));
-    set.declare_with(vec![next], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![next], &mut kernel, &mut nft).unwrap();
     let table = |rule: &str| Resource::NftTable(NftTable {
         owner: "mihomo", name: "u60_mihomo", file: set.path.with_extension("nft"),
         families: Some(FAMILIES.map(|family| super::super::table(family, "u60_mihomo", &[], &[("input", "", vec![rule.into()])]))),
     });
     let accept = table("accept");
     let drop = table("drop");
-    set.declare_with(vec![accept.clone()], false, &mut kernel, &mut nft).unwrap();
-    set.declare_with(vec![accept], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![accept.clone()], &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![accept], &mut kernel, &mut nft).unwrap();
     assert_eq!(nft.loads, 1);
     nft.fail.push(("timed out".into(), false));
-    assert!(set.declare_with(vec![drop], false, &mut kernel, &mut nft).is_err());
+    assert!(set.declare_with(vec![drop], &mut kernel, &mut nft).is_err());
     assert!(!set.tables_confirmed("u60_mihomo"));
     assert!(set.reconcile_with(&mut kernel, &mut nft).failed.is_empty());
     assert!(set.tables_confirmed("u60_mihomo"));
@@ -513,7 +531,7 @@ fn selected_reconcile_leaves_live_lease_addresses_to_their_session() {
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
     let route = Resource::Route(Route::new(Family::V4, RouteType::Throw, "192.0.2.0/24", "60631"));
-    set.declare_with(vec![chain(), route], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain(), route], &mut kernel, &mut nft).unwrap();
     kernel.commands.clear();
     kernel.lines_mut().retain(|line| line != "-A U60_TEST -j ACCEPT");
     let result = set.reconcile_selected(|resource| matches!(resource, Resource::LegacyChain(_)), &mut kernel, &mut nft);
@@ -528,7 +546,7 @@ fn a_normalized_chain_repairs_once_and_a_changed_chain_repairs_again() {
     let mut kernel = Kernel::seeded();
     kernel.normalize = true;
     let mut nft = FakeNft::default();
-    set.declare_with(vec![chain()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain()], &mut kernel, &mut nft).unwrap();
     assert_eq!(set.reconcile_with(&mut kernel, &mut nft).restored, ["iptables -t filter chain U60_TEST"]);
     let writes = kernel.writes.len();
     assert!(set.reconcile_with(&mut kernel, &mut nft).restored.is_empty());
@@ -543,7 +561,7 @@ fn an_unpredicted_hook_found_by_the_tool_is_kept_without_a_repair_loop() {
     let mut set = set("unpredicted-hook");
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
-    set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain(), hook()], &mut kernel, &mut nft).unwrap();
     kernel.lines_mut().iter_mut().filter(|line| line.starts_with("-A INPUT -j U60_")).for_each(|line| *line = line.replace("-j", "-m alternate -j"));
     kernel.check_error = Some((0, String::new()));
     kernel.writes.clear();
@@ -558,7 +576,7 @@ fn an_unpredicted_hook_found_by_the_tool_is_kept_without_a_repair_loop() {
 fn teardown_saves_once_on_failure_or_partial_success_and_never_after_each_undo() {
     let mut set = set("write-count");
     let mut kernel = Kernel::seeded();
-    set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut FakeNft::default()).unwrap();
+    set.declare_with(vec![chain(), hook()], &mut kernel, &mut FakeNft::default()).unwrap();
     set.journal_writes.set(0);
     kernel.undo_error = true;
     assert!(set.release_with(&mut kernel).is_err());
@@ -579,7 +597,7 @@ fn teardown_saves_once_on_failure_or_partial_success_and_never_after_each_undo()
 fn a_missing_target_never_installs_a_hook_or_takes_its_journal() {
     let mut set = set("missing-target");
     let mut kernel = Kernel::seeded();
-    assert!(set.declare_with(vec![hook()], false, &mut kernel, &mut FakeNft::default()).is_err());
+    assert!(set.declare_with(vec![hook()], &mut kernel, &mut FakeNft::default()).is_err());
     assert!(kernel.writes.is_empty() && !set.path.exists());
 }
 
@@ -589,7 +607,7 @@ fn nft_load_errors_and_unreadable_checks_have_different_operator_reports() {
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
     let resource = Resource::NftTable(NftTable { owner: "mihomo", name: "u60_mihomo", file: set.path.with_extension("nft"), families: Some(FAMILIES.map(|family| super::super::table(family, "u60_mihomo", &[], &[("input", "", vec!["accept".into()])])))});
-    set.declare_with(vec![resource], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![resource], &mut kernel, &mut nft).unwrap();
     nft.unreadable = true;
     assert!(set.reconcile_with(&mut kernel, &mut nft).failed[0].contains("not checked"));
     nft.unreadable = false;
@@ -659,7 +677,7 @@ fn previous_build_takeover_keeps_accepts_until_the_new_hook_and_cleans_both_layo
     setup.undo = setup_undo;
     setup.save().unwrap();
     let mut adopted = EffectSet::load("relay", &setup.path).unwrap();
-    crate::wifi_relay::adopt::adopt_resources(&mut adopted, crate::wifi_relay::ipv6::setup_plan(), &mut kernel, &mut FakeNft::default()).unwrap();
+    adopted.declare_with( crate::wifi_relay::ipv6::setup_plan(), &mut kernel, &mut FakeNft::default()).unwrap();
     assert_eq!(kernel.writes.len(), 1);
     assert_eq!(kernel.writes[0].1, "*filter\n-I INPUT 1 -i ath20 -j U60_R6_IN\nCOMMIT\n");
     let lines = &kernel.tables[&("ip6tables".into(), "filter".into())];
@@ -677,11 +695,11 @@ fn this_build_takeover_of_intact_resources_and_tables_writes_nothing() {
     let mut nft = FakeNft::default();
     let table = Resource::NftTable(NftTable { owner: "mihomo", name: "u60_mihomo", file: set.path.with_extension("nft"), families: Some(FAMILIES.map(|family| super::super::table(family, "u60_mihomo", &[], &[("input", "", vec!["accept".into()])])))});
     let resources = vec![chain(), hook(), table];
-    set.declare_with(resources.clone(), false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(resources.clone(), &mut kernel, &mut nft).unwrap();
     let mut adopted = EffectSet::load("mihomo", &set.path).unwrap();
     kernel.writes.clear();
     let loads = nft.loads;
-    adopted.declare_with(resources, true, &mut kernel, &mut nft).unwrap();
+    adopted.declare_with(resources, &mut kernel, &mut nft).unwrap();
     assert!(kernel.writes.is_empty());
     assert_eq!(nft.loads, loads);
     adopted.release_with(&mut kernel).unwrap();
@@ -698,7 +716,7 @@ fn one_fw3_repair_restores_all_chains_and_unique_hooks_with_portal_before_dnat()
     resources.extend(crate::wifi_relay::ipv6::setup_plan());
     let mut kernel = Kernel::empty_router();
     let mut nft = FakeNft::default();
-    set.declare_with(resources, false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(resources, &mut kernel, &mut nft).unwrap();
     for lines in kernel.tables.values_mut() { lines.retain(|line| line.starts_with("-P ") || line == "-N redirect_chain"); }
     kernel.tables.get_mut(&("iptables".into(), "nat".into())).unwrap().push("-A redirect_chain -j DNAT".into());
     kernel.writes.clear();
@@ -719,7 +737,7 @@ fn a_failed_restore_is_never_retried_as_commands_and_its_whole_journal_recovers(
     let mut set = set("partial-batch");
     let mut kernel = Kernel::seeded();
     kernel.stop_before_effect = Some(set.path.clone());
-    assert!(set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut FakeNft::default()).is_err());
+    assert!(set.declare_with(vec![chain(), hook()], &mut kernel, &mut FakeNft::default()).is_err());
     assert!(kernel.commands.is_empty());
     assert_eq!(EffectSet::read(&set.path).unwrap().undo.len(), 2);
     EffectSet::recover_with(&set.path, &mut kernel).unwrap();
@@ -728,7 +746,7 @@ fn a_failed_restore_is_never_retried_as_commands_and_its_whole_journal_recovers(
     later.table = "nat".into();
     later.name = "U60_LATER".into();
     kernel.fail_after_commit = true;
-    assert!(set.declare_with(vec![chain(), Resource::LegacyChain(later)], false, &mut kernel, &mut FakeNft::default()).is_err());
+    assert!(set.declare_with(vec![chain(), Resource::LegacyChain(later)], &mut kernel, &mut FakeNft::default()).is_err());
     assert!(kernel.lines().contains(&"-N U60_TEST".into()));
     assert!(kernel.commands.is_empty());
     EffectSet::recover_with(&set.path, &mut kernel).unwrap();
@@ -768,7 +786,7 @@ fn a_reconcile_after_a_release_never_reapplies_the_released_step() {
     let mut kernel = Kernel::default();
     let mut nft = FakeNft::default();
     let resource = Resource::Sysctl(Sysctl { key: "bridge-nf-call-iptables".into(), value: "0".into() });
-    set.declare_with(vec![resource.clone()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![resource.clone()], &mut kernel, &mut nft).unwrap();
     set.withdraw_with(&[resource.key()], &mut kernel).unwrap();
     kernel.settings.insert("bridge-nf-call-iptables".into(), "1".into());
     kernel.commands.clear();
@@ -783,11 +801,11 @@ fn a_journal_write_failure_never_executes_or_repairs_unjournaled_changes() {
     fs::create_dir_all(&set.path).unwrap();
     let mut kernel = Kernel::seeded();
     let mut nft = FakeNft::default();
-    assert!(set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut nft).is_err());
+    assert!(set.declare_with(vec![chain(), hook()], &mut kernel, &mut nft).is_err());
     assert!(kernel.writes.is_empty() && kernel.commands.is_empty());
     assert!(set.reconcile_with(&mut kernel, &mut nft).restored.is_empty());
     fs::remove_dir(&set.path).unwrap();
-    set.declare_with(vec![chain(), hook()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain(), hook()], &mut kernel, &mut nft).unwrap();
     assert_eq!(set.undo.len(), 2);
     set.release_with(&mut kernel).unwrap();
 }
@@ -797,7 +815,7 @@ fn a_failed_table_listing_does_not_stop_a_different_tables_repair() {
     let mut set = set("independent");
     let mut kernel = Kernel::empty_router();
     let mut nft = FakeNft::default();
-    set.declare_with(vec![chain()], false, &mut kernel, &mut nft).unwrap();
+    set.declare_with(vec![chain()], &mut kernel, &mut nft).unwrap();
     kernel.tables.get_mut(&("iptables".into(), "filter".into())).unwrap().retain(|line| !line.starts_with("-A U60_TEST"));
     let bad = Resource::Internal(Internal::new("@u60-relay-power-save", vec!["off".into()], vec![]).with_undo(Cmd::new("true", &[])));
     set.assume(vec![bad]);

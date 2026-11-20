@@ -9,7 +9,6 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -66,9 +65,7 @@ pub fn cli_smoke() -> i32 {
             0
         }
         (Err(error), _) => {
-            let _ = Command::new("ip")
-                .args(["link", "delete", "dev", SMOKE_INTERFACE])
-                .output();
+            let _ = crate::netfx::effect::remove_diagnostic_link(SMOKE_INTERFACE);
             eprintln!("wireguard smoke: inspect failed: {error}");
             5
         }
@@ -681,11 +678,14 @@ fn apply(config: &Config) -> Result<(), String> {
         resolved.push(endpoint);
     }
 
+    let mut set = crate::netfx::effect::EffectSet::new("wireguard", Path::new(JOURNAL).into());
+    use crate::net_tools::{Cmd, Step};
+    set.step(Step::new(Cmd::new("ip", &["link", "add", "dev", INTERFACE, "type", "wireguard"]), Cmd::new("ip", &["link", "del", "dev", INTERFACE])))?;
     if let Err(error) = update.apply(&interface, BACKEND) {
         let _ = clear_owned_state();
         return Err(format!("configure kernel WireGuard interface: {error}"));
     }
-    let result = configure_interface(config);
+    let result = configure_interface(config, &mut set);
     if let Err(error) = result {
         let _ = clear_owned_state();
         return Err(error);
@@ -693,181 +693,50 @@ fn apply(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn configure_interface(config: &Config) -> Result<(), String> {
-    run_required("ip", &["address", "flush", "dev", INTERFACE])?;
+fn configure_interface(config: &Config, set: &mut crate::netfx::effect::EffectSet) -> Result<(), String> {
+    use crate::net_tools::{Cmd, Step};
+    use crate::netfx::effect::{Addr, Family, Resource, Route, RouteType};
+    let family = |net: IpNet| if net.addr().is_ipv4() { Family::V4 } else { Family::V6 };
+    let mut addresses = Vec::new();
     for address in &config.addresses {
-        let family = if matches!(parse_network(address, "interface address")?, IpNet::V4(_)) {
-            "-4"
-        } else {
-            "-6"
-        };
-        run_required("ip", &[family, "address", "add", address, "dev", INTERFACE])?;
+        addresses.push(Resource::Addr(Addr { family: family(parse_network(address, "interface address")?), address: address.clone(), device: INTERFACE.into(),
+            broadcast: None, valid_lft: None, preferred_lft: None, noprefixroute: false }));
     }
-    let mtu = config.mtu.to_string();
-    run_required("ip", &["link", "set", "dev", INTERFACE, "mtu", &mtu, "up"])?;
-    for peer in &config.peers {
-        for route in &peer.allowed_ips {
-            let family = if matches!(parse_network(route, "AllowedIPs")?, IpNet::V4(_)) {
-                "-4"
-            } else {
-                "-6"
-            };
-            run_required(
-                "ip",
-                &[
-                    family, "route", "replace", route, "dev", INTERFACE, "metric", "50",
-                ],
-            )?;
-        }
+    set.declare(addresses)?;
+    set.step(Step::new(Cmd::new("ip", &["link", "set", "dev", INTERFACE, "mtu", &config.mtu.to_string(), "up"]), Cmd::new("true", &[])))?;
+    let mut routes = Vec::new();
+    for network in config.peers.iter().flat_map(|peer| &peer.allowed_ips) {
+        let mut route = Route::new(family(parse_network(network, "AllowedIPs")?), RouteType::Unicast, network, "main");
+        route.device = Some(INTERFACE.into());
+        route.metric = Some(50);
+        let resource = Resource::Route(route);
+        if !routes.contains(&resource) { routes.push(resource); }
     }
-    install_firewall_rules()
+    routes.extend(firewall_plan());
+    set.declare(routes)
 }
 
-fn install_firewall_rules() -> Result<(), String> {
-    ensure_chain("iptables", "filter", FORWARD_CHAIN)?;
-    run_required(
-        "iptables",
-        &["-w", "2", "-t", "filter", "-F", FORWARD_CHAIN],
-    )?;
-    run_required(
-        "iptables",
-        &[
-            "-w",
-            "2",
-            "-t",
-            "filter",
-            "-A",
-            FORWARD_CHAIN,
-            "-i",
-            LAN_INTERFACE,
-            "-o",
-            INTERFACE,
-            "-j",
-            "ACCEPT",
-        ],
-    )?;
-    run_required(
-        "iptables",
-        &[
-            "-w",
-            "2",
-            "-t",
-            "filter",
-            "-A",
-            FORWARD_CHAIN,
-            "-i",
-            INTERFACE,
-            "-o",
-            LAN_INTERFACE,
-            "-m",
-            "conntrack",
-            "--ctstate",
-            "RELATED,ESTABLISHED",
-            "-j",
-            "ACCEPT",
-        ],
-    )?;
-    ensure_jump("iptables", "filter", "FORWARD", FORWARD_CHAIN)?;
-
-    ensure_chain("iptables", "nat", NAT_CHAIN)?;
-    run_required("iptables", &["-w", "2", "-t", "nat", "-F", NAT_CHAIN])?;
-    run_required(
-        "iptables",
-        &[
-            "-w",
-            "2",
-            "-t",
-            "nat",
-            "-A",
-            NAT_CHAIN,
-            "-o",
-            INTERFACE,
-            "-j",
-            "MASQUERADE",
-        ],
-    )?;
-    ensure_jump("iptables", "nat", "POSTROUTING", NAT_CHAIN)
+fn firewall_plan() -> Vec<crate::netfx::effect::Resource> {
+    use crate::netfx::effect::{hooked_chain, LegacyTool};
+    let forward = vec![["-i", LAN_INTERFACE, "-o", INTERFACE, "-j", "ACCEPT"].map(String::from).to_vec(),
+        ["-i", INTERFACE, "-o", LAN_INTERFACE, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"].map(String::from).to_vec()];
+    let nat = vec![["-o", INTERFACE, "-j", "MASQUERADE"].map(String::from).to_vec()];
+    hooked_chain(LegacyTool::V4, "filter", "FORWARD", FORWARD_CHAIN, forward).into_iter()
+        .chain(hooked_chain(LegacyTool::V4, "nat", "POSTROUTING", NAT_CHAIN, nat)).collect()
 }
+
+const JOURNAL: &str = "/data/zte-agent-wireguard/network.json";
 
 fn clear_owned_state() -> Result<(), String> {
-    let mut errors = Vec::new();
-    for (table, parent, chain) in [
-        ("filter", "FORWARD", FORWARD_CHAIN),
-        ("nat", "POSTROUTING", NAT_CHAIN),
-    ] {
-        if succeeds(
-            "iptables",
-            &["-w", "2", "-t", table, "-C", parent, "-j", chain],
-        ) {
-            if let Err(error) = run_required(
-                "iptables",
-                &["-w", "2", "-t", table, "-D", parent, "-j", chain],
-            ) {
-                errors.push(error);
-            }
-        }
-        if succeeds("iptables", &["-w", "2", "-t", table, "-S", chain]) {
-            if let Err(error) = run_required("iptables", &["-w", "2", "-t", table, "-F", chain]) {
-                errors.push(error);
-            }
-            if let Err(error) = run_required("iptables", &["-w", "2", "-t", table, "-X", chain]) {
-                errors.push(error);
-            }
-        }
+    let mut set = crate::netfx::effect::EffectSet::legacy_feature("wireguard", Path::new(JOURNAL), &firewall_plan())?;
+    set.release()?;
+    // Prior agents had no journal for their private WG device. Verify its
+    // kind before asking the WireGuard backend to delete it and its routes.
+    if Path::new("/sys/class/net").join(INTERFACE).try_exists().map_err(|e| e.to_string())? {
+        let interface = InterfaceName::from_str(INTERFACE).map_err(|e| e.to_string())?;
+        Device::get(&interface, BACKEND).and_then(|device| device.delete()).map_err(|e| format!("Cannot remove previous WireGuard interface: {e}"))?;
     }
-    let _ = Command::new("ip")
-        .args(["link", "delete", "dev", INTERFACE])
-        .output();
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
-fn ensure_chain(program: &str, table: &str, chain: &str) -> Result<(), String> {
-    if succeeds(program, &["-w", "2", "-t", table, "-S", chain]) {
-        Ok(())
-    } else {
-        run_required(program, &["-w", "2", "-t", table, "-N", chain])
-    }
-}
-
-fn ensure_jump(program: &str, table: &str, parent: &str, chain: &str) -> Result<(), String> {
-    if succeeds(
-        program,
-        &["-w", "2", "-t", table, "-C", parent, "-j", chain],
-    ) {
-        Ok(())
-    } else {
-        run_required(
-            program,
-            &["-w", "2", "-t", table, "-I", parent, "1", "-j", chain],
-        )
-    }
-}
-
-fn succeeds(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn run_required(program: &str, args: &[&str]) -> Result<(), String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|error| format!("run {program}: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if detail.is_empty() {
-        Err(format!("{program} exited with {}", output.status))
-    } else {
-        Err(format!("{program}: {detail}"))
-    }
+    Ok(())
 }
 
 fn public_status(config: &Config, remembered_active: bool, last_error: Option<String>) -> Value {
@@ -964,6 +833,21 @@ mod tests {
         format!(
             "[Interface]\nPrivateKey = {PRIVATE}\nAddress = 10.8.0.2/32\nDNS = 10.8.0.1\n\n[Peer]\nPublicKey = {PUBLIC}\nEndpoint = vpn.example.com:51820\nAllowedIPs = {allowed}\nPersistentKeepalive = 25\n"
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a disposable Linux network namespace with legacy iptables"]
+    fn isolated_feature_wireguard_ownership() {
+        assert_eq!(std::env::var("U60_ISOLATED_FEATURES").as_deref(), Ok("1"));
+        let mut config = parse_ini(&valid_config("10.8.0.0/24").replace("vpn.example.com", "192.0.2.1")).unwrap();
+        config.enabled = true;
+        apply(&config).unwrap();
+        assert!(Path::new(JOURNAL).is_file());
+        assert!(crate::net_tools::Cmd::new("ip", &["-4", "route", "show", "dev", INTERFACE]).run().unwrap().contains("10.8.0.0/24"));
+        apply(&config).unwrap();
+        clear_owned_state().unwrap();
+        assert!(!Path::new(JOURNAL).exists());
     }
 
     #[test]

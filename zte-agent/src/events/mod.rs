@@ -52,6 +52,8 @@ pub enum Topic {
     Netscan,
     SignalDetect,
     Stk,
+    Relay,
+    Mihomo,
 }
 
 /// Which sampler thread reads a topic. `/proc` and sysfs reads (Fast) never
@@ -107,6 +109,8 @@ const SPECS: [TopicSpec; Topic::COUNT] = [
     spec(Lane::Ubus, 2_000, 0),     // Netscan (the app's 2 s scan/register polls)
     spec(Lane::Ubus, 2_000, 0),     // SignalDetect (the app's 2 s progress poll)
     spec(Lane::Fast, 0, 0),         // Stk: the toolkit worker's memory, re-read when the worker touches it
+    spec(Lane::Fast, 0, 0),         // Relay controller snapshot
+    spec(Lane::Fast, 0, 0),         // Mihomo controller + private index metadata
 ];
 
 /// Every topic name, in `Topic` order; `NAME_END[i]` ends name `i`. (One
@@ -114,11 +118,11 @@ const SPECS: [TopicSpec; Topic::COUNT] = [
 /// 22 relocated pointers.)
 const NAMES: &str = "signaltrafficbatteryhealthclientswansimmodemchargerbattery_info\
                      sim_identityservicepower_statesmsesim_switchesim_downloadprocessesusbspeedtest\
-                     netscansignal_detectstk";
-const NAME_END: [u8; Topic::COUNT] = [6, 13, 20, 26, 33, 36, 39, 44, 51, 63, 75, 82, 93, 96, 107, 120, 129, 132, 141, 148, 161, 164];
+                     netscansignal_detectstkrelaymihomo";
+const NAME_END: [u8; Topic::COUNT] = [6, 13, 20, 26, 33, 36, 39, 44, 51, 63, 75, 82, 93, 96, 107, 120, 129, 132, 141, 148, 161, 164, 169, 175];
 
 impl Topic {
-    pub const COUNT: usize = 22;
+    pub const COUNT: usize = 24;
     pub const ALL: [Topic; Topic::COUNT] = [
         Topic::Signal,
         Topic::Traffic,
@@ -142,6 +146,8 @@ impl Topic {
         Topic::Netscan,
         Topic::SignalDetect,
         Topic::Stk,
+        Topic::Relay,
+        Topic::Mihomo,
     ];
 
     pub fn name(self) -> &'static str {
@@ -396,7 +402,7 @@ mod tests {
             [
                 "signal", "traffic", "battery", "health", "clients", "wan", "sim", "modem", "charger",
                 "battery_info", "sim_identity", "service", "power_state", "sms", "esim_switch", "esim_download",
-                "processes", "usb", "speedtest", "netscan", "signal_detect", "stk",
+                "processes", "usb", "speedtest", "netscan", "signal_detect", "stk", "relay", "mihomo",
             ]
         );
         let st = Topic::Speedtest.spec();

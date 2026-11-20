@@ -63,10 +63,14 @@ const TOPICS: &[&str] = &[
     "https",
     "dns",
     "ota",
+    "relay",
+    "mihomo",
 ];
 const ESIM_TOPIC: usize = 8;
-const DNS_TOPIC: usize = TOPICS.len() - 2;
-const OTA_TOPIC: usize = TOPICS.len() - 1;
+const DNS_TOPIC: usize = 11;
+const OTA_TOPIC: usize = 12;
+const RELAY_TOPIC: usize = 13;
+const MIHOMO_TOPIC: usize = 14;
 const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("operators", 2, 0),
     ("forwarding", 2, 1),
@@ -82,6 +86,8 @@ const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("qos_config", 10, 6),
     ("client_details", 2, 7),
     ("esim_status", 0, ESIM_TOPIC),
+    ("relay_status", 0, RELAY_TOPIC),
+    ("mihomo_status", 0, MIHOMO_TOPIC),
     ("battery_details", 5, 9),
     ("https_status", 5, 10),
     ("ota_status", 5, OTA_TOPIC),
@@ -265,7 +271,7 @@ impl Dashboard {
 
     fn start_extra_collectors(self: &Arc<Self>, app: Arc<AppState>) {
         for (index, topic_name) in TOPICS.iter().enumerate() {
-            if index == ESIM_TOPIC || index == DNS_TOPIC {
+            if [ESIM_TOPIC, DNS_TOPIC, RELAY_TOPIC, MIHOMO_TOPIC].contains(&index) {
                 continue;
             }
             let feed = Arc::clone(self);
@@ -319,39 +325,43 @@ impl Dashboard {
         }
     }
 
-    /// eSIM progress is a composite of watched switch/download state and the
-    /// saved inventory. Publish it only after an eSIM touch, an API mutation,
-    /// or a fresh subscription; never poll the card or its API from the UI.
-    fn start_esim_collector(self: &Arc<Self>, app: Arc<AppState>) {
-        let changes = crate::events::subscribe_touches(&[
-            crate::events::Topic::EsimSwitch,
-            crate::events::Topic::EsimDownload,
-        ]);
+    /// The event-driven views share one worker. A topic is read only on
+    /// demand after subscribe, a mutation, or an owner notification.
+    fn start_state_collector(self: &Arc<Self>, app: Arc<AppState>) {
+        use crate::events::{subscribe_touches, Topic};
+        let watched = [
+            (ESIM_TOPIC, "esim_status", subscribe_touches(&[Topic::EsimSwitch, Topic::EsimDownload])),
+            (RELAY_TOPIC, "relay_status", subscribe_touches(&[Topic::Relay])),
+            (MIHOMO_TOPIC, "mihomo_status", subscribe_touches(&[Topic::Mihomo])),
+        ];
         let feed = Arc::clone(self);
-        crate::system::spawn_named("dashboard-esim", move || {
-            let mut pending = true;
-            let mut version = 0;
+        crate::system::spawn_named("dashboard-state", move || {
+            let mut last = [0; 3];
             loop {
-                let (active, refresh, missing) = {
-                    let guard = feed.state.lock().unwrap_or_else(|p| p.into_inner());
-                    (
-                        guard.extra_clients[ESIM_TOPIC] > 0,
-                        guard.refresh_version,
-                        !guard.readings.contains_key("esim_status"),
-                    )
-                };
-                if active && (pending || missing || refresh != version) {
-                    let mut updates = Readings::new();
-                    updates.insert("esim_status".into(), esim_reading(&app));
-                    feed.publish(updates);
-                    pending = false;
+                let state = feed.state.lock().unwrap_or_else(|p| p.into_inner());
+                let state = feed.changed.wait_while(state, |s| watched.iter().all(|(i, _, _)| s.extra_clients[*i] == 0)).unwrap_or_else(|p| p.into_inner());
+                let mut due = Vec::new();
+                for (slot, (index, name, changes)) in watched.iter().enumerate() {
+                    if state.extra_clients[*index] == 0 { continue; }
+                    if changes.try_recv().is_ok() || !state.readings.contains_key(*name) || last[slot] != state.refresh_version {
+                        due.push(*name);
+                        last[slot] = state.refresh_version;
+                    }
                 }
-                version = refresh;
-                match changes.recv_timeout(Duration::from_secs(1)) {
-                    Ok(()) => pending = true,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                if due.is_empty() {
+                    drop(feed.changed.wait_timeout(state, Duration::from_secs(1)));
+                    continue;
                 }
+                drop(state);
+                let updates = due.into_iter().map(|name| {
+                    let reading = match name {
+                        "relay_status" => crate::wifi_relay::status(&app).1,
+                        "mihomo_status" => json!({"ok":true,"data":{"status":app.mihomo.status(),"library":app.mihomo.profile_status().ok()}}),
+                        _ => esim_reading(&app),
+                    };
+                    (name.to_owned(), reading)
+                }).collect();
+                feed.publish(updates);
             }
         });
     }
@@ -409,7 +419,7 @@ impl Dashboard {
                 }
             }),
         );
-        self.start_esim_collector(Arc::clone(&state));
+        self.start_state_collector(Arc::clone(&state));
         self.start_extra_collectors(Arc::clone(&state));
         self.start_dns_collector(Arc::clone(&state));
         let feed = Arc::clone(self);
@@ -712,8 +722,9 @@ mod tests {
 
     #[test]
     fn esim_dashboard_projection_does_not_wake_its_collector() {
+        let app = AppState::new();
         crate::events::test_sink::take();
-        let _ = esim_reading(&AppState::new());
+        let _ = esim_reading(&app);
         assert!(crate::events::test_sink::take().is_empty());
     }
 

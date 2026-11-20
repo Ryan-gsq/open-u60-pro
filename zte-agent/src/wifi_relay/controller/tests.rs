@@ -942,8 +942,8 @@ fn boot_recovery_and_callback_entry_points_keep_their_synchronous_contract() {
     let relay_boot = restore.find("state.wifi_relay.recover_idle();").unwrap();
     let core_first = restore.find("state.mihomo.restore(").unwrap();
     let relay_restore = restore.find("state.wifi_relay.restore();").unwrap();
-    let core_again = restore.rfind("state.mihomo.restore(").unwrap();
-    assert!(barrier < relay_boot && relay_boot < core_first && core_first < relay_restore && relay_restore < core_again);
+    assert_eq!(restore.matches("state.mihomo.restore(").count(), 1);
+    assert!(barrier < relay_boot && relay_boot < core_first && core_first < relay_restore);
     assert!(source.contains("wifi_relay::WifiRelay::new(lock).recover()"));
 }
 

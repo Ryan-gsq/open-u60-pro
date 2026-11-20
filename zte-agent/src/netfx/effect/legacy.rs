@@ -60,13 +60,22 @@ pub(crate) fn has_chain(listing: &str, chain: &str) -> bool {
 /// chain, jumps to one, or carries our comment. The relay's station name
 /// is no identity (the vendor's IPACM configuration lists it too). Another
 /// writer's identical rule fails all three.
+pub(super) fn feature_chain(owner: &str, chain: &str) -> bool {
+    use crate::netfx::ids::*;
+    matches!((owner, chain), ("ttl", TTL_CHAIN) | ("wireguard", WG_NAT_CHAIN | WG_FORWARD_CHAIN))
+}
+
+pub(super) fn owned_chain(chain: &str) -> bool {
+    chain.starts_with("U60_") || crate::netfx::ids::OTHER_CHAINS.contains(&chain)
+}
+
 pub(crate) fn owned_rule(args: &[String]) -> bool {
     let Some(at) = args.iter().position(|a| matches!(a.as_str(), "-D" | "-A" | "-I")) else {
         return false;
     };
     let values = |flag: &str| args.windows(2).filter(|w| w[0] == flag).map(|w| w[1].as_str()).collect::<Vec<_>>();
-    args.get(at + 1).is_some_and(|chain| chain.starts_with("U60_"))
-        || values("-j").iter().any(|t| t.starts_with("U60_"))
+    args.get(at + 1).is_some_and(|chain| owned_chain(chain))
+        || values("-j").iter().any(|t| owned_chain(t))
         || values("--comment").iter().any(|c| c.starts_with("zte-agent"))
 }
 
@@ -101,7 +110,7 @@ pub(crate) fn undo(cmd: &Cmd, probe: &mut impl Probe) -> Result<(), String> {
         // Emptied only when nothing jumps to it any more, so that its delete
         // can then succeed: a hook outside the journal keeps the chain whole.
         let jumped = tables.lines().any(|line| line.starts_with("-A ") && line.split(' ').collect::<Vec<_>>().windows(2).any(|w| matches!(w[0], "-j" | "-g") && w[1] == chain));
-        if chain.starts_with("U60_") && !jumped {
+        if owned_chain(chain) && !jumped {
             let mut flush = cmd.clone();
             flush.args[at] = "-F".into();
             if probe.status(&flush).is_ok_and(|s| s.0 == 0) && probe.status(cmd).is_ok_and(|s| s.0 == 0) {
@@ -126,7 +135,7 @@ pub(crate) fn undo(cmd: &Cmd, probe: &mut impl Probe) -> Result<(), String> {
     let target = args.windows(2).find(|w| w[0] == "-j").map(|w| w[1].as_str());
     // Without its chain, or its owned target chain, the rule cannot exist
     // (and the tool refuses a check that names a missing target).
-    if !has_chain(&tables, chain) || target.is_some_and(|t| t.starts_with("U60_") && !has_chain(&tables, t)) {
+    if !has_chain(&tables, chain) || target.is_some_and(|t| owned_chain(t) && !has_chain(&tables, t)) {
         return Ok(());
     }
     let mut check = cmd.clone();
@@ -149,6 +158,11 @@ pub(crate) fn undo(cmd: &Cmd, probe: &mut impl Probe) -> Result<(), String> {
 /// rule never gets the same line, so a prediction that is wrong costs one
 /// `-C`, never a wrong answer.
 pub(crate) fn listed(v6: bool, chain: &str, rest: &[String]) -> Option<String> {
+    if let [o, iface, jump, target, option, value] = rest {
+        if chain == crate::netfx::ids::TTL_CHAIN && o == "-o" && jump == "-j" && ((v6 && target == "HL" && option == "--hl-set") || (!v6 && target == "TTL" && option == "--ttl-set")) {
+            return Some(format!("-A {chain} -o {} -j {target} {option} {}", interface(iface)?, value.parse::<u8>().ok()?));
+        }
+    }
     // -s -d -i -o -p, as the tool prints them.
     let mut head: [Option<String>; 5] = Default::default();
     let mut matches: Vec<(&'static str, Vec<(&str, String)>)> = Vec::new();
@@ -308,7 +322,7 @@ fn port(value: &str) -> Option<String> {
 
 /// Targets listed without options, and the owned chains.
 fn jump(value: &str) -> Option<String> {
-    (matches!(value, "ACCEPT" | "DROP" | "RETURN" | "MASQUERADE") || (value.starts_with("U60_") && interface(value).is_some()))
+    (matches!(value, "ACCEPT" | "DROP" | "RETURN" | "MASQUERADE") || ((value.starts_with("U60_") && interface(value).is_some()) || crate::netfx::ids::OTHER_CHAINS.contains(&value)))
         .then(|| value.to_owned())
 }
 

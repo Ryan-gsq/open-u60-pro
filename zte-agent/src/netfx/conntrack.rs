@@ -132,7 +132,7 @@ impl Report {
         } else {
             "none"
         };
-        json!({"result": result, "deleted": self.deleted, "scope": self.scope.describe()})
+        json!({"result": result, "deleted": self.deleted, "scope": self.scope.describe(), "hardware_eviction_confirmed": false})
     }
 }
 
@@ -165,17 +165,22 @@ static RESULTS: Mutex<VecDeque<Value>> = Mutex::new(VecDeque::new());
 /// Results kept for the status pages.
 const HISTORY: usize = 8;
 
+struct Batch {
+    scope: Scope,
+    latest: Instant,
+    replies: Vec<std::sync::mpsc::SyncSender<Result<Report, String>>>,
+}
+static COLLECT: Mutex<Option<Batch>> = Mutex::new(None);
+
 /// Deletes the conntrack entries of `scope`, whose path changed at `changed`
 /// (an earlier deletion that started at or after it settles the request;
 /// `reason` goes to the log and the history).
 pub fn reset_since(reason: &'static str, scope: Scope, changed: Instant) -> Result<Report, String> {
+    coalesce(reason, scope, changed, &mut Device)
+}
+
+fn coalesce(reason: &'static str, scope: Scope, changed: Instant, tables: &mut impl Tables) -> Result<Report, String> {
     if scope.empty() { return Ok(Report { scope, merged: false, deleted: 0 }); }
-    struct Batch {
-        scope: Scope,
-        latest: Instant,
-        replies: Vec<std::sync::mpsc::SyncSender<Result<Report, String>>>,
-    }
-    static COLLECT: Mutex<Option<Batch>> = Mutex::new(None);
     let mut open = COLLECT.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(batch) = open.as_mut() {
         batch.scope = batch.scope.union(&scope);
@@ -183,7 +188,7 @@ pub fn reset_since(reason: &'static str, scope: Scope, changed: Instant) -> Resu
         let (reply, receive) = std::sync::mpsc::sync_channel(1);
         batch.replies.push(reply);
         drop(open);
-        let _coverage = receive.recv().map_err(|_| "Conntrack batch interrupted")??;
+        receive.recv().map_err(|_| "Conntrack batch interrupted")??;
         record(reason, &scope, "merged");
         return Ok(Report { scope, merged: true, deleted: 0 });
     }
@@ -191,7 +196,7 @@ pub fn reset_since(reason: &'static str, scope: Scope, changed: Instant) -> Resu
     drop(open);
     std::thread::sleep(Duration::from_millis(200));
     let batch = COLLECT.lock().unwrap_or_else(PoisonError::into_inner).take().unwrap();
-    let result = reset_with(reason, batch.scope, batch.latest, &mut Device);
+    let result = reset_with(reason, batch.scope, batch.latest, tables);
     for reply in batch.replies { let _ = reply.send(result.clone()); }
     result
 }
@@ -420,6 +425,27 @@ mod tests {
         let mut fake = Fake::default();
         let none = reset_with("test", Scope::Destinations(Vec::new()), Instant::now(), &mut fake).unwrap();
         assert!(!none.merged && none.deleted == 0 && fake.deleted.is_empty());
+    }
+
+    #[test]
+    fn requests_in_one_window_share_the_union_and_return_only_after_deletion() {
+        let _serial = fresh();
+        let first = std::thread::spawn(|| {
+            let mut tables = Fake::default();
+            let result = coalesce("first", Scope::Lan { v4: true, v6: false }, Instant::now(), &mut tables).unwrap();
+            (result, tables.deleted)
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while COLLECT.lock().unwrap().is_none() {
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        let mut tables = Fake::default();
+        let other = coalesce("second", Scope::Lan { v4: false, v6: true }, Instant::now(), &mut tables).unwrap();
+        let (report, deleted) = first.join().unwrap();
+        assert!(other.merged && tables.deleted.is_empty());
+        assert_eq!(report.scope, Scope::Lan { v4: true, v6: true });
+        assert_eq!(deleted.len(), 2);
     }
 
     #[test]

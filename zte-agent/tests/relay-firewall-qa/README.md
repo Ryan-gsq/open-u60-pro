@@ -46,6 +46,8 @@ beside the handoff). The checks cover the following cases.
   cannot open connections to the LAN or the router; LAN and router IPv6 to
   `rmnet*` is rejected at once; LAN IPv6 does not leave without NAT66; LAN
   and router DNS go to the Wi-Fi resolver, DNS to the router stays local.
+  The dual-stack core socket mark preserves its original DNS destination. The
+  vendor portal mark 8880 alone selects the Wi-Fi resolver in both families.
 - NAT66: an approved LAN source leaves as the relay address and gets its
   reply; another source and new upstream connections do not; DHCPv6
   replies pass, router ports stay closed; LAN IPv6 DNS is answered locally,

@@ -355,8 +355,8 @@ impl Upstream {
         Self {
             client: None,
             session: None,
-            setup: EffectSet::new("relay", Path::new(JOURNAL).join("ipv6-setup.json")),
-            network: EffectSet::new("relay", Path::new(JOURNAL).join("ipv6-network.json")),
+            setup: EffectSet::new("relay", Path::new(JOURNAL).join(super::journals::V6_SETUP)),
+            network: EffectSet::new("relay", Path::new(JOURNAL).join(super::journals::V6_NETWORK)),
             uplink,
             installed: None,
             path: None,
@@ -864,8 +864,8 @@ impl Upstream {
         let local = Cmd::new("ip", &["-j", "-6", "addr", "show"]).run()?;
         let dns_lease = safe_dns_lease(&live, &sources, &local)?;
         let mtu = ra::advertised_mtu(live.mtu, ra::lan_mtu()?)?;
-        let setup = EffectSet::load("relay", &Path::new(JOURNAL).join("ipv6-setup.json"))?;
-        let network = EffectSet::load("relay", &Path::new(JOURNAL).join("ipv6-network.json"))?;
+        let setup = EffectSet::load("relay", &Path::new(JOURNAL).join(super::journals::V6_SETUP))?;
+        let network = EffectSet::load("relay", &Path::new(JOURNAL).join(super::journals::V6_NETWORK))?;
         // The tables first: the relay's adoption declared them without NAT66.
         self.uplink.update(|l| {
             l.discovery = true;
@@ -874,9 +874,9 @@ impl Upstream {
         (self.setup, self.network) = (setup, network);
         self.client = Some(Helper::Adopted(client));
         self.session = Some(session.to_owned());
-        super::adopt::adopt_resources(&mut self.setup, setup_plan(), &mut net::Device, &mut crate::netfx::effect::Device)?;
-        self.network.adopt(network_plan(&dns_lease, &ula, &sources))?;
-        self.network.adopt(vec![ra_step(&ula, linklocal, mtu)])?;
+        self.setup.declare(setup_plan())?;
+        self.network.declare(network_plan(&dns_lease, &ula, &sources))?;
+        self.network.declare(vec![ra_step(&ula, linklocal, mtu)])?;
         self.requested = true;
         self.installed = Some(lease);
         self.path = Some(live);
@@ -932,10 +932,10 @@ fn session_client(args: &[String]) -> bool {
 }
 
 pub fn recover() -> Result<(), String> {
-    EffectSet::recover(&Path::new(JOURNAL).join("ipv6-network.json"))?;
+    EffectSet::recover(&Path::new(JOURNAL).join(super::journals::V6_NETWORK))?;
     // The separate RA snapshot also covers a crash before applying its journal step.
     ra_restore()?;
-    EffectSet::recover(&Path::new(JOURNAL).join("ipv6-setup.json"))?;
+    EffectSet::recover(&Path::new(JOURNAL).join(super::journals::V6_SETUP))?;
     // Delayed odhcp6c script children may survive their client. Each writes
     // only its own nonce path, never the next session's state.
     if let Ok(entries) = fs::read_dir(ROOT) {
@@ -959,7 +959,6 @@ fn capabilities() -> Result<(), String> {
     // odhcp6c's help exits 1 even on OpenWrt. Its owned spawn below is the
     // executable check, and any failure rolls back the journaled setup. The
     // NAT66 masquerade is nftables (`uplink`): loading the tables checks it.
-    Cmd::new("ip6tables", &["-w", "2", "-t", "nat", "-S"]).run()?;
     if fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding")
         .unwrap_or_default()
         .trim()
@@ -1365,19 +1364,13 @@ fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Resource> {
     let mut linklocal = Route::new(Family::V6, RouteType::Unicast, "fe80::/64", TABLE);
     linklocal.device = Some(IFACE.into());
     p.push(Resource::Route(linklocal));
-    let destinations: Vec<&str> = vec![TAILNET, crate::netfx::ids::LINK_LOCAL_V6, crate::netfx::ids::MULTICAST_V6];
     for source in sources {
         let mut route = Route::new(Family::V6, RouteType::Unicast, source, TABLE);
         route.device = Some("br-lan".into());
         route.expires = Some(LAN_GRACE as u32);
         p.push(Resource::Route(route));
     }
-    for dest in destinations {
-        // Link-local gateways are resolved within this table; destinations
-        // with an explicit scope/interface retain the kernel link route.
-        if dest == "fe80::/10" {
-            continue;
-        }
+    for dest in [TAILNET, crate::netfx::ids::MULTICAST_V6] {
         p.push(Resource::Route(Route::new(Family::V6, RouteType::Throw, dest, TABLE)));
     }
     // SLAAC's A flag does not imply on-link (L). Only explicit no-gateway
@@ -2063,7 +2056,7 @@ mod tests {
         for ((name, resources, expected), restore) in plans.into_iter().zip(expected_restores) {
             let mut set = EffectSet::new("relay", directory.join(format!("{name}.json")));
             let mut kernel = Kernel::empty_router();
-            set.declare_with(resources, false, &mut kernel, &mut FakeNft::default()).unwrap();
+            set.declare_with(resources, &mut kernel, &mut FakeNft::default()).unwrap();
             let journal = set.journal();
             let undo: Vec<Cmd> = serde_json::from_value(journal["undo"].clone()).unwrap();
             let lines: Vec<String> = undo.iter().map(|command| format!("{} {}", command.program, command.args.join(" ")).trim().to_owned()).collect();
@@ -2093,11 +2086,11 @@ mod tests {
             ("full-nodns", Layout { relay: Some(relay.clone()), discovery: true, nat66: Some(nat66(None)) }),
         ];
         for (generation, (name, layout)) in layouts.iter().enumerate() {
-            let (marker, text) = crate::netfx::effect::batch("relay", uplink::TABLE, generation as u64 + 1, uplink::tables(layout, None).unwrap()).unwrap();
+            let (marker, text) = crate::netfx::effect::batch("relay", uplink::TABLE, generation as u64 + 1, uplink::tables(layout, crate::netfx::ids::CORE_OUT_MARK).unwrap()).unwrap();
             fs::write(dir.join(format!("{name}.nft")), text).unwrap();
             fs::write(dir.join(format!("{name}.marker")), marker).unwrap();
         }
-        let [ip, ip6] = uplink::tables(&layouts[3].1, None).unwrap();
+        let [ip, ip6] = uplink::tables(&layouts[3].1, crate::netfx::ids::CORE_OUT_MARK).unwrap();
         let (_, broken) = crate::netfx::effect::batch("relay", uplink::TABLE, 99, [ip, ip6.replace("masquerade", "masquerade to nowhere")]).unwrap();
         fs::write(dir.join("broken.nft"), broken).unwrap();
         let v4 = super::super::Lease { ip: "10.20.0.7".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.20.0.1".parse().unwrap(), dns: vec!["10.20.0.1".parse().unwrap()] };
@@ -2115,7 +2108,7 @@ mod tests {
         for (name, plan) in [("wireless", &wireless), ("network", &network), ("dns", &dns), ("ipv6-setup", &super::setup_plan()), ("ipv6-network", &v6)] {
             let mut set = EffectSet::new("relay", dir.join(format!("{name}.json")));
             kernel.writes.clear();
-            set.declare_with(plan.clone(), false, &mut kernel, &mut crate::netfx::effect::fake::FakeNft::default()).unwrap();
+            set.declare_with(plan.clone(), &mut kernel, &mut crate::netfx::effect::fake::FakeNft::default()).unwrap();
             for (program, input) in &kernel.writes {
                 restore.push(json!({"plan": name, "program": program, "input": input}));
             }
@@ -2135,7 +2128,7 @@ mod tests {
         let mut kernel = crate::netfx::effect::testing::Kernel::empty_router();
         let resources: Vec<Resource> = network.iter().filter(|resource| matches!(resource, Resource::LegacyChain(_) | Resource::LegacyHook(_))).cloned().collect();
         let mut set = EffectSet::new("relay", dir.join("repair-qa.json"));
-        set.declare_with(resources, false, &mut kernel, &mut crate::netfx::effect::fake::FakeNft::default()).unwrap();
+        set.declare_with(resources, &mut kernel, &mut crate::netfx::effect::fake::FakeNft::default()).unwrap();
         kernel.tables.get_mut(&("iptables".into(), "filter".into())).unwrap().push("-A U60_RELAY_FWD -j RETURN".into());
         kernel.writes.clear();
         set.reconcile_with(&mut kernel, &mut crate::netfx::effect::fake::FakeNft::default());

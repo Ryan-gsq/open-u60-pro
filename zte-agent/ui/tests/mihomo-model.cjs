@@ -2,9 +2,9 @@ const assert=require('node:assert/strict'),M=require('../mihomo-model.js');
 
 // Lifecycle wording and which actions exist in each state.
 let v=M.view({running:true,installed:true,configured:true,autostart:true});
-assert.deepEqual([v.key,v.chip,v.title,v.toggleLabel,v.canStart,v.showInstall,v.showClearAutostart],['running','RUNNING','Clash is running','Stop Clash',true,false,false]);
+assert.deepEqual([v.key,v.chip,v.title,v.toggleLabel,v.canStart,v.showInstall,v.showClearAutostart],['running','RUNNING','Mihomo is running','Stop Mihomo',true,false,false]);
 v=M.view({running:false,installed:true,configured:true});
-assert.deepEqual([v.key,v.chip,v.toggleLabel,v.canStart,v.showInstall,v.installLabel],['off','OFF','Start Clash',true,true,'Reinstall pinned core']);
+assert.deepEqual([v.key,v.chip,v.toggleLabel,v.canStart,v.showInstall,v.installLabel],['off','OFF','Start Mihomo',true,true,'Reinstall pinned core']);
 v=M.view({running:false,installed:false,configured:false});
 assert.deepEqual([v.canStart,v.toggleHint,v.installLabel],[false,'Install the core first.','Install Mihomo core']);
 assert.equal(M.view({installed:true,configured:false}).toggleHint,'Add a configuration profile first.');
@@ -46,7 +46,7 @@ assert.deepEqual(M.profileRequest({...base,url:' https://example.com/sub ',inter
 assert.deepEqual(M.profileRequest({mode:'edit',id:'0a1b',type:'local',name:'Pasted',url:'https://ignored',yaml:'rules: []',interval:'168'}),{action:'edit',id:'0a1b',name:'Pasted',source_type:'local',url:'',yaml:'rules: []',interval_hours:0});
 assert.deepEqual(M.profileAction('select','0a1b'),{action:'select',id:'0a1b'});assert.deepEqual(M.scheduleRequest('0a1b','6'),{action:'schedule',id:'0a1b',interval_hours:6});assert.equal(M.scheduleRequest('x','nope').interval_hours,0);
 
-// Confirmations mention the reconnect only when Clash is running.
+// Confirmations mention the reconnect only when Mihomo is running.
 assert.match(M.confirmation('select',{name:'Home'},true)[1],/briefly reconnects/);assert.doesNotMatch(M.confirmation('select',{name:'Home'},false)[1],/briefly reconnects/);
 assert.equal(M.confirmation('delete',{name:'Home'},false)[0],'Delete Home?');assert.match(M.confirmation('add',{name:'Home'},false)[1],/cellular data is never turned on/);
 for(const action of ['select','refresh','edit','add','delete'])assert.equal(M.confirmation(action,null,false).length,3);
@@ -81,5 +81,5 @@ assert.deepEqual(M.filterGroups(groups,'  us ').map(g=>g.name),['Auto'],'a membe
   assert.equal(M.dashboardTarget({url:'/ui/mihomo/dashboard/#/proxies'}),'/ui/mihomo/dashboard/#/proxies');
   assert.equal(M.dashboardTarget({url:'/ui/mihomo/dashboard/'}),'/ui/mihomo/dashboard/');
   for(const bad of [null,{},{url:7},{url:''},{url:'https://evil.example/ui/mihomo/dashboard/'},{url:'//evil.example/ui/mihomo/dashboard/'},{url:'/ui/mihomo/api/'},{url:'/ui/mihomo/dashboard/\\evil'},{url:'/ui/mihomo/dashboard/ x'},{url:'javascript:alert(1)'}])assert.equal(M.dashboardTarget(bad),'',JSON.stringify(bad));
-  console.log('Passed: Clash lifecycle wording, profile validation and requests, extensions, proxy-group resolution, bounded delay tests and Zashboard address checks.');
+  console.log('Passed: Mihomo lifecycle wording, profile validation and requests, extensions, proxy-group resolution, bounded delay tests and Zashboard address checks.');
 })().catch(error=>{console.error(error);process.exitCode=1;});

@@ -86,6 +86,8 @@ pub fn read(t: Topic, app: &AppState, hub: &Hub) -> Option<ReadOut> {
         Topic::SignalDetect => signal_detect(app),
         // The worker's state (`GET /api/stk/session`) from memory: never
         // starts the worker, connects, sends or waits for it.
+        Topic::Relay => data_of(crate::wifi_relay::status(app)),
+        Topic::Mihomo => data_of(crate::mihomo::status(app)),
         Topic::Stk => data_of(app.stk.session_view()),
         Topic::PowerState | Topic::Sms => return None,
     })

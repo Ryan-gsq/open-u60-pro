@@ -4,17 +4,17 @@
   const {el, button, request, json, confirm, mutate, say} = UI;
   const GROUP_TEST_LIMIT = 30, TEST_PARALLEL = 3;
 
-  const modePanel = UI.panel(route, 'proxies-mode', 'Clash proxies', 'Choose how Clash routes traffic and which node each group uses. Changes take effect for new connections; existing ones finish on their old route.');
+  const modePanel = UI.panel(route, 'proxies-mode', 'Mihomo proxies', 'Choose how Mihomo routes traffic and which node each group uses. Changes take effect for new connections; existing ones finish on their old route.');
   modePanel.classList.add('proxies-panel');
   const modeRow = el('div', 'proxies-mode-row'), modeLabel = el('label', '', 'Routing mode'), modeSelect = el('select');
   modeSelect.id = 'proxies-mode-select'; modeLabel.htmlFor = modeSelect.id;
   for (const [value, text] of M.modes) modeSelect.add(new Option(text, value));
   const modeHelp = el('small', 'field-help', 'Rule follows your profile’s rules. Global sends everything through the GLOBAL group. Direct bypasses nodes (this is not a kill switch).');
-  const refresh = button('Read current state', () => load()), openClash = button('Open Clash / Mihomo', () => OpenU60Navigation.go('network/mihomo'));
-  openClash.hidden = true;
+  const refresh = button('Read current state', () => load()), openMihomo = button('Open Mihomo', () => OpenU60Navigation.go('network/mihomo'));
+  openMihomo.hidden = true;
   const zashboard = button('Open Zashboard', () => M.openDashboard(modeText, zashboard));
   zashboard.hidden = true;
-  modeRow.append(modeLabel, modeSelect, refresh, zashboard, openClash);
+  modeRow.append(modeLabel, modeSelect, refresh, zashboard, openMihomo);
   const modeText = UI.status(modePanel);
   modePanel.append(modeRow, modeHelp, modeText);
 
@@ -34,7 +34,7 @@
   function drawMode() {
     modeSelect.value = data?.mode || 'rule';
     modeSelect.disabled = !data || busy || !API.connected;
-    openClash.hidden = !off;
+    openMihomo.hidden = !off;
     zashboard.hidden = !data;
     zashboard.disabled = !API.connected;
     refresh.disabled = loading || busy || !API.connected;
@@ -42,7 +42,7 @@
   function drawGroups() {
     const groups = M.filterGroups(data?.groups || [], search.value);
     if (!data) {
-      groupList.replaceChildren(el('p', 'empty', off ? 'Clash is off. Start it from Clash / Mihomo to see its proxy groups.' : 'Proxy groups appear here once they are read.'));
+      groupList.replaceChildren(el('p', 'empty', off ? 'Mihomo is off. Start it from Mihomo to see its proxy groups.' : 'Proxy groups appear here once they are read.'));
       return;
     }
     if (!groups.length) { groupList.replaceChildren(el('p', 'empty', data.groups.length ? 'No group or node matches the filter.' : 'The running configuration has no proxy groups.')); return; }
@@ -64,7 +64,7 @@
         select.addEventListener('change', () => choose(group, select.value, select));
         select.disabled = busy || !API.connected;
         controls.append(select);
-      } else controls.append(el('span', 'field-help', 'Chosen automatically by Clash.'));
+      } else controls.append(el('span', 'field-help', 'Chosen automatically by Mihomo.'));
       const testOne = button('Test delay', () => test(group, [now])), testAll = button('Test group', () => test(group, group.all));
       testOne.disabled = busy || !API.connected || !now || !nodes()[now];
       testAll.disabled = busy || !API.connected || !group.all.some(name => nodes()[name]);

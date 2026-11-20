@@ -114,6 +114,8 @@ fn answer_address(query: &[u8], answer: &[u8]) -> Option<Ipv4Addr> {
 pub(super) fn upstream(host: &str, server: Ipv4Addr, deadline: std::time::Instant) -> Result<Vec<SocketAddr>, String> {
     let mut addresses = Vec::new();
     for kind in [1, 28] {
+        let now = std::time::Instant::now();
+        let deadline = if kind == 1 { now + deadline.saturating_duration_since(now) / 2 } else { deadline };
         let mut id = [0; 2];
         getrandom::getrandom(&mut id).map_err(|_| "Cannot create DNS query")?;
         let query = crate::doh::dns_packet::build_query(u16::from_be_bytes(id), host, kind)?;
@@ -132,12 +134,19 @@ pub(super) fn upstream(host: &str, server: Ipv4Addr, deadline: std::time::Instan
                 tcp.set_write_timeout(Some(remaining()?))?;
                 tcp.write_all(&(query.len() as u16).to_be_bytes())?;
                 tcp.write_all(&query)?;
-                tcp.set_read_timeout(Some(remaining()?))?;
+                let mut receive = |mut target: &mut [u8]| -> std::io::Result<()> {
+                    while !target.is_empty() {
+                        tcp.set_read_timeout(Some(remaining()?))?;
+                        let n = tcp.read(target)?;
+                        if n == 0 { return Err(std::io::ErrorKind::UnexpectedEof.into()); }
+                        target = &mut target[n..];
+                    }
+                    Ok(())
+                };
                 let mut size = [0; 2];
-                tcp.read_exact(&mut size)?;
+                receive(&mut size)?;
                 bytes.resize(u16::from_be_bytes(size).into(), 0);
-                tcp.set_read_timeout(Some(remaining()?))?;
-                tcp.read_exact(&mut bytes)?;
+                receive(&mut bytes)?;
             }
             Ok(bytes)
         })();

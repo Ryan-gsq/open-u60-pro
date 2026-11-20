@@ -138,7 +138,7 @@ fn pass_cookies(headers: &HeaderMap) -> Vec<&str> {
 /// by the API layer): a pass cookie that only `/ui/mihomo/` ever receives.
 pub fn grant(app: &AppState, owner: SessionId) -> Response {
     if !app.mihomo.running() {
-        return api::json_reply(409, &crate::server::error_body("Clash is off"));
+        return api::json_reply(409, &crate::server::error_body("Mihomo is off"));
     }
     if !matches!(app.auth.touch_session(owner), SessionCheck::Live { .. }) {
         return api::json_reply(401, &crate::server::error_body("unauthorized"));
@@ -768,7 +768,7 @@ mod tests {
             std::fs::create_dir_all(root.join("ui/assets")).unwrap();
             std::fs::write(root.join("ui/assets/app.css"), "body{}").unwrap();
             std::fs::write(root.join("ui/index.html"), "<html>not the pinned page</html>").unwrap();
-            state.mihomo = Arc::new(Mihomo::for_bridge(root, Arc::clone(&state.network_lock), "private-core-key".into()));
+            state.mihomo = Arc::new(Mihomo::for_bridge(root, "private-core-key".into()));
         }
         let ctx = Ctx::new(Arc::new(state), 2);
         let bearer = ctx.app.auth.login(PW, Kind::Bearer, PeerKey::from(peer(test, 250).0), &[]).unwrap().token.expose().to_owned();
@@ -832,7 +832,7 @@ mod tests {
         let off = rig("off", false, 3);
         let (reply, cookie) = grant_pass(&off, 3).await;
         assert_eq!((reply.status, cookie.as_str()), (409, ""));
-        assert!(reply.body.contains("Clash is off"));
+        assert!(reply.body.contains("Mihomo is off"));
     }
 
     #[tokio::test]
