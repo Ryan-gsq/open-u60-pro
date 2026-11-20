@@ -8,7 +8,9 @@ use std::path::Component;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
+use std::io::Read;
+use crate::netfx::files::Stamp;
 use axum::extract::{Request, State};
 use axum::http::{header::*, HeaderMap, Method, StatusCode};
 use axum::response::Response;
@@ -235,11 +237,7 @@ fn see_other(location: &str) -> Response {
 /// Everything after sign-in: the dashboard's files and the bridge.
 pub async fn serve(ctx: Ctx, mut req: Request, owner: SessionId) -> Response {
     let path = req.uri().path().to_owned();
-    let secret = match core_secret(&ctx).await {
-        Ok(Some(secret)) => secret,
-        Ok(None) => return plain(409, "Mihomo is off"),
-        Err(_) => return busy(),
-    };
+    let Some(secret) = core_secret(&ctx).await else { return plain(409, "Mihomo is off") };
     if path == DASHBOARD.trim_end_matches('/') {
         return see_other(DASHBOARD);
     }
@@ -263,7 +261,9 @@ pub async fn serve(ctx: Ctx, mut req: Request, owner: SessionId) -> Response {
             return plain(404, "Not found");
         }
         let (root, file, head) = (ctx.app.mihomo.dashboard_root(), file.to_owned(), req.method() == Method::HEAD);
-        return match ctx.gate.run(Lane::General, move || dashboard_file(&root, &file, head)).await {
+        let mut conditional = HeaderMap::new();
+        for tag in req.headers().get_all(IF_NONE_MATCH) { conditional.append(IF_NONE_MATCH, tag.clone()); }
+        return match ctx.gate.run(Lane::General, move || dashboard_file(&root, &file, head, &conditional)).await {
             Ok(reply) => reply,
             Err(GateError::Busy) => busy(),
             Err(GateError::Panicked) => plain(500, "Internal error"),
@@ -365,7 +365,10 @@ pub async fn serve(ctx: Ctx, mut req: Request, owner: SessionId) -> Response {
 }
 
 
-fn dashboard_file(root: &std::path::Path, file: &str, head: bool) -> Response {
+#[derive(Clone)]
+struct Asset { stamp: Stamp, bytes: Bytes, etag: String }
+
+fn dashboard_file(root: &std::path::Path, file: &str, head: bool, conditional: &HeaderMap) -> Response {
     let Ok(canonical) = root.join(file).canonicalize() else {
         return plain(404, "Dashboard file not found");
     };
@@ -375,15 +378,27 @@ fn dashboard_file(root: &std::path::Path, file: &str, head: bool) -> Response {
     if !canonical.starts_with(root) {
         return plain(404, "Not found");
     }
-    let Ok(data) = std::fs::read(canonical) else {
-        return plain(404, "Not found");
-    };
-    if data.len() > 8 * 1024 * 1024 {
-        return plain(413, "Dashboard file too large");
-    }
-    let data = match adapter::asset(file, data) {
-        Ok(data) => data,
-        Err(e) => return plain(503, e),
+    // Index and main bundle require pin verification. Cache only those two
+    // representations; a directory of arbitrary assets cannot grow the cache.
+    static ADAPTED: OnceLock<Mutex<[Option<Asset>; 2]>> = OnceLock::new();
+    let pinned = adapter::slot(file);
+    let file_handle = match std::fs::File::open(canonical) { Ok(f) => f, Err(_) => return plain(404, "Not found") };
+    let Ok(meta) = file_handle.metadata() else { return plain(404, "Not found") };
+    if !meta.is_file() { return plain(404, "Not found"); }
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    if meta.len() > LIMIT { return plain(413, "Dashboard file too large"); }
+    let stamp = Stamp::of(&meta);
+    let mut cache = pinned.map(|_| ADAPTED.get_or_init(Default::default).lock().unwrap_or_else(PoisonError::into_inner));
+    let cached = pinned.and_then(|slot| cache.as_ref()?[slot].as_ref()).filter(|asset| asset.stamp == stamp);
+    let asset = if let Some(asset) = cached { asset.clone() } else {
+        let mut data = Vec::with_capacity(meta.len() as usize);
+        if (&file_handle).take(LIMIT + 1).read_to_end(&mut data).is_err() { return plain(404, "Not found"); }
+        if data.len() as u64 > LIMIT { return plain(413, "Dashboard file too large"); }
+        if file_handle.metadata().ok().map(|m| Stamp::of(&m)) != Some(stamp) { return plain(503, "Dashboard changed while loading"); }
+        let bytes = match adapter::asset(file, data) { Ok(bytes) => Bytes::from(bytes), Err(e) => return plain(503, e) };
+        let asset = Asset { stamp, etag: format!("\"{:x}\"", Sha256::digest(&bytes)), bytes };
+        if let (Some(slot), Some(cache)) = (pinned, &mut cache) { cache[slot] = Some(asset.clone()); }
+        asset
     };
     let mime = match std::path::Path::new(file).extension().and_then(|e| e.to_str()).unwrap_or("") {
         "html" => "text/html; charset=utf-8",
@@ -397,9 +412,13 @@ fn dashboard_file(root: &std::path::Path, file: &str, head: bool) -> Response {
         "woff" => "font/woff",
         _ => "application/octet-stream",
     };
-    let mut r = Response::new(if head { Body::empty() } else { Body::from(data) });
+    let matched = crate::httpd::none_match(conditional, &asset.etag);
+    let mut r = Response::new(if head || matched { Body::empty() } else { Body::from(asset.bytes.clone()) });
+    if matched { *r.status_mut() = StatusCode::NOT_MODIFIED; }
+    else { r.headers_mut().insert(CONTENT_LENGTH, asset.bytes.len().into()); }
+    r.headers_mut().insert(ETAG, HeaderValue::from_str(&asset.etag).unwrap());
     r.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(mime));
-    r.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
     r
 }
 
@@ -529,6 +548,7 @@ async fn websocket(ctx: &Ctx, req: &mut Request, path: &str, secret: &str, owner
     let Some(accept) = accept.and_then(|v| HeaderValue::from_str(v).ok()) else {
         return plain(502, "Invalid WebSocket handshake");
     };
+    let expected_secret = secret.to_owned();
     let upgrade = hyper::upgrade::on(req);
     let ctx = ctx.clone();
     tokio::spawn(lifetime.until_stopped(async move {
@@ -538,7 +558,7 @@ async fn websocket(ctx: &Ctx, req: &mut Request, path: &str, secret: &str, owner
         let relay = tokio::io::copy_bidirectional(&mut client, &mut upstream);
         tokio::pin!(relay);
         loop {
-            if !matches!(core_secret(&ctx).await, Ok(Some(_))) { break; }
+            if core_secret(&ctx).await.as_deref() != Some(expected_secret.as_str()) { break; }
             let Some(remaining) = ctx.app.mihomo.passes.remaining(pass, ctx.app.auth.now()) else { break };
             if !matches!(ctx.app.auth.touch_session(owner), SessionCheck::Live { .. }) { break; }
             tokio::select! {
@@ -556,9 +576,10 @@ async fn websocket(ctx: &Ctx, req: &mut Request, path: &str, secret: &str, owner
     r
 }
 
-async fn core_secret(ctx: &Ctx) -> Result<Option<String>, GateError> {
+async fn core_secret(ctx: &Ctx) -> Option<String> {
+    if let Ok(state) = ctx.app.mihomo.shared.try_lock() { return state.running().then(|| state.secret.clone()).flatten(); }
     let core = Arc::clone(&ctx.app.mihomo);
-    tokio::task::spawn_blocking(move || core.secret()).await.map_err(|_| GateError::Panicked)
+    tokio::task::spawn_blocking(move || core.secret()).await.ok().flatten()
 }
 
 /// Zashboard is a trusted, separately version-pinned SPA. Give only its
@@ -572,6 +593,22 @@ pub fn secure_dashboard(resp: &mut Response) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_revalidates_the_served_bytes_and_head_has_the_get_length() {
+        let root = std::env::temp_dir().join(format!("u60-etag-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("style.css");
+        std::fs::write(&path, b"one").unwrap();
+        let mut headers = HeaderMap::new();
+        let head = dashboard_file(&root, "style.css", true, &headers);
+        assert_eq!(head.headers()[CONTENT_LENGTH], "3");
+        headers.insert(IF_NONE_MATCH, head.headers()[ETAG].clone());
+        assert_eq!(dashboard_file(&root, "style.css", false, &headers).status(), StatusCode::NOT_MODIFIED);
+        std::fs::write(&path, b"two").unwrap();
+        assert_eq!(dashboard_file(&root, "style.css", false, &headers).status(), StatusCode::OK);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn private_download_credentials_never_reach_dashboard() {

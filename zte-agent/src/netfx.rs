@@ -10,6 +10,7 @@ pub mod conntrack;
 pub mod effect;
 pub mod exec;
 pub mod files;
+pub mod neighbours;
 pub mod ids;
 
 use crate::boottime::{BootClock, Clock};

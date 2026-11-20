@@ -28,6 +28,7 @@ impl CoreHandle for FakeCore {
 #[derive(Default)]
 struct World {
     events: Vec<String>,
+    validation: Option<Validation>,
     wanted: bool,
     adoptable: bool,
     /// Effects are held (`Port::owns`).
@@ -137,8 +138,9 @@ impl Port for FakePort {
         let bypass = !self.world().bypass_off;
         let notice = super::super::geodata::bypass_notice(config, bypass);
         let text = if previous { "profile: previous".into() } else { format!("{config}\nfilter: {}", self.world().dns) };
-        Ok(Prepared { secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode": "rule"}), routes, dns, bypass, notice, source: config.into(), config: text })
+        Ok(Prepared { facts: super::super::reload::Facts::from(&serde_yaml_ng::from_str(&text).unwrap()), secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode": "rule"}), routes, dns, bypass, notice, source: config.into(), config: text })
     }
+    fn validator(&self, _: &Prepared, _: bool) -> Option<Validation> { self.world().validation.take() }
     fn ports_free(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -969,4 +971,22 @@ fn a_domain_rule_set_refresh_loads_no_table() {
     let before = h.events().len();
     refresh("cidrs");
     assert_eq!(h.events()[before..], ["tables full/0", "write providers/rules/cidrs with tables full/0", "tables full/1"]);
+}
+
+#[test]
+fn exit_while_validating_withdraws_now_and_discards_the_candidate() {
+    let h = Harness::with(World::default(), slow_retries());
+    h.enable(true).unwrap();
+    let generation = h.snapshot().generation;
+    let (started, waiting) = mpsc::sync_channel(1);
+    let (finish, done) = mpsc::sync_channel(1);
+    h.port.world().validation = Some(Box::new(move || { started.send(()).unwrap(); done.recv_timeout(Duration::from_secs(5)).unwrap(); Ok(()) }));
+    let (reply, result) = mpsc::sync_channel(1);
+    h.tx.send(Message::Config { refresh: true, reply }).unwrap();
+    waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+    h.tx.send(Message::Exited { generation, how: "fixture".into() }).unwrap();
+    h.until("D3 during validation", |s| s.phase == Phase::Backoff);
+    finish.send(()).unwrap();
+    assert!(result.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+    assert_eq!(h.port.world().spawned, [generation]);
 }

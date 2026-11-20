@@ -253,7 +253,7 @@ pub fn status(_state: &crate::handlers::AppState) -> (u16, Value) {
 
 /// Reservations serialize their own writes and reloads; they do not
 /// conflict with the relay or Mihomo (section 4.6).
-static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static WRITES: crate::netfx::admission::Gate = crate::netfx::admission::Gate::new();
 
 pub fn change(state: &crate::handlers::AppState, body: &[u8]) -> (u16, Value) {
     let result = (|| {

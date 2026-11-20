@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use crate::netfx::effect::legacy;
@@ -48,7 +48,7 @@ pub fn route_target(args: &[String]) -> (&str, &str) {
     if matches!(kind, "throw" | "local" | "unreachable") { (kind, args[4].as_str()) } else { ("unicast", kind) }
 }
 
-pub type NetworkLock = Arc<Mutex<()>>;
+pub type NetworkLock = Arc<crate::netfx::admission::Gate>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cmd { pub program: String, pub args: Vec<String> }

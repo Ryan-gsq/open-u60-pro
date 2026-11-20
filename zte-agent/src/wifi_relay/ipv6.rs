@@ -800,8 +800,7 @@ impl Upstream {
         self.network.declare(plan)?;
         self.uplink.update(|l| l.nat66 = Some(super::uplink::Nat66 { sources: sources.clone(), dns: upstream_dns(&dns_lease) }))?;
         self.network.declare(vec![rule])?;
-        let route = Cmd::new("ip", &["-6", "route", "get", "2606:4700:4700::1111"]).run()?;
-        if !route.contains(&format!("dev {IFACE}")) {
+        if !crate::mihomo::egress::relay_route(true) {
             return Err("IPv6 routing did not select Wi-Fi".into());
         }
         // Advertising is last. Undo withdraws RA before removing NAT/routes.
@@ -971,11 +970,8 @@ fn capabilities() -> Result<(), String> {
     if Cmd::new("uci", &["-q", "get", "dhcp.lan.ra"]).run()? != "server" {
         return Err("IPv6 relay requires the existing LAN odhcpd RA server".into());
     }
-    if !Cmd::new("pidof", &["odhcpd"])
-        .run()?
-        .split_whitespace()
-        .any(|s| s.parse::<u32>().is_ok())
-    {
+    if !fs::read_dir("/proc").map_err(|e| e.to_string())?.flatten().any(|entry|
+        entry.file_name().to_str().is_some_and(|n| n.parse::<u32>().is_ok()) && fs::read(entry.path().join("comm")).is_ok_and(|name| name == b"odhcpd\n")) {
         return Err("Existing LAN odhcpd is not running".into());
     }
     Ok(())

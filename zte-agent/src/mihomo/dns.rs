@@ -108,6 +108,107 @@ fn answer_address(query: &[u8], answer: &[u8]) -> Option<Ipv4Addr> {
     None
 }
 
+/// Resolve against the lease's DNS server. Accept only records for the
+/// question or its CNAME chain in the answer section. HTTPS still verifies
+/// the original hostname, including after a redirect.
+pub(super) fn upstream(host: &str, server: Ipv4Addr, deadline: std::time::Instant) -> Result<Vec<SocketAddr>, String> {
+    let mut addresses = Vec::new();
+    for kind in [1, 28] {
+        let mut id = [0; 2];
+        getrandom::getrandom(&mut id).map_err(|_| "Cannot create DNS query")?;
+        let query = crate::doh::dns_packet::build_query(u16::from_be_bytes(id), host, kind)?;
+        let reply = (|| -> std::io::Result<Vec<u8>> {
+            let remaining = || -> std::io::Result<Duration> { deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()).ok_or(std::io::ErrorKind::TimedOut.into()) };
+            let remote = SocketAddr::from((server, 53));
+            let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+            socket.connect(remote)?;
+            socket.set_read_timeout(Some(remaining()?))?;
+            socket.send(&query)?;
+            let mut bytes = vec![0; 4096];
+            let n = socket.recv(&mut bytes)?;
+            bytes.truncate(n);
+            if bytes.starts_with(&id) && bytes.get(2).is_some_and(|flags| flags & 2 != 0) {
+                let mut tcp = TcpStream::connect_timeout(&remote, remaining()?)?;
+                tcp.set_write_timeout(Some(remaining()?))?;
+                tcp.write_all(&(query.len() as u16).to_be_bytes())?;
+                tcp.write_all(&query)?;
+                tcp.set_read_timeout(Some(remaining()?))?;
+                let mut size = [0; 2];
+                tcp.read_exact(&mut size)?;
+                bytes.resize(u16::from_be_bytes(size).into(), 0);
+                tcp.set_read_timeout(Some(remaining()?))?;
+                tcp.read_exact(&mut bytes)?;
+            }
+            Ok(bytes)
+        })();
+        if let Ok(reply) = reply { addresses.extend(answer_ips(&query, &reply).unwrap_or_default()); }
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses.truncate(16);
+    Ok(addresses)
+}
+
+fn name_at(packet: &[u8], mut pos: usize) -> Option<(Vec<u8>, usize)> {
+    let mut name = Vec::new();
+    let mut end = None;
+    for _ in 0..128 {
+        let len = *packet.get(pos)?;
+        pos += 1;
+        if len == 0 { return Some((name, end.unwrap_or(pos))); }
+        if len & 0xc0 == 0xc0 {
+            let to = usize::from(u16::from_be_bytes([len & 0x3f, *packet.get(pos)?]));
+            if to >= pos - 1 { return None; }
+            end.get_or_insert(pos + 1);
+            pos = to;
+        } else {
+            if len > 63 || name.len() + usize::from(len) + 1 > 254 { return None; }
+            name.push(len);
+            name.extend(packet.get(pos..pos + usize::from(len))?.iter().map(u8::to_ascii_lowercase));
+            pos += usize::from(len);
+        }
+    }
+    None
+}
+
+fn answer_ips(query: &[u8], packet: &[u8]) -> Option<Vec<SocketAddr>> {
+    if packet.len() < query.len() || packet[..2] != query[..2] || packet[2] & 0xfa != 0x80 || packet[3] & 15 != 0
+        || packet[4..6] != [0, 1] || packet[12..query.len()] != query[12..] { return None; }
+    let (mut name, end) = name_at(query, 12)?;
+    let kind = u16::from_be_bytes(query.get(end..end+2)?.try_into().ok()?);
+    let mut aliases = std::collections::HashMap::new();
+    let mut ips = Vec::new();
+    let mut pos = query.len();
+    for _ in 0..u16::from_be_bytes([packet[6], packet[7]]) {
+        let (owner, end) = name_at(packet, pos)?;
+        let h = packet.get(end..end+10)?;
+        let ty = u16::from_be_bytes([h[0],h[1]]);
+        let data = end + 10;
+        pos = data + usize::from(u16::from_be_bytes([h[8],h[9]]));
+        let rr = packet.get(data..pos)?;
+        if h[2..4] != [0,1] { continue; }
+        if ty == 5 {
+            let (target, next) = name_at(packet, data)?;
+            if next != pos { return None; }
+            aliases.insert(owner, target);
+        } else if ty == kind {
+            let ip = match (ty, rr.len()) {
+                (1, 4) => std::net::IpAddr::from(<[u8; 4]>::try_from(rr).ok()?),
+                (28, 16) => std::net::IpAddr::from(<[u8; 16]>::try_from(rr).ok()?),
+                _ => continue,
+            };
+            if !ip.is_multicast() && !ip.is_unspecified() { ips.push((owner, SocketAddr::new(ip, 0))); }
+        }
+    }
+    for _ in 0..16 {
+        match aliases.remove(&name) {
+            Some(target) => name = target,
+            None => return Some(ips.into_iter().filter_map(|(owner, ip)| (owner == name).then_some(ip)).take(16).collect()),
+        }
+    }
+    None
+}
+
 fn matches_answer(query: &[u8], answer: &[u8], expected: Ipv4Addr) -> bool {
     if answer.len() < query.len()
         || answer[..2] != query[..2]
@@ -152,6 +253,21 @@ mod tests {
         assert!(available(tcp.local_addr().unwrap().port()).is_err());
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
         assert!(available(udp.local_addr().unwrap().port()).is_err());
+    }
+
+    #[test]
+    fn upstream_answers_follow_the_question_and_exclude_unrelated_addresses() {
+        let query = crate::doh::dns_packet::build_query(873, "a.test", 1).unwrap();
+        let mut reply = query.clone();
+        reply[2] |= 0x80;
+        reply[7] = 3;
+        reply.extend_from_slice(&[0xc0,12,0,5,0,1,0,0,0,10,0,4,1,b'b',0xc0,14]);
+        for (name, address) in [(b'x',1),(b'b',2)] {
+            reply.extend_from_slice(&[1,name,0xc0,14,0,1,0,1,0,0,0,10,0,4,192,0,2,address]);
+        }
+        assert_eq!(answer_ips(&query,&reply).unwrap(), [SocketAddr::from(([192,0,2,2],0))]);
+        reply[0] ^= 1;
+        assert!(answer_ips(&query,&reply).is_none());
     }
 
     #[test]

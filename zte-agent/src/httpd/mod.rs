@@ -24,6 +24,13 @@ use crate::tailscale::TailscaleManager;
 use gate::Gate;
 use guard::HostPolicy;
 
+/// `If-None-Match` lists `etag` or `*` (weak comparison: `W/` is ignored).
+pub(crate) fn none_match(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers.get_all(axum::http::header::IF_NONE_MATCH).iter().filter_map(|v| v.to_str().ok()).any(|v| {
+        v.split(',').map(str::trim).any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
+    })
+}
+
 /// Open connections; one more is accepted and closed at once, without a reply.
 pub const MAX_CONNS: usize = 64;
 /// Open connections from one LAN address, so one host (a leaky client, a

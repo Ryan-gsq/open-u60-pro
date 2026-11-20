@@ -106,7 +106,7 @@ fn main() {
         std::process::exit(guard::cli(&args[2..]));
     }
     if args.get(1).map(String::as_str) == Some("network-recover") {
-        let lock = Arc::new(std::sync::Mutex::new(()));
+        let lock = Arc::new(crate::netfx::admission::Gate::new());
         let result = mihomo::Mihomo::new(Arc::clone(&lock)).recover()
             .and_then(|_| wifi_relay::WifiRelay::new(lock).recover());
         if let Err(e) = result { eprintln!("{e}"); std::process::exit(1); }

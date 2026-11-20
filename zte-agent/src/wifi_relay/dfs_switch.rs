@@ -37,7 +37,9 @@ enum Key {
 /// Best effort: a firmware without the key or the command keeps its old
 /// behaviour, and the join goes on either way.
 pub(super) fn allow() {
-    let _ = allow_with(&mut |cmd| cmd.run());
+    if crate::ubus::committed_option("wireless", "zte_mbb", "dfs_channel_switch_disable").as_deref() == Some("1") {
+        apply_driver(&mut |cmd| cmd.run());
+    } else { let _ = allow_with(&mut |cmd| cmd.run()); }
 }
 
 fn allow_with(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Key, String> {
@@ -48,10 +50,14 @@ fn allow_with(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Ke
         Ok(Key::Uncommitted(others)) => crate::netlog!("[relay] set {KEY}=1 without committing it: {others} other uncommitted wireless change(s); the next join commits it"),
         Err(e) => crate::netlog!("[relay] cannot set {KEY}=1: {e}"),
     }
+    apply_driver(run);
+    key
+}
+
+fn apply_driver(run: &mut impl FnMut(&Cmd) -> Result<String, String>) {
     if let Err(e) = run(&Cmd::new("iwpriv", &["wlan2", "disableDfsCS", "0"])) {
         crate::netlog!("[relay] cannot turn the DFS channel switch on for wlan2: {e}");
     }
-    key
 }
 
 fn vendor_key(run: &mut impl FnMut(&Cmd) -> Result<String, String>) -> Result<Key, String> {

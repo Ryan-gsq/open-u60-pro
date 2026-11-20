@@ -149,11 +149,22 @@ impl IpacmPort for Device {
         enabled()
     }
     fn fingerprint(&mut self) -> Result<(), String> {
-        let version = crate::ubus::uci_get("zwrt_common_info.common_config.wa_inner_version").unwrap_or_default();
-        let binary = fs::read(IPACM).ok().map(|bytes| {
-            use sha2::Digest;
-            sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>()
-        });
+        let version = crate::ubus::committed_option("zwrt_common_info", "common_config", "wa_inner_version")
+            .or_else(|| crate::ubus::uci_get("zwrt_common_info.common_config.wa_inner_version").ok()).unwrap_or_default();
+        static DIGEST: std::sync::Mutex<Option<(crate::netfx::files::Stamp, String)>> = std::sync::Mutex::new(None);
+        let binary = (|| {
+            use crate::netfx::files::Stamp;
+            use sha2::{Digest, Sha256};
+            let mut file = fs::File::open(IPACM).ok()?;
+            let stamp = Stamp::of(&file.metadata().ok()?);
+            let mut cache = DIGEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((_, hash)) = cache.as_ref().filter(|(s, _)| *s == stamp) { return Some(hash.clone()); }
+            let mut hash = Sha256::new();
+            if std::io::copy(&mut file, &mut hash).ok()? != stamp.len || Stamp::of(&file.metadata().ok()?) != stamp { return None; }
+            let hash = format!("{:x}", hash.finalize());
+            *cache = Some((stamp, hash.clone()));
+            Some(hash)
+        })();
         fingerprint(&version, binary.as_deref())
     }
     fn monitors(&mut self, gateway: Ipv4Addr) -> Vec<monitor::Monitor> {

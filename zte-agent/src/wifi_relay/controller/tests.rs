@@ -248,7 +248,7 @@ impl Harness {
         if world.scans.is_empty() {
             world.scans.push(network());
         }
-        let relay = Arc::new(WifiRelay::new(Arc::new(Mutex::new(()))));
+        let relay = Arc::new(WifiRelay::new(Arc::new(crate::netfx::admission::Gate::new())));
         relay.shared.snapshot.lock().unwrap().scans = world.scans.clone();
         let port = FakePort { world: Arc::new(Mutex::new(world)), epoch: Instant::now() };
         let (sender, receiver) = mpsc::channel();
@@ -453,7 +453,7 @@ fn status_and_admission_are_answered_during_a_sixty_second_port_wait() {
     let started = Instant::now();
     assert_eq!(harness.relay.status()["phase"], "scanning");
     assert!(harness.relay.owns_network());
-    assert!(harness.relay.lock.try_lock().is_ok());
+    assert!(crate::netfx::admission::enter(&harness.relay.lock, Duration::ZERO).is_some());
     assert!(started.elapsed() < Duration::from_millis(100));
     release.send(()).unwrap();
     thread.join().unwrap().unwrap();
@@ -503,7 +503,7 @@ fn operations_and_ticks_run_in_arrival_order_without_overlap() {
 #[test]
 fn boot_runs_first_without_a_barrier_and_the_second_boot_is_idempotent() {
     for adopted in [false, true] {
-        let relay = Arc::new(WifiRelay::new(Arc::new(Mutex::new(()))));
+        let relay = Arc::new(WifiRelay::new(Arc::new(crate::netfx::admission::Gate::new())));
         let port = FakePort { world: Arc::new(Mutex::new(World { adopted, ..World::default() })), epoch: Instant::now() };
         let (sender, receiver) = mpsc::channel();
         let (reply, answer) = mpsc::sync_channel(1);
@@ -556,7 +556,7 @@ fn restore_rechecks_changed_target_and_same_target_owner_replacement() {
     let root = Path::new("/tmp/u60-test/work/relayctl/restore-target");
     resume::save(root, &network(), false).unwrap();
     let shared = Arc::new(Shared::new());
-    let port = DevicePort { shared: Arc::clone(&shared), mihomo: None };
+    let port = DevicePort { control: None, settings: None, shared: Arc::clone(&shared), mihomo: None };
     let cancel = Cancellation { shared: Arc::clone(&shared), generation: 0, target: Some(target()) };
     assert!(cancel.check().is_ok());
     let mut changed = network();
@@ -681,7 +681,7 @@ fn a_port_panic_reaches_the_abort_hook_and_stops_processing() {
     boot(&sender, reply);
     let (reply, _) = mpsc::sync_channel(1);
     boot(&sender, reply);
-    let controller = Controller::new(port.clone(), receiver, sender, shared, Arc::new(Mutex::new(())), Timings::default());
+    let controller = Controller::new(port.clone(), receiver, sender, shared, Arc::new(crate::netfx::admission::Gate::new()), Timings::default());
     let (ended, answer) = mpsc::channel();
     let thread = std::thread::spawn(move || controller.supervised(|why| ended.send(why).unwrap()));
     assert_eq!(answer.recv_timeout(Duration::from_secs(2)).unwrap(), "scripted port panic");
@@ -984,7 +984,7 @@ fn an_expired_request_is_abandoned_even_when_its_waiter_has_not_run_yet() {
 
 #[test]
 fn abandoned_requests_release_admission_before_the_controller_dequeues_them() {
-    let relay = Arc::new(WifiRelay::new(Arc::new(Mutex::new(()))));
+    let relay = Arc::new(WifiRelay::new(Arc::new(crate::netfx::admission::Gate::new())));
     let (sender, receiver) = mpsc::channel();
     assert!(relay.commands.set(sender).is_ok());
     let worker = Arc::clone(&relay);

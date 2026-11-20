@@ -1,10 +1,7 @@
 //! The only writer of conntrack (`relay-mihomo-architecture.md` section
-//! 4.5). Deleting an entry makes established and IPA-offloaded connections
-//! take the current path: IPACM drops the hardware entry on the DESTROY event
-//! and offloads a connection whose path did not change again about 0.1 s
-//! later (plan, confirmation 4), so a download that keeps its path goes on.
-//! Deleting an entry neither sends a TCP reset nor clears a client's DNS
-//! cache.
+//! 4.5). Deletion evicts software conntrack state. On B31 an active
+//! IPA NAT entry stayed enabled for over 12 s (454 MB) after deletion.
+//! A successful delete is not evidence of hardware eviction.
 //!
 //! `conntrack -D` (conntrack-tools 1.4.8) exits 1 both when nothing matched
 //! and when an operation failed; only its standard error tells them apart
@@ -172,7 +169,31 @@ const HISTORY: usize = 8;
 /// (an earlier deletion that started at or after it settles the request;
 /// `reason` goes to the log and the history).
 pub fn reset_since(reason: &'static str, scope: Scope, changed: Instant) -> Result<Report, String> {
-    reset_with(reason, scope, changed, &mut Device)
+    if scope.empty() { return Ok(Report { scope, merged: false, deleted: 0 }); }
+    struct Batch {
+        scope: Scope,
+        latest: Instant,
+        replies: Vec<std::sync::mpsc::SyncSender<Result<Report, String>>>,
+    }
+    static COLLECT: Mutex<Option<Batch>> = Mutex::new(None);
+    let mut open = COLLECT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(batch) = open.as_mut() {
+        batch.scope = batch.scope.union(&scope);
+        batch.latest = batch.latest.max(changed);
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        batch.replies.push(reply);
+        drop(open);
+        let _coverage = receive.recv().map_err(|_| "Conntrack batch interrupted")??;
+        record(reason, &scope, "merged");
+        return Ok(Report { scope, merged: true, deleted: 0 });
+    }
+    *open = Some(Batch { scope, latest: changed, replies: Vec::new() });
+    drop(open);
+    std::thread::sleep(Duration::from_millis(200));
+    let batch = COLLECT.lock().unwrap_or_else(PoisonError::into_inner).take().unwrap();
+    let result = reset_with(reason, batch.scope, batch.latest, &mut Device);
+    for reply in batch.replies { let _ = reply.send(result.clone()); }
+    result
 }
 
 /// Tries a failed request again; `None` when nothing is pending.
@@ -267,7 +288,7 @@ fn reset_with(reason: &'static str, scope: Scope, changed: Instant, tables: &mut
     }
     // A pending failed request joins this one: one deletion settles both.
     let (scope, changed) = match state.pending.take() {
-        Some(pending) => (pending.scope.union(&scope), pending.changed.min(changed)),
+        Some(pending) => (pending.scope.union(&scope), pending.changed.max(changed)),
         None => (scope, changed),
     };
     run(&mut state, reason, scope, changed, tables)
@@ -456,7 +477,7 @@ mod tests {
 
     #[test]
     fn history_and_relay_status_do_not_wait_for_a_reset_or_tick() {
-        let relay = std::sync::Arc::new(crate::wifi_relay::WifiRelay::new(std::sync::Arc::new(Mutex::new(()))));
+        let relay = std::sync::Arc::new(crate::wifi_relay::WifiRelay::new(std::sync::Arc::new(crate::netfx::admission::Gate::new())));
         let (send, receive) = std::sync::mpsc::channel();
         while_reset_locked(|| {
             let worker = std::thread::spawn(move || send.send((history(), relay.status())).unwrap());

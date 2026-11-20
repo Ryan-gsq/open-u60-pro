@@ -1,8 +1,19 @@
 use serde_yaml_ng::Value;
 
-pub(super) fn needs_restart(previous: &str, next: &str) -> bool {
-    let (Ok(previous), Ok(next)) = (serde_yaml_ng::from_str::<Value>(previous), serde_yaml_ng::from_str::<Value>(next)) else { return true };
-    let keys = [
+/// Only fields needed after the YAML tree is dropped. In particular this
+/// excludes node payloads, rules, provider bodies and DNS filter lists.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Facts {
+    pub startup: Value,
+    pub runtime: Value,
+    pub groups: Vec<(String, bool)>,
+    pub providers: Vec<String>,
+    pub assets: Vec<super::geodata::Asset>,
+}
+
+impl Facts {
+    pub fn from(config: &Value) -> Self {
+        let keys = [
         "port", "socks-port", "redir-port", "tproxy-port", "mixed-port", "ss-config", "vmess-config", "tuic-server",
         "allow-lan", "bind-address", "skip-auth-prefixes", "lan-allowed-ips", "lan-disallowed-ips",
         "inbound-tfo", "inbound-mptcp",
@@ -10,10 +21,27 @@ pub(super) fn needs_restart(previous: &str, next: &str) -> bool {
         "external-controller-routing-mark", "external-controller-cors", "external-doh-server", "secret",
         "external-ui", "external-ui-url", "external-ui-name",
     ];
-    keys.iter().any(|key| previous.get(*key) != next.get(*key))
-        || ["certificate", "private-key", "client-auth-type", "client-auth-cert", "ech-key"].iter().any(|key| previous["tls"].get(*key) != next["tls"].get(*key))
-        || ["quic-go-disable-gso", "quic-go-disable-ecn"].iter().any(|key| previous["experimental"].get(*key) != next["experimental"].get(*key))
-        || (previous["geodata-mode"].as_bool() == Some(true) && next.get("geodata-mode").is_none())
+        let mut startup = serde_yaml_ng::Mapping::new();
+        for key in keys { if let Some(value) = config.get(key) { startup.insert(key.into(), value.clone()); } }
+        for (section, keys) in [("tls", &["certificate", "private-key", "client-auth-type", "client-auth-cert", "ech-key"][..]), ("experimental", &["quic-go-disable-gso", "quic-go-disable-ecn"][..])] {
+            for key in keys { if let Some(value) = config[section].get(*key) { startup.insert(format!("{section}.{key}").into(), value.clone()); } }
+        }
+        let mut runtime = serde_yaml_ng::Mapping::new();
+        for key in ["interface-name", "mode", "log-level", "geodata-mode"] { if let Some(v) = config.get(key) { runtime.insert(key.into(), v.clone()); } }
+        let groups = config["proxy-groups"].as_sequence().into_iter().flatten().map(|g| (g["name"].as_str().unwrap_or_default().into(), g["type"].as_str() == Some("select"))).collect();
+        let providers = config["rule-providers"].as_mapping().into_iter().flat_map(|m| m.keys()).filter_map(|k| k.as_str().map(str::to_owned)).collect();
+        Self { startup: Value::Mapping(startup), runtime: Value::Mapping(runtime), groups, providers, assets: super::geodata::required(config) }
+    }
+
+    pub fn needs_restart(&self, next: &Self) -> bool {
+        self.startup != next.startup || (self.runtime["geodata-mode"].as_bool() == Some(true) && next.runtime.get("geodata-mode").is_none())
+    }
+}
+
+#[cfg(test)]
+fn needs_restart(previous: &str, next: &str) -> bool {
+    let (Ok(previous), Ok(next)) = (serde_yaml_ng::from_str(previous), serde_yaml_ng::from_str(next)) else { return true };
+    Facts::from(&previous).needs_restart(&Facts::from(&next))
 }
 
 #[cfg(test)]

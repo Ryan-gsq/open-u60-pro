@@ -294,7 +294,7 @@ pub struct WifiRelay {
 impl WifiRelay {
     pub fn new(lock: NetworkLock) -> Self {
         let relay = Self { lock, shared: Arc::new(Shared::new()), commands: OnceLock::new(), mihomo: None };
-        let mut port = DevicePort { shared: Arc::clone(&relay.shared), mihomo: None };
+        let mut port = DevicePort { control: None, settings: None, shared: Arc::clone(&relay.shared), mihomo: None };
         let mut state = State::default();
         if recovery_pending(Path::new(JOURNAL)) { state.phase = Phase::RecoveryPending; }
         port.publish(&state);
@@ -310,7 +310,7 @@ impl WifiRelay {
         let (reply, _) = std::sync::mpsc::sync_channel(1);
         controller::boot(&sender, reply);
         if self.commands.set(sender.clone()).is_err() { return; }
-        let port = DevicePort { shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone() };
+        let port = DevicePort { control: None, settings: None, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone() };
         let controller = controller::Controller::new(port, receiver, sender.clone(), Arc::clone(&self.shared), Arc::clone(&self.lock), controller::Timings::default());
         crate::system::spawn_named("relay", move || controller.supervised(|_| {
             crate::netlog!("[relay] the controller thread panicked; ending the agent so that its guard starts it again and it adopts the connection");
@@ -346,7 +346,7 @@ impl WifiRelay {
     }
 
     pub fn recover(&self) -> Result<(), String> {
-        DevicePort { shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone() }.recover()
+        DevicePort { control: None, settings: None, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone() }.recover()
     }
 
     pub fn recover_idle(&self) { let _ = controller::request(self, RelayCommand::Boot, None); }
@@ -418,6 +418,8 @@ fn snapshot(i: &State, now: BootInstant) -> Value {
     }
 
 struct DevicePort {
+    control: Option<scan::Ctrl>,
+    settings: Option<Value>,
     shared: Arc<Shared>,
     mihomo: Option<Arc<crate::mihomo::Mihomo>>,
 }
@@ -580,19 +582,32 @@ impl controller::Port for DevicePort {
             core.set_subscription_dns(state.session.as_ref().and_then(|session| session.lease.as_ref()).map(|lease| if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() }).unwrap_or_default());
         }
         let mut value = snapshot(state, BootClock.now());
-        value["autostart"] = json!(resume::load(Path::new(JOURNAL)).is_some());
+        let settings = self.settings.get_or_insert_with(|| {
+            let mut settings = json!({"autostart":resume::load(Path::new(JOURNAL)).is_some(), "enabled":offload::enabled(), "auto_off":power_save::auto_off(Path::new(JOURNAL))});
+            saved::annotate(&mut settings);
+            settings
+        });
+        value["autostart"] = settings["autostart"].clone();
         if !value["offload"].is_object() { value["offload"] = json!({}); }
         value["offload"]["config"] = json!(offload::config());
-        value["offload"]["enabled"] = json!(offload::enabled());
+        value["offload"]["enabled"] = settings["enabled"].clone();
         if !value["power_save"].is_object() { value["power_save"] = json!({}); }
-        value["power_save"]["auto_off"] = json!(power_save::auto_off(Path::new(JOURNAL)));
-        saved::annotate(&mut value);
+        value["power_save"]["auto_off"] = settings["auto_off"].clone();
+        if let Some(saved) = settings["saved_networks"].as_array() {
+            if let Some(networks) = value["networks"].as_array_mut() {
+                for network in networks {
+                    network["remembered"] = json!(saved.iter().any(|n| n["ssid"] == network["ssid"] && n["security"] == network["security"] && n["remembered"] == true));
+                }
+            }
+            value["saved_networks"] = settings["saved_networks"].clone();
+        } else { value["saved_error"] = settings["saved_error"].clone(); self.settings = None; }
+
         value
     }
 
     fn pending(&self) -> bool { recovery_pending(Path::new(JOURNAL)) }
     fn target(&mut self) -> Option<resume::Resume> { resume::load(Path::new(JOURNAL)) }
-    fn clear(&mut self) -> Result<(), String> { resume::clear(Path::new(JOURNAL)) }
+    fn clear(&mut self) -> Result<(), String> { self.settings = None; resume::clear(Path::new(JOURNAL)) }
     fn hotspot(&mut self) -> (bool, bool) { (hotspot::owner_off("wlan2"), hotspot::off_by_owner("wlan2")) }
     fn recover(&mut self) -> Result<(), String> {
         let routed = routes_journaled(Path::new(JOURNAL));
@@ -633,7 +648,8 @@ impl controller::Port for DevicePort {
         }
         // A validated replacement owns the next restart choice only once it
         // succeeds. Until then, do not silently restart the previous network.
-        if cancel.target.is_none() { resume::clear(root)?; }
+        if cancel.target.is_none() { self.settings = None; resume::clear(root)?; }
+        self.control = None;
         let old = state.session.take();
         self.publish(state);
         // Between 5 GHz upstreams the station and hotspot are handed over
@@ -725,8 +741,7 @@ impl controller::Port for DevicePort {
             session.uplink.update(|l| l.relay = Some(relay_layout(&lease, lan_ip, lan_mask)))?;
             session.network.declare(vec![rule])?;
             session.routed = true;
-            let route = Cmd::new("ip", &["-4", "route", "get", "1.1.1.1"]).run()?;
-            if !route.contains(&format!("dev {IFACE}")) {
+            if !crate::mihomo::egress::relay_route(false) {
                 return Err("Firmware policy routing did not select the Wi-Fi upstream".into());
             }
             // CPU-path help and hardware forwarding are optional: the relay
@@ -777,7 +792,7 @@ impl controller::Port for DevicePort {
     }
 
     fn persist(&mut self, selection: &Selection, ipv6: bool, remember: bool) -> Option<String> {
-        let mut error = None;
+        self.settings = None; let mut error = None;
         if let Err(problem) = saved::remember(&selection.network, remember.then_some(selection.password.as_str())) { error = Some(format!("Relay connected, but {problem}")); }
         let kept = selection.network.security == "open" || saved::password(&selection.network).ok().flatten().is_some_and(|password| password == selection.password);
         if kept {
@@ -786,10 +801,12 @@ impl controller::Port for DevicePort {
         error
     }
 
-    fn cleanup(&mut self, session: &mut Session) -> Result<(), String> { cleanup(session, || self.uplink_changed()) }
+    fn cleanup(&mut self, session: &mut Session) -> Result<(), String> { self.control = None; cleanup(session, || self.uplink_changed()) }
     fn observe_link(&mut self) -> (Option<String>, u128) {
         let started = Instant::now();
-        let status = scan::status(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT)).ok();
+        if self.control.is_none() { self.control = scan::Ctrl::attach(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT)).ok(); }
+        let status = self.control.as_mut().and_then(|ctrl| ctrl.status().ok());
+        if status.is_none() { self.control = None; }
         (status.as_deref().and_then(|text| net::key(text, "wpa_state")).map(str::to_owned), started.elapsed().as_millis())
     }
     fn observe(&mut self, session: &mut Session) -> Observation {
@@ -826,12 +843,12 @@ impl controller::Port for DevicePort {
     }
     fn uplink_changed(&self) { DevicePort::uplink_changed(self); }
     fn power_save(&mut self, state: &mut State, auto_off: bool) -> Result<(), String> {
-        power_save::save(Path::new(JOURNAL), auto_off)?;
+        self.settings = None; power_save::save(Path::new(JOURNAL), auto_off)?;
         let result = state.session.as_mut().map_or(Ok(()), |session| session.power_save.set(&mut session.network, auto_off));
         result.map_err(|error| format!("Setting saved. {error}"))
     }
     fn offload(&mut self, state: &mut State, enabled: bool) -> Result<Option<Value>, String> {
-        offload::set_enabled(enabled)?;
+        self.settings = None; offload::set_enabled(enabled)?;
         crate::netlog!("[relay] hardware forwarding switched {}", if enabled { "on" } else { "off" });
         let Some(session) = state.session.as_mut() else { return Ok(None) };
         let changed_at = Instant::now();
@@ -845,7 +862,7 @@ impl controller::Port for DevicePort {
             Err(error) => Err(error),
         }
     }
-    fn forget(&mut self, id: &str) -> Result<(), String> { saved::forget(id) }
+    fn forget(&mut self, id: &str) -> Result<(), String> { self.settings = None; saved::forget(id) }
     fn clock(&mut self) -> Result<(), String> { crate::network_clock::recheck_wifi() }
 }
 
@@ -1087,6 +1104,7 @@ fn stop_strays(spare: &[offload::Record]) -> Result<(), String> {
             let pid = entry.file_name().to_str()?.parse::<libc::pid_t>().ok()?;
             let cmdline = fs::read(entry.path().join("cmdline")).ok()?;
             let args: Vec<String> = cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+            if !matches!(args.first()?.rsplit('/').next()?, "wpa_supplicant" | "odhcp6c" | "udhcpc" | "ip" | "iw") { return None; }
             let status = fs::read_to_string(entry.path().join("status")).ok()?;
             let parent = status.lines().find_map(|l| l.strip_prefix("PPid:")).map(str::trim);
             let process = offload::Record { pid: pid as u32, start: crate::netfx::exec::process_start(pid as u32)? };
@@ -1720,7 +1738,7 @@ mod tests {
         assert_eq!(resume::clear(&root).unwrap_err(), "Cannot clear the relay to restore");
         let network = Network { id: "write-fails".into(), ssid: "Restore test".into(), frequency: 2412, signal: -40, security: "open", supported: true, bssid: "02:00:00:00:00:01".into() };
         assert_eq!(resume::save(&root, &network, true).unwrap_err(), "Cannot save the relay to restore after a restart");
-        let relay = WifiRelay::new(Arc::new(Mutex::new(())));
+        let relay = WifiRelay::new(Arc::new(crate::netfx::admission::Gate::new()));
         let generation = relay.shared.cancel_restore();
         assert!(!relay.shared.generation_matches(generation - 1));
         fs::remove_dir_all(root).unwrap();
@@ -1781,7 +1799,7 @@ mod tests {
     #[test]
     fn later_successful_clock_check_clears_relay_warning_without_reconnecting() {
         let clock = crate::network_clock::WifiClock::new();
-        let relay = WifiRelay::new(Arc::new(Mutex::new(())));
+        let relay = WifiRelay::new(Arc::new(crate::netfx::admission::Gate::new()));
         let error = "Cannot verify UTC over Wi-Fi HTTPS; check upstream/portal access";
         assert!(clock.sync_with(false, |_| Err(error.into())).is_err());
         relay.shared.snapshot.lock().unwrap().value = json!({

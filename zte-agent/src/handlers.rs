@@ -55,7 +55,7 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
-        let network_lock = Arc::new(std::sync::Mutex::new(()));
+        let network_lock = Arc::new(crate::netfx::admission::Gate::new());
         let mihomo = Arc::new(crate::mihomo::Mihomo::new(Arc::clone(&network_lock)));
         let dashboard = Arc::new(crate::dashboard::Dashboard::default());
         let ota = crate::ota::OtaManager::system(Arc::downgrade(&dashboard));

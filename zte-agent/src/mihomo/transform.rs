@@ -49,7 +49,7 @@ impl Extensions {
 }
 
 pub fn compile(source: &str, name: &str, extensions: &Extensions) -> Result<String, String> {
-    extensions.validate()?;
+    if extensions.merge.len() > MAX_EXTENSION || extensions.script.len() > MAX_EXTENSION { return Err("Each extension is limited to 128 KiB".into()); }
     let mut config = mapping(source)?;
     if extensions.merge_enabled && !extensions.merge.trim().is_empty() {
         overlay(&mut config, mapping(&extensions.merge)?)?;
@@ -62,8 +62,8 @@ pub fn compile(source: &str, name: &str, extensions: &Extensions) -> Result<Stri
             name: name.into(),
             script: extensions.script.clone(),
         })?;
-    }
-    mapping(&yaml)?;
+        mapping(&yaml)?;
+    } else if yaml.len() > MAX_CONFIG { return Err("Configuration exceeds 512 KiB".into()); }
     Ok(yaml)
 }
 

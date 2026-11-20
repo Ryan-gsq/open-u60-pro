@@ -1044,7 +1044,7 @@ async fn retained_network_ownership_has_explicit_cleanup_actions_without_reconne
 #[test]
 fn conflicting_device_setters_refuse_during_network_transactions() {
     let app = AppState::new();
-    let _network = app.network_lock.lock().unwrap();
+    let _network = crate::netfx::admission::enter(&app.network_lock, std::time::Duration::ZERO).unwrap();
     for path in ["/api/wifi/settings", "/api/wifi/guest", "/api/router/lan", "/api/usb/mode", "/api/router/firewall/switch", "/api/router/domain-filter"] {
         let (status, _) = crate::server::route(&crate::server::Method::Put, path, &app, b"{}");
         assert_eq!(status, 409, "{path}");

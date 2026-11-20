@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     decode_ssid, input_guards, lease_change, lease_file, net, network_id, offload, power_save, read_lease, relay_layout,
-    relay_plan, resolvers_acceptable, resume, start_dhcp, steering, validate_lease, wpa, Cmd, Helper, Lease,
+    relay_plan, resolvers_acceptable, resume, start_dhcp, steering, validate_lease, wpa, Helper, Lease,
     LeaseChange, Network, Session, EffectSet, IFACE, JOURNAL, ROOT,
 };
 
@@ -45,8 +45,7 @@ pub(super) fn adopt(target: &resume::Resume, lan_ip: Ipv4Addr, lan_mask: Ipv4Add
     let client = if target.ipv6 { super::ipv6::running_client() } else { None };
     let (old, installed) = installed_lease(Path::new(ROOT))?;
     let prefix = validate_lease(&installed, lan_ip, lan_mask)?;
-    let address = format!("{}/{prefix}", installed.ip);
-    if !Cmd::new("ip", &["-o", "-4", "addr", "show", "dev", IFACE]).run()?.split_whitespace().any(|w| w == address) {
+    if !crate::httpd::mobile::interfaces().map_err(|e| e.to_string())?.iter().any(|address| address.name == IFACE && address.addr == std::net::IpAddr::V4(installed.ip) && u32::from(address.prefix) == prefix) {
         return Err("the lease's address is not on the relay interface".into());
     }
     // From here on the previous agent's helpers change: its monitors go,

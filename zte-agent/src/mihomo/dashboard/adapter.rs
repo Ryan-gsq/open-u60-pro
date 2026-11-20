@@ -29,6 +29,10 @@ const REPLACEMENTS: &[(&str, &str)] = &[
     ),
 ];
 
+pub(super) fn slot(file: &str) -> Option<usize> {
+    match file { "index.html" => Some(0), MAIN => Some(1), _ => None }
+}
+
 pub(super) fn asset(file: &str, data: Vec<u8>) -> Result<Vec<u8>, &'static str> {
     let sha = match file {
         "index.html" => INDEX_SHA,

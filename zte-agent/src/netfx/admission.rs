@@ -3,7 +3,7 @@
 //! for a network operation in progress instead of failing at once, then
 //! check who owns the network and write.
 
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long an owner request waits before it answers "in progress".
@@ -32,6 +32,7 @@ struct Held {
 /// passes (section 4.6). The network lock only guards checking and
 /// registering them; nobody holds it across device work.
 static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
+static RELEASED: Condvar = Condvar::new();
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// `what` is held for at most `bound`; the id releases it.
@@ -44,10 +45,12 @@ pub fn occupy(what: &'static str, bound: Duration) -> u64 {
 /// Releases every occupation of `what`.
 pub fn release(what: &'static str) {
     HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|h| h.what != what);
+    RELEASED.notify_all();
 }
 
 fn release_id(id: u64) {
     HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|h| h.id != id);
+    RELEASED.notify_all();
 }
 
 /// Whether `what` is still held.
@@ -78,27 +81,27 @@ impl Drop for Claim {
 /// conflict (`conflict` says why: the relay or Mihomo owns the network),
 /// otherwise registers `what` until the claim is dropped, so a relay
 /// operation cannot start in the middle of the write.
-pub fn admit(lock: &Mutex<()>, what: &'static str, conflict: impl Fn() -> Option<String>) -> Result<Claim, String> {
+pub fn admit(lock: &Gate, what: &'static str, conflict: impl Fn() -> Option<String>) -> Result<Claim, String> {
     let deadline = Instant::now() + WAIT;
     loop {
-        if let Some(_guard) = enter(lock, Duration::ZERO) {
-            if !held(RELAY_OPERATION) {
-                if let Some(why) = conflict() {
-                    return Err(why);
-                }
-                return Ok(Claim(occupy(what, Duration::from_secs(600))));
-            }
+        let guard = enter(lock, deadline.saturating_duration_since(Instant::now())).ok_or(IN_PROGRESS)?;
+        let held = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        if let Some(until) = held.iter().filter(|h| h.what == RELAY_OPERATION && h.until > now).map(|h| h.until).min() {
+            if now >= deadline { return Err(IN_PROGRESS.into()); }
+            drop(guard);
+            drop(RELEASED.wait_timeout(held, until.min(deadline) - now).unwrap_or_else(std::sync::PoisonError::into_inner));
+        } else {
+            drop(held);
+            if let Some(why) = conflict() { return Err(why); }
+            return Ok(Claim(occupy(what, Duration::from_secs(600))));
         }
-        if Instant::now() >= deadline {
-            return Err(IN_PROGRESS.into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 /// A relay operation the owner asked for (or a boot restore): refused while
 /// one of `blockers` is held, registered as `what` until the claim drops.
-pub fn begin(lock: &Mutex<()>, what: &'static str, blockers: &[&'static str], wait: Duration) -> Result<Claim, String> {
+pub fn begin(lock: &Gate, what: &'static str, blockers: &[&'static str], wait: Duration) -> Result<Claim, String> {
     let _guard = enter(lock, wait).ok_or_else(|| IN_PROGRESS.to_owned())?;
     if let Some(blocker) = blockers.iter().find(|b| held(b)) {
         return Err(if *blocker == VENDOR_WIFI_RELOAD {
@@ -111,15 +114,24 @@ pub fn begin(lock: &Mutex<()>, what: &'static str, blockers: &[&'static str], wa
 }
 
 /// The lock within `wait`, or `None` when an operation still holds it.
-pub fn enter<T>(lock: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
-    let deadline = Instant::now() + wait;
-    loop {
-        match lock.try_lock() {
-            Ok(guard) => return Some(guard),
-            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Err(TryLockError::WouldBlock) => return None,
-        }
+pub fn enter(lock: &Gate, wait: Duration) -> Option<Permit<'_>> {
+    let held = lock.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut held, _) = lock.free.wait_timeout_while(held, wait, |held| *held).unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *held { return None; }
+    *held = true;
+    Some(Permit(lock))
+}
+
+#[derive(Default)]
+pub struct Gate { held: Mutex<bool>, free: Condvar }
+impl Gate {
+    pub const fn new() -> Self { Self { held: Mutex::new(false), free: Condvar::new() } }
+}
+pub struct Permit<'a>(&'a Gate);
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        *self.0.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.0.free.notify_one();
     }
 }
 
@@ -151,7 +163,7 @@ mod tests {
     #[test]
     fn writes_and_relay_operations_admit_each_other_in_short_sections() {
         let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let lock = Mutex::new(());
+        let lock = Gate::new();
         let relay = begin(&lock, RELAY_OPERATION, &[VENDOR_WRITE], WAIT).unwrap();
         let started = Instant::now();
         assert_eq!(admit(&lock, VENDOR_WRITE, || None).err().as_deref(), Some(IN_PROGRESS));
@@ -159,7 +171,7 @@ mod tests {
         drop(relay);
         assert_eq!(admit(&lock, VENDOR_WRITE, || Some("Disconnect Wi-Fi relay first".into())).err().as_deref(), Some("Disconnect Wi-Fi relay first"));
         let write = admit(&lock, VENDOR_WRITE, || None).unwrap();
-        assert!(lock.try_lock().is_ok(), "the lock is not held across the write");
+        assert!(enter(&lock, Duration::ZERO).is_some(), "the lock is not held across the write");
         assert!(begin(&lock, RELAY_OPERATION, &[VENDOR_WRITE], WAIT).unwrap_err().contains("router setting change"));
         drop(write);
         occupy(VENDOR_WIFI_RELOAD, Duration::from_secs(60));
@@ -173,18 +185,18 @@ mod tests {
 
     #[test]
     fn a_short_operation_is_waited_for_and_a_long_one_is_refused() {
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(Gate::new());
         let held = Arc::clone(&lock);
         let (started, ready) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let _guard = held.lock().unwrap();
+            let _guard = enter(&held, WAIT).unwrap();
             started.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(100));
         });
         ready.recv().unwrap();
         assert!(enter(&lock, Duration::from_secs(3)).is_some(), "released after 100 ms");
         worker.join().unwrap();
-        let _busy = lock.lock().unwrap();
+        let _busy = enter(&lock, WAIT).unwrap();
         let before = Instant::now();
         assert!(enter(&lock, Duration::from_millis(200)).is_none());
         assert!(before.elapsed() >= Duration::from_millis(200));
@@ -192,8 +204,8 @@ mod tests {
 
     #[test]
     fn relay_admission_also_stops_waiting_for_the_network_lock() {
-        let lock = Mutex::new(());
-        let _busy = lock.lock().unwrap();
+        let lock = Gate::new();
+        let _busy = enter(&lock, WAIT).unwrap();
         let started = Instant::now();
         assert_eq!(begin(&lock, "bounded relay admission test", &[], WAIT).unwrap_err(), IN_PROGRESS);
         assert!(started.elapsed() >= WAIT && started.elapsed() < Duration::from_secs(1));

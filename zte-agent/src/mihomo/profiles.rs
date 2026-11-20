@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn metadata_has_no_subscription_or_node_credentials() {
         let dir = std::env::temp_dir().join(format!("u60-profiles-{}", std::process::id()));
-        let mihomo = Mihomo::at(dir.clone(), Arc::new(std::sync::Mutex::new(())));
+        let mihomo = Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()));
         let mut library = seed(&mihomo, "secret: private-node\nrules: ['MATCH,DIRECT']");
         library.profiles[0].url = Some("https://example.com/?token=private-url".into());
         library.extensions.merge = "secret: private-extension-secret".into();
@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn status_is_parsed_once_per_change_of_the_library() {
         let dir = std::env::temp_dir().join(format!("u60-status-cache-{}", std::process::id()));
-        let mihomo = Mihomo::at(dir.clone(), Arc::new(std::sync::Mutex::new(())));
+        let mihomo = Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()));
         seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let first = mihomo.profile_status().unwrap();
         assert_eq!(first["selected"], "seed");
@@ -707,7 +707,7 @@ mod tests {
     #[test]
     fn identical_refresh_only_updates_metadata_without_compilation_or_validation() {
         let dir = std::env::temp_dir().join(format!("u60-refresh-identical-{}", std::process::id()));
-        let mihomo = Mihomo::at(dir.clone(), Arc::new(std::sync::Mutex::new(())));
+        let mihomo = Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()));
         let mut library = seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let profile = &mut library.profiles[0];
         profile.compiled = "previous compiled text".into();
@@ -725,7 +725,7 @@ mod tests {
     fn changed_selected_refresh_is_validated_by_the_controller_and_failed_commit_restores_library() {
         use super::super::controller::{Message, Phase};
         let dir = std::env::temp_dir().join(format!("u60-refresh-commit-{}", std::process::id()));
-        let mihomo = Mihomo::for_bridge(dir.clone(), Arc::new(std::sync::Mutex::new(())), "s".into());
+        let mihomo = Mihomo::for_bridge(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()), "s".into());
         let old = seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let mut next = old.clone();
         mihomo.refresh_source(&mut next.profiles[0], &next.extensions, "rules: ['MATCH,REJECT']".into(), true).unwrap();
@@ -767,7 +767,7 @@ mod tests {
             std::env::temp_dir().join(format!("u60-profile-start-race-{}", std::process::id()));
         let mihomo = Mihomo::for_bridge(
             dir.clone(),
-            Arc::new(std::sync::Mutex::new(())),
+            Arc::new(crate::netfx::admission::Gate::new()),
             "test-secret".into(),
         );
         let old = seed(&mihomo, "rules: ['MATCH,DIRECT']");
@@ -789,7 +789,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("u60-library-transaction-{}", std::process::id()));
-        let mihomo = Mihomo::at(dir.clone(), Arc::new(std::sync::Mutex::new(())));
+        let mihomo = Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()));
         net::write_private(&dir.join("mihomo"), b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(dir.join("mihomo"), fs::Permissions::from_mode(0o700)).unwrap();
         let request = |v: Value| serde_json::from_value::<Request>(v).unwrap();

@@ -632,15 +632,11 @@ impl DeviceEffects {
             .map(|v| v["enable"].as_u64() == Some(1) || v["enable"].as_str() == Some("1"))
     }
 
-    fn network_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+    fn network_guard(&self) -> Result<crate::netfx::admission::Permit<'_>, String> {
         // B31 reports the same enable=0 for our PDN pause and an off request
         // from the official panel/screen. Do not guess permission to re-enable.
         automatic_recovery_allowed()?;
-        let guard = self
-            .app
-            .network_lock
-            .try_lock()
-            .map_err(|_| "Network transition in progress")?;
+        let guard = crate::netfx::admission::enter(&self.app.network_lock, std::time::Duration::ZERO).ok_or("Network transition in progress")?;
         if self.app.wifi_relay.owns_network() {
             return Err("Wi-Fi relay owns the upstream; cellular recovery refused".into());
         }

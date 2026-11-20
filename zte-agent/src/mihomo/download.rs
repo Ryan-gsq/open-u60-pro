@@ -1,7 +1,7 @@
 //! One bounded HTTPS path for subscriptions, geodata and pinned assets. A
 //! running core is used explicitly; never silently retry through direct WAN.
 
-use super::{net, Mihomo};
+use super::Mihomo;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -64,28 +64,29 @@ impl Download {
     pub(super) fn bytes(&self, url: &str, max: u64, timeout: Duration) -> Result<Vec<u8>, String> {
         let mut url = https_url(url)?;
         let deadline = Instant::now() + timeout;
+        let mut cached = None;
         for _ in 0..=4 {
-            let mut builder = reqwest::blocking::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(10));
-            if let Some(secret) = &self.secret {
-                let proxy = reqwest::Proxy::https(format!("http://{PROXY}"))
-                    .map_err(|_| "Cannot configure the local download proxy")?
-                    .basic_auth(USER, secret);
-                builder = builder.proxy(proxy);
-            } else if !self.dns.is_empty() {
-                if let Some(host) = url.domain() {
-                    builder = builder.resolve_to_addrs(host, &lookup(host, &self.dns, deadline)?);
+            let domain = if self.secret.is_none() && !self.dns.is_empty() { url.domain().map(str::to_owned) } else { None };
+            if cached.as_ref().is_none_or(|(previous, _)| *previous != domain) {
+                let mut builder = reqwest::blocking::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(10));
+                if let Some(secret) = &self.secret {
+                    let proxy = reqwest::Proxy::https(format!("http://{PROXY}"))
+                        .map_err(|_| "Cannot configure the local download proxy")?
+                        .basic_auth(USER, secret);
+                    builder = builder.proxy(proxy);
+                } else if !self.dns.is_empty() {
+                    if let Some(host) = url.domain() {
+                        builder = builder.resolve_to_addrs(host, &lookup(host, &self.dns, deadline)?);
+                    }
                 }
+                cached = Some((domain, builder.build().map_err(|_| "Cannot initialize HTTPS download")?));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err("Download timed out".into());
-            }
-            let client = builder
-                .build()
-                .map_err(|_| "Cannot initialize HTTPS download")?;
+            if remaining.is_zero() { return Err("Download timed out".into()); }
+            let (_, client) = cached.as_ref().unwrap();
             let response = client.get(url.clone()).timeout(remaining)
                 .header("User-Agent", format!("clash.meta/{}", super::VERSION))
                 .header("Accept", "*/*").send().map_err(|_| if self.secret.is_some() {
@@ -135,55 +136,16 @@ fn lookup(host: &str, dns: &[Ipv4Addr], deadline: Instant) -> Result<Vec<SocketA
         if remaining.is_zero() {
             break;
         }
-        let mut cmd = std::process::Command::new("nslookup");
-        cmd.args([host, &server.to_string()]);
-        if let Ok(text) = net::run(cmd, remaining) {
-            let addresses = lookup_addresses(&text);
-            if !addresses.is_empty() {
-                return Ok(addresses);
-            }
+        if let Ok(answers) = super::dns::upstream(host, *server, Instant::now() + remaining) {
+            if !answers.is_empty() { return Ok(answers); }
         }
     }
     Err("Download hostname could not be resolved through upstream Wi-Fi DNS".into())
 }
 
-fn lookup_addresses(text: &str) -> Vec<SocketAddr> {
-    let mut answers = false;
-    let mut addresses = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if line.starts_with("Name:") {
-            answers = true;
-        }
-        if !answers || !line.starts_with("Address") {
-            continue;
-        }
-        if let Some(ip) = line
-            .split_once(':')
-            .and_then(|(_, value)| value.split_whitespace().next())
-            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        {
-            if !ip.is_unspecified() && !ip.is_multicast() {
-                addresses.push(SocketAddr::new(ip, 0));
-            }
-        }
-    }
-    addresses.sort_unstable();
-    addresses.dedup();
-    addresses.truncate(16);
-    addresses
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn upstream_dns_parser_ignores_server_and_accepts_both_answer_formats() {
-        let addresses = lookup_addresses("Server: upstream\nAddress: 192.168.2.1:53\nName: service.test\nAddress: 203.0.113.8\nName: service.test\nAddress 1: 2001:db8::8 service.test\n");
-        assert_eq!(addresses.len(), 2);
-        assert!(addresses.contains(&"203.0.113.8:0".parse().unwrap()));
-        assert!(addresses.contains(&"[2001:db8::8]:0".parse().unwrap()));
-        assert!(lookup_addresses("Server: upstream\nAddress: 192.168.2.1:53\nNXDOMAIN").is_empty());
-    }
     #[test]
     fn downloads_never_allow_insecure_redirects() {
         for url in [

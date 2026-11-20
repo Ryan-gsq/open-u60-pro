@@ -51,69 +51,91 @@ fn run_with_input(
     let mut child = command
         .spawn()
         .map_err(|e| format!("Cannot run device tool: {e}"))?;
-    let writer = input.map(|bytes| {
-        let mut stdin = child.stdin.take().unwrap();
-        std::thread::spawn(move || stdin.write_all(&bytes))
-    });
-    // Drain both pipes while waiting; a verbose tool must not deadlock on a full pipe.
-    let read = |pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let r = pipe.take(256 * 1024 + 1).read_to_end(&mut bytes);
-            (r, bytes)
-        })
-    };
-    let stdout = child.stdout.take().map(|pipe| read(Box::new(pipe)));
-    let stderr = child.stderr.take().map(|pipe| read(Box::new(pipe)));
+    let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
-    // These tools usually finish within a few milliseconds; a fixed 20 ms
-    // poll made every one of the hundreds of firewall/route commands wait
-    // for it. Back off from 1 ms so long-running tools still poll cheaply.
-    let mut pause = Duration::from_millis(1);
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(pause);
-                pause = (pause * 2).min(Duration::from_millis(20));
-            }
-            _ => {
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err("Device tool timed out".to_owned());
+    let result = pump(&mut child, input.as_deref().unwrap_or_default(), deadline, capture_stdout);
+    // A successful tool may leave descendants holding its pipes. Kill the
+    // process group on every exit path, including a pipe setup/read error.
+    unsafe { libc::kill(-pid, libc::SIGKILL); }
+    let _ = child.wait();
+    result
+}
+
+fn pump(child: &mut Child, mut input: &[u8], deadline: Instant, capture_stdout: bool) -> Result<(ExitStatus, String), String> {
+    use std::os::fd::AsRawFd;
+    let (mut stdin, mut stdout, mut stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut input_failed = false;
+    let mut exited = None;
+    let pid = child.id() as i32;
+    let descriptor = |fd, events| libc::pollfd { fd, events, revents: 0 };
+    let io_error = |e: std::io::Error| format!("Device tool I/O failed: {e}");
+    // pidfds wake poll on process exit even when a grandchild inherited a pipe.
+    // Older kernels and the development Mac use a bounded waitpid fallback.
+    #[cfg(target_os = "linux")]
+    let process = {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    #[cfg(not(target_os = "linux"))]
+    let process: Option<std::os::fd::OwnedFd> = None;
+    for fd in [stdin.as_ref().map(AsRawFd::as_raw_fd), stdout.as_ref().map(AsRawFd::as_raw_fd), stderr.as_ref().map(AsRawFd::as_raw_fd)].into_iter().flatten() {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 { return Err(io_error(std::io::Error::last_os_error())); }
+    }
+    loop {
+        if exited.is_none() {
+            exited = child.try_wait().map_err(io_error)?;
+            if exited.is_some() { unsafe { libc::kill(-pid, libc::SIGKILL); } }
+        }
+        if input.is_empty() || exited.is_some() { stdin.take(); }
+        if let Some(status) = exited {
+            if stdout.is_none() && stderr.is_none() {
+                if status.success() && (input_failed || !input.is_empty()) { return Err("Device tool input failed".into()); }
+                let bytes = if capture_stdout { out } else { err };
+                return Ok((status, String::from_utf8_lossy(&bytes).trim().to_owned()));
             }
         }
-    };
-    // A tool can exit successfully while leaving a background child holding
-    // stdout/stderr. These tools are synchronous; no descendants are owned.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let collect = |reader: Option<std::thread::JoinHandle<(std::io::Result<usize>, Vec<u8>)>>| {
-        reader.map_or(Ok(Vec::new()), |r| r.join().map(|(_, bytes)| bytes).map_err(|_| "Device tool reader failed"))
-    };
-    let out = collect(stdout)?;
-    let err = collect(stderr)?;
-    let written = writer.map(|writer| {
-        writer
-            .join()
-            .map_err(|_| "Device tool input failed")
-            .and_then(|r| r.map_err(|_| "Device tool input failed"))
-    });
-    let status = result?;
-    if out.len() > 256 * 1024 || err.len() > 256 * 1024 {
-        return Err("Device tool output exceeded its limit".into());
-    }
-    if status.success() {
-        if let Some(written) = written {
-            written?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { return Err("Device tool timed out".into()); }
+        let mut fds = [descriptor(stdin.as_ref().map_or(-1, AsRawFd::as_raw_fd), libc::POLLOUT),
+            descriptor(stdout.as_ref().map_or(-1, AsRawFd::as_raw_fd), libc::POLLIN),
+            descriptor(stderr.as_ref().map_or(-1, AsRawFd::as_raw_fd), libc::POLLIN),
+            descriptor(process.as_ref().filter(|_| exited.is_none()).map_or(-1, AsRawFd::as_raw_fd), libc::POLLIN)];
+        let wait = if process.is_some() { left } else { left.min(Duration::from_millis(10)) };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, wait.as_millis().clamp(1, i32::MAX as u128) as i32) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(io_error(error));
         }
+        if let Some(pipe) = stdin.as_mut().filter(|_| fds[0].revents != 0) {
+            match pipe.write(input) {
+                Ok(n) if n > 0 => input = &input[n..],
+                Err(e) if transient(&e) => (),
+                _ => { stdin.take(); input_failed = true; }
+            }
+        }
+        if fds[1].revents != 0 { read_pipe(&mut stdout, &mut out)?; }
+        if fds[2].revents != 0 { read_pipe(&mut stderr, &mut err)?; }
     }
-    let answer = if capture_stdout { out } else { err };
-    Ok((status, String::from_utf8_lossy(&answer).trim().to_owned()))
+}
+
+fn transient(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted)
+}
+
+fn read_pipe(pipe: &mut Option<impl Read>, bytes: &mut Vec<u8>) -> Result<(), String> {
+    let mut buffer = [0; 8192];
+    match pipe.as_mut().unwrap().read(&mut buffer) {
+        Ok(0) => { pipe.take(); }
+        Ok(n) if bytes.len() + n <= 256 * 1024 => bytes.extend_from_slice(&buffer[..n]),
+        Ok(_) => return Err("Device tool output exceeded its limit".into()),
+        Err(e) if transient(&e) => (),
+        Err(e) => return Err(format!("Device tool output failed: {e}")),
+    }
+    Ok(())
 }
 
 /// The child cannot outlive the agent on Linux, unless its exec changes the

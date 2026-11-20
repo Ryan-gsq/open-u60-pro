@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use crate::netfx::files::Stamp;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -17,13 +17,13 @@ const BASE: &str = "https://github.com/MetaCubeX/meta-rules-dat/releases/downloa
 const RAW: &str = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Asset {
+pub(super) struct Asset {
     remote: &'static str,
     local: &'static str,
     limit: u64,
 }
 
-fn required(config: &Value) -> Vec<Asset> {
+pub(super) fn required(config: &Value) -> Vec<Asset> {
     fn contains(value: &Value, needle: &str) -> bool {
         match value {
             Value::String(s) => {
@@ -47,16 +47,10 @@ fn required(config: &Value) -> Vec<Asset> {
     }
     // mihomo v1.19.33 also loads databases for the sniffer's `geosite:` and
     // `geoip:` entries (config/config.go parseSniffer) during `-t`.
-    let references = Value::Sequence(vec![
-        config["rules"].clone(),
-        config["sub-rules"].clone(),
-        config["rule-providers"].clone(),
-        config["dns"].clone(),
-        config["sniffer"].clone(),
-    ]);
+    let references = |needle| ["rules", "sub-rules", "rule-providers", "dns", "sniffer"].iter().any(|key| contains(&config[*key], needle));
     let mut assets = Vec::new();
-    if contains(&references, "GEOSITE,")
-        || contains(&references, "GEOSITE:")
+    if references("GEOSITE,")
+        || references("GEOSITE:")
         || config["dns"]["fallback-filter"]["geosite"]
             .as_sequence()
             .is_some_and(|v| !v.is_empty())
@@ -67,8 +61,8 @@ fn required(config: &Value) -> Vec<Asset> {
             limit: 16 * 1024 * 1024,
         });
     }
-    if contains(&references, "GEOIP,")
-        || contains(&references, "GEOIP:")
+    if references("GEOIP,")
+        || references("GEOIP:")
         || config["dns"]["fallback-filter"]["geoip"].as_bool() == Some(true)
         || config["dns"]["fallback"].as_sequence().is_some_and(|v| {
             !v.is_empty() && config["dns"]["fallback-filter"]["geoip"].as_bool() != Some(false)
@@ -88,7 +82,7 @@ fn required(config: &Value) -> Vec<Asset> {
             }
         });
     }
-    if contains(&references, "IP-ASN,") {
+    if references("IP-ASN,") {
         assets.push(Asset {
             remote: "GeoLite2-ASN.mmdb",
             local: "ASN.mmdb",
@@ -98,10 +92,14 @@ fn required(config: &Value) -> Vec<Asset> {
     assets
 }
 
+#[cfg(test)]
 pub(super) fn bypass_notice(config: &str, bypass: bool) -> Option<String> {
     let config: Value = serde_yaml_ng::from_str(config).ok()?;
-    (bypass && config["geodata-mode"].as_bool() != Some(true)
-        && required(&config).iter().any(|asset| asset.local == "geoip.metadb"))
+    notice(&required(&config), bypass)
+}
+
+pub(super) fn notice(assets: &[Asset], bypass: bool) -> Option<String> {
+    (bypass && assets.iter().any(|asset| asset.local == "geoip.metadb"))
         .then(|| "GEOIP rules cannot bypass the core while geodata-mode is off (the kernel needs GeoIP.dat). The core keeps using its configured database.".into())
 }
 
@@ -126,32 +124,13 @@ pub(super) fn prepare(
 ) -> Result<(), String> {
     let config: Value =
         serde_yaml_ng::from_str(config).map_err(|_| "Invalid managed configuration")?;
-    prepare_with(root, &required(&config), |url, max| {
+    prepare_assets(root, &required(&config), download)
+}
+
+pub(super) fn prepare_assets(root: &Path, assets: &[Asset], download: &super::download::Download) -> Result<(), String> {
+    prepare_with(root, assets, |url, max| {
         download.bytes(url, max, std::time::Duration::from_secs(60))
     })
-}
-
-/// The identity of a database file as last hashed. A replacement (new inode),
-/// a size change or any rewrite (which moves the change time) re-hashes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stamp {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    mtime: (i64, i64),
-    ctime: (i64, i64),
-}
-
-impl Stamp {
-    fn of(metadata: &fs::Metadata) -> Self {
-        Self {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-            len: metadata.len(),
-            mtime: (metadata.mtime(), metadata.mtime_nsec()),
-            ctime: (metadata.ctime(), metadata.ctime_nsec()),
-        }
-    }
 }
 
 /// Per-database digests, so repeated fingerprints of unchanged files do not
@@ -186,7 +165,7 @@ impl Digests {
             digest.update(&buf[..n]);
         }
         // Empty, or changed while it was read: never a reusable identity.
-        if length == 0 || length != stamp.len {
+        if length == 0 || length != stamp.len || file.get_ref().metadata().ok().map(|m| Stamp::of(&m)) != Some(stamp) {
             known.remove(asset.local);
             return None;
         }
@@ -198,10 +177,15 @@ impl Digests {
 
 /// Hash the actual databases consumed by validation, not just the YAML that
 /// names them. Missing/unreadable/oversized dependencies disable cache reuse.
+#[cfg(test)]
 pub(super) fn validation_inputs(root: &Path, config: &str, digests: &Digests) -> Option<String> {
     let config: Value = serde_yaml_ng::from_str(config).ok()?;
+    inputs(root, &required(&config), digests)
+}
+
+pub(super) fn inputs(root: &Path, assets: &[Asset], digests: &Digests) -> Option<String> {
     let mut digest = Sha256::new();
-    for asset in required(&config) {
+    for asset in assets {
         digest.update(asset.local.as_bytes());
         digest.update(digests.of(&root.join(asset.local), &asset)?);
     }
@@ -212,11 +196,9 @@ fn file_matches(path: &Path, sha: &str, limit: u64) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
     };
-    let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes).is_ok()
-        && !bytes.is_empty()
-        && bytes.len() as u64 <= limit
-        && format!("{:x}", Sha256::digest(&bytes)) == sha
+    let mut hash = Sha256::new();
+    std::io::copy(&mut file.take(limit + 1), &mut hash).is_ok_and(|n| n > 0 && n <= limit)
+        && format!("{:x}", hash.finalize()) == sha
 }
 
 fn prepare_with(

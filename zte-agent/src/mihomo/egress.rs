@@ -277,6 +277,10 @@ pub(super) fn v6_due(since: Instant, last: Option<Instant>) -> Instant {
 /// The kernel's route lookup for one destination over rtnetlink: the
 /// `RTM_GETROUTE` request `ip route get <to>` sends (same policy rules, no
 /// mark), and its answer's output interface, gateway and preferred source.
+pub(crate) fn relay_route(v6: bool) -> bool {
+    netlink::route_get(PROBES[usize::from(v6)].parse().unwrap()).is_some_and(|(route, _)| route.device == RELAY_IFACE)
+}
+
 mod netlink {
     // Only Linux asks the kernel; elsewhere the parsing is for tests.
     #![cfg_attr(not(target_os = "linux"), allow(dead_code))]

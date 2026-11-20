@@ -30,7 +30,7 @@ mod core;
 pub mod dashboard;
 mod dns;
 mod download;
-mod egress;
+pub(crate) mod egress;
 mod geodata;
 mod geoip;
 mod intercept;
@@ -175,7 +175,7 @@ impl Mihomo {
     }
 
     pub fn running(&self) -> bool {
-        self.snapshot().running()
+        self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).running()
     }
 
     /// How much public LAN IPv4 the core intercepts: `all`, `rules` (what
@@ -197,8 +197,8 @@ impl Mihomo {
     }
 
     pub fn secret(&self) -> Option<String> {
-        let s = self.snapshot();
-        s.running().then_some(s.secret).flatten()
+        let s = self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.running() { s.secret.clone() } else { None }
     }
 
     pub fn dashboard_root(&self) -> PathBuf {
@@ -335,10 +335,34 @@ impl Mihomo {
         })
     }
 
-    fn validation_fingerprint(&self, config: &str, secret: &str) -> Option<String> {
+    fn validate_candidate(&self, config: &str, secret: &str, assets: &[geodata::Asset], serving: bool) -> Result<(), String> {
+        geodata::prepare_assets(&self.root, assets, &self.downloader())?;
+        let fingerprint = self.validation_fingerprint(config, secret, assets);
+        let reused = fingerprint.as_ref().is_some_and(|key| self.validated_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(key));
+        if reused {
+            crate::netlog!("[mihomo] validation reused");
+        } else {
+            net::write_private(&self.root.join("candidate.yaml"), config.as_bytes())?;
+            let checked = self.check_with("candidate.yaml", serving);
+            let _ = fs::remove_file(self.root.join("candidate.yaml"));
+            checked?;
+            // Only dependencies that stayed the same across the check passed it.
+            let after = self.validation_fingerprint(config, secret, assets);
+            if let Some(key) = fingerprint.filter(|key| after.as_ref() == Some(key)) {
+                let mut validated = self.validated_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                validated.retain(|k| *k != key);
+                validated.insert(0, key);
+                validated.truncate(VALIDATIONS_KEPT);
+                remember_validation(&self.root, &validated);
+            }
+        }
+        Ok(())
+    }
+
+    fn validation_fingerprint(&self, config: &str, secret: &str, assets: &[geodata::Asset]) -> Option<String> {
         use std::os::unix::fs::MetadataExt;
         let core = fs::metadata(self.root.join("mihomo")).ok()?;
-        let dependencies = geodata::validation_inputs(&self.root, config, &self.digests)?;
+        let dependencies = geodata::inputs(&self.root, assets, &self.digests)?;
         Some(format!(
             "{}:{dependencies}:{}:{}:{}:{}:{}",
             config_fingerprint(config, secret),
@@ -536,7 +560,7 @@ impl controller::Port for DevicePort {
         self.m.operation.try_lock().is_err().then(|| "A Mihomo operation is in progress".into())
     }
 
-    fn prepare(&mut self, source: &Source, serving: bool) -> Result<Prepared, String> {
+    fn prepare(&mut self, source: &Source, _serving: bool) -> Result<Prepared, String> {
         let m = &self.m;
         let prepared = match source {
             Source::Previous(previous) => (**previous).clone(),
@@ -546,9 +570,8 @@ impl controller::Port for DevicePort {
                 let refresh = matches!(source, Source::Refresh(_));
                 let bypass = if refresh { previous.bypass } else { m.root.join(BYPASS).is_file() };
                 let source = if refresh { m.selected_source()? } else { previous.source.clone() };
-                let (managed, routes) = config_with_lan_host(&source, &previous.secret, Some((&previous.local, lan)), bypass)?;
-                let running: Yaml = serde_yaml_ng::from_str(&previous.config).map_err(|_| "Cannot parse the running configuration")?;
-                let mut config: Yaml = serde_yaml_ng::from_str(&managed).map_err(|_| "Cannot parse managed configuration")?;
+                let (mut config, routes) = managed_mapping(&source, &previous.secret, Some((&previous.local, lan)), bypass)?;
+                let running = &previous.facts.runtime;
                 let map = config.as_mapping_mut().ok_or("Mihomo YAML must be a mapping")?;
                 for key in ["interface-name", "mode", "log-level"] {
                     match running.get(key) {
@@ -562,9 +585,10 @@ impl controller::Port for DevicePort {
                     }
                 }
                 let dns = routes.dns(bypass);
+                let facts = reload::Facts::from(&config);
                 let config = serde_yaml_ng::to_string(&config).map_err(|_| "Cannot encode managed configuration")?;
-                let notice = geodata::bypass_notice(&config, bypass);
-                Prepared { secret: previous.secret.clone(), local: previous.local.clone(), runtime: previous.runtime.clone(), routes, dns, bypass, notice, source, config }
+                let notice = geodata::notice(&facts.assets, bypass);
+                Prepared { secret: previous.secret.clone(), local: previous.local.clone(), runtime: previous.runtime.clone(), routes, dns, bypass, notice, source, config, facts }
             }
             Source::Selected { local, runtime } => {
                 let local = if local.is_empty() { self.local.clone() } else { local.clone() };
@@ -575,12 +599,11 @@ impl controller::Port for DevicePort {
                 let lan = lan_address()?;
                 self.lan = Some(lan);
                 let bypass = m.root.join(BYPASS).is_file();
-                let (managed, routes) = config_with_lan_host(&source, &secret, Some((&local, lan)), bypass)?;
+                let (mut config, routes) = managed_mapping(&source, &secret, Some((&local, lan)), bypass)?;
                 let dns = routes.dns(bypass);
-                let mut config: Yaml = serde_yaml_ng::from_str(&managed).map_err(|_| "Cannot parse managed configuration")?;
                 // A user may have disabled cellular data while Wi-Fi is offline. Keep
                 // the core available without creating a route or enabling the modem.
-                if Cmd::new("ip", &["-4", "route", "get", "1.1.1.1"]).run().is_ok_and(|route| route.contains(&format!("dev {}", ids::RELAY_IFACE))) {
+                if egress::relay_route(false) {
                     check_clock();
                     config.as_mapping_mut().unwrap().insert(Yaml::from("interface-name"), Yaml::from(ids::RELAY_IFACE));
                 }
@@ -591,35 +614,24 @@ impl controller::Port for DevicePort {
                     config.as_mapping_mut().unwrap().insert(Yaml::from(key), Yaml::from(value));
                 }
                 let runtime = json!({"mode": config["mode"].as_str().unwrap_or("rule"), "log-level": config["log-level"].as_str().unwrap_or("info")});
+                let facts = reload::Facts::from(&config);
                 let config = serde_yaml_ng::to_string(&config).map_err(|_| "Cannot encode managed configuration")?;
-                let notice = geodata::bypass_notice(&config, bypass);
-                Prepared { secret, local, runtime, routes, dns, bypass, notice, source, config }
+                let notice = geodata::notice(&facts.assets, bypass);
+                Prepared { secret, local, runtime, routes, dns, bypass, notice, source, config, facts }
             }
         };
-        geodata::prepare(&m.root, &prepared.config, &m.downloader())?;
-        let fingerprint = m.validation_fingerprint(&prepared.config, &prepared.secret);
-        let reused = fingerprint.as_ref().is_some_and(|key| m.validated_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(key));
-        if reused {
-            crate::netlog!("[mihomo] validation reused");
-        } else {
-            net::write_private(&m.root.join("candidate.yaml"), prepared.config.as_bytes())?;
-            let checked = m.check_with("candidate.yaml", serving);
-            let _ = fs::remove_file(m.root.join("candidate.yaml"));
-            checked?;
-            // Only dependencies that stayed the same across the check passed it.
-            let after = m.validation_fingerprint(&prepared.config, &prepared.secret);
-            if let Some(key) = fingerprint.filter(|key| after.as_ref() == Some(key)) {
-                let mut validated = m.validated_config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                validated.retain(|k| *k != key);
-                validated.insert(0, key);
-                validated.truncate(VALIDATIONS_KEPT);
-                remember_validation(&m.root, &validated);
-            }
-        }
         if self.lan.is_none() {
             self.lan = Some(lan_address()?);
         }
         Ok(prepared)
+    }
+
+    fn validator(&self, prepared: &Prepared, serving: bool) -> Option<controller::Validation> {
+        let m = Arc::clone(&self.m);
+        let config = prepared.config.clone();
+        let secret = prepared.secret.clone();
+        let assets = prepared.facts.assets.clone();
+        Some(Box::new(move || m.validate_candidate(&config, &secret, &assets, serving)))
     }
 
     fn ports_free(&mut self) -> Result<(), String> {
@@ -856,11 +868,11 @@ impl controller::CoreHandle for core::Core {
 /// every configured rule set present.
 fn reload_findings(prepared: &Prepared, configs: Option<&Value>, proxies: Option<&Value>, providers: Option<&Value>, before: &routing::Selected) -> Result<(), String> {
     let configs = configs.ok_or("Mihomo did not report its settings")?;
-    let config: Yaml = serde_yaml_ng::from_str(&prepared.config).map_err(|_| "Invalid configuration")?;
+    let facts = &prepared.facts;
     if configs["mode"].as_str() != prepared.runtime["mode"].as_str() {
         return Err(format!("the mode is {}", configs["mode"]));
     }
-    if configs["interface-name"].as_str().unwrap_or("") != config["interface-name"].as_str().unwrap_or("") {
+    if configs["interface-name"].as_str().unwrap_or("") != facts.runtime["interface-name"].as_str().unwrap_or("") {
         return Err("the egress interface changed".into());
     }
     let selected = proxies.and_then(routing::selected_from).ok_or("Mihomo did not report its groups")?;
@@ -870,7 +882,7 @@ fn reload_findings(prepared: &Prepared, configs: Option<&Value>, proxies: Option
     let listing = proxies.ok_or("Mihomo did not report its groups")?;
     for (group, old) in before {
         let Some(current) = selected.get(group) else {
-            if config["proxy-groups"].as_sequence().is_some_and(|groups| groups.iter().any(|entry| entry["name"].as_str() == Some(group))) {
+            if facts.groups.iter().any(|(name, _)| name == group) {
                 return Err("a configured group is missing".into());
             }
             continue;
@@ -879,13 +891,13 @@ fn reload_findings(prepared: &Prepared, configs: Option<&Value>, proxies: Option
             return Err("a group's choice changed while its previous member still exists".into());
         }
     }
-    for group in config["proxy-groups"].as_sequence().into_iter().flatten().filter(|group| group["type"].as_str() == Some("select")) {
-        if group["name"].as_str().is_none_or(|name| !selected.contains_key(name)) {
+    for (name, selector) in &facts.groups {
+        if *selector && !selected.contains_key(name) {
             return Err("a configured selector is missing".into());
         }
     }
     let providers = providers.ok_or("Mihomo did not report its rule sets")?;
-    if config["rule-providers"].as_mapping().into_iter().flatten().filter_map(|(name, _)| name.as_str()).any(|name| providers["providers"][name]["ruleCount"].as_u64().is_none_or(|count| count == 0)) {
+    if facts.providers.iter().any(|name| providers["providers"][name]["ruleCount"].as_u64().is_none_or(|count| count == 0)) {
         return Err("a configured rule set is missing or empty".into());
     }
     Ok(())
@@ -1048,6 +1060,12 @@ fn config_with_lan_host(
     local: Option<(&str, std::net::Ipv4Addr)>,
     bypass: bool,
 ) -> Result<(String, routing::Routes), String> {
+    let (mapping, routes) = managed_mapping(source, secret, local, bypass)?;
+    let text = serde_yaml_ng::to_string(&mapping).map_err(|_| "Cannot encode Mihomo configuration")?;
+    Ok((text, routes))
+}
+
+fn managed_mapping(source: &str, secret: &str, local: Option<(&str, std::net::Ipv4Addr)>, bypass: bool) -> Result<(Yaml, routing::Routes), String> {
     if source.len() > MAX_CONFIG {
         return Err("Configuration exceeds 512 KiB".into());
     }
@@ -1218,8 +1236,7 @@ fn config_with_lan_host(
         );
     }
     validate_dns_routes(&root)?;
-    let text = serde_yaml_ng::to_string(&root).map_err(|_| "Cannot encode Mihomo configuration")?;
-    Ok((text, routes))
+    Ok((root, routes))
 }
 
 // Mihomo interprets an unknown bare DNS URL fragment as SO_BINDTODEVICE,
@@ -1376,17 +1393,10 @@ pub(crate) fn nft_command(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Whether some socket listens on `port` (`/proc/net/tcp*`, hex port, state 0A).
+/// A successful loopback TCP handshake confirms a listener without dumping all sockets.
 fn listening(port: u16) -> bool {
-    let needle = format!(":{port:04X} ");
-    ["/proc/net/tcp6", "/proc/net/tcp"].iter().any(|path| {
-        fs::read_to_string(path).is_ok_and(|text| {
-            text.lines().skip(1).any(|line| {
-                let f: Vec<&str> = line.split_whitespace().collect();
-                f.len() > 3 && format!("{} ", f[1]).ends_with(&needle) && f[3] == "0A"
-            })
-        })
-    })
+    [std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)].into_iter()
+        .any(|ip| std::net::TcpStream::connect_timeout(&(ip, port).into(), Duration::from_millis(75)).is_ok())
 }
 
 pub fn status(state: &crate::handlers::AppState) -> (u16, Value) {
@@ -1481,7 +1491,7 @@ mod tests {
         assert!(remembered_validation(&dir).is_empty(), "another boot's validation is not reused");
         remember_validation(&dir, &[]);
         assert!(!dir.join(VALIDATED).exists());
-        assert!(Mihomo::at(dir.clone(), Arc::new(Mutex::new(()))).validated_config.lock().unwrap().is_empty());
+        assert!(Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new())).validated_config.lock().unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1489,7 +1499,7 @@ mod tests {
     fn slow_profile_status_does_not_hold_dashboard_runtime_mutex() {
         let m = Arc::new(Mihomo::for_bridge(
             std::env::temp_dir(),
-            Arc::new(Mutex::new(())),
+            Arc::new(crate::netfx::admission::Gate::new()),
             "fixture".into(),
         ));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -1615,10 +1625,10 @@ mod tests {
     #[test]
     fn mihomo_never_waits_for_the_relays_network_lock() {
         let dir = std::env::temp_dir().join(format!("u60-core-cac-{}", std::process::id()));
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(crate::netfx::admission::Gate::new());
         let m = Arc::new(Mihomo::at(dir.clone(), Arc::clone(&lock)));
         m.start("u60.home.arpa".into());
-        let held = lock.lock().unwrap();
+        let held = crate::netfx::admission::enter(&lock, Duration::ZERO).unwrap();
         let started = Instant::now();
         assert!(m.enable("u60.home.arpa").is_err(), "fails fast here (no ip/nft), but answers");
         m.uplink_changed();
@@ -1711,7 +1721,7 @@ mod tests {
         let run = |args: &[&str]| Cmd::new(args[0], &args[1..]).run();
         let root = PathBuf::from("/tmp/u60-mihomo-qa-root");
         fs::create_dir_all(&root).unwrap();
-        let m = Arc::new(Mihomo::at(root.clone(), Arc::new(Mutex::new(()))));
+        let m = Arc::new(Mihomo::at(root.clone(), Arc::new(crate::netfx::admission::Gate::new())));
         let mut port = DevicePort::new(Arc::clone(&m), "qa.home.arpa".into());
         // Foreign names: a table without our marker, a route in our table,
         // a rule at our priority. Each is refused and left as it was.
@@ -1768,6 +1778,7 @@ mod tests {
     /// v3: a 204 is not a reload; what the core reports must match.
     #[test]
     fn a_reload_is_confirmed_only_by_what_the_core_reports() {
+        let config = "interface-name: ath20\nrule-providers:\n  Web: {type: http, behavior: ipcidr, url: 'https://x', path: ./w.yaml}\n";
         let prepared = Prepared {
             secret: "s".into(),
             local: "u60.home.arpa".into(),
@@ -1777,7 +1788,7 @@ mod tests {
             bypass: true,
             notice: None,
             source: String::new(),
-            config: "interface-name: ath20\nrule-providers:\n  Web: {type: http, behavior: ipcidr, url: 'https://x', path: ./w.yaml}\n".into(),
+            config: config.into(), facts: reload::Facts::from(&serde_yaml_ng::from_str(config).unwrap()),
         };
         let before: routing::Selected = [("G".to_owned(), "DIRECT".to_owned())].into();
         let configs = json!({"mode": "rule", "interface-name": "ath20"});
@@ -1816,19 +1827,20 @@ mod tests {
         use controller::Port;
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("u60-reload-validation-{}", std::process::id()));
-        let mihomo = Arc::new(Mihomo::at(dir.clone(), Arc::new(Mutex::new(()))));
+        let mihomo = Arc::new(Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new())));
         net::write_private(&dir.join("mihomo"), b"#!/bin/sh\nprintf x >> \"$3/check-count\"\n").unwrap();
         fs::set_permissions(dir.join("mihomo"), fs::Permissions::from_mode(0o700)).unwrap();
         net::write_private(&dir.join("config.yaml"), b"serving config").unwrap();
         let prepared = Prepared {
             secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode":"rule"}),
             routes: routing::Routes::default(), dns: Vec::new(), bypass: false, notice: None,
-            source: "rules: ['MATCH,DIRECT']".into(), config: "rules: ['MATCH,DIRECT']".into(),
+            facts: Default::default(), source: "rules: ['MATCH,DIRECT']".into(), config: "rules: ['MATCH,DIRECT']".into(),
         };
         let mut port = DevicePort::new(Arc::clone(&mihomo), "u60.home.arpa".into());
         port.lan = Some(std::net::Ipv4Addr::LOCALHOST);
         let first = port.prepare(&Source::Previous(Box::new(prepared)), true).unwrap();
-        port.prepare(&Source::Previous(Box::new(first)), false).unwrap();
+        port.validator(&first, true).unwrap()().unwrap();
+        port.validator(&first, false).unwrap()().unwrap();
         assert_eq!(fs::read(dir.join("check-count")).unwrap(), b"x");
         assert_eq!(fs::read(dir.join("config.yaml")).unwrap(), b"serving config");
         assert!(!dir.join("candidate.yaml").exists());
@@ -1890,7 +1902,7 @@ mod tests {
     #[test]
     fn off_status_has_no_dashboard_and_creates_nothing() {
         let dir = std::env::temp_dir().join("u60-mihomo-no-side-effects");
-        let m = Mihomo::at(dir.clone(), Arc::new(Mutex::new(())));
+        let m = Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new()));
         assert_eq!(m.status()["running"], false);
         assert!(m.status()["dashboard"].is_null());
         assert!(!dir.exists());
@@ -1944,11 +1956,11 @@ mod tests {
     #[test]
     fn core_operations_refuse_while_installing_without_occupying_the_network_lock() {
         let dir = std::env::temp_dir().join(format!("u60-core-busy-{}", std::process::id()));
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(crate::netfx::admission::Gate::new());
         let m = Mihomo::at(dir.clone(), Arc::clone(&lock));
         let _operation = m.operation.lock().unwrap();
         assert!(
-            lock.try_lock().is_ok(),
+            crate::netfx::admission::enter(&lock, Duration::ZERO).is_some(),
             "install serialization must not stall the relay watchdog"
         );
         assert_eq!(m.install().unwrap_err(), "A Mihomo operation is in progress");
@@ -1965,7 +1977,7 @@ mod tests {
     #[test]
     fn owner_choice_outlives_restarts_until_turned_off_or_failing() {
         let dir = std::env::temp_dir().join(format!("u60-core-wanted-{}", std::process::id()));
-        let m = Arc::new(Mihomo::at(dir.clone(), Arc::new(Mutex::new(()))));
+        let m = Arc::new(Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new())));
         net::write_private(&dir.join(WANTED), b"1").unwrap();
         assert!(m.wants_restore());
         assert_eq!(m.status_with(|| Err("none".into()))["autostart"], true);
@@ -1986,7 +1998,7 @@ mod tests {
     #[test]
     fn restore_marker_write_and_delete_failures_are_reported() {
         let dir = std::env::temp_dir().join(format!("u60-core-marker-{}", std::process::id()));
-        let m = Arc::new(Mihomo::at(dir.clone(), Arc::new(Mutex::new(()))));
+        let m = Arc::new(Mihomo::at(dir.clone(), Arc::new(crate::netfx::admission::Gate::new())));
         std::fs::create_dir_all(dir.join(WANTED)).unwrap();
         assert!(net::write_private(&dir.join(WANTED), b"1").is_err());
         assert_eq!(m.set_wanted(false).unwrap_err(), "Cannot clear Mihomo's restart setting");

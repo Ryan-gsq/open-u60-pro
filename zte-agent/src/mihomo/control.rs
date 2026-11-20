@@ -51,17 +51,12 @@ fn call(
     if !query.is_empty() {
         url.query_pairs_mut().extend_pairs(query);
     }
-    let agent = ureq::Agent::config_builder()
-        .proxy(None)
-        .http_status_as_error(false)
-        .timeout_global(Some(wait))
-        .build()
-        .new_agent();
+    let agent = agent();
     let auth = format!("Bearer {secret}");
     let sent = match (method, body) {
-        ("GET", None) => agent.get(url.as_str()).header("Authorization", &auth).call(),
-        ("PUT", Some(body)) => agent.put(url.as_str()).header("Authorization", &auth).send_json(body),
-        ("PATCH", Some(body)) => agent.patch(url.as_str()).header("Authorization", &auth).send_json(body),
+        ("GET", None) => agent.get(url.as_str()).config().timeout_global(Some(wait)).build().header("Authorization", &auth).call(),
+        ("PUT", Some(body)) => agent.put(url.as_str()).config().timeout_global(Some(wait)).build().header("Authorization", &auth).send_json(body),
+        ("PATCH", Some(body)) => agent.patch(url.as_str()).config().timeout_global(Some(wait)).build().header("Authorization", &auth).send_json(body),
         _ => return Err("Unsupported controller request".into()),
     };
     let mut response = sent.map_err(|_| "Mihomo did not answer".to_owned())?;
@@ -83,16 +78,21 @@ fn call(
     Err(detail.unwrap_or_else(|| format!("Mihomo refused the request (HTTP {status})")))
 }
 
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| ureq::Agent::config_builder().proxy(None).http_status_as_error(false).build().new_agent())
+}
+
 /// A routing write for the controller (`controller::Write`): the core's
 /// status and body as they are, for the console and the dashboard bridge.
 pub(crate) fn raw_call(base: &str, secret: &str, method: &str, segments: &[String], body: &Value, wait: Duration) -> Result<(u16, Vec<u8>), String> {
     let mut url = reqwest::Url::parse(&format!("http://{base}/")).map_err(|_| "Invalid controller address")?;
     url.path_segments_mut().map_err(|_| "Invalid controller address")?.clear().extend(segments);
-    let agent = ureq::Agent::config_builder().proxy(None).http_status_as_error(false).timeout_global(Some(wait)).build().new_agent();
+    let agent = agent();
     let auth = format!("Bearer {secret}");
     let sent = match method {
-        "PUT" => agent.put(url.as_str()).header("Authorization", &auth).send_json(body),
-        "PATCH" => agent.patch(url.as_str()).header("Authorization", &auth).send_json(body),
+        "PUT" => agent.put(url.as_str()).config().timeout_global(Some(wait)).build().header("Authorization", &auth).send_json(body),
+        "PATCH" => agent.patch(url.as_str()).config().timeout_global(Some(wait)).build().header("Authorization", &auth).send_json(body),
         _ => return Err("Unsupported controller request".into()),
     };
     let mut response = sent.map_err(|_| "Mihomo did not answer".to_owned())?;

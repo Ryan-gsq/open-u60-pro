@@ -66,7 +66,10 @@ impl Answer {
     }
 }
 
+pub(super) type Validation = Box<dyn FnOnce() -> Result<(), String> + Send>;
+
 pub(super) enum Message {
+    Validated { ticket: u64, result: Result<(), String> },
     /// The agent started: adopt this boot's tables if the owner wants
     /// Mihomo on, else roll back what a previous process left.
     Boot,
@@ -171,6 +174,7 @@ impl Snapshot {
 /// The configuration a start uses, written and validated.
 #[derive(Clone, Debug)]
 pub(super) struct Prepared {
+    pub facts: super::reload::Facts,
     pub secret: String,
     pub local: String,
     pub runtime: Value,
@@ -226,6 +230,7 @@ pub(super) trait Port: Send + 'static {
     /// serving meanwhile, so a validation runs in the background (one Go
     /// execution slot, lower priority).
     fn prepare(&mut self, source: &Source, serving: bool) -> Result<Prepared, String>;
+    fn validator(&self, _prepared: &Prepared, _serving: bool) -> Option<Validation> { None }
     /// Ports the core binds are free (checked before each spawn).
     fn ports_free(&mut self) -> Result<(), String>;
     /// Effects are held (a start re-applies them rather than claiming them).
@@ -411,6 +416,7 @@ pub(super) struct Controller<P: Port> {
     timings: Timings,
     phase: Phase,
     run: Option<Run>,
+    validation_ticket: u64,
     /// The core generation counter: every spawn takes the next.
     generation: u64,
     error: Option<String>,
@@ -449,6 +455,7 @@ impl<P: Port> Controller<P> {
             phase: Phase::Off,
             run: None,
             generation: 0,
+            validation_ticket: 0,
             error: None,
             failures: 0,
             exits: VecDeque::new(),
@@ -525,6 +532,7 @@ impl<P: Port> Controller<P> {
 
     fn handle(&mut self, message: Message) {
         match message {
+            Message::Validated { .. } => {}
             Message::Boot => self.boot(),
             Message::Enable { local, owner, reply } => {
                 let result = self.enable(local, owner);
@@ -550,7 +558,7 @@ impl<P: Port> Controller<P> {
                     Phase::Running if refresh => self.refresh(),
                     Phase::Running => self.restart("the profile changed", Restart::Profile),
                     Phase::Backoff => self.start(false),
-                    _ if refresh => self.port.prepare(&Source::Selected { local: self.local.clone(), runtime: None }, false).map(|_| ()),
+                    _ if refresh => self.prepare(&Source::Selected { local: self.local.clone(), runtime: None }, false).map(|_| ()),
                     _ => Ok(()),
                 };
                 self.publish();
@@ -733,10 +741,41 @@ impl<P: Port> Controller<P> {
         result
     }
 
+    /// Only one worker owns candidate.yaml at a time. Exit and guard messages
+    /// remain actionable while it checks. A queued disable or the loss of
+    /// the serving generation invalidates the result before any widening.
+    fn prepare(&mut self, source: &Source, serving: bool) -> Result<Prepared, String> {
+        let prepared = self.port.prepare(source, serving)?;
+        let Some(validate) = self.port.validator(&prepared, serving) else { return Ok(prepared) };
+        self.validation_ticket += 1;
+        let ticket = self.validation_ticket;
+        let tx = self.tx.clone();
+        std::thread::Builder::new().name("mihomo-validate".into()).spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(validate)).unwrap_or_else(|_| Err("Mihomo validation worker stopped".into()));
+            let _ = tx.send(Message::Validated { ticket, result });
+        }).map_err(|e| format!("Cannot start Mihomo validation: {e}"))?;
+        let generation = self.run.as_ref().map(|r| r.core.generation());
+        let mut cancelled = false;
+        loop {
+            match self.rx.recv().map_err(|_| "Mihomo controller stopped")? {
+                Message::Validated { ticket: id, result } if id == ticket => {
+                    if cancelled || generation != self.run.as_ref().map(|r| r.core.generation()) { return Err("Mihomo validation superseded".into()); }
+                    return result.map(|()| prepared);
+                }
+                Message::Validated { .. } => {}
+                event @ (Message::Guard | Message::Exited { .. }) => self.handle(event),
+                message => {
+                    cancelled |= matches!(message, Message::Disable { .. });
+                    self.backlog.push_back(message);
+                }
+            }
+        }
+    }
+
     /// Prepares, spawns and verifies a core, then loads the plan its
     /// read-back mode and choices give. The tables already hold or guard.
     fn launch(&mut self, source: Source, restart: bool) -> Result<(), String> {
-        let prepared = self.port.prepare(&source, false)?;
+        let prepared = self.prepare(&source, false)?;
         self.launch_prepared(prepared, restart)
     }
 
@@ -851,8 +890,9 @@ impl<P: Port> Controller<P> {
         crate::netlog!("[mihomo] restarting: {reason}");
         let Some(run) = self.run.as_ref() else { return Ok(()) };
         let source = Source::Selected { local: run.prepared.local.clone(), runtime: Some(run.prepared.runtime.clone()) };
-        let prepared = match self.port.prepare(&source, why == Restart::Profile) {
+        let prepared = match self.prepare(&source, why == Restart::Profile) {
             Ok(prepared) => prepared,
+            Err(e) if self.run.is_none() => return Err(e),
             Err(e) if why == Restart::Profile => {
                 crate::netlog!("[mihomo] the new profile was not started ({e}); the running one keeps serving");
                 let error = format!("{e}; the running profile keeps serving");
@@ -915,7 +955,7 @@ impl<P: Port> Controller<P> {
     fn reload(&mut self, reason: &str) -> Result<(), String> {
         let Some(run) = self.run.as_ref() else { return Ok(()) };
         let previous = run.prepared.clone();
-        let next = self.port.prepare(&Source::Reload(Box::new(previous.clone())), true)?;
+        let next = self.prepare(&Source::Reload(Box::new(previous.clone())), true)?;
         if next.config == previous.config {
             if self.run.as_ref().is_some_and(Run::may_return) {
                 self.load(Shape::Hold, Bypass::None(format!("Following {reason}")), true)?;
@@ -935,8 +975,8 @@ impl<P: Port> Controller<P> {
             return self.restart("the profile changed while the core was unhealthy", Restart::Profile);
         }
         let previous = run.prepared.clone();
-        let next = self.port.prepare(&Source::Refresh(Box::new(previous.clone())), true)?;
-        if super::reload::needs_restart(&previous.config, &next.config) {
+        let next = self.prepare(&Source::Refresh(Box::new(previous.clone())), true)?;
+        if previous.facts.needs_restart(&next.facts) {
             return self.restart_prepared("the profile changed startup settings", Restart::Profile, next);
         }
         self.reload_prepared("the selected subscription refreshed", next)
@@ -1169,22 +1209,23 @@ impl<P: Port> Controller<P> {
     /// may load here: what the controller believes and shows follows it,
     /// and a narrowing that was loaded for a change that never happened is
     /// widened again once the core is read back.
-    fn guard(&mut self) {
+    fn guard(&mut self) -> bool {
         if !self.port.guard_due() {
-            return;
+            return false;
         }
         let checked = self.port.reconcile();
         if let Err(e) = checked.result {
             self.error = Some(e);
         }
-        let Some(run) = self.run.as_mut().filter(|_| checked.confirmed) else { return };
-        let Some(narrowing) = run.loaded() else { return };
+        let Some(run) = self.run.as_mut().filter(|_| checked.confirmed) else { return true };
+        let Some(narrowing) = run.loaded() else { return true };
         crate::netlog!("[mihomo] a table that had not loaded is in the kernel now (bypass {})", run.kernel.0.label());
         let shown = run.kernel.0.clone();
         self.set_bypass(shown);
         if narrowing {
             self.widen("a narrowed table that loaded late");
         }
+        true
     }
 
     fn egress(&mut self) {
@@ -1246,14 +1287,17 @@ impl<P: Port> Controller<P> {
             Phase::Running => {}
             _ => return,
         }
+        let mut changed = false;
         let now = Instant::now();
         if self.run.as_ref().is_some_and(|r| now.duration_since(r.started) >= self.timings.stable) && self.failures > 0 {
+            changed = true;
             self.failures = 0;
             self.exits.clear();
         }
-        self.guard();
+        changed |= self.guard();
         // A narrowing whose follow did not read the core back yet.
         if self.run.as_ref().is_some_and(|r| r.unfollowed) {
+            changed = true;
             self.widen("an earlier change");
         }
         // An IPv6-only egress change that held.
@@ -1278,6 +1322,7 @@ impl<P: Port> Controller<P> {
             let last = self.egress_restarted;
             let restart = self.run.as_mut().is_some_and(|run| {
                 run.audited = now;
+                changed |= run.ipv6 != observed.paths[1].is_some();
                 run.ipv6 = observed.paths[1].is_some();
                 egress::settle_egress(&mut run.uplink, &mut run.stranding, observed, last, now)
             });
@@ -1291,6 +1336,7 @@ impl<P: Port> Controller<P> {
         // Rule sets the controller refreshes (Q2), one per tick.
         let due = self.run.as_ref().and_then(|r| r.refresh.iter().position(|(_, _, at)| *at <= now));
         if let Some(index) = due {
+            changed = true;
             let (name, every) = {
                 let run = self.run.as_mut().unwrap();
                 let entry = &mut run.refresh[index];
@@ -1318,6 +1364,7 @@ impl<P: Port> Controller<P> {
             if let Some((mode, selected, secret)) = current {
                 let differs = sources || self.port.read_back(&secret).is_none_or(|(m, s, _)| m != mode || s != selected);
                 if differs {
+                    changed = true;
                     crate::netlog!("[mihomo] the core's mode, a group or a rule set changed outside the controller; following it");
                     let _ = self.follow("a change in the core", &[], |_| {});
                 } else if let Some(run) = self.run.as_mut() {
@@ -1325,7 +1372,7 @@ impl<P: Port> Controller<P> {
                 }
             }
         }
-        self.publish();
+        if changed { self.publish(); }
     }
 }
 

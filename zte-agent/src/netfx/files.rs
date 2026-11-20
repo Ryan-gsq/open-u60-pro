@@ -2,8 +2,31 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+
+/// The identity of a database file as last hashed. A replacement (new inode),
+/// a size change or any rewrite (which moves the change time) re-hashes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    dev: u64,
+    ino: u64,
+    pub(crate) len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    pub(crate) fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
 
 pub fn private_dir(path: &Path) -> Result<(), String> {
     fs::DirBuilder::new()
@@ -11,7 +34,10 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
         .mode(0o700)
         .create(path)
         .map_err(|e| e.to_string())?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())
+    if fs::metadata(path).map_err(|e| e.to_string())?.mode() & 0o7777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {

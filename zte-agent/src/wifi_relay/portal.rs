@@ -39,6 +39,7 @@ const OFFLINE: [&str; 2] = ["4", "19"];
 const CLOSED: &str = "1";
 
 pub(super) fn plan() -> Result<Option<Resource>, String> {
+    if crate::ubus::committed_option(PACKAGE, "redirect", "switch").as_deref() == Some("0") { return Ok(None); }
     plan_with(&mut |cmd| cmd.run())
 }
 

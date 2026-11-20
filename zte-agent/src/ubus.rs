@@ -66,6 +66,15 @@ fn send_command(event: &str, payload: &Value) -> Command {
 }
 
 /// Run `uci get <key>` and return the value, within 3 s (as `ubus -t 3`).
+/// Read a named option from committed configuration only when UCI has no
+/// overlay for this package. Unreadable/missing values fall back to libuci.
+pub fn committed_option(package: &str, section: &str, key: &str) -> Option<String> {
+    let delta = std::path::Path::new("/tmp/.uci").join(package);
+    let text = std::fs::read_to_string(std::path::Path::new("/etc/config").join(package)).ok()?;
+    if delta.try_exists().ok()? { return None; }
+    crate::wifi_watchdog::config_option(&text, section, key)
+}
+
 pub fn uci_get(key: &str) -> Result<String, String> {
     let mut command = Command::new("uci");
     command.args(["get", key]);

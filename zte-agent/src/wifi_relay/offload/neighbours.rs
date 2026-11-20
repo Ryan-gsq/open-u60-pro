@@ -117,6 +117,10 @@ fn retire(n: &Neighbour) -> Result<(), String> {
 
 fn handle(retirer: &mut Retirer, line: &str, mut retire: impl FnMut(&Neighbour) -> Result<(), String>) {
     let Some(seen) = parse(line) else { return };
+    handle_entry(retirer, seen, &mut retire);
+}
+
+fn handle_entry(retirer: &mut Retirer, seen: Neighbour, mut retire: impl FnMut(&Neighbour) -> Result<(), String>) {
     for n in retirer.observe(seen) {
         // The MAC's last 2 octets only, as device lists show them.
         let tail = &n.mac[12..];
@@ -135,8 +139,8 @@ pub(super) fn watch(gateway: Ipv4Addr) -> Monitor {
     let mut retirer = Retirer::new(gateway);
     Monitor::start("relay-neigh", "upstream neighbour monitor", "ip", &["-4", "monitor", "neigh", "dev", IFACE], Some(crate::wifi_relay::pid_file("relay-neigh")), move |line, _| match line {
         Some(line) => handle(&mut retirer, line, retire),
-        None => match Cmd::new("ip", &["-4", "neigh", "show", "dev", IFACE]).run() {
-            Ok(table) => table.lines().for_each(|line| handle(&mut retirer, line, retire)),
+        None => match crate::netfx::neighbours::list(IFACE) {
+            Ok(table) => table.into_iter().for_each(|entry| handle_entry(&mut retirer, Neighbour { ip: entry.ip, mac: entry.mac }, retire)),
             Err(e) => crate::netlog!("[relay] cannot list upstream neighbours: {e}"),
         },
     })

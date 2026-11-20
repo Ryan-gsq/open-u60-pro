@@ -95,9 +95,17 @@ fn varint(r: &mut impl Read) -> Result<Option<u64>, String> {
 }
 
 /// Field number and payload (length-delimited only; varints are skipped).
+#[cfg(test)]
 type Raw = Option<(u64, Option<Vec<u8>>)>;
 
+#[cfg(test)]
 fn field(r: &mut impl Read) -> Result<Raw, String> {
+    let mut buffer = Vec::new();
+    Ok(field_into(r, &mut buffer)?.map(|(number, data)| (number, data.map(<[u8]>::to_vec))))
+}
+
+fn field_into<'a>(r: &mut impl Read, bytes: &'a mut Vec<u8>) -> Result<Option<(u64, Option<&'a [u8]>)>, String> {
+    bytes.clear();
     let Some(key) = varint(r)? else { return Ok(None) };
     let payload = match key & 7 {
         0 => {
@@ -109,12 +117,11 @@ fn field(r: &mut impl Read) -> Result<Raw, String> {
             if len > MAX_ENTRY {
                 return Err("GeoIP.dat is malformed".into());
             }
-            let mut bytes = Vec::new();
-            r.take(len).read_to_end(&mut bytes).map_err(|_| "Cannot read GeoIP.dat")?;
+            r.take(len).read_to_end(bytes).map_err(|_| "Cannot read GeoIP.dat")?;
             if bytes.len() as u64 != len {
                 return Err("GeoIP.dat is truncated".into());
             }
-            Some(bytes)
+            Some(bytes.as_slice())
         }
         _ => return Err("GeoIP.dat is malformed".into()),
     };
@@ -126,20 +133,27 @@ fn field(r: &mut impl Read) -> Result<Raw, String> {
 /// (v2ray / meta-rules-dat). IPv4 ranges of the `wanted` codes (upper case).
 fn geoip_v4(r: &mut impl Read, wanted: &[String]) -> Result<HashMap<String, Vec<(Ipv4Addr, u8)>>, String> {
     let mut lists: HashMap<String, Vec<(Ipv4Addr, u8)>> = HashMap::new();
-    while let Some((number, payload)) = field(r)? {
+    let mut buffer = Vec::new();
+    let mut offsets = Vec::new();
+    while let Some((number, payload)) = field_into(r, &mut buffer)? {
         let (1, Some(entry)) = (number, payload) else { continue };
-        let mut fields = entry.as_slice();
+        let mut fields = entry;
         let mut code = None;
+        offsets.clear();
         while let Some((number, payload)) = cidr_field(&mut fields, MAX_ENTRY)? {
-            if let (1, Field::Bytes(name)) = (number, payload) {
-                code = Some(String::from_utf8_lossy(name).to_ascii_uppercase());
+            match (number, payload) {
+                (1, Field::Bytes(name)) => code = Some(String::from_utf8_lossy(name).to_ascii_uppercase()),
+                (2, Field::Bytes(bytes)) => {
+                    let end = entry.len() - fields.len();
+                    offsets.push(end - bytes.len()..end);
+                }
+                _ => {}
             }
         }
         let Some(code) = code.filter(|c| wanted.contains(c)) else { continue };
         let ranges = lists.entry(code).or_default();
-        let mut fields = entry.as_slice();
-        while let Some((number, payload)) = cidr_field(&mut fields, MAX_ENTRY)? {
-            let (2, Field::Bytes(mut cidr)) = (number, payload) else { continue };
+        for offset in &offsets {
+            let mut cidr = &entry[offset.clone()];
             let (mut ip, mut prefix) = (None, 0u64);
             while let Some((number, payload)) = cidr_field(&mut cidr, u64::MAX)? {
                 match (number, payload) {

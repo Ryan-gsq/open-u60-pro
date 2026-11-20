@@ -4,8 +4,9 @@
 //! not accept gzip. Names change with the content, so they are cached forever.
 
 use axum::body::Body;
+use crate::httpd::none_match;
 use axum::http::header::{
-    HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+    HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG,
     VARY,
 };
 use axum::http::{StatusCode, Uri};
@@ -114,13 +115,6 @@ fn is_q_zero(p: &str) -> bool {
     };
     let (int, frac) = q.split_once('.').unwrap_or((q, ""));
     int == "0" && frac.bytes().all(|b| b == b'0')
-}
-
-/// `If-None-Match` lists `etag` or `*` (weak comparison: `W/` is ignored).
-fn none_match(headers: &HeaderMap, etag: &str) -> bool {
-    headers.get_all(IF_NONE_MATCH).iter().filter_map(|v| v.to_str().ok()).any(|v| {
-        v.split(',').map(str::trim).any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
-    })
 }
 
 /// The original bytes of a build.rs gzip member: a plain 10-byte header (no

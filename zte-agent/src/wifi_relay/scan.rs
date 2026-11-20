@@ -154,11 +154,17 @@ pub(super) struct Ctrl {
 /// The supplicant's `STATUS` reply, the text `wpa_cli status` prints,
 /// without a process. `Err` when it cannot be reached or does not answer
 /// within `STATUS_WAIT`, where `wpa_cli` failed.
+#[cfg(test)]
 pub(super) fn status(server: &Path, dir: &Path) -> Result<String, String> {
     Ctrl::open(server, dir, STATUS_WAIT)?.request("STATUS")
 }
 
 impl Ctrl {
+    pub(super) fn status(&mut self) -> Result<String, String> {
+        self.answer = STATUS_WAIT;
+        self.request("STATUS")
+    }
+
     /// `server` is the supplicant's socket; the client socket lives in `dir`.
     pub(super) fn attach(server: &Path, dir: &Path) -> Result<Self, String> {
         let mut ctrl = Self::open(server, dir, ANSWER)?;
@@ -204,7 +210,7 @@ impl Supplicant for Ctrl {
         let deadline = Instant::now() + self.answer;
         while let Some(message) = self.recv(deadline)? {
             if message.starts_with('<') {
-                self.events.push_back(message);
+                if command == "SCAN" || command.starts_with("SCAN ") { self.events.push_back(message); }
             } else {
                 return Ok(message.trim_end().to_owned());
             }

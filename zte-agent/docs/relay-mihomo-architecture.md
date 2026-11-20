@@ -113,7 +113,7 @@ guard 修复日志列应用命令或资源描述，例如 `iptables -t nat hook 
 
 - 同时考虑新旧计划的**首条命中结果**。只有两边直到最后一个放行点的有效判定都能以纯目的 IPv4 区间表达时，才用“旧 DIRECT 减新 DIRECT”。例如在原 DIRECT /24 前加 `DST-PORT,443,PROXY`，虽然 DIRECT 条文本身没变，已有 443 硬件流也必须退出。来源、端口、协议、复合条件或全域兜底无法可靠求差时，退回 LAN IPv4；超过 64 段同样退回（D10）。纯目的集合没有失去放行时，不为了重编同一张表清连接。UDP 不享受已有 TCP 的 socket 固定；需改路径时也纳入相应范围。
 - 没有合并窗口（规范的“200 ms 内合并”未实现，§8）。合并只有两种：已完成的一次删除只有在**它开始于本次路径变化之后**、成功并覆盖全部请求范围时才可抵账；失败待重试的请求与下一个请求取并集，一次删除了结两者。删除在状态锁内依次进行。保留有界诊断，区分“成功删除、有证据的零匹配、操作失败”：conntrack-tools 1.4.8 的退出码 1 也可能是 netlink 错误，不能单凭返回码判断。部分失败记录待重试，不报告“已重置”。[conntrack-tools 1.4.8 源码包](https://www.netfilter.org/projects/conntrack-tools/files/conntrack-tools-1.4.8.tar.xz) 中的 `print_stats`（零匹配）和 `OTHER_PROBLEM`（操作失败）是两个不同分支。
-- 删除 conntrack 不是给 TCP 发送 RST，也不是清理客户端 DNS 缓存。UI 按实际范围及结果显示。已卸载的流要以失去 DIRECT 的真实硬件流验证；路径没变的流在 B31 上能很快重新卸载。
+- 删除 conntrack 不是给 TCP 发送 RST，也不是清理客户端 DNS 缓存。UI 按实际范围及结果显示。已卸载的流要以失去 DIRECT 的真实硬件流验证；B31 实测删除后活跃流仍持续超过 12 秒（454 MB），IPA SRAM 条目一直为 `Enable=true`。成功删除只证明软件 conntrack 条目已清理。
 
 ### 4.6 准入 `Admission`
 

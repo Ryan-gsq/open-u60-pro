@@ -16,7 +16,9 @@
 //! IPACM skips the event for a client it already knows at that address.
 
 use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use super::monitor::{Alive, Monitor};
 use super::Cmd;
@@ -29,14 +31,26 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// One relay session's hotspot station watch (`iw event`); at its start every
 /// client is announced, since the relay's connection moved them between bands.
 pub(super) fn watch() -> Monitor {
-    Monitor::start("relay-lan", "hotspot station monitor", "iw", &["event", "-t"], Some(crate::wifi_relay::pid_file("relay-lan")), |line, alive| match line {
+    let pending = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
+    Monitor::start("relay-lan", "hotspot station monitor", "iw", &["event", "-t"], Some(crate::wifi_relay::pid_file("relay-lan")), move |line, alive| match line {
         None => announce(None),
         Some(line) => {
             if let Some(mac) = joined(line) {
+                let now = Instant::now();
+                if pending.lock().unwrap().insert(mac.clone(), now).is_some() { return; }
+                let pending = Arc::clone(&pending);
                 let alive: Alive = alive.clone();
                 crate::system::spawn_named("relay-lan-arp", move || {
-                    if alive.wait(SETTLE) {
+                    let mut due = now + SETTLE;
+                    while alive.wait(due.saturating_duration_since(Instant::now())) {
                         announce(Some(&mac));
+                        let sent = Instant::now();
+                        due = sent + Duration::from_secs(12);
+                        if !alive.wait(due - sent) { break; }
+                        let mut pending = pending.lock().unwrap();
+                        let last = pending[&mac];
+                        if last <= sent { pending.remove(&mac); break; }
+                        due = due.max(last + SETTLE);
                     }
                 });
             }
@@ -60,6 +74,7 @@ fn joined(line: &str) -> Option<String> {
 
 /// A REACHABLE IPv4 entry of `ip -4 neigh show dev br-lan`. Other states
 /// need nothing: the kernel reports the next change itself.
+#[cfg(test)]
 fn reachable(line: &str) -> Option<(Ipv4Addr, String)> {
     let words: Vec<&str> = line.split_whitespace().collect();
     let ip = words.first()?.parse().ok()?;
@@ -74,11 +89,11 @@ fn stale(ip: Ipv4Addr, mac: &str) -> Cmd {
 
 /// Sets the REACHABLE entries of `mac` (all clients when `None`) STALE.
 fn announce(mac: Option<&str>) {
-    let table = match Cmd::new("ip", &["-4", "neigh", "show", "dev", LAN]).run() {
+    let table = match crate::netfx::neighbours::list(LAN) {
         Ok(table) => table,
         Err(e) => return crate::netlog!("[relay] cannot list LAN neighbours: {e}"),
     };
-    for (ip, client) in table.lines().filter_map(reachable).filter(|(_, m)| mac.is_none_or(|mac| m.as_str() == mac)) {
+    for (ip, client) in table.into_iter().filter(|e| e.reachable && mac.is_none_or(|mac| mac == e.mac)).map(|e| (e.ip, e.mac)) {
         // The MAC's last 2 octets only, as device lists show them.
         let tail = &client[12..];
         match stale(ip, &client).run() {
