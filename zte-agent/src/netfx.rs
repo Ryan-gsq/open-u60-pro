@@ -56,8 +56,6 @@ mod boundary {
 
     // Match file, function AND command prefix; a new write in that file still fails.
     const ALLOWED: &[(&str, &str, &str, &str)] = &[
-        ("wifi_relay.rs", "prepare", "ip link set dev {IFACE} address {mac}", "the wireless journal deletes the station interface, so its MAC cannot outlive the session and needs no guard replay"),
-        ("wifi_relay.rs", "prepare", "ip link set dev {IFACE} up", "the wireless journal deletes the station interface, so its link state cannot outlive the session and needs no guard replay"),
         ("wifi_relay/steering.rs", "command", "fs::write BACKLOG", "the journaled @u60-relay-steer step implements its backlog apply/undo here"),
         ("wifi_relay/ipv6.rs", "tick_inner", "ip -6 addr change", "refresh only the lifetime of the LAN address already held by the IPv6 journal"),
         ("wifi_relay/ipv6.rs", "refresh_path", "ip -6 addr change", "refresh only the lifetimes of upstream addresses already held by the IPv6 journal"),
@@ -569,7 +567,7 @@ mod boundary {
         let rejected = violations("case.rs", &source.replace("&[\"link\", \"set\", \"x\", \"up\"])", "&[\"link\", \"set\", \"x\", \"up\"]).run()"));
         assert_eq!(rejected.len(), 1);
         assert!(rejected[0].contains("EffectSet resource/step"));
-        assert_eq!(ALLOWED.len(), 10);
+        assert_eq!(ALLOWED.len(), 8);
     }
 
     #[test]
@@ -614,11 +612,7 @@ mod boundary {
         }
         for args in [r#"["link", "set", "dev", IFACE, "address", &mac]"#, r#"["link", "set", "dev", IFACE, "up"]"#] {
             let source = format!("fn prepare() {{ Cmd::new(\"ip\", &{args}); }}");
-            assert!(violations("wifi_relay.rs", &source).is_empty(), "{source}");
-            assert!(violations("wifi_relay.rs", &format!("\n\n{source}")).is_empty());
-            for bad in [source.replace("prepare", "other"), source.replace("IFACE", "other"), source.replace("\"link\"", "\"route\"")] {
-                assert_eq!(violations("wifi_relay.rs", &bad).len(), 1, "{bad}");
-            }
+            assert_eq!(violations("wifi_relay.rs", &source).len(), 1);
         }
     }
 

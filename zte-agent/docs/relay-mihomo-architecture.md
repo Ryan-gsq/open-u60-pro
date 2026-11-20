@@ -6,7 +6,7 @@
 
 | 编号 | 实现与验收共同遵守的约束 | 代码现状 |
 | --- | --- | --- |
-| I1 | 中继和 Mihomo 的 nft、iptables-legacy、地址、路由、策略规则、sysctl、conntrack 写入只经 `netfx`，可撤销资源归 `netfx::effect::EffectSet`；一项资源只有一个 owner。agent 不写 IPACM 的配置文件（`wifi_relay::offload` 只读它）；核心进程、托管配置及影响路由的核心 API 写操作由 Mihomo 控制器排序。ZTE 是外部写入者；WireGuard 和 TTL 的 legacy 链不在本次迁移范围。 | 随 `cargo test` 的源码扫描（`netfx::boundary`）识别资源和步骤，10 项例外见 §4。agent 既不写 IPACM 的配置，也不写它的 HW/SW 模式（§7）。 |
+| I1 | 中继和 Mihomo 的 nft、iptables-legacy、地址、路由、策略规则、sysctl、conntrack 写入只经 `netfx`，可撤销资源归 `netfx::effect::EffectSet`；一项资源只有一个 owner。agent 不写 IPACM 的配置文件（`wifi_relay::offload` 只读它）；核心进程、托管配置及影响路由的核心 API 写操作由 Mihomo 控制器排序。ZTE 是外部写入者；WireGuard 和 TTL 的 legacy 链不在本次迁移范围。 | 随 `cargo test` 的源码扫描（`netfx::boundary`）识别资源和步骤，8 项例外见 §4。agent 既不写 IPACM 的配置，也不写它的 HW/SW 模式（§7）。 |
 | I2 | 不持跨功能锁做设备 I/O。HTTP 读状态只取快照；在单线程 Tokio 上不得阻塞等待控制器、运行命令或调用阻塞 HTTP。中继的关联、CAC、撤销或核对不能挡住 Mihomo 的退出处理、重试或 brnf 修复。 | `relay` 与 `mihomo` 各自串行执行设备操作。中继会话由控制器独占，状态和扫描列表经短锁发布，`active()`、`owns_network()` 读原子值和准入登记（§3）。 |
 | I3 | 对可撤销的自有效果，先持久记录本次开机的撤销依据，再生效；只能撤自己的东西。部分执行、执行前被杀、重复撤销都可恢复。conntrack 删除不可逆，按已生效的策略代次记录结果，不伪造 undo。 | `EffectSet` 在批量生效前一次持久写入撤销，日志为 `{boot, undo: Vec<Cmd>}`，撤销遇错保留剩余项（§4.1）。 |
 | I4 | 控制器主导的计划内重启、重载和规则切换，必须先收紧受影响的内核绕过，核心不可接包时阻断本应拦截的流量，核验后才扩大 DIRECT。provider 自主刷新也不允许误直连；用旧 DNS 真实 A 新建的连接必须遵守新策略，无法证明可直连的流量不得绕过。agent 仍在且确认核心意外退出，或计划内重启最终失败时，按 D3 撤常规拦截、显示正在直连并重试。单次 nft 写失败、PUT 超时或读回失败本身不授权直连。 | 由 Mihomo 控制器按 §5.4 的顺序做。 |
@@ -47,7 +47,7 @@ Mihomo 和中继各用一个串行控制器线程。中继的会话、扫描列�
 
 I1 的写入边界有随 `cargo test` 运行的源码扫描测试（`netfx::boundary`），识别 `EffectSet` 资源与步骤以及 `netfx` 的写入路径，覆盖 legacy、nft、地址、路由、策略规则、sysctl 和 conntrack。扫描在命令构造处识别写入，覆盖所有 `ip` 对象、iptables/ip6tables 及 restore、nft、conntrack、sysctl 和 `/proc/sys` 写入。它用轻量词法扫描跳过注释、无关字符串、测试及只读检查。WireGuard 和 TTL 的既有 legacy 写入按 §4.7 不在范围内。
 
-例外逐项匹配文件、函数和命令，并记录原因；失去匹配的例外会使测试失败。当前 `netfx::boundary::ALLOWED` 有 10 项，包括 `wifi_relay::prepare` 的站点 MAC 设置和 link-up（日志撤销接口），已记账的 `@u60-relay-steer` 内部 backlog 写入，IPv6 的两处 `addr change` 寿命刷新和两个路由工厂，以及两个 IPACM 监视器的三种邻居写入。IPv6 地址撤销已纳入资源路径。`netfx` 提供有界命令（`exec`）、私有文件（`files`）、名字与编号（`ids`）、唯一的 conntrack 写入者（`conntrack`）、效果层（`effect`）和准入（`admission`）。
+例外逐项匹配文件、函数和命令，并记录原因；失去匹配的例外会使测试失败。当前 `netfx::boundary::ALLOWED` 有 8 项，包括已记账的 `@u60-relay-steer` 内部 backlog 写入，IPv6 的两处 `addr change` 寿命刷新和两个路由工厂，以及两个 IPACM 监视器的三种邻居写入。IPv6 地址撤销已纳入资源路径。`netfx` 提供有界命令（`exec`）、私有文件（`files`）、名字与编号（`ids`）、唯一的 conntrack 写入者（`conntrack`）、效果层（`effect`）和准入（`admission`）。
 
 ### 4.1 日志、撤销与资源归属
 
@@ -65,7 +65,7 @@ nft 撤销由所属 set 记账，Mihomo 为 `@u60-mihomo-nft remove`，中继为
 | --- | --- |
 | nft 表（族、表名） | 一个表一个 owner。用 `nft -f` 整表原子替换，过期集合随之消失；两族放入同一 nft 批处理。分别保留目标代次和最后一次读回确认的代次。写失败时目标仍待重试；读回失败是“未确认”。内容与已确认目标相同、且读回仍在内核里时不再载入。核对用一次 `nft -t list ruleset` 读两族（ZTE 不写 nft，里面只有 agent 的表），比对代次标记和每条链的**规则条数**；集合元素被清空或规则被等量替换查不出来（内容核验未实现，§8；没有别的写入者碰 nft）。 |
 | `LegacyChain` | 描述一条自有 `U60_*` 链及有序规则。首次用 `-N` 创建，替换/修复时将 `:NAME - [0:0]` 和全部规则放进同一 restore 事务，核对内容和顺序，undo 为 `-X`。B31 两族实测该声明会清空再填充自有链，证据为 `measurements/b5-qa-scripts/restore-chain-probe.txt`。 |
-| `LegacyHook` | 描述厂商链里跳向自有链或带 `zte-agent*` 注释的一条规则，核对恰有一份，重复时修复。`InsertFirst` 在添加/补回时插第一条，之后保留厂商在其前面插入的规则（INPUT、FORWARD、IPv4 MASQUERADE）。`BeforeVendor` 每次检查位置，将排在厂商 DNAT 后的门户 RETURN 在同一 restore 事务里删除并插到第一条。目标链就位后才应用钩子，undo 为精确 `-D`。 |
+| `LegacyHook` | 描述厂商链里跳向自有链或带 `zte-agent*` 注释的一条规则，核对恰有一份，重复时修复。`InsertFirst` 在添加/补回时插第一条，之后保留厂商在其前面插入的规则（INPUT、FORWARD）。`BeforeVendor` 每次检查位置，将排在厂商 DNAT 后的门户 RETURN 在同一 restore 事务里删除并插到第一条。目标链就位后才应用钩子，undo 为精确 `-D`。 |
 | `Route`、`Rule`、`Addr`、`Sysctl` | 从族、接口、表、优先级等描述生成 `ip … add`/`del` 及核验。sysctl 首次记原值，向 guard 登记采样，undo 为 `@u60-sysctl key original`。IPv6 寿命、DAD 和冲突由会话根据活租约核验（§6.2）。 |
 | `Internal`（`@u60-*`） | 名称对应 `netfx/effect/internal.rs` 的处理表，`Cmd::run`/`Cmd::undo` 据此调用无线、漫游、RA、DNS、门户开关、steering、省电和 nft 等处理器。处理器声明可核对性，射频切换等命令式操作只在操作流程中执行。 |
 
@@ -74,7 +74,7 @@ nft 撤销由所属 set 记账，Mihomo 为 `@u60-mihomo-nft remove`，中继为
 | 日志 | 资源归属 |
 | --- | --- |
 | `wireless.json` | IPv4 `U60_RELAY_IN` 与 INPUT 钩子、两族 nft 表、站点、漫游、热点信道和关联，`uplink` 共享此 set 并声明表。 |
-| `network.json` | IPv4 地址、路由、`U60_RELAY_FWD` 与 FORWARD 钩子、MASQUERADE、策略规则，以及 steering、省电和 IPA main 路由。 |
+| `network.json` | IPv4 地址、路由、`U60_RELAY_FWD` 与 FORWARD 钩子、策略规则，以及 steering、省电和 IPA main 路由。 |
 | `dns.json` | 两族门户 RETURN、解析器、门户开关。 |
 | `ipv6-setup.json` | 站点 IPv6 sysctl、`U60_R6_IN` 及 INPUT 钩子。 |
 | `ipv6-network.json` | IPv6 地址、路由、`U60_R6_FWD` 及钩子、策略规则、RA。 |
@@ -92,7 +92,7 @@ Mihomo 在自己的目录持有 `network.json`，仍写同样的九条 undo，�
 | 上游 INPUT v4/v6，`filter - 1` | 只约束 `iifname ath20`。v4 允许 established/related 和 DHCP 67→68 后 drop。未请求 IPv6 或尚未启用发现时保持上游 v6 关闭；发现开始前才允许 established/related、RA（链路本地源、跳数 255）、NS/NA（跳数 255）、ICMPv6 错误 1–4、DHCPv6 547→546，拒绝其余。 | v6 需要 `U60_R6_IN` 在 ZTE reject 前放行。v4 在证明首租、单播续租、广播重绑定和已建立回程都能穿过厂商 INPUT 前保留相应放行；仅看到 ESTABLISHED 规则不够。 |
 | IPv4 FORWARD，`filter - 1` | 先返回 `br-lan → ath20`，再返回 `ath20 → br-lan` 的 established/related；然后 drop 其余从/向 `ath20` 的流量。其他接口保持原路径。 | `U60_RELAY_FWD` 放行同样的合法流量，共两条（去程、已建立/相关的回程）。 |
 | IPv6 FORWARD / OUTPUT | 从 `br-lan` 向 `rmnet*` **先 reject**，不让后面的本地/组播例外覆盖它。NAT66 有效时返回经认可 LAN 源到 `ath20` 的去程、从该接口到 LAN 的 established/related 回程，再拒绝其他涉及该上游的转发。基线对其余 LAN 转发保留 `fc00::/7`、`fe80::/10`、`ff00::/8` 的本地例外，拒绝其他外部 v6；与中继无关的转发不受影响。OUTPUT 只需一条向 `rmnet*` 的拒绝。 | 合法 NAT66 流仍经 `U60_R6_FWD` 穿过厂商过滤。OUTPUT 拒绝归**中继基线**，覆盖 IPv6 未开启、租约丢失、NAT66 撤销后仍有 IPv4 中继的时段。 |
-| DNS、门户和地址转换 | `u60_mihomo` LAN DNS 优先于 `u60_relay`；中继区分 LAN DNS 与路由器 DNS，保留管理地址和必要的本地例外。核心出站采用经设备核对的独立掩码位后，中继 DNS OUTPUT 遇该位返回（M13；尚未启用，`ids::CORE_OUT_MARK` 为 `None`）。NAT66 只匹配中继上游出口；IPv4 MASQUERADE 迁移须通过 D11（未迁移）。 | 门户 `redirect_chain` 的两族 RETURN 必须位于厂商 DNAT **之前**；`-C` 成功不能证明位置正确。厂商只在 `zwrt_redirect.redirect.switch=1` 时写 DNAT；中继会话期间 agent 用易失 uci 改动把它设成 0。开关改动和两条 RETURN 都记在 `dns.json`，5 GHz 之间交接时原样交给新会话（之前的版本交接时释放开关几秒，期间的 fw3 重载写入过 DNAT）。RETURN 仍保留，以防开关读到 1。iptables 之下，厂商内核模块 `zte_http_redirect` 按 User-Agent 给浏览器回 302；`/sys/zte_genl/httpredirect_cmd` 读到 4 或 0x13 时，中继把它作为内核设置持有为 1，同样记在 `dns.json`（[硬件转发](relay-hw-offload.md)第 5 节）。IPv4 MASQUERADE 留在 legacy，带注释 `zte-agent-wifi-relay`。 |
+| DNS、门户和地址转换 | `u60_mihomo` LAN DNS 优先于 `u60_relay`。两族 `dns_out` 首先检查本机核心的 `0x01000000` 标记，命中即保留 DNS 目的地址。B31 门户的整字 `--set-mark 8880` 会覆写途经该规则的标记。两族的 masquerade 均仅匹配活动中继的 `ath20` 出口。 | 两族门户 `redirect_chain` RETURN。 |
 | 自有 legacy 规则的身份 | — | 在 `U60_*` 链里、跳到 `U60_*` 链，或带 `zte-agent*` 注释（`netfx::effect::legacy::owned_rule`）。站点名不算身份：厂商的 IPACM 文件也列着 `ath20`。 |
 
 IPv4 自有链为 `U60_RELAY_IN`、`U60_RELAY_FWD`，IPv6 为 `U60_R6_IN`、`U60_R6_FWD`。IPv6 INPUT 直接挂 `-i ath20 -j U60_R6_IN`。跨版本接管时，旧会话的 IPv6 `U60_RELAY_IN` 及跳转随旧日志保留到该会话拆除。
@@ -234,7 +234,7 @@ Connect 从已发布扫描列表校验选择，然后取消待恢复，再取得
 
 批次 5 已完成中继控制器和 `EffectSet`，其中尚待实现的是中继出口快照、IPv6 自己的设备端口，以及门户 RETURN 以外钩子的持续位置约束，后者按 D8 保留厂商后来插到前面的过滤规则，使车主开启的过滤继续生效。
 
-另有两项是规范里带门槛、按门槛暂不启用的：核心出站标志位 M13（`ids::CORE_OUT_MARK` 为 `None`，等设备核对空闲位）和 IPv4 MASQUERADE 迁到 nft（D11，等 ≥220 Mbit/s 硬件下载证明不影响卸载）。
+D11 的 B31 公网 CN 下载为 nft 240.3 Mbit/s、CPU 15.0%，legacy 为 249.6 Mbit/s、CPU 17.7%，IPA 两者均卸载。接管旧会话时先标记租约格式、撤销旧日志中的精确 legacy 规则，再加载 nft；旧槽无法接管新版租约，会先执行原有日志恢复再重连。M13 的 B31 标记核验已通过。本段数值来自车主测量。
 
 2026-11-12 批次 4 已完成原表中的“中继会话阶段”和“HTTP 只读快照”，所以从未实现清单移除；验证范围见[实现记录](relay-mihomo-implementation.md#batch-4)。
 

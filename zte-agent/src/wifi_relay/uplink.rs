@@ -2,7 +2,7 @@
 //! (`relay-mihomo-architecture.md` section 4.3). Denials live here; legacy
 //! iptables keeps only the accepts that must pass the vendor's DROP/REJECT
 //! (`U60_RELAY_IN`, `U60_RELAY_FWD`, `U60_R6_IN`, `U60_R6_FWD`), the portal
-//! RETURN and the IPv4 MASQUERADE (D11 not proven). A return here leaves
+//! RETURN. The active IPv4 and IPv6 layouts own their masquerade. A return here leaves
 //! only these chains: the vendor's rules still apply after them.
 //!
 //! What the tables hold follows the session (`Layout`):
@@ -114,8 +114,10 @@ fn v4(layout: &Layout, mark: Option<u32>) -> Result<String, String> {
     forward.extend([format!("{mine} drop"), format!("oifname \"{IFACE}\" drop")]);
     let (filter_in, filter_fwd) = (hook("filter", "input", FILTER), hook("filter", "forward", FILTER));
     let mut chains = vec![("input", filter_in.as_str(), input), ("forward", filter_fwd.as_str(), forward)];
+    let nat = hook("nat", "postrouting", SRCNAT);
     let (pre, out) = (hook("nat", "prerouting", DNS_PRIORITY), hook("nat", "output", DNS_OUTPUT_PRIORITY));
     if let Some(relay) = &layout.relay {
+        chains.push(("nat4", nat.as_str(), vec![format!("oifname \"{IFACE}\" masquerade")]));
         // LAN and router DNS to the Wi-Fi resolver, except local, LAN,
         // tailnet and link-local destinations.
         let exempt = format!("ip daddr {{ {}, {} }} return", ids::LOCAL_DNS_V4.join(", "), network(&relay.lan, false)?);
@@ -474,9 +476,9 @@ pub mod tests {
     /// M13: only once a free mark is verified on the device; off until then.
     #[test]
     fn the_cores_marked_dns_keeps_its_destination_only_with_a_verified_mark() {
-        assert_eq!(ids::CORE_OUT_MARK, None, "not deployed before the device check");
+        assert_eq!(ids::CORE_OUT_MARK, Some(0x0100_0000));
         let layout = Layout { relay: Some(relay()), discovery: true, nat66: Some(nat66(Some("2001:db8:1::53"))) };
-        for text in tables(&layout, Some(0x0100_0000)).unwrap() {
+        for text in tables(&layout, ids::CORE_OUT_MARK).unwrap() {
             assert_eq!(chain(&text, "dns_out")[0], "meta mark & 0x01000000 == 0x01000000 return");
         }
         for text in tables(&layout, None).unwrap() {

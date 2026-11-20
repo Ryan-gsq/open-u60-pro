@@ -249,6 +249,12 @@ impl EffectSet {
         Ok(())
     }
 
+    /// Retire an exact undo from a loaded journal before adopting its replacement.
+    pub fn retire_legacy_hook(&mut self, hook: LegacyHook) -> Result<(), String> {
+        let undo = Resource::LegacyHook(hook).undo(|_| unreachable!())?;
+        if self.undo.contains(&undo) { self.remove(&[undo], &mut net::Device) } else { Ok(()) }
+    }
+
     pub fn withdraw(&mut self, keys: &[Key]) -> Result<(), String> {
         self.withdraw_with(keys, &mut net::Device)
     }

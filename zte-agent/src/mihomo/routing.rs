@@ -157,8 +157,7 @@ impl Provider {
 /// The parts of a configuration that decide routing.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Routes {
-    rules: Vec<String>,
-    rule_targets: Vec<String>,
+    rules: Vec<(Rule, String)>,
     groups: HashMap<String, Group>,
     providers: HashMap<String, Provider>,
     /// The subscription's own fake-ip-filter blacklist, as real-ip rules.
@@ -560,8 +559,8 @@ impl Routes {
     /// From the subscription configuration, before the agent rewrites its DNS.
     pub(super) fn from(config: &Yaml) -> Self {
         let strings = |v: &Yaml| v.as_sequence().map(|s| s.iter().filter_map(Yaml::as_str).map(str::to_owned).collect::<Vec<_>>());
-        let rules = strings(&config["rules"]).unwrap_or_default();
-        let rule_targets = rules.iter().map(|line| parse(line, true).target).collect();
+        let rules = config["rules"].as_sequence().into_iter().flatten().filter_map(Yaml::as_str)
+            .map(|line| (parse(line, true), short(line))).collect();
         let groups = config["proxy-groups"]
             .as_sequence()
             .into_iter()
@@ -593,7 +592,7 @@ impl Routes {
             .filter(|p| p["server"].as_str().is_some_and(|s| s.trim_start_matches('[').trim_end_matches(']').parse::<std::net::Ipv6Addr>().is_ok()))
             .filter_map(|p| p["name"].as_str().map(str::to_owned))
             .collect();
-        Self { rules, rule_targets, groups, providers, compat, geodata: config["geodata-mode"].as_bool() == Some(true), v6_only }
+        Self { rules, groups, providers, compat, geodata: config["geodata-mode"].as_bool() == Some(true), v6_only }
     }
 
     /// The nodes with only an IPv6 server address that traffic can reach now:
@@ -606,7 +605,7 @@ impl Routes {
         let mut todo: Vec<(&str, usize)> = match mode {
             Mode::Direct => return Vec::new(),
             Mode::Global => vec![("GLOBAL", 0)],
-            Mode::Rule => self.rule_targets.iter().map(|target| (target.as_str(), 0)).collect(),
+            Mode::Rule => self.rules.iter().map(|(rule, _)| (rule.target.as_str(), 0)).collect(),
         };
         let (mut seen, mut found) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
         while let Some((name, depth)) = todo.pop() {
@@ -673,7 +672,9 @@ impl Routes {
             return out;
         }
         let tail = self.real_until(&mut out);
-        out.extend(self.compat.iter().cloned());
+        if tail == "real-ip" {
+            out.extend(self.compat.iter().cloned());
+        }
         out.push(format!("MATCH,{tail}"));
         out
     }
@@ -681,8 +682,7 @@ impl Routes {
     /// The per-rule entries of `dns`; the action for the names left over.
     fn real_until(&self, out: &mut Vec<String>) -> &'static str {
         let end = self.last_return().map_or(0, |last| last + 1);
-        for line in &self.rules[..end] {
-            let rule = parse(line, true);
+        for (rule, _) in &self.rules[..end] {
             let fixed = rule.target == "DIRECT";
             let action = if fixed { "real-ip" } else { "fake-ip" };
             match rule.kind.as_str() {
@@ -704,7 +704,7 @@ impl Routes {
                 // rules after it decide the rest, as for any other name.
                 "AND" | "OR" if fixed => {}
                 "AND" | "OR" => {
-                    if !self.domain_leaves(&rule.payload, 0, out) {
+                    if !self.domain_leaves(rule, 0, out) {
                         return "fake-ip";
                     }
                 }
@@ -724,8 +724,7 @@ impl Routes {
     /// rule-set file or GeoIP code does not change DNS.
     fn last_return(&self) -> Option<usize> {
         let mut last = None;
-        for (index, line) in self.rules.iter().enumerate() {
-            let rule = parse(line, true);
+        for (index, (rule, _)) in self.rules.iter().enumerate() {
             let direct = self.could_direct(&rule.target);
             if rule.kind == "MATCH" {
                 return if direct { Some(index) } else { last };
@@ -751,11 +750,22 @@ impl Routes {
     /// A non-DIRECT logical rule's domain conditions, as fake-ip entries;
     /// false when one names domains this filter cannot list (a refreshed set,
     /// a `NOT`, too deep).
-    fn domain_leaves(&self, payload: &str, depth: usize, out: &mut Vec<String>) -> bool {
+    fn domain_leaves(&self, rule: &Rule, depth: usize, out: &mut Vec<String>) -> bool {
         if depth > MAX_DEPTH {
             return false;
         }
-        for sub in sub_rules(payload).unwrap_or_default() {
+        let Some(subs) = sub_rules(&rule.payload).filter(|rules| !rules.is_empty()) else { return false };
+        // Every match of an intersection belongs to each mandatory domain
+        // operand, even after a sibling provider changes. Keep that entire
+        // fixed superset fake, leaving unrelated GEOSITE entries reachable.
+        if rule.kind == "AND" {
+            if let Some(bound) = subs.iter().find(|sub| domain_kind(&sub.kind) ||
+                (sub.kind == "RULE-SET" && self.providers.get(&sub.payload).is_some_and(|p| p.kind == "inline" && p.behavior == "domain"))) {
+                out.push(format!("{},{},fake-ip", bound.kind, bound.payload));
+                return true;
+            }
+        }
+        for sub in subs {
             match sub.kind.as_str() {
                 kind if domain_kind(kind) => out.push(format!("{kind},{},fake-ip", sub.payload)),
                 "RULE-SET" => match self.providers.get(&sub.payload) {
@@ -764,7 +774,7 @@ impl Routes {
                     _ => return false,
                 },
                 "AND" | "OR" => {
-                    if !self.domain_leaves(&sub.payload, depth + 1, out) {
+                    if !self.domain_leaves(&sub, depth + 1, out) {
                         return false;
                     }
                 }
@@ -797,16 +807,15 @@ impl Routes {
     /// it sends DIRECT, the end of the chain otherwise.
     pub(super) fn compile(&self, selected: &Selected, root: &Path, unsettled: &[String]) -> Compiled {
         let mut out = Compiled { steps: Vec::new(), tail: Verdict::Direct, cut: None, geoip: Vec::new(), sources: Vec::new() };
-        for (index, line) in self.rules.iter().enumerate() {
-            let rule = parse(line, true);
+        for (index, (rule, summary)) in self.rules.iter().enumerate() {
             let verdict = if self.direct(&rule.target, selected) { Verdict::Direct } else { Verdict::Core };
             if rule.kind == "MATCH" {
                 out.tail = verdict;
                 break;
             }
-            let label = format!("Rule {} ({})", index + 1, short(line));
+            let label = format!("Rule {} ({summary})", index + 1);
             let mut alts = Vec::new();
-            for alt in self.effect(&rule, root, 0, &mut out.sources, unsettled) {
+            for alt in self.effect(rule, root, 0, &mut out.sources, unsettled) {
                 match alt {
                     Ok(alt) => alts.push(alt),
                     // Skipping a DIRECT condition only sends more to the core.
@@ -1180,8 +1189,7 @@ mod tests {
     fn ipv6_targets_are_parsed_once_without_changing_rule_order() {
         let mut routes = with_rules(&["AND,((NETWORK,UDP),(DST-PORT,443)),JP6", "MATCH,DIRECT"]);
         routes.v6_only.insert("JP6".into());
-        assert_eq!(routes.rule_targets, routes.rules.iter().map(|line| parse(line, true).target).collect::<Vec<_>>());
-        routes.rules.clear();
+        assert_eq!(routes.rules.iter().map(|(r, _)| r.target.as_str()).collect::<Vec<_>>(), ["JP6", "DIRECT"]);
         for _ in 0..10 {
             assert_eq!(routes.v6_only_in_use(Mode::Rule, &Selected::new()), ["JP6"]);
         }
@@ -1338,13 +1346,6 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
                 "DOMAIN-SUFFIX,claude.ai,fake-ip",
                 "DOMAIN-SUFFIX,lihan.me,real-ip",
                 "RULE-SET,Ads,fake-ip",
-                "DOMAIN-WILDCARD,*.lan,real-ip",
-                "DOMAIN-SUFFIX,local.dev,real-ip",
-                "DOMAIN-WILDCARD,time.*.com,real-ip",
-                "DOMAIN,localhost.ptlogin2.qq.com,real-ip",
-                "GEOSITE,private,real-ip",
-                "RULE-SET,Ads,real-ip",
-                "DOMAIN-WILDCARD,*.corp,real-ip",
                 "MATCH,fake-ip",
             ]
             .map(String::from),
@@ -1354,6 +1355,19 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         off.extend(routes().compat.iter().cloned());
         off.push("MATCH,fake-ip".into());
         assert_eq!(routes().dns(false), off, "with the bypass off only local names and the subscription's list are real");
+    }
+
+    #[test]
+    fn a_fixed_domain_boundary_limits_a_refreshable_reject_set_only_in_an_intersection() {
+        for (logic, reaches_cn) in [("AND", true), ("OR", false)] {
+            let text = format!("rule-providers: {{Ads: {{type: http, behavior: domain}}}}\nrules: ['{logic},((RULE-SET,Ads),(DOMAIN-SUFFIX,ads.test)),REJECT','GEOSITE,CN,DIRECT','GEOIP,CN,DIRECT','MATCH,P']");
+            let filter = Routes::from(&serde_yaml_ng::from_str(&text).unwrap()).dns(true);
+            assert_eq!(filter.iter().any(|entry| entry == "GEOSITE,CN,real-ip"), reaches_cn);
+            if reaches_cn {
+                let guard = filter.iter().position(|entry| entry == "DOMAIN-SUFFIX,ads.test,fake-ip").unwrap();
+                assert_eq!(filter[guard + 1], "GEOSITE,CN,real-ip");
+            }
+        }
     }
 
     /// Q3: a domain a group sends somewhere is fake whatever the group's

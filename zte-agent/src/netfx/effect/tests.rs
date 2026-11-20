@@ -706,7 +706,7 @@ fn one_fw3_repair_restores_all_chains_and_unique_hooks_with_portal_before_dnat()
     assert!(result.failed.is_empty(), "{result:?}");
     let portal = &kernel.tables[&("iptables".into(), "nat".into())];
     assert!(portal.iter().position(|line| line.contains("-j RETURN")) < portal.iter().position(|line| line.contains("-j DNAT")));
-    assert_eq!(portal.iter().filter(|line| line.contains("MASQUERADE")).count(), 1);
+    assert_eq!(portal.iter().filter(|line| line.contains("MASQUERADE")).count(), 0);
     kernel.writes.clear();
     let result = set.reconcile_with(&mut kernel, &mut nft);
     assert!(result.failed.is_empty() && result.restored.is_empty());

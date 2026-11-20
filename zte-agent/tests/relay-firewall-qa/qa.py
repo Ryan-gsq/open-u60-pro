@@ -320,7 +320,7 @@ def data_plane():
 
     load("relay")
     got = ask("client", "10.20.0.1", 80)
-    report("relay: LAN IPv4 reaches the upstream, masqueraded (legacy)", got[0] == "up:10.20.0.7:hi", got)
+    report("relay: LAN IPv4 reaches the upstream, masqueraded (nft)", got[0] == "up:10.20.0.7:hi", got)
     got = ask("upstream", "192.168.0.23", 80)
     report("relay: a new connection from the upstream to the LAN is dropped", got[0] == "timeout", got)
     got = ask("upstream", "10.20.0.7", 9090)

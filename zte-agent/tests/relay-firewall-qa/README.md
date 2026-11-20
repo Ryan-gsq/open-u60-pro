@@ -42,7 +42,7 @@ beside the handoff). The checks cover the following cases.
 - Guard: the upstream reaches no router port (IPv4, IPv6) except DHCP
   67 -> 68; nothing is forwarded through the upstream; IPv6 stays closed
   until discovery.
-- Routes: LAN IPv4 reaches the upstream (legacy MASQUERADE); the upstream
+- Routes: LAN IPv4 reaches the upstream (nft masquerade); the upstream
   cannot open connections to the LAN or the router; LAN and router IPv6 to
   `rmnet*` is rejected at once; LAN IPv6 does not leave without NAT66; LAN
   and router DNS go to the Wi-Fi resolver, DNS to the router stays local.

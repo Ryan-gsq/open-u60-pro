@@ -511,10 +511,10 @@ impl DevicePort {
             bytes[0] = (bytes[0] | 2) & !1;
             bytes[5] ^= 0x60;
             let mac = bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
-            Cmd::new("ip", &["link", "set", "dev", IFACE, "address", &mac]).run()?;
+            session.wireless.lock().unwrap().step(Step::new(Cmd::new("ip", &["link", "set", "dev", IFACE, "address", &mac]), Cmd::new("true", &[])))?;
             // Deleting the interface is the undo.
             session.wireless.lock().unwrap().step(Step::new(Cmd::new("sysctl", &["-w", &format!("net.ipv6.conf.{IFACE}.disable_ipv6=1")]), Cmd::new("true", &[])))?;
-            Cmd::new("ip", &["link", "set", "dev", IFACE, "up"]).run()?;
+            session.wireless.lock().unwrap().step(Step::new(Cmd::new("ip", &["link", "set", "dev", IFACE, "up"]), Cmd::new("true", &[])))?;
             net::write_private(&Path::new(ROOT).join("wpa.conf"), format!("ctrl_interface={ROOT}/ctrl\nupdate_config=0\n").as_bytes())?;
             let mut cmd = Command::new("wpa_supplicant");
             cmd.args(["-D", "nl80211", "-i", IFACE, "-c", &format!("{ROOT}/wpa.conf"), "-qq"]);
@@ -1363,7 +1363,7 @@ fn resolver_key() -> Key {
     Key::Internal("@u60-relay-dns", Cmd::new("@u60-relay-dns", &[]))
 }
 
-/// Addresses, routes, the legacy accepts and MASQUERADE; the policy rule is
+/// Addresses, routes and the legacy accepts; the policy rule is
 /// last (the caller loads the tables before it). The portal RETURN is not
 /// here: `handover` rolls this plan back, and the RETURN stays with the
 /// switch in `dns` (`portal::web_bypasses`).
@@ -1394,13 +1394,6 @@ pub(crate) fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) 
         words(&["-i", IFACE, "-o", "br-lan", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]),
     ] }));
     p.push(Resource::LegacyHook(LegacyHook { tool: LegacyTool::V4, table: "filter".into(), chain: "FORWARD".into(), rule: words(&["-j", "U60_RELAY_FWD"]), position: Position::InsertFirst }));
-    // Core/router UDP sockets may retain a previously selected SIM source.
-    // Translate only our owned Wi-Fi egress, not cellular or local traffic
-    // (it stays in legacy until an nft MASQUERADE is shown to keep hardware
-    // forwarding, D11). It also covers router DNS that `uplink` redirects
-    // from a socket bound to a SIM source. Its comment is its identity
-    // (`owned_rule`): the station's name is one the vendor's files list.
-    p.push(Resource::LegacyHook(LegacyHook { tool: LegacyTool::V4, table: "nat".into(), chain: "POSTROUTING".into(), rule: words(&["-o", IFACE, "-m", "comment", "--comment", crate::netfx::ids::RELAY_COMMENT, "-j", "MASQUERADE"]), position: Position::InsertFirst }));
     // Installed last: no downstream traffic switches until NAT/guards exist.
     p.push(Resource::Rule(Rule { family: Family::V4, priority: PREF.parse().unwrap(), table: TABLE.into(), mark: None }));
     p
@@ -1573,9 +1566,15 @@ fn lease_file(root: &Path, session: &str) -> Option<std::path::PathBuf> {
         .then(|| root.join(format!("ipv4-lease-{session}.json")))
 }
 
+/// The envelope identifies the NAT implementation on adoption. A rollback
+/// to an older agent rejects this lease before it installs legacy NAT and
+/// runs its ordinary journal recovery (including removal of the nft table).
+#[derive(Serialize, Deserialize)]
+struct NftLease { nft_v4: Lease }
+
 fn read_lease(session: &str) -> Result<Lease, String> {
     let path = lease_file(Path::new(ROOT), session).ok_or("Invalid DHCP session")?;
-    serde_json::from_slice(&fs::read(path).map_err(|_| "No DHCP lease")?).map_err(|_| "Invalid DHCP lease".into())
+    serde_json::from_slice::<NftLease>(&fs::read(path).map_err(|_| "No DHCP lease")?).map(|record| record.nft_v4).map_err(|_| "Invalid DHCP lease".into())
 }
 
 /// A DHCP client on a new session path (its lease file), asking for
@@ -1620,7 +1619,7 @@ fn dhcp_callback_at(root: &Path, event: &str, env: impl Fn(&str) -> Option<Strin
     let (Some(ip), Some(subnet), Some(gateway)) = (read("ip"), read("subnet"), read("router")) else { return 1 };
     let dns = env("dns").unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).take(3).collect();
     let lease = Lease { ip, subnet, gateway, dns };
-    if net::write_private(&path, &serde_json::to_vec(&lease).unwrap()).is_ok() {
+    if net::write_private(&path, &serde_json::to_vec(&NftLease { nft_v4: lease }).unwrap()).is_ok() {
         0
     } else {
         1
@@ -1982,7 +1981,7 @@ mod tests {
     fn no_default_main_route_or_persistent_wifi_is_overwritten() {
         let l = Lease { ip: "10.0.0.2".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.0.0.1".parse().unwrap(), dns: vec![] };
         let p = relay_plan(&l, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
-        assert!(p.iter().any(|s| s.apply.program == "iptables" && s.apply.args.ends_with(&["-o", IFACE, "-m", "comment", "--comment", crate::netfx::ids::RELAY_COMMENT, "-j", "MASQUERADE"].map(String::from))));
+        assert!(p.iter().all(|s| !s.apply.args.iter().any(|a| a == "MASQUERADE")));
         assert!(p.iter().filter(|s| s.apply.args.iter().any(|a| a == "default")).all(|s| s.apply.args.iter().any(|a| a == TABLE)));
         assert!(p.iter().all(|s| s.apply.program != "uci"));
         assert!(p.last().unwrap().apply.args.iter().any(|a| a == PREF));
@@ -2043,7 +2042,7 @@ mod tests {
     }
 
     /// v5: the denials are in the relay's tables; legacy holds accepts only
-    /// (the vendor's DROP/REJECT is what they pass), MASQUERADE (D11) and
+    /// (the vendor's DROP/REJECT is what they pass) and
     /// the portal RETURN.
     #[test]
     fn legacy_rules_only_accept_what_must_pass_the_vendors_rejects() {
@@ -2148,8 +2147,8 @@ mod tests {
         assert!(!p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["--dport", "53"])), "no legacy DNS rules");
         // Router DNS redirected from a socket bound to a SIM source still
         // leaves with the relay's address.
-        assert!(p.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["-I", "POSTROUTING"])
-            && s.apply.args.ends_with(&["-o", IFACE, "-m", "comment", "--comment", crate::netfx::ids::RELAY_COMMENT, "-j", "MASQUERADE"].map(String::from))));
+        let [ip, _] = uplink::tables(&uplink::Layout { relay: Some(relay_layout(&l, lan.0, lan.1)), ..Default::default() }, None).unwrap();
+        assert_eq!(uplink::tests::chain(&ip, "nat4"), ["oifname \"ath20\" masquerade"]);
         assert_eq!(relay_layout(&Lease { dns: vec![], ..l }, lan.0, lan.1).dns, "10.20.0.1".parse::<Ipv4Addr>().unwrap());
     }
 

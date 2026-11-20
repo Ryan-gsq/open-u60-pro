@@ -93,6 +93,12 @@ fn take_over(session: &mut Session, installed: &Lease, prefix: u32, lan_ip: Ipv4
     guards.push(session.uplink.resource(None));
     adopt_resources(&mut session.wireless.lock().unwrap(), guards, &mut net::Device, &mut crate::netfx::effect::Device)?;
     session.network = EffectSet::load("relay", &root.join("network.json"))?;
+    // Remove precisely the old tagged rule before any declaration of nat4.
+    let legacy_nat = super::LegacyHook {
+        tool: super::LegacyTool::V4, table: "nat".into(), chain: "POSTROUTING".into(), position: super::Position::InsertFirst,
+        rule: super::words(&["-o", IFACE, "-m", "comment", "--comment", crate::netfx::ids::RELAY_COMMENT, "-j", "MASQUERADE"]),
+    };
+    session.network.retire_legacy_hook(legacy_nat)?;
     session.network.adopt(relay_plan(installed, prefix, lan_ip, lan_mask))?;
     session.routed = true;
     for step in steering::plan() {
@@ -223,7 +229,16 @@ fn installed_lease(dir: &Path) -> Result<(String, Lease), String> {
     match sessions.as_slice() {
         [one] => {
             let path = lease_file(dir, one).ok_or("Invalid DHCP session")?;
-            let lease = serde_json::from_slice(&fs::read(path).map_err(|_| "No DHCP lease")?).map_err(|_| "Invalid DHCP lease")?;
+            let bytes = fs::read(&path).map_err(|_| "No DHCP lease")?;
+            let lease = match serde_json::from_slice::<super::NftLease>(&bytes) {
+                Ok(record) => record.nft_v4,
+                Err(_) => {
+                    let lease: Lease = serde_json::from_slice(&bytes).map_err(|_| "Invalid DHCP lease")?;
+                    let record = super::NftLease { nft_v4: lease };
+                    net::write_private(&path, &serde_json::to_vec(&record).map_err(|e| e.to_string())?)?;
+                    record.nft_v4
+                }
+            };
             Ok((one.clone(), lease))
         }
         [] => Err("no DHCP lease of the previous session".into()),
@@ -289,6 +304,9 @@ mod tests {
         fs::write(dir.join(format!("ipv6-lease-{a}.json")), "{}").unwrap();
         let (session, taken) = installed_lease(&dir).unwrap();
         assert_eq!(session, a);
+        let migrated = fs::read(dir.join(format!("ipv4-lease-{a}.json"))).unwrap();
+        assert!(serde_json::from_slice::<Lease>(&migrated).is_err(), "the old slot must recover before adding legacy NAT");
+        assert_eq!(installed_lease(&dir).unwrap().1, taken);
         assert_eq!(taken.ip, Ipv4Addr::new(192, 168, 2, 124));
         fs::write(dir.join(format!("ipv4-lease-{}.json", "0".repeat(32))), lease).unwrap();
         assert!(installed_lease(&dir).is_err(), "two sessions are not one connection");

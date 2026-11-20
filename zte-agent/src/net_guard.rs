@@ -55,7 +55,8 @@ static TRIGGERED: Condvar = Condvar::new();
 
 /// Something ZTE runs may have changed our state.
 pub fn poke() {
-    *LAST.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
+    *last = Some(Instant::now());
     GENERATION.fetch_add(1, Ordering::Relaxed);
     TRIGGERED.notify_all();
 }
@@ -127,7 +128,11 @@ pub fn release(owner: &str, key: Option<&str>) {
 /// back if its holder still holds it at the same generation. `read` and
 /// `write` stand for `/proc/sys` (tests).
 fn sample(read: impl Fn(&str) -> Option<String>, write: impl Fn(&str, &str) -> Result<(), String>) -> Vec<String> {
-    let held = HELD.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let held = {
+        let held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.is_empty() { return Vec::new(); }
+        held.clone()
+    };
     let mut restored = Vec::new();
     for h in held {
         let Some(now) = read(&h.key) else { continue };
@@ -159,7 +164,7 @@ pub fn on_settled(waker: impl Fn() + Send + Sync + 'static) {
 /// After each trigger: samples the held settings for `SAMPLE`, and wakes
 /// the owners once the trigger is `SETTLE` quiet.
 fn sampler() {
-    let mut seen = GENERATION.load(Ordering::Relaxed);
+    let mut seen = 0;
     loop {
         let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
         while GENERATION.load(Ordering::Relaxed) == seen {
@@ -182,7 +187,9 @@ fn sampler() {
                 seen = generation;
                 break;
             }
-            std::thread::sleep(SAMPLE_EVERY);
+            let last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(TRIGGERED.wait_timeout_while(last, SAMPLE_EVERY, |_| GENERATION.load(Ordering::Relaxed) == generation)
+                .unwrap_or_else(PoisonError::into_inner));
         }
     }
 }

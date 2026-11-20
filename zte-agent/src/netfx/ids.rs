@@ -28,10 +28,10 @@ pub const RELAY_METRIC: &str = "60631";
 /// TPROXY mark and mask (`mark and 0xffff00ff or 0x700`).
 pub const TPROXY_MARK: &str = "0x700/0xff00";
 /// The core's outbound socket mark (M13): the relay's DNS output chain lets
-/// the core's own plain DNS keep its destination. Off until a bit is
-/// verified free on the device: ZTE's scripts use `0x3f00` and `0x40000000`,
-/// TPROXY `0xff00`, Tailscale `0xff0000`; the candidate is `0x01000000`.
-pub const CORE_OUT_MARK: Option<u32> = None;
+/// the core's own plain DNS keep its destination. B31's portal PREROUTING
+/// can overwrite a transit mark with decimal 8880. Only test locally
+/// generated OUTPUT here, never trust a mark on a forwarded packet.
+pub const CORE_OUT_MARK: Option<u32> = Some(0x0100_0000);
 
 /// nftables tables (one `ip` and one `ip6` table each).
 pub const MIHOMO_NFT: &str = "u60_mihomo";
