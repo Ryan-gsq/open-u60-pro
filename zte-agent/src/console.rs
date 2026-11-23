@@ -162,6 +162,8 @@ fn legacy_destination(path: &str) -> &'static str {
         "/console/#network/firewall"
     } else if route.starts_with("relay") {
         "/console/#network/relay"
+    } else if route.starts_with("router/tailscale") || route.starts_with("tailscale") {
+        "/console/#network/tailscale"
     } else if route.starts_with("router/mihomo") || route.starts_with("mihomo") {
         "/console/#network/mihomo"
     } else if route.starts_with("router/qos") {
@@ -325,6 +327,14 @@ fn asset(path: &str) -> Option<(&'static str, &'static str)> {
             "text/javascript; charset=utf-8",
             include_str!("../ui/wireguard.js"),
         )),
+        "/console/a/tailscale-model.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/tailscale-model.js"),
+        )),
+        "/console/a/tailscale.js" => Some((
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/tailscale.js"),
+        )),
         "/console/a/relay-model.js" => Some((
             "text/javascript; charset=utf-8",
             include_str!("../ui/relay-model.js"),
@@ -433,6 +443,8 @@ mod tests {
             ("/console/a/dns-cache.js", 200),
             ("/console/a/wireguard-model.js", 200),
             ("/console/a/wireguard.js", 200),
+            ("/console/a/tailscale-model.js", 200),
+            ("/console/a/tailscale.js", 200),
             ("/console/a/relay-model.js", 200),
             ("/console/a/relay.js", 200),
             ("/console/a/mihomo-model.js", 200),
@@ -499,6 +511,7 @@ mod tests {
             ),
             ("/ui/router/esim?iccid=private", "/console/#network/esim"),
             ("/ui/relay", "/console/#network/relay"),
+            ("/ui/tailscale?next=private", "/console/#network/tailscale"),
             ("/ui/router/mihomo?add=1&token=private", "/console/#network/mihomo"),
             ("/ui/battery", "/console/#tools/battery"),
             ("/ui/settings/https", "/console/#settings/https"),

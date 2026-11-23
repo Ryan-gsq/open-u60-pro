@@ -545,6 +545,7 @@ impl<P: Port> Controller<P> {
         let _claim = self.claim();
         let (off, owner) = self.port.hotspot();
         let result = if off && owner {
+            crate::netlog!("[relay] restore attempt {} cancelled: hotspot is off by owner", attempt + 1);
             let error = self.port.clear().err();
             self.end_restore(error);
             self.shared.cancel_restore();
@@ -630,7 +631,8 @@ impl<P: Port> Controller<P> {
         match decide(link, observed.helpers, change, observed.hotspot_off) {
             Decision::Teardown(reason) => {
                 crate::netlog!(
-                    "[relay] teardown reason={reason} recovery_ms={} query_ms={query_ms}",
+                    "[relay] teardown reason={reason} by_owner={} recovery_ms={} query_ms={query_ms}",
+                    observed.by_owner,
                     session.association.elapsed(self.port.boot_now()).as_millis()
                 );
                 if observed.hotspot_off {

@@ -11,6 +11,7 @@ struct World {
     joins: VecDeque<Result<(), String>>,
     pending: bool,
     off: (bool, bool),
+    off_during_join: Option<(bool, bool)>,
     cleanup_error: Option<String>,
     clear_error: Option<String>,
     pause: Option<(&'static str, mpsc::Sender<()>, mpsc::Receiver<()>)>,
@@ -137,6 +138,19 @@ impl Port for FakePort {
     }
     fn join(&mut self, state: &mut State, selection: Selection, _: bool, cancel: &Cancellation) -> Result<Session, String> {
         self.call("join");
+        let hotspot_state = self.world.lock().unwrap().off_during_join.take();
+        if let Some(hotspot_state) = hotspot_state {
+            let (_off, by_owner) = hotspot_state;
+            self.world.lock().unwrap().off = hotspot_state;
+            let clear_error = finish_join_hotspot_failure(&cancel.shared, by_owner, || {
+                self.world.lock().unwrap().target = None;
+                Ok(())
+            });
+            if let Some(error) = clear_error {
+                state.error = Some(error);
+            }
+            return Err("Hotspot was turned off while connecting relay".into());
+        }
         if let Some(result) = self.world.lock().unwrap().joins.pop_front() {
             result?;
         }
@@ -556,7 +570,7 @@ fn restore_rechecks_changed_target_and_same_target_owner_replacement() {
     let root = Path::new("/tmp/u60-test/work/relayctl/restore-target");
     resume::save(root, &network(), false).unwrap();
     let shared = Arc::new(Shared::new());
-    let port = DevicePort { control: None, settings: None, shared: Arc::clone(&shared), mihomo: None };
+    let port = DevicePort { control: None, settings: None, shared: Arc::clone(&shared), mihomo: None, tailscale: None };
     let cancel = Cancellation { shared: Arc::clone(&shared), generation: 0, target: Some(target()) };
     assert!(cancel.check().is_ok());
     let mut changed = network();
@@ -622,6 +636,69 @@ fn restore_distinguishes_owner_off_firmware_off_and_missing_password() {
     harness.barrier();
     assert_eq!(harness.calls().iter().filter(|call| call.as_str() == "enter join").count(), 1);
     assert!(harness.relay.status()["error"].as_str().unwrap().contains(RESTORE_NO_PASSWORD));
+}
+
+#[test]
+fn firmware_shutdown_preserves_target_and_retries_until_wifi_returns_after_boot() {
+    let before_reboot = Harness::new(World::default());
+    before_reboot.connect().unwrap();
+    let mut shutdown = observation("COMPLETED");
+    shutdown.hotspot_off = true;
+    shutdown.by_owner = false;
+    before_reboot.tick(shutdown, 0);
+    assert_eq!(before_reboot.relay.status()["phase"], "idle");
+    let saved = before_reboot.port.world.lock().unwrap().target.clone();
+    assert!(saved.is_some(), "firmware power-off must keep resume target");
+
+    let after_reboot = Harness::new(World { target: saved, off: (true, false), ..World::default() });
+    let (answer, thread) = after_reboot.restore();
+    after_reboot.until(|| after_reboot.relay.status()["restoring"].is_string());
+    after_reboot.barrier();
+    assert!(after_reboot.port.world.lock().unwrap().target.is_some());
+    after_reboot.port.world.lock().unwrap().off = (false, false);
+    after_reboot.advance(RESTORE_WAITS[1]);
+    answer.recv_timeout(Duration::from_secs(2)).unwrap();
+    thread.join().unwrap();
+    assert_eq!(after_reboot.relay.status()["phase"], "active");
+    assert!(after_reboot.relay.status()["restoring"].is_null());
+}
+
+#[test]
+fn temporary_hotspot_off_during_join_retries_and_recovers_in_same_boot() {
+    let harness = Harness::new(World {
+        target: Some(target()),
+        off: (false, false),
+        off_during_join: Some((true, false)),
+        ..World::default()
+    });
+    let (answer, thread) = harness.restore();
+    harness.until(|| harness.calls().contains(&"exit join".into()));
+    harness.barrier();
+    assert!(answer.try_recv().is_err());
+    assert!(harness.relay.status()["restoring"].is_string());
+    assert!(harness.port.world.lock().unwrap().target.is_some());
+    assert!(harness.relay.shared.generation_matches(0));
+
+    harness.port.world.lock().unwrap().off = (false, false);
+    harness.advance(RESTORE_WAITS[1]);
+    answer.recv_timeout(Duration::from_secs(2)).unwrap();
+    thread.join().unwrap();
+    assert_eq!(harness.relay.status()["phase"], "active");
+    assert!(harness.relay.status()["restoring"].is_null());
+    assert_eq!(harness.calls().iter().filter(|call| call.as_str() == "enter join").count(), 2);
+
+    let owner_off = Harness::new(World {
+        target: Some(target()),
+        off: (false, false),
+        off_during_join: Some((true, true)),
+        ..World::default()
+    });
+    let (owner_answer, owner_thread) = owner_off.restore();
+    owner_answer.recv_timeout(Duration::from_secs(2)).unwrap();
+    owner_thread.join().unwrap();
+    assert!(owner_off.port.world.lock().unwrap().target.is_none());
+    assert!(owner_off.relay.status()["restoring"].is_null());
+    assert_eq!(owner_off.calls().iter().filter(|call| call.as_str() == "enter join").count(), 1);
 }
 
 #[test]

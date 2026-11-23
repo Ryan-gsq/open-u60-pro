@@ -65,12 +65,14 @@ const TOPICS: &[&str] = &[
     "ota",
     "relay",
     "mihomo",
+    "tailscale",
 ];
 const ESIM_TOPIC: usize = 8;
 const DNS_TOPIC: usize = 11;
 const OTA_TOPIC: usize = 12;
 const RELAY_TOPIC: usize = 13;
 const MIHOMO_TOPIC: usize = 14;
+const TAILSCALE_TOPIC: usize = 15;
 const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("operators", 2, 0),
     ("forwarding", 2, 1),
@@ -91,12 +93,13 @@ const EXTRA_READINGS: &[(&str, u64, usize)] = &[
     ("battery_details", 5, 9),
     ("https_status", 5, 10),
     ("ota_status", 5, OTA_TOPIC),
+    ("tailscale_status", 5, TAILSCALE_TOPIC),
 ];
 
 #[derive(Clone, Copy, Default)]
 struct Interests {
     sms: bool,
-    extras: u16,
+    extras: u32,
 }
 
 impl From<bool> for Interests {
@@ -1077,6 +1080,21 @@ mod tests {
         assert!(!feed.next(0, false).1.contains_key("battery_details"));
         drop(viewer);
         assert!(!feed.state.lock().unwrap().readings.contains_key("battery_details"));
+    }
+    #[test]
+    fn tailscale_status_is_collected_only_for_tailscale_viewers_and_discarded_after_leaving() {
+        let feed = Arc::new(Dashboard::default());
+        let _ordinary = feed.subscribe(false).unwrap();
+        let tailscale = Interests::from_url("/api/dashboard/events?topics=tailscale");
+        let viewer = feed.subscribe(tailscale).unwrap();
+        feed.publish(BTreeMap::from([(
+            "tailscale_status".into(),
+            json!({"ok":true,"data":{"state":"disabled"}}),
+        )]));
+        assert!(feed.next(0, tailscale).1.contains_key("tailscale_status"));
+        assert!(!feed.next(0, false).1.contains_key("tailscale_status"));
+        drop(viewer);
+        assert!(!feed.state.lock().unwrap().readings.contains_key("tailscale_status"));
     }
 
 }

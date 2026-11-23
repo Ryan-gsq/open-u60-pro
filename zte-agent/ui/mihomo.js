@@ -38,6 +38,15 @@
   copy.append(el('span', 'eyebrow', 'TRANSPARENT PROXY'), title, detail);
   hero.append(glyph, copy, chip);
   const facts = el('dl', 'mihomo-facts');
+  const bypassBox = el('label', 'relay-choice');
+  const bypassInput = el('input');
+  bypassInput.id = 'mihomo-direct-bypass';
+  bypassInput.type = 'checkbox';
+  const bypassCopy = el('span', 'mihomo-bypass-copy');
+  const bypassTitle = el('strong', '', 'Bypass Mihomo for DIRECT rules');
+  const bypassSummary = el('small', 'field-help', '');
+  bypassCopy.append(bypassTitle, bypassSummary);
+  bypassBox.append(bypassInput, bypassCopy);
   const problem = el('p', 'relay-problem');
   problem.setAttribute('role', 'alert');
   problem.hidden = true;
@@ -47,7 +56,7 @@
   actions.append(toggle, zashboard, install, cleanup, clearStart, refresh);
   const hint = el('p', 'field-help');
   const statusText = UI.status(statusPanel);
-  statusPanel.append(hero, facts, problem, actions, hint, statusText);
+  statusPanel.append(hero, facts, bypassBox, problem, actions, hint, statusText);
 
   // ── Profiles ────────────────────────────────────────────────────────────
   const profilePanel = UI.panel(route, 'mihomo-profiles', 'Configuration profiles', 'Switching or editing the active profile briefly reconnects Mihomo. An invalid download, Merge or Script keeps the previous configuration. Downloads use Mihomo when it runs, otherwise the current uplink; cellular data is never turned on.');
@@ -135,9 +144,12 @@
     title.textContent = view.title;
     detail.textContent = view.detail;
     facts.replaceChildren(...M.facts(status).map(([label, value]) => { const pair = el('div'); pair.append(el('dt', '', label), el('dd', '', value)); return pair; }));
+    bypassInput.checked = view.directBypass;
+    bypassSummary.textContent = M.directBypassSummary(status);
     problem.hidden = !status?.error && !status?.notice;
     problem.textContent = status?.error || status?.notice || '';
     const disabled = busy || loading || !API.connected;
+    bypassInput.disabled = disabled || !view.installed || view.recovery;
     toggle.textContent = view.toggleLabel;
     toggle.className = `button ${view.running ? 'danger' : 'primary'}`;
     toggle.hidden = view.recovery;
@@ -234,6 +246,19 @@
     if (!await confirm(heading, text, {label, destructive: view.running})) return;
     await act(statusText, 'POST', '/api/mihomo/switch', {enabled: !view.running}, {timeoutMs: 3 * MINUTE, working: view.running ? 'Stopping Mihomo…' : 'Starting Mihomo. Validating the configuration and the interception first…', done: view.running ? 'Mihomo is off.' : 'Mihomo is running.'});
   }
+  bypassInput.addEventListener('change', async () => {
+    const enabled = bypassInput.checked;
+    const [heading, text, label] = M.directBypassConfirmation(enabled, status?.running === true);
+    if (!await confirm(heading, text, {label})) {
+      bypassInput.checked = status?.direct_bypass === true;
+      return;
+    }
+    await act(statusText, 'POST', '/api/mihomo/direct-bypass', {enabled}, {
+      timeoutMs: 3 * MINUTE,
+      working: enabled ? 'Enabling DIRECT bypass…' : 'Disabling DIRECT bypass…',
+      done: enabled ? 'DIRECT bypass enabled.' : 'DIRECT bypass disabled.'
+    });
+  });
   async function stopCore(kind) {
     const [heading, text, label] = kind === 'cleanup'
       ? ['Retry proxy cleanup?', 'Remove the remaining proxy network changes. This also clears automatic start.', 'Retry cleanup']

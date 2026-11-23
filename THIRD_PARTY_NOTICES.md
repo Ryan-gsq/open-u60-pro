@@ -308,7 +308,7 @@ or automatically installed at boot:
   index/main-module hashes and adapts the served main module to select the
   router's same-origin backend, prefill Setup and support unavailable browser
   storage. The downloaded upstream files remain unchanged on disk; the
-  adapter/bootstrap source is in `zte-agent/src/web/mihomo/`.
+  adapter/bootstrap source is in `zte-agent/src/mihomo/dashboard/`.
 - Optional GeoSite/GeoIP/ASN databases are downloaded separately from
   [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat), whose
   repository is GPL-3.0 and lists its underlying data sources and licenses.

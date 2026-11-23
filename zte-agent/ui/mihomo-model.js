@@ -12,12 +12,13 @@
     const chip = {running: 'RUNNING', recovery: 'RECOVERY REQUIRED', off: 'OFF'}[key];
     const title = running ? 'Mihomo is running' : recovery ? 'Cleanup required' : 'Mihomo is off';
     const detail = running
-      ? 'LAN traffic is intercepted by Mihomo over a private TUN. Turning it off returns to direct routing; it is not a kill switch.'
+      ? 'LAN traffic is intercepted by Mihomo via transparent proxy (TPROXY). Turning it off returns to direct routing; it is not a kill switch.'
       : recovery ? 'Some proxy network changes remain. Retry cleanup before starting or reinstalling. This also clears automatic start.'
       : !installed ? 'Install the pinned Mihomo core first.' : !configured ? 'Add and select a configuration profile first.' : 'Ready to start. Experimental LAN TCP/UDP, IPv4/IPv6 interception.';
     const canStart = running || (!recovery && installed && configured);
+    const directBypass = data.direct_bypass === true, directBypassActive = data.direct_bypass_active === true;
     return {
-      key, chip, title, detail, running, recovery, installed, configured, autostart, canStart,
+      key, chip, title, detail, running, recovery, installed, configured, autostart, canStart, directBypass, directBypassActive,
       toggleLabel: running ? 'Stop Mihomo' : 'Start Mihomo',
       toggleHint: running || canStart ? '' : recovery ? 'Retry cleanup first.' : !installed ? 'Install the core first.' : 'Add a configuration profile first.',
       showInstall: !running && !recovery,
@@ -26,6 +27,29 @@
     };
   }
   const autostartLabel = status => status?.autostart === true ? 'Automatic start enabled' : status?.autostart === false ? 'Stays off' : 'Unknown';
+  function directBypassSummary(status) {
+    const data = status || {};
+    if (data.direct_bypass !== true) {
+      return 'Off. All LAN IPv4 and IPv6 traffic goes through Mihomo. Turn on to let kernel nftables bypass IPv4 traffic matched as DIRECT by your rules (enabling relay hardware forwarding).';
+    }
+    if (data.running !== true) return 'Enabled. Takes effect when Mihomo starts.';
+    const kernel = data.kernel;
+    if (kernel?.bypass === 'all') return 'Active · All IPv4 bypasses the core in Direct mode.';
+    if (kernel?.bypass === 'rules') {
+      const count = typeof kernel.returns === 'number' ? `${kernel.returns} rule${kernel.returns === 1 ? '' : 's'} compiled` : 'Rules compiled';
+      return kernel.reason ? `Active · ${count} in kernel (${kernel.reason}).` : `Active · ${count} in kernel.`;
+    }
+    if (kernel?.bypass === 'none') {
+      return kernel.reason ? `Enabled · Inactive (${kernel.reason}).` : 'Enabled · Inactive for the current mode.';
+    }
+    return data.direct_bypass_active === true ? 'Active in kernel.' : 'Enabled.';
+  }
+  function directBypassConfirmation(enabled, running) {
+    const reset = running ? ' Existing LAN IPv4 connections are reset so interception matches the updated rules; Mihomo stays running.' : '';
+    return enabled
+      ? ['Bypass Mihomo for DIRECT rules?', `IPv4 traffic matched as DIRECT by your active mode and rules will skip the Mihomo core in the kernel (allowing relay hardware forwarding).${reset}`, 'Enable bypass']
+      : ['Disable DIRECT rule bypass?', `All LAN IPv4 traffic will return to the Mihomo core.${reset}`, 'Disable bypass'];
+  }
   function facts(status) {
     const data = status || {};
     return [
@@ -145,6 +169,6 @@
     return url.startsWith(DASHBOARD) && !/[\\\s]/.test(url) ? url : '';
   }
 
-  const api = {dashboardTarget, intervals, view, autostartLabel, facts, updatedLabel, intervalLabel, subscriptionProblem, profileProblem, profileRequest, profileAction, scheduleRequest, confirmation, extensionsProblem, extensionsRequest, delayLabel, delayLevel, modes, modeLabel, resolveNode, memberOptions, filterGroups, limited, MAX_CONFIG, MAX_EXTENSION};
+  const api = {dashboardTarget, intervals, view, autostartLabel, directBypassSummary, directBypassConfirmation, facts, updatedLabel, intervalLabel, subscriptionProblem, profileProblem, profileRequest, profileAction, scheduleRequest, confirmation, extensionsProblem, extensionsRequest, delayLabel, delayLevel, modes, modeLabel, resolveNode, memberOptions, filterGroups, limited, MAX_CONFIG, MAX_EXTENSION};
   if (typeof module === 'object' && module.exports) module.exports = api; else globalThis.OpenU60Mihomo = api;
 })(globalThis);

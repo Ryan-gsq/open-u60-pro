@@ -12,6 +12,7 @@ pub(crate) fn read(state: &AppState, name: &str) -> Value {
         "https_status" => state.tls.status_json().1,
         "ota_status" => crate::ota::dashboard_status(state),
         "battery_details" => crate::battery_details::snapshot(state),
+        "tailscale_status" => crate::tailscale::dashboard_status(state),
         "esim_status" => esim::dashboard_status(state),
         "operators" => json!({"ok":true,"data":{
             "status":modem_ext::modem_scan_status(state).1,

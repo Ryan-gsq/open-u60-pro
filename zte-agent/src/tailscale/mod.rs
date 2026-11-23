@@ -5,10 +5,10 @@ pub use config::TsConfig;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use crate::handlers::AppState;
 use crate::ubus;
+use crate::wifi_relay::WifiRelay;
 
 const BIN_DIR: &str = "/data/tailscale/bin";
 const TAILSCALED_BIN: &str = "/data/tailscale/bin/tailscaled";
@@ -29,6 +30,10 @@ const LOG_FILE: &str = "/tmp/tailscaled.log";
 const POLL_SECS: u64 = 30;
 /// WAN-reconnect events closer together than this get one health check.
 const WAN_DEBOUNCE: Duration = Duration::from_secs(30);
+/// Brief settle window to coalesce rapid Wi-Fi relay route/IPv6 transitions.
+const RELAY_SETTLE: Duration = Duration::from_secs(2);
+/// Wait after a relay-triggered rebind/restun before escalating to a restart.
+const RELAY_VERIFY_WAIT: Duration = Duration::from_secs(25);
 const CLI_TIMEOUT_SECS: u64 = 20;
 /// Shorter than CLI_TIMEOUT_SECS so GET /status can't stall mobile clients
 /// for long when the daemon is wedged.
@@ -54,6 +59,147 @@ const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// 2025-01-01 UTC — clock earlier than this means NTP hasn't synced yet.
 const SANE_CLOCK_EPOCH: i64 = 1_735_689_600;
 
+#[derive(Default)]
+struct RelayWatchState {
+    generation: u64,
+    child: Option<ChildIdentity>,
+    saw_disconnect: bool,
+    restart_request: Option<(u64, ChildIdentity)>,
+    #[cfg(test)]
+    stopped: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ChildIdentity {
+    pid: u32,
+    instance: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EnrollmentOp {
+    Idle,
+    AuthKey,
+    InteractiveLogin,
+}
+
+struct AuthKeyEnrollmentGuard<'a> {
+    mgr: &'a TailscaleManager,
+}
+
+impl Drop for AuthKeyEnrollmentGuard<'_> {
+    fn drop(&mut self) {
+        let mut op = self
+            .mgr
+            .enrollment
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if *op == EnrollmentOp::AuthKey {
+            *op = EnrollmentOp::Idle;
+        }
+    }
+}
+
+struct InteractiveLoginGuard {
+    mgr: Arc<TailscaleManager>,
+}
+
+impl Drop for InteractiveLoginGuard {
+    fn drop(&mut self) {
+        let mut op = self
+            .mgr
+            .enrollment
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if *op == EnrollmentOp::InteractiveLogin {
+            *op = EnrollmentOp::Idle;
+        }
+    }
+}
+
+enum InteractiveLoginSlot {
+    Started(InteractiveLoginGuard),
+    AlreadyRunning,
+}
+
+struct StatusRefreshGuard {
+    mgr: Arc<TailscaleManager>,
+}
+
+impl Drop for StatusRefreshGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .mgr
+            .status_refresh_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *in_flight = false;
+        self.mgr.status_refresh_cv.notify_all();
+    }
+}
+
+struct StatusRefreshRefGuard<'a> {
+    mgr: &'a TailscaleManager,
+}
+
+impl Drop for StatusRefreshRefGuard<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .mgr
+            .status_refresh_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *in_flight = false;
+        self.mgr.status_refresh_cv.notify_all();
+    }
+}
+
+static NEXT_AUTHKEY_ID: AtomicU64 = AtomicU64::new(0);
+
+struct TempAuthKeyFile {
+    path: PathBuf,
+}
+
+impl TempAuthKeyFile {
+    fn write(dir: &Path, key: &str) -> Result<Self, String> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::create_dir_all(dir)
+            .map_err(|err| format!("create auth key dir: {err}"))?;
+        let pid = std::process::id();
+        for _ in 0..16 {
+            let seq = NEXT_AUTHKEY_ID.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("authkey-{pid}-{seq}"));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let guard = Self { path };
+                    file.write_all(key.as_bytes())
+                        .map_err(|_| "failed to write auth key".to_string())?;
+                    return Ok(guard);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(format!("write auth key: {err}")),
+            }
+        }
+        Err("write auth key: could not allocate unique key file".to_string())
+    }
+
+    fn path_str(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for TempAuthKeyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub struct TailscaleManager {
     config: Mutex<TsConfig>,
     /// Desired state: should tailscaled be running?
@@ -66,12 +212,16 @@ pub struct TailscaleManager {
     /// window where swapping binaries is safe.
     supervisor_idle: AtomicBool,
     updating: AtomicBool,
-    login_in_progress: AtomicBool,
+    enrollment: Mutex<EnrollmentOp>,
     /// One state-file restore attempt per enrollment (reset on setup/logout).
     state_restore_attempted: AtomicBool,
-    child_pid: Mutex<Option<u32>>,
-    /// Last computed status payload + unix timestamp it was computed at.
-    last_status: Mutex<(Value, i64)>,
+    active_child: Mutex<Option<ChildIdentity>>,
+    next_child_instance: AtomicU64,
+    /// Last computed status payload + unix timestamp + monotonic refresh sequence.
+    last_status: Mutex<(Value, i64, u64)>,
+    status_seq: AtomicU64,
+    status_refresh_lock: Mutex<bool>,
+    status_refresh_cv: Condvar,
     /// Outcome of the most recent update attempt (surfaced in /status).
     last_update: Mutex<Option<Value>>,
     login_url: Mutex<Option<String>>,
@@ -82,6 +232,9 @@ pub struct TailscaleManager {
     /// predicate re-check so a wake cannot be lost.
     wake_lock: Mutex<()>,
     wake_cv: Condvar,
+    relay: OnceLock<Weak<WifiRelay>>,
+    relay_watch_lock: Mutex<RelayWatchState>,
+    relay_watch_cv: Condvar,
 }
 
 /// Logged once per process: LocalAPI failing while the CLI works means the
@@ -282,15 +435,108 @@ impl TailscaleManager {
             supervisor_started: AtomicBool::new(false),
             supervisor_idle: AtomicBool::new(true),
             updating: AtomicBool::new(false),
-            login_in_progress: AtomicBool::new(false),
+            enrollment: Mutex::new(EnrollmentOp::Idle),
             state_restore_attempted: AtomicBool::new(false),
-            child_pid: Mutex::new(None),
-            last_status: Mutex::new((Value::Null, 0)),
+            active_child: Mutex::new(None),
+            next_child_instance: AtomicU64::new(0),
+            last_status: Mutex::new((Value::Null, 0, 0)),
+            status_seq: AtomicU64::new(0),
+            status_refresh_lock: Mutex::new(false),
+            status_refresh_cv: Condvar::new(),
             last_update: Mutex::new(None),
             login_url: Mutex::new(None),
             wakelock_held: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
             wake_cv: Condvar::new(),
+            relay: OnceLock::new(),
+            relay_watch_lock: Mutex::new(RelayWatchState::default()),
+            relay_watch_cv: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn set_relay(&self, relay: &Arc<WifiRelay>) {
+        let _ = self.relay.set(Arc::downgrade(relay));
+    }
+
+    fn relay_active(&self) -> bool {
+        self.relay
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|relay| relay.active())
+    }
+
+    /// Non-blocking hook called by `WifiRelay` when its routes are installed,
+    /// updated, or torn down. Wakes the startup gate immediately and schedules
+    /// a fast rebind/restun when `tailscaled` is already running.
+    pub(crate) fn relay_uplink_changed(&self) {
+        self.wake_supervisor();
+        if !self.running.load(Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(child) = *self.active_child.lock().unwrap_or_else(|err| err.into_inner()) else {
+            return;
+        };
+        let relay_up = self.relay_active();
+        let mut state = self
+            .relay_watch_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        state.child = Some(child);
+        state.restart_request = None;
+        if !relay_up {
+            state.saw_disconnect = true;
+        }
+        self.relay_watch_cv.notify_all();
+    }
+
+    fn enrollment_active(&self) -> bool {
+        *self
+            .enrollment
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            != EnrollmentOp::Idle
+    }
+
+    fn enrollment_is_auth_key(&self) -> bool {
+        *self
+            .enrollment
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            == EnrollmentOp::AuthKey
+    }
+
+    fn try_begin_auth_key_enrollment(&self) -> Result<AuthKeyEnrollmentGuard<'_>, &'static str> {
+        let mut op = self
+            .enrollment
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        match *op {
+            EnrollmentOp::Idle => {
+                *op = EnrollmentOp::AuthKey;
+                Ok(AuthKeyEnrollmentGuard { mgr: self })
+            }
+            EnrollmentOp::AuthKey => Err("enrollment already in progress"),
+            EnrollmentOp::InteractiveLogin => Err("interactive login in progress"),
+        }
+    }
+
+    fn try_begin_interactive_login(
+        self: &Arc<Self>,
+    ) -> Result<InteractiveLoginSlot, &'static str> {
+        let mut op = self
+            .enrollment
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        match *op {
+            EnrollmentOp::Idle => {
+                *op = EnrollmentOp::InteractiveLogin;
+                Ok(InteractiveLoginSlot::Started(InteractiveLoginGuard {
+                    mgr: Arc::clone(self),
+                }))
+            }
+            EnrollmentOp::InteractiveLogin => Ok(InteractiveLoginSlot::AlreadyRunning),
+            EnrollmentOp::AuthKey => Err("enrollment already in progress"),
         }
     }
 
@@ -311,6 +557,25 @@ impl TailscaleManager {
     /// WAN-flap hook: on reconnect events, nudge tailscaled (rebind + restun)
     /// and escalate to a daemon restart if it stays unhealthy.
     pub fn start_wan_watch(self: &Arc<Self>, rx: mpsc::Receiver<Value>) {
+        let relay_mgr = Arc::clone(self);
+        thread::spawn(move || {
+            relay_mgr.watch_relay_uplink(
+                RELAY_SETTLE,
+                RELAY_VERIFY_WAIT,
+                Instant::now,
+                || relay_mgr.relay_active(),
+                probe_cellular_wan,
+                || {
+                    relay_mgr.refresh_status();
+                },
+                || relay_mgr.is_unhealthy(),
+                || relay_mgr.nudge(),
+                |generation, child| {
+                    relay_mgr.request_relay_restart(generation, child);
+                },
+            );
+        });
+
         let mgr = Arc::clone(self);
         thread::spawn(move || {
             let mut last_handled: Option<Instant> = None;
@@ -370,8 +635,260 @@ impl TailscaleManager {
     /// taking the lock orders that store before the waiter's predicate
     /// re-check (see `wake_lock`).
     fn wake_supervisor(&self) {
-        let _guard = self.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.wake_cv.notify_all();
+        {
+            let _guard = self.wake_lock.lock().unwrap_or_else(|err| err.into_inner());
+            self.wake_cv.notify_all();
+        }
+        {
+            let _guard = self
+                .relay_watch_lock
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            self.relay_watch_cv.notify_all();
+        }
+    }
+
+    fn is_relay_check_current(
+        &self,
+        expected_generation: u64,
+        expected_child: ChildIdentity,
+    ) -> bool {
+        let active = self
+            .active_child
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let state = self
+            .relay_watch_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        self.running.load(Ordering::SeqCst)
+            && !self.paused.load(Ordering::SeqCst)
+            && *active == Some(expected_child)
+            && state.generation == expected_generation
+    }
+
+    fn request_relay_restart(
+        &self,
+        expected_generation: u64,
+        expected_child: ChildIdentity,
+    ) -> bool {
+        let accepted = {
+            let active = self
+                .active_child
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let mut state = self
+                .relay_watch_lock
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if self.running.load(Ordering::SeqCst)
+                && !self.paused.load(Ordering::SeqCst)
+                && *active == Some(expected_child)
+                && state.generation == expected_generation
+            {
+                state.restart_request = Some((expected_generation, expected_child));
+                true
+            } else {
+                false
+            }
+        };
+        if accepted {
+            self.wake_supervisor();
+        }
+        accepted
+    }
+
+    fn has_relay_restart(&self, identity: ChildIdentity) -> bool {
+        let active = self
+            .active_child
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let state = self
+            .relay_watch_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.restart_request.is_some_and(|(req_gen, req_child)| {
+            self.running.load(Ordering::SeqCst)
+                && !self.paused.load(Ordering::SeqCst)
+                && *active == Some(identity)
+                && req_child == identity
+                && req_gen == state.generation
+        })
+    }
+
+    fn take_relay_restart(&self, identity: ChildIdentity) -> bool {
+        let active = self
+            .active_child
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mut state = self
+            .relay_watch_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let matches = state.restart_request.is_some_and(|(req_gen, req_child)| {
+            self.running.load(Ordering::SeqCst)
+                && !self.paused.load(Ordering::SeqCst)
+                && *active == Some(identity)
+                && req_child == identity
+                && req_gen == state.generation
+        });
+        if matches {
+            state.restart_request = None;
+        }
+        matches
+    }
+
+    fn wait_relay_quiet(&self, expected_generation: u64, duration: Duration) -> bool {
+        let deadline = Instant::now() + duration;
+        let mut guard = self
+            .relay_watch_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        loop {
+            if guard.generation != expected_generation
+                || !self.running.load(Ordering::SeqCst)
+                || self.paused.load(Ordering::SeqCst)
+            {
+                return false;
+            }
+            #[cfg(test)]
+            if guard.stopped {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            let (next, _) = self
+                .relay_watch_cv
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|err| err.into_inner());
+            guard = next;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn watch_relay_uplink(
+        &self,
+        settle: Duration,
+        verify_wait: Duration,
+        now_fn: impl Fn() -> Instant,
+        relay_active: impl Fn() -> bool,
+        mut probe_cellular: impl FnMut(bool) -> bool,
+        mut refresh_status: impl FnMut(),
+        is_unhealthy: impl Fn() -> bool,
+        mut nudge: impl FnMut(),
+        mut restart_child: impl FnMut(u64, ChildIdentity),
+    ) {
+        let mut seen = 0u64;
+        let mut last_nudge: Option<(Instant, bool)> = None;
+        let mut pending_disconnect = false;
+        loop {
+            let (generation, child, saw_disconnect) = {
+                let mut guard = self
+                    .relay_watch_lock
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                loop {
+                    #[cfg(test)]
+                    if guard.stopped {
+                        return;
+                    }
+                    if guard.generation != seen {
+                        break;
+                    }
+                    guard = self
+                        .relay_watch_cv
+                        .wait(guard)
+                        .unwrap_or_else(|err| err.into_inner());
+                }
+                let disconnected = std::mem::take(&mut guard.saw_disconnect);
+                (guard.generation, guard.child, disconnected)
+            };
+            seen = generation;
+            pending_disconnect |= saw_disconnect;
+            let Some(child) = child else {
+                pending_disconnect = false;
+                continue;
+            };
+
+            if !self.wait_relay_quiet(generation, settle) {
+                if !self.running.load(Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
+                    pending_disconnect = false;
+                    last_nudge = None;
+                }
+                continue;
+            }
+            if !self.is_relay_check_current(generation, child) {
+                pending_disconnect = false;
+                continue;
+            }
+
+            let relay_up = relay_active();
+            let has_uplink = relay_up || probe_cellular(true);
+            if !has_uplink {
+                pending_disconnect = false;
+                last_nudge = None;
+                continue;
+            }
+
+            let saw_down = std::mem::take(&mut pending_disconnect);
+            let now = now_fn();
+            let same_direction = !saw_down
+                && last_nudge.is_some_and(|(at, prev_relay)| {
+                    prev_relay == relay_up && debounced(Some(at), now)
+                });
+            if same_direction {
+                refresh_status();
+                if !is_unhealthy() {
+                    continue;
+                }
+            }
+            if !self.is_relay_check_current(generation, child) {
+                if !self.running.load(Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
+                    pending_disconnect = false;
+                    last_nudge = None;
+                }
+                continue;
+            }
+
+            eprintln!(
+                "[tailscale] Wi-Fi relay {} — rebind/restun",
+                if relay_up {
+                    "connected/updated"
+                } else {
+                    "disconnected (cellular fallback)"
+                }
+            );
+            nudge();
+            last_nudge = Some((now_fn(), relay_up));
+
+            if !self.wait_relay_quiet(generation, verify_wait) {
+                if !self.running.load(Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
+                    pending_disconnect = false;
+                    last_nudge = None;
+                }
+                continue;
+            }
+            if !self.is_relay_check_current(generation, child) {
+                continue;
+            }
+
+            refresh_status();
+            if is_unhealthy() && (relay_active() || probe_cellular(false)) {
+                if !self.is_relay_check_current(generation, child) {
+                    if !self.running.load(Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
+                        pending_disconnect = false;
+                        last_nudge = None;
+                    }
+                    continue;
+                }
+                eprintln!(
+                    "[tailscale] still unhealthy after Wi-Fi relay switch — requesting tailscaled restart"
+                );
+                restart_child(generation, child);
+            }
+        }
     }
 
     /// Park for `dur`, returning early once a disable or an update pause
@@ -443,13 +960,23 @@ impl TailscaleManager {
             match self.spawn_tailscaled() {
                 Ok(mut child) => {
                     eprintln!("[tailscale] tailscaled started (pid {})", child.id());
-                    *self.child_pid.lock().unwrap() = Some(child.id());
+                    let instance = self.next_child_instance.fetch_add(1, Ordering::SeqCst) + 1;
+                    let identity = ChildIdentity {
+                        pid: child.id(),
+                        instance,
+                    };
+                    *self.active_child.lock().unwrap() = Some(identity);
                     self.apply_prefs_when_ready();
-                    let clean_exit = self.monitor_until_exit(&mut child);
-                    *self.child_pid.lock().unwrap() = None;
+                    let clean_exit = self.monitor_until_exit(&mut child, identity);
+                    *self.active_child.lock().unwrap() = None;
+                    self.relay_watch_lock
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .restart_request = None;
                     // AuthURL was in-memory in the dead daemon — a cached copy
                     // would be served as live and block re-enrollment
                     *self.login_url.lock().unwrap() = None;
+                    self.refresh_status();
                     if clean_exit {
                         backoff = BACKOFF_MIN_SECS;
                     }
@@ -501,7 +1028,11 @@ impl TailscaleManager {
     /// Poll status while the child is alive. Detects suspend/resume via
     /// wall-clock jumps and nudges the daemon. Returns true if the exit was
     /// requested (disable/update), false on crash/forced restart.
-    fn monitor_until_exit(&self, child: &mut std::process::Child) -> bool {
+    fn monitor_until_exit(
+        &self,
+        child: &mut std::process::Child,
+        identity: ChildIdentity,
+    ) -> bool {
         let mut last_tick = unix_now();
         let mut bad_cycles = 0u32;
         let mut needs_login_cycles = 0u32;
@@ -510,6 +1041,11 @@ impl TailscaleManager {
             if !self.running.load(Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
                 self.graceful_stop(child);
                 return true;
+            }
+            if self.take_relay_restart(identity) {
+                eprintln!("[tailscale] restarting tailscaled on verified relay health check");
+                self.graceful_stop(child);
+                return false;
             }
             match child.try_wait() {
                 Ok(Some(_)) => return false, // crashed / externally killed
@@ -556,7 +1092,7 @@ impl TailscaleManager {
                 // the user wants it enabled — self-heal with a full-pref `up`.
                 // Makes POST /enable eventually consistent regardless of the
                 // daemon-startup races. Never runs during interactive login.
-                "paused" if cfg.enabled && !self.login_in_progress.load(Ordering::SeqCst) => {
+                "paused" if cfg.enabled && !self.enrollment_active() => {
                     eprintln!("[tailscale] backend Stopped while enabled — bringing it up");
                     let mut args = self.pref_args("up");
                     args.push("--timeout=30s".to_string());
@@ -572,7 +1108,7 @@ impl TailscaleManager {
                     needs_login_cycles += 1;
                     if needs_login_cycles >= 3
                         && Path::new(STATE_BAK).exists()
-                        && !self.login_in_progress.load(Ordering::SeqCst)
+                        && !self.enrollment_active()
                         && !self.state_restore_attempted.swap(true, Ordering::SeqCst)
                     {
                         eprintln!("[tailscale] enrolled node stuck in NeedsLogin — restoring state backup");
@@ -594,6 +1130,7 @@ impl TailscaleManager {
             loop {
                 if !self.running.load(Ordering::SeqCst)
                     || self.paused.load(Ordering::SeqCst)
+                    || self.has_relay_restart(identity)
                     || matches!(child.try_wait(), Ok(Some(_)) | Err(_))
                 {
                     break;
@@ -603,6 +1140,12 @@ impl TailscaleManager {
                     break;
                 }
                 let guard = self.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
+                if !self.running.load(Ordering::SeqCst)
+                    || self.paused.load(Ordering::SeqCst)
+                    || self.has_relay_restart(identity)
+                {
+                    break;
+                }
                 drop(
                     self.wake_cv
                         .wait_timeout(guard, remaining.min(Duration::from_secs(CHILD_POLL_SECS)))
@@ -629,7 +1172,8 @@ impl TailscaleManager {
     /// Signal the supervised child by pid, verifying via /proc that the pid
     /// still belongs to tailscaled (guards against pid recycling).
     fn kill_child(&self, sig: i32) {
-        if let Some(pid) = *self.child_pid.lock().unwrap() {
+        if let Some(child) = *self.active_child.lock().unwrap() {
+            let pid = child.pid;
             let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
             let comm = comm.trim();
             if comm.is_empty() || comm == "tailscaled" {
@@ -676,30 +1220,47 @@ impl TailscaleManager {
     }
 
     /// Gate startup on a sane clock (control-plane TLS fails with a 1970
-    /// clock) and a connected WAN. Best-effort: proceeds after ~90s anyway —
-    /// tailscaled retries on its own.
+    /// clock) and a connected uplink (Wi-Fi relay or cellular WAN). Best-effort:
+    /// proceeds after ~90s anyway — tailscaled retries on its own.
     fn wait_for_clock_and_wan(&self) {
-        let mut wan_ok = false;
+        self.wait_for_clock_and_wan_with(
+            unix_now,
+            || probe_cellular_wan(true),
+            || self.relay_active(),
+            Duration::from_secs(1),
+        );
+    }
+
+    fn wait_for_clock_and_wan_with(
+        &self,
+        now_fn: impl Fn() -> i64,
+        mut probe_wan: impl FnMut() -> bool,
+        relay_up: impl Fn() -> bool,
+        tick_dur: Duration,
+    ) {
+        let mut cellular_ok = false;
         for tick in 0..90 {
             if !self.running.load(Ordering::SeqCst) || self.paused.load(Ordering::SeqCst) {
                 return;
             }
-            let clock_ok = unix_now() >= SANE_CLOCK_EPOCH;
-            // Each probe forks `ubus`; the clock check is free and runs every tick
-            if should_probe_wan(tick) {
-                wan_ok = match ubus::call(
-                    "zwrt_data",
-                    "get_wwaniface",
-                    Some(r#"{"source_module":"zte_topsw_data","cid":1}"#),
-                ) {
-                    Ok(v) => v["connect_status"].as_str().is_some_and(wan_connected),
-                    Err(_) => true, // can't tell (e.g. dev machine) — don't block
-                };
+            let clock_ok = now_fn() >= SANE_CLOCK_EPOCH;
+            let relay_ok = relay_up();
+            if !relay_ok && should_probe_wan(tick) {
+                cellular_ok = probe_wan();
             }
-            if clock_ok && wan_ok {
+            if clock_ok && (relay_ok || cellular_ok) {
                 return;
             }
-            self.park_while_active(Duration::from_secs(1));
+            let guard = self.wake_lock.lock().unwrap_or_else(|err| err.into_inner());
+            drop(
+                self.wake_cv
+                    .wait_timeout_while(guard, tick_dur, |_| {
+                        self.running.load(Ordering::SeqCst)
+                            && !self.paused.load(Ordering::SeqCst)
+                            && (relay_ok || !relay_up())
+                    })
+                    .unwrap_or_else(|err| err.into_inner()),
+            );
         }
     }
 
@@ -745,16 +1306,150 @@ impl TailscaleManager {
 
     // --- Status ---
 
+    fn store_status(&self, seq: u64, payload: &Value, now: i64) {
+        let mut last = self
+            .last_status
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if seq >= last.2 {
+            *last = (payload.clone(), now, seq);
+        }
+    }
+
     /// Fetch `tailscale status --json` and cache the derived payload.
     fn refresh_status(&self) -> Value {
+        let seq = self.status_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let payload = self.build_status();
-        *self.last_status.lock().unwrap() = (payload.clone(), unix_now());
+        self.store_status(seq, &payload, unix_now());
         payload
     }
 
-    fn build_status(&self) -> Value {
+    fn status_nonblocking(self: &Arc<Self>) -> Value {
+        self.status_nonblocking_with(
+            unix_now,
+            || self.build_base_status(),
+            |mgr| {
+                mgr.refresh_status();
+            },
+        )
+    }
+
+    fn status_nonblocking_with(
+        self: &Arc<Self>,
+        now_fn: impl Fn() -> i64,
+        base_fn: impl FnOnce() -> (Value, bool),
+        refresh_fn: impl FnOnce(Arc<Self>) + Send + 'static,
+    ) -> Value {
+        let now = now_fn();
+        let (cached, at, _) = self
+            .last_status
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if !cached.is_null() && now.saturating_sub(at) < 10 {
+            return cached;
+        }
+        let (base, needs_probe) = base_fn();
+        if !needs_probe {
+            let seq = self.status_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            self.store_status(seq, &base, now);
+            return base;
+        }
+        let start = {
+            let mut in_flight = self
+                .status_refresh_lock
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if *in_flight {
+                false
+            } else {
+                *in_flight = true;
+                true
+            }
+        };
+        if start {
+            let mgr = Arc::clone(self);
+            let spawned = thread::Builder::new()
+                .name("ts-status".into())
+                .spawn(move || {
+                    let _done = StatusRefreshGuard {
+                        mgr: Arc::clone(&mgr),
+                    };
+                    refresh_fn(mgr);
+                });
+            if spawned.is_err() {
+                let mut in_flight = self
+                    .status_refresh_lock
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                *in_flight = false;
+                self.status_refresh_cv.notify_all();
+            }
+        }
+        if !cached.is_null() && cached["daemon_running"].as_bool() == Some(true) {
+            cached
+        } else {
+            base
+        }
+    }
+
+    fn status_coalesced(&self) -> Value {
+        self.status_coalesced_with(
+            unix_now,
+            || self.build_base_status(),
+            || self.refresh_status(),
+        )
+    }
+
+    fn status_coalesced_with(
+        &self,
+        now_fn: impl Fn() -> i64,
+        base_fn: impl FnOnce() -> (Value, bool),
+        refresh_fn: impl FnOnce() -> Value,
+    ) -> Value {
+        let now = now_fn();
+        let (cached, at, _) = self
+            .last_status
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if !cached.is_null() && now.saturating_sub(at) < 10 {
+            return cached;
+        }
+        let (base, needs_probe) = base_fn();
+        if !needs_probe {
+            let seq = self.status_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            self.store_status(seq, &base, now);
+            return base;
+        }
+        let mut in_flight = self
+            .status_refresh_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if *in_flight {
+            while *in_flight {
+                in_flight = self
+                    .status_refresh_cv
+                    .wait(in_flight)
+                    .unwrap_or_else(|err| err.into_inner());
+            }
+            drop(in_flight);
+            let (updated, _, _) = self
+                .last_status
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone();
+            return if !updated.is_null() { updated } else { base };
+        }
+        *in_flight = true;
+        drop(in_flight);
+        let _done = StatusRefreshRefGuard { mgr: self };
+        refresh_fn()
+    }
+
+    fn build_base_status(&self) -> (Value, bool) {
         let cfg = self.config.lock().unwrap().clone();
-        let daemon_up = self.child_pid.lock().unwrap().is_some();
+        let daemon_up = self.active_child.lock().unwrap().is_some();
 
         let mut payload = json!({
             "installed": installed(),
@@ -785,20 +1480,30 @@ impl TailscaleManager {
 
         if !installed() {
             payload["state"] = json!("not_installed");
-            return payload;
+            return (payload, false);
         }
         if self.updating.load(Ordering::SeqCst) {
             payload["state"] = json!("updating");
-            return payload;
+            return (payload, false);
         }
         if !cfg.enabled && !daemon_up {
             payload["state"] = json!("disabled");
-            return payload;
+            return (payload, false);
         }
         if !daemon_up {
             payload["state"] = json!("respawning");
+            return (payload, false);
+        }
+        payload["state"] = json!("starting");
+        (payload, true)
+    }
+
+    fn build_status(&self) -> Value {
+        let (mut payload, needs_probe) = self.build_base_status();
+        if !needs_probe {
             return payload;
         }
+        let cfg = self.config.lock().unwrap().clone();
 
         let status = match daemon_status(STATUS_CLI_TIMEOUT_SECS) {
             Ok(v) => v,
@@ -870,7 +1575,7 @@ impl TailscaleManager {
     }
 
     fn is_unhealthy(&self) -> bool {
-        let (status, _) = self.last_status.lock().unwrap().clone();
+        let (status, _, _) = self.last_status.lock().unwrap().clone();
         matches!(
             status["state"].as_str().unwrap_or(""),
             "degraded" | "connecting" | "starting" | "unknown" | "respawning"
@@ -916,7 +1621,7 @@ impl TailscaleManager {
     pub(crate) fn for_test(cfg: TsConfig, status: Value) -> Self {
         let mgr = Self::new();
         *mgr.config.lock().unwrap() = cfg;
-        *mgr.last_status.lock().unwrap() = (status, 0);
+        *mgr.last_status.lock().unwrap() = (status, 0, 0);
         mgr
     }
 
@@ -1000,7 +1705,7 @@ impl TailscaleManager {
             config::save(&cfg)?;
         }
         // Politely stop the backend so the node shows offline, then stop the daemon
-        if self.child_pid.lock().unwrap().is_some() {
+        if self.active_child.lock().unwrap().is_some() {
             let _ = cli(&["down"], 15);
         }
         self.running.store(false, Ordering::SeqCst);
@@ -1037,7 +1742,7 @@ impl TailscaleManager {
                 self.kill_child(libc::SIGTERM);
             }
             if self.supervisor_idle.load(Ordering::SeqCst)
-                && self.child_pid.lock().unwrap().is_none()
+                && self.active_child.lock().unwrap().is_none()
             {
                 return true;
             }
@@ -1084,6 +1789,19 @@ fn should_probe_wan(tick: u32) -> bool {
     tick < 3 || tick % 10 == 0
 }
 
+fn probe_cellular_wan(default_on_err: bool) -> bool {
+    match ubus::call(
+        "zwrt_data",
+        "get_wwaniface",
+        Some(r#"{"source_module":"zte_topsw_data","cid":1}"#),
+    ) {
+        Ok(value) => value["connect_status"]
+            .as_str()
+            .is_some_and(wan_connected),
+        Err(_) => default_on_err,
+    }
+}
+
 fn rotate_log_if_big() {
     if let Ok(meta) = std::fs::metadata(LOG_FILE) {
         if meta.len() > LOG_MAX_BYTES {
@@ -1109,15 +1827,13 @@ fn require_password(state: &AppState) -> Option<(u16, Value)> {
 
 /// GET /api/tailscale/status
 pub fn status(state: &AppState) -> (u16, Value) {
-    let mgr = &state.tailscale;
-    // Serve cached status if fresh; refresh otherwise
-    let (cached, at) = mgr.last_status.lock().unwrap().clone();
-    let payload = if !cached.is_null() && unix_now() - at < 10 {
-        cached
-    } else {
-        mgr.refresh_status()
-    };
+    let payload = state.tailscale.status_nonblocking();
     (200, json!({"ok": true, "data": payload}))
+}
+
+/// Dedicated dashboard-tailscale topic reader (runs off the General lane).
+pub fn dashboard_status(state: &AppState) -> Value {
+    json!({"ok": true, "data": state.tailscale.status_coalesced()})
 }
 
 /// POST /api/tailscale/setup — body: {"auth_key": "tskey-auth-..."}
@@ -1138,9 +1854,10 @@ pub fn setup(state: &AppState, body: &[u8]) -> (u16, Value) {
     if mgr.updating.load(Ordering::SeqCst) {
         return (409, json!({"ok": false, "error": "update in progress"}));
     }
-    if mgr.login_in_progress.load(Ordering::SeqCst) {
-        return (409, json!({"ok": false, "error": "interactive login in progress"}));
-    }
+    let _enroll_guard = match mgr.try_begin_auth_key_enrollment() {
+        Ok(guard) => guard,
+        Err(error) => return (409, json!({"ok": false, "error": error})),
+    };
 
     if state_file_exists() {
         let current = mgr.refresh_status();
@@ -1153,34 +1870,17 @@ pub fn setup(state: &AppState, body: &[u8]) -> (u16, Value) {
         return (503, json!({"ok": false, "error": e}));
     }
 
-    // Key goes to tmpfs with 0600, never to /data, never into argv
-    let keyfile = format!("{RUN_DIR}/authkey");
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&keyfile);
-        match file {
-            Ok(mut f) => {
-                if f.write_all(key.as_bytes()).is_err() {
-                    let _ = std::fs::remove_file(&keyfile);
-                    return (500, json!({"ok": false, "error": "failed to write auth key"}));
-                }
-            }
-            Err(e) => return (500, json!({"ok": false, "error": format!("write auth key: {e}")})),
-        }
-    }
+    let keyfile = match TempAuthKeyFile::write(Path::new(RUN_DIR), &key) {
+        Ok(file) => file,
+        Err(error) => return (500, json!({"ok": false, "error": error})),
+    };
 
     let mut args = mgr.pref_args("up");
     args.push("--timeout=60s".to_string());
-    args.push(format!("--auth-key=file:{keyfile}"));
+    args.push(format!("--auth-key=file:{}", keyfile.path_str()));
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let result = cli(&arg_refs, 90);
-    let _ = std::fs::remove_file(&keyfile);
+    drop(keyfile);
 
     match result {
         Ok(_) => {
@@ -1202,6 +1902,9 @@ pub fn login_url(state: &AppState) -> (u16, Value) {
     if mgr.updating.load(Ordering::SeqCst) {
         return (409, json!({"ok": false, "error": "update in progress"}));
     }
+    if mgr.enrollment_is_auth_key() {
+        return (409, json!({"ok": false, "error": "enrollment already in progress"}));
+    }
     {
         let cfg = mgr.config.lock().unwrap().clone();
         if cfg.enrolled && !cfg.enabled {
@@ -1216,19 +1919,20 @@ pub fn login_url(state: &AppState) -> (u16, Value) {
     if current["backend_state"].as_str() == Some("Running") {
         return (409, json!({"ok": false, "error": "already enrolled"}));
     }
+    let slot = match mgr.try_begin_interactive_login() {
+        Ok(slot) => slot,
+        Err(error) => return (409, json!({"ok": false, "error": error})),
+    };
     if let Some(url) = current["login_url"].as_str() {
         if !url.is_empty() {
             return (200, json!({"ok": true, "data": {"login_url": url, "pending": false}}));
         }
     }
 
-    if mgr
-        .login_in_progress
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
+    if let InteractiveLoginSlot::Started(login_guard) = slot {
         let mgr2 = Arc::clone(&state.tailscale);
         thread::spawn(move || {
+            let _guard = login_guard;
             let mut args = mgr2.pref_args("up");
             args.push("--json".to_string());
             args.push("--timeout=300s".to_string());
@@ -1237,7 +1941,6 @@ pub fn login_url(state: &AppState) -> (u16, Value) {
             // surfaces via `tailscale status` which the monitor loop and the
             // poll below both read.
             let _ = cli(&arg_refs, 310);
-            mgr2.login_in_progress.store(false, Ordering::SeqCst);
             let status = mgr2.refresh_status();
             if status["backend_state"].as_str() == Some("Running") {
                 mgr2.after_enrollment_success();
@@ -1297,7 +2000,7 @@ pub fn config_set(state: &AppState, body: &[u8]) -> (u16, Value) {
         return (400, json!({"ok": false, "error": e}));
     }
 
-    let daemon_up = mgr.child_pid.lock().unwrap().is_some();
+    let daemon_up = mgr.active_child.lock().unwrap().is_some();
     if candidate.enabled && daemon_up && state_file_exists() {
         let args = pref_args_for(&candidate, "set");
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -1337,10 +2040,10 @@ pub fn logout(state: &AppState) -> (u16, Value) {
     // `tailscale logout` can actually invalidate it.
     let mut warning: Option<String> = None;
     if installed() && state_file_exists() {
-        if mgr.child_pid.lock().unwrap().is_none() {
+        if mgr.active_child.lock().unwrap().is_none() {
             let _ = mgr.ensure_daemon_ready(20);
         }
-        if mgr.child_pid.lock().unwrap().is_some() {
+        if mgr.active_child.lock().unwrap().is_some() {
             if let Err(e) = cli(&["logout"], 30) {
                 warning = Some(format!(
                     "tailscale logout failed ({e}) — remove this machine in the admin console"
@@ -1583,7 +2286,6 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
 
     /// Tab-indented like tailscaled's encoder (`SetIndent("", "\t")`).
     const STATUS_BODY: &str = "{\n\t\"Version\": \"1.86.2\",\n\t\"BackendState\": \"Running\",\n\t\"Self\": {\n\t\t\"Online\": true,\n\t\t\"DNSName\": \"u60-pro.tail.ts.net.\"\n\t},\n\t\"Health\": []\n}\n";
@@ -1753,5 +2455,616 @@ mod tests {
             localapi_status_at(&path, 1),
             Err(LocalApiError::Other(_))
         ));
+    }
+
+    fn test_manager(running: bool, pid: Option<u32>) -> Arc<TailscaleManager> {
+        let manager = Arc::new(TailscaleManager {
+            config: Mutex::new(TsConfig::default()),
+            running: AtomicBool::new(running),
+            paused: AtomicBool::new(false),
+            supervisor_started: AtomicBool::new(false),
+            supervisor_idle: AtomicBool::new(true),
+            updating: AtomicBool::new(false),
+            enrollment: Mutex::new(EnrollmentOp::Idle),
+            state_restore_attempted: AtomicBool::new(false),
+            active_child: Mutex::new(pid.map(|pid| ChildIdentity { pid, instance: 1 })),
+            next_child_instance: AtomicU64::new(u64::from(pid.is_some())),
+            last_status: Mutex::new((Value::Null, 0, 0)),
+            status_seq: AtomicU64::new(0),
+            status_refresh_lock: Mutex::new(false),
+            status_refresh_cv: Condvar::new(),
+            last_update: Mutex::new(None),
+            login_url: Mutex::new(None),
+            wakelock_held: AtomicBool::new(false),
+            wake_lock: Mutex::new(()),
+            wake_cv: Condvar::new(),
+            relay: OnceLock::new(),
+            relay_watch_lock: Mutex::new(RelayWatchState::default()),
+            relay_watch_cv: Condvar::new(),
+        });
+        manager
+    }
+
+    fn stop_relay_watch(manager: &TailscaleManager) {
+        let mut state = manager
+            .relay_watch_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.stopped = true;
+        manager.relay_watch_cv.notify_all();
+    }
+
+    #[test]
+    fn startup_gate_returns_immediately_when_wifi_relay_is_active_without_probing_cellular() {
+        use std::sync::atomic::AtomicUsize;
+
+        let manager = test_manager(true, None);
+        let probes = AtomicUsize::new(0);
+        let started = Instant::now();
+        manager.wait_for_clock_and_wan_with(
+            || SANE_CLOCK_EPOCH + 100,
+            || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                false
+            },
+            || true,
+            Duration::from_secs(2),
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn startup_gate_wakes_immediately_when_wifi_relay_connects() {
+        let manager = test_manager(true, None);
+        let relay_up = Arc::new(AtomicBool::new(false));
+        let wake_manager = Arc::clone(&manager);
+        let wake_relay = Arc::clone(&relay_up);
+        let waker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            wake_relay.store(true, Ordering::SeqCst);
+            wake_manager.relay_uplink_changed();
+        });
+
+        let started = Instant::now();
+        manager.wait_for_clock_and_wan_with(
+            || SANE_CLOCK_EPOCH + 100,
+            || false,
+            || relay_up.load(Ordering::SeqCst),
+            Duration::from_secs(5),
+        );
+        waker.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(manager.relay_watch_lock.lock().unwrap().generation, 0);
+    }
+
+    #[test]
+    fn startup_gate_waits_for_clock_without_spinning_when_relay_is_already_up() {
+        use std::sync::atomic::AtomicUsize;
+
+        let manager = test_manager(true, None);
+        let checks = AtomicUsize::new(0);
+        let started = Instant::now();
+        manager.wait_for_clock_and_wan_with(
+            || {
+                if checks.fetch_add(1, Ordering::SeqCst) >= 2 {
+                    SANE_CLOCK_EPOCH + 100
+                } else {
+                    0
+                }
+            },
+            || false,
+            || true,
+            Duration::from_millis(15),
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn relay_watch_coalesces_bursts_and_escalates_when_unhealthy() {
+        let manager = test_manager(true, Some(100));
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker_mgr = Arc::clone(&manager);
+        let worker_tx = event_tx.clone();
+        let handle = thread::spawn(move || {
+            worker_mgr.watch_relay_uplink(
+                Duration::from_millis(35),
+                Duration::from_millis(60),
+                Instant::now,
+                || true,
+                |_| false,
+                || {
+                    let _ = worker_tx.send("refresh");
+                },
+                || true,
+                || {
+                    let _ = worker_tx.send("nudge");
+                },
+                |_generation, child| {
+                    let _ = worker_tx.send(if child.pid == 100 { "restart-100" } else { "restart-other" });
+                },
+            );
+        });
+
+        {
+            let mut state = manager.relay_watch_lock.lock().unwrap();
+            state.generation = 1;
+            state.child = Some(ChildIdentity { pid: 100, instance: 1 });
+            manager.relay_watch_cv.notify_all();
+        }
+        thread::sleep(Duration::from_millis(10));
+        {
+            let mut state = manager.relay_watch_lock.lock().unwrap();
+            state.generation = 2;
+            state.child = Some(ChildIdentity { pid: 100, instance: 1 });
+            manager.relay_watch_cv.notify_all();
+        }
+
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nudge");
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "refresh");
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "restart-100");
+        assert!(event_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        stop_relay_watch(&manager);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn relay_watch_handles_cellular_fallback_offline_and_fast_handover() {
+        let manager = test_manager(true, Some(200));
+        let relay_up = Arc::new(AtomicBool::new(true));
+        let cellular_up = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = mpsc::channel();
+
+        let worker_mgr = Arc::clone(&manager);
+        let worker_relay = Arc::clone(&relay_up);
+        let worker_cell = Arc::clone(&cellular_up);
+        let worker_tx = event_tx.clone();
+        let handle = thread::spawn(move || {
+            worker_mgr.watch_relay_uplink(
+                Duration::from_millis(30),
+                Duration::from_millis(50),
+                Instant::now,
+                || worker_relay.load(Ordering::SeqCst),
+                |_| worker_cell.load(Ordering::SeqCst),
+                || {
+                    let _ = worker_tx.send("refresh");
+                },
+                || false,
+                || {
+                    let label = if worker_relay.load(Ordering::SeqCst) {
+                        "nudge-relay"
+                    } else {
+                        "nudge-cell"
+                    };
+                    let _ = worker_tx.send(label);
+                },
+                |_, _| {
+                    let _ = worker_tx.send("restart");
+                },
+            );
+        });
+
+        let fire = |gen_val: u64, disconnected: bool| {
+            let mut state = manager.relay_watch_lock.lock().unwrap();
+            state.generation = gen_val;
+            state.child = Some(ChildIdentity { pid: 200, instance: 1 });
+            if disconnected {
+                state.saw_disconnect = true;
+            }
+            manager.relay_watch_cv.notify_all();
+        };
+
+        // 1. Initial relay connect nudges once.
+        fire(1, false);
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nudge-relay");
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "refresh");
+
+        // 2. Same-direction IPv6 update within debounce skips redundant nudge while healthy.
+        fire(2, false);
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "refresh");
+        assert!(event_rx.recv_timeout(Duration::from_millis(80)).is_err());
+
+        // 3. Fast AP-A -> AP-B handover (< settle) preserves saw_disconnect and still nudges.
+        relay_up.store(false, Ordering::SeqCst);
+        fire(3, true);
+        thread::sleep(Duration::from_millis(8));
+        relay_up.store(true, Ordering::SeqCst);
+        fire(4, false);
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nudge-relay");
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "refresh");
+
+        // 4. Disconnect with cellular off skips nudge cleanly.
+        relay_up.store(false, Ordering::SeqCst);
+        cellular_up.store(false, Ordering::SeqCst);
+        fire(5, true);
+        assert!(event_rx.recv_timeout(Duration::from_millis(120)).is_err());
+
+        // 5. Disconnect with cellular on nudges immediately onto cellular.
+        cellular_up.store(true, Ordering::SeqCst);
+        fire(6, true);
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nudge-cell");
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "refresh");
+
+        stop_relay_watch(&manager);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn relay_watch_ignores_stale_pid_after_daemon_restart() {
+        let manager = test_manager(true, Some(300));
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker_mgr = Arc::clone(&manager);
+        let handle = thread::spawn(move || {
+            worker_mgr.watch_relay_uplink(
+                Duration::from_millis(40),
+                Duration::from_millis(40),
+                Instant::now,
+                || true,
+                |_| false,
+                || {},
+                || true,
+                || {
+                    let _ = event_tx.send("nudge");
+                },
+                |_, _| {
+                    let _ = event_tx.send("restart");
+                },
+            );
+        });
+
+        {
+            let mut state = manager.relay_watch_lock.lock().unwrap();
+            state.generation = 1;
+            state.child = Some(ChildIdentity { pid: 300, instance: 1 });
+            manager.relay_watch_cv.notify_all();
+        }
+        thread::sleep(Duration::from_millis(10));
+        *manager.active_child.lock().unwrap() = Some(ChildIdentity { pid: 301, instance: 2 });
+        assert!(event_rx.recv_timeout(Duration::from_millis(120)).is_err());
+
+        stop_relay_watch(&manager);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn relay_watch_skips_restart_when_new_event_arrives_during_status_refresh() {
+        use std::sync::atomic::AtomicUsize;
+
+        let manager = test_manager(true, Some(400));
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        let worker_mgr = Arc::clone(&manager);
+        let worker_refreshes = Arc::clone(&refresh_count);
+        let health_refreshes = Arc::clone(&refresh_count);
+        let refresh_tx = event_tx.clone();
+        let restart_tx = event_tx.clone();
+        let handle = thread::spawn(move || {
+            worker_mgr.watch_relay_uplink(
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+                Instant::now,
+                || true,
+                |_| false,
+                move || {
+                    let step = worker_refreshes.fetch_add(1, Ordering::SeqCst);
+                    let _ = refresh_tx.send(if step == 0 { "refresh-1" } else { "refresh-2" });
+                    if step == 0 {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                    }
+                },
+                move || health_refreshes.load(Ordering::SeqCst) < 2,
+                move || {
+                    let _ = event_tx.send("nudge");
+                },
+                move |_, _| {
+                    let _ = restart_tx.send("restart");
+                },
+            );
+        });
+
+        let identity = ChildIdentity { pid: 400, instance: 1 };
+        {
+            let mut state = manager.relay_watch_lock.lock().unwrap();
+            state.generation = 1;
+            state.child = Some(identity);
+            manager.relay_watch_cv.notify_all();
+        }
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nudge");
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "refresh-1");
+
+        {
+            let mut state = manager.relay_watch_lock.lock().unwrap();
+            state.generation = 2;
+            state.child = Some(identity);
+            state.saw_disconnect = true;
+            manager.relay_watch_cv.notify_all();
+        }
+        release_tx.send(()).unwrap();
+
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nudge");
+        assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "refresh-2");
+        assert!(event_rx.recv_timeout(Duration::from_millis(120)).is_err());
+
+        stop_relay_watch(&manager);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn relay_watch_skips_restart_when_paused_or_disabled_during_status_refresh() {
+        for pause_instead_of_stop in [true, false] {
+            let manager = test_manager(true, Some(410));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::channel();
+
+            let worker_mgr = Arc::clone(&manager);
+            let worker_tx = event_tx.clone();
+            let handle = thread::spawn(move || {
+                worker_mgr.watch_relay_uplink(
+                    Duration::from_millis(20),
+                    Duration::from_millis(20),
+                    Instant::now,
+                    || true,
+                    |_| false,
+                    move || {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                    },
+                    || true,
+                    move || {
+                        let _ = event_tx.send("nudge");
+                    },
+                    move |_, _| {
+                        let _ = worker_tx.send("restart");
+                    },
+                );
+            });
+
+            {
+                let mut state = manager.relay_watch_lock.lock().unwrap();
+                state.generation = 1;
+                state.child = Some(ChildIdentity { pid: 410, instance: 1 });
+                manager.relay_watch_cv.notify_all();
+            }
+            assert_eq!(event_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "nudge");
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+            if pause_instead_of_stop {
+                manager.paused.store(true, Ordering::SeqCst);
+            } else {
+                manager.running.store(false, Ordering::SeqCst);
+            }
+            manager.wake_supervisor();
+            release_tx.send(()).unwrap();
+
+            assert!(event_rx.recv_timeout(Duration::from_millis(120)).is_err());
+
+            stop_relay_watch(&manager);
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn supervisor_relay_restart_verifies_generation_intent_and_instance() {
+        let manager = test_manager(true, Some(420));
+        let first = ChildIdentity { pid: 420, instance: 1 };
+        let recycled = ChildIdentity { pid: 420, instance: 2 };
+        {
+            let mut state = manager.relay_watch_lock.lock().unwrap();
+            state.generation = 3;
+            state.child = Some(first);
+        }
+
+        assert!(!manager.request_relay_restart(2, first));
+        assert!(!manager.request_relay_restart(3, recycled));
+        assert!(manager.request_relay_restart(3, first));
+        assert!(manager.has_relay_restart(first));
+        assert!(!manager.take_relay_restart(recycled));
+        assert!(manager.take_relay_restart(first));
+        assert!(!manager.take_relay_restart(first));
+
+        assert!(manager.request_relay_restart(3, first));
+        manager.relay_watch_lock.lock().unwrap().generation = 4;
+        assert!(!manager.take_relay_restart(first));
+
+        assert!(manager.request_relay_restart(4, first));
+        manager.paused.store(true, Ordering::SeqCst);
+        assert!(!manager.take_relay_restart(first));
+        manager.paused.store(false, Ordering::SeqCst);
+        manager.running.store(false, Ordering::SeqCst);
+        assert!(!manager.request_relay_restart(4, first));
+        assert!(!manager.take_relay_restart(first));
+    }
+
+    #[test]
+    fn enrollment_mutex_serializes_auth_key_and_interactive_login() {
+        let manager = test_manager(true, Some(500));
+        assert!(!manager.enrollment_active());
+
+        let auth_guard = manager.try_begin_auth_key_enrollment().unwrap();
+        assert!(manager.enrollment_active());
+        assert!(manager.enrollment_is_auth_key());
+        assert!(manager.try_begin_auth_key_enrollment().is_err());
+        assert!(manager.try_begin_interactive_login().is_err());
+        drop(auth_guard);
+        assert!(!manager.enrollment_active());
+
+        let login_guard = match manager.try_begin_interactive_login().unwrap() {
+            InteractiveLoginSlot::Started(guard) => guard,
+            InteractiveLoginSlot::AlreadyRunning => panic!("expected fresh interactive login"),
+        };
+        assert!(manager.enrollment_active());
+        assert!(!manager.enrollment_is_auth_key());
+        assert!(matches!(
+            manager.try_begin_interactive_login().unwrap(),
+            InteractiveLoginSlot::AlreadyRunning
+        ));
+        assert!(manager.try_begin_auth_key_enrollment().is_err());
+        drop(login_guard);
+
+        assert!(!manager.enrollment_active());
+        assert!(manager.try_begin_auth_key_enrollment().is_ok());
+    }
+
+    #[test]
+    fn temp_auth_key_file_is_unique_private_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("u60-ts-authkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = TempAuthKeyFile::write(&dir, "tskey-auth-first").unwrap();
+        let second = TempAuthKeyFile::write(&dir, "tskey-auth-second").unwrap();
+        let first_path = first.path.clone();
+        let second_path = second.path.clone();
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(std::fs::read_to_string(&first_path).unwrap(), "tskey-auth-first");
+        assert_eq!(std::fs::read_to_string(&second_path).unwrap(), "tskey-auth-second");
+        assert_eq!(
+            std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&second_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(first);
+        assert!(!first_path.exists());
+        assert_eq!(std::fs::read_to_string(&second_path).unwrap(), "tskey-auth-second");
+
+        drop(second);
+        assert!(!second_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_nonblocking_returns_immediately_and_coalesces_background_refresh() {
+        use std::sync::atomic::AtomicUsize;
+
+        let manager = test_manager(true, Some(600));
+        *manager.last_status.lock().unwrap() = (
+            json!({"daemon_running": true, "state": "healthy", "relay": "hkg"}),
+            100,
+            1,
+        );
+        manager.status_seq.store(1, Ordering::SeqCst);
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let shared_release = Arc::new(Mutex::new(Some(release_rx)));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let started_at = Instant::now();
+        let mut callers = Vec::new();
+        for _ in 0..4 {
+            let call_mgr = Arc::clone(&manager);
+            let call_probes = Arc::clone(&probes);
+            let call_started = started_tx.clone();
+            let call_release = Arc::clone(&shared_release);
+            let call_done = done_tx.clone();
+            callers.push(thread::spawn(move || {
+                call_mgr.status_nonblocking_with(
+                    || 200,
+                    || (json!({"daemon_running": true, "state": "starting"}), true),
+                    move |bg_mgr| {
+                        call_probes.fetch_add(1, Ordering::SeqCst);
+                        let _ = call_started.send(());
+                        let rx = call_release.lock().unwrap().take();
+                        if let Some(rx) = rx {
+                            let _ = rx.recv_timeout(Duration::from_secs(2));
+                        }
+                        let seq = bg_mgr.status_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                        bg_mgr.store_status(
+                            seq,
+                            &json!({"daemon_running": true, "state": "healthy", "relay": "sin"}),
+                            200,
+                        );
+                        let _ = call_done.send(());
+                    },
+                )
+            }));
+        }
+        for caller in callers {
+            let snapshot = caller.join().unwrap();
+            assert_eq!(snapshot["relay"], "hkg");
+        }
+        assert!(started_at.elapsed() < Duration::from_millis(250));
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let fresh = manager.status_nonblocking_with(
+            || 205,
+            || (json!({"daemon_running": true, "state": "starting"}), true),
+            |_| panic!("fresh cache must not spawn background refresh"),
+        );
+        assert_eq!(fresh["relay"], "sin");
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn status_coalesced_joins_in_flight_refresh_and_rejects_stale_overwrite() {
+        use std::sync::atomic::AtomicUsize;
+
+        let manager = test_manager(true, Some(610));
+        *manager.last_status.lock().unwrap() = (
+            json!({"daemon_running": true, "state": "healthy", "relay": "hkg"}),
+            100,
+            1,
+        );
+        manager.status_seq.store(1, Ordering::SeqCst);
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let probe_count = Arc::clone(&probes);
+        let initial = manager.status_nonblocking_with(
+            || 200,
+            || (json!({"daemon_running": true, "state": "starting"}), true),
+            move |bg_mgr| {
+                probe_count.fetch_add(1, Ordering::SeqCst);
+                let _ = started_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                let seq = bg_mgr.status_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                bg_mgr.store_status(
+                    seq,
+                    &json!({"daemon_running": true, "state": "healthy", "relay": "nrt"}),
+                    200,
+                );
+            },
+        );
+        assert_eq!(initial["relay"], "hkg");
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let waiter_mgr = Arc::clone(&manager);
+        let waiter = thread::spawn(move || {
+            waiter_mgr.status_coalesced_with(
+                || 200,
+                || (json!({"daemon_running": true, "state": "starting"}), true),
+                || panic!("coalesced caller must join existing in-flight refresh"),
+            )
+        });
+        thread::sleep(Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+        let joined = waiter.join().unwrap();
+        assert_eq!(joined["relay"], "nrt");
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        manager.store_status(5, &json!({"state": "disabled"}), 210);
+        manager.store_status(4, &json!({"state": "healthy"}), 211);
+        let (latest, _, seq) = manager.last_status.lock().unwrap().clone();
+        assert_eq!(seq, 5);
+        assert_eq!(latest["state"], "disabled");
     }
 }

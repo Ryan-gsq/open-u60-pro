@@ -58,6 +58,7 @@ const path = require('node:path');
         response.end(JSON.stringify(valid?{ok:true,data:{token:'test-token'}}:{ok:false}));
       }); return;
     }
+    if (request.url === '/api/auth/logout' && request.method === 'POST') { response.writeHead(200,{'Content-Type':'application/json'}); response.end('{"ok":true,"data":{}}'); return; }
     if (request.url === '/api/wifi/status' || request.url === '/api/wifi/guest') { response.setHeader('Content-Type','application/json'); response.end(JSON.stringify({ok:true,data:request.url.endsWith('status') ? fixtures.wifi : {ssid:'Guest',encryption:'psk2+ccmp',disabled_2g:'1',disabled_5g:'1',hidden:'0',isolate:'1'}})); return; }
     const file = {'/':'index.html','/ui/dashboard.css':'dashboard.css','/ui/routing-model.js':'routing-model.js','/ui/routing.js':'routing.js','/ui/clients-model.js':'clients-model.js','/ui/clients.js':'clients.js','/ui/dashboard.js':'dashboard.js','/ui/cellular.js':'cellular.js','/ui/esim-model.js':'esim-model.js','/ui/esim.js':'esim.js','/ui/addresses.js':'addresses.js','/ui/numbers.js':'numbers.js','/ui/motion.js':'motion.js','/ui/navigation.js':'navigation.js','/ui/appearance.js':'appearance.js','/ui/actions.js':'actions.js','/ui/controls.js':'controls.js','/ui/advanced.js':'advanced.js','/ui/operators.js':'operators.js','/ui/forwarding.js':'forwarding.js','/ui/diagnostics.js':'diagnostics.js','/ui/https.js':'https.js','/ui/battery-model.js':'battery-model.js','/ui/battery.js':'battery.js'}[request.url.split('#')[0].replace('/console/a/','/ui/')];
     if (!file) { response.writeHead(404); response.end(); return; }
@@ -440,7 +441,7 @@ const path = require('node:path');
   await page.waitForFunction(() => document.querySelector('#login-dialog').open);
   assert.equal(await page.locator('#hostname').textContent(),'ZTE U60 Pro');
   assert.equal(await page.locator('#client-list').textContent(),'Device data unavailable.');
-  assert.ok(requests.every(request => ['/api/dashboard/events','/api/auth/login','/api/wifi/status','/api/wifi/guest','/api/esim/profiles','/api/esim/enable'].includes(request.url.split('?')[0])),'no polling of individual API readings');
+  assert.ok(requests.every(request => ['/api/dashboard/events','/api/auth/login','/api/auth/logout','/api/wifi/status','/api/wifi/guest','/api/esim/profiles','/api/esim/enable'].includes(request.url.split('?')[0])),'no polling of individual API readings');
   assert.deepEqual(errors,[]);
   await browser.close(); clearInterval(heartbeat); disconnect(); server.close();
   console.log('Passed: dashboard eSIM ISP switching with confirmation and SSE progress, saved Light/Dark/System themes, system appearance changes, themed phone/tablet/desktop and contrast, five primary tabs, expandable sidebars, routed pages and browser back, state preservation, optional live SMS, LTE and NR carrier aggregation, SA/NSA, no-service and LPM states, retained offline statistics, SSE snapshots and dependency patches, split frames, auth headers and expiry, automatic reconnection, tab visibility, no endpoint polling, 11 responsive viewports, search and session lock.');

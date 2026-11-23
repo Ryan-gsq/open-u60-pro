@@ -1,6 +1,6 @@
 const assert=require('node:assert/strict'),{chromium}=require('playwright'),{start}=require('./fixture.cjs');
 (async()=>{
-  let status={installed:false,configured:false,running:false,version:'1.19.33',dashboard_version:'3.29.1',dashboard:null,scope:'lan_tcp_udp_dual_stack_tun',experimental:true,error:null,autostart:false,recovery_required:false};
+  let status={installed:false,configured:false,running:false,version:'1.19.33',dashboard_version:'3.29.1',dashboard:null,scope:'lan_tcp_udp_dual_stack_tproxy',experimental:true,error:null,autostart:false,recovery_required:false,direct_bypass:false,direct_bypass_active:false,kernel:null};
   let library={selected:null,profiles:[],merge_enabled:false,script_enabled:false,merge_saved:false,script_saved:false};
   const editors={},extensions={merge_enabled:false,script_enabled:false,merge:'',script:''};
   let switchFails=null,nextId=1,dashboard=()=>({url:'/ui/mihomo/dashboard/#/proxies'}),dashboardFails=null;
@@ -16,7 +16,8 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     }
     if(url==='/api/mihomo/dashboard'){if(dashboardFails){fail(...dashboardFails);return true;}reply(dashboard());return true;}
     if(url==='/api/mihomo/install'){status={...status,installed:true};reply(status);return true;}
-    if(url==='/api/mihomo/switch'){if(switchFails){fail(switchFails);return true;}status={...status,running:body.enabled,autostart:body.enabled,recovery_required:false};sync();reply(status);return true;}
+    if(url==='/api/mihomo/switch'){if(switchFails){fail(switchFails);return true;}status={...status,running:body.enabled,autostart:body.enabled,recovery_required:false,direct_bypass_active:body.enabled&&status.direct_bypass,kernel:body.enabled?{mode:'rule',bypass:status.direct_bypass?'rules':'none',returns:status.direct_bypass?9:null,reason:null}:null};sync();reply(status);return true;}
+    if(url==='/api/mihomo/direct-bypass'){const enabled=body.enabled===true;status={...status,direct_bypass:enabled,direct_bypass_active:status.running&&enabled,kernel:status.running?{mode:'rule',bypass:enabled?'rules':'none',returns:enabled?9:null,reason:null}:null};sync();reply(status);return true;}
     if(url==='/api/mihomo/profiles'){
       const id=body.id||`a${String(nextId).padStart(3,'0')}`;
       if(body.action==='add'||body.action==='edit'){
@@ -115,6 +116,17 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     await said('#mihomo-profiles .action-status','Profile deleted');assert.equal(await page.locator('.mihomo-profile').count(),1);
 
     assert.equal(await button('Open Zashboard').isVisible(),true);
+    // DIRECT rule bypass confirms before posting, reverts on cancel, and reflects active kernel state.
+    const bypass=page.locator('#mihomo-direct-bypass');
+    assert.equal(await bypass.isChecked(),false);
+    await bypass.check();assert.match(await text('.confirm-dialog'),/LAN IPv4 connections are reset/);await confirm('Cancel');
+    await page.waitForFunction(()=>!document.querySelector('#mihomo-direct-bypass').checked);
+    assert.equal(await bypass.isChecked(),false,'cancelling leaves DIRECT bypass unchecked');
+    await bypass.check();await confirm('Enable bypass');await said('#mihomo-status .action-status','DIRECT bypass enabled');
+    assert.equal(last().url,'/api/mihomo/direct-bypass');assert.deepEqual(last().body,{enabled:true});
+    assert.equal(await bypass.isChecked(),true);assert.match(await text('.mihomo-bypass-copy'),/9 rules compiled in kernel/);
+    await bypass.uncheck();await confirm('Disable bypass');await said('#mihomo-status .action-status','DIRECT bypass disabled');
+    assert.deepEqual(last().body,{enabled:false});assert.equal(await bypass.isChecked(),false);
     // A refusal from the router is shown as it is.
     switchFails='Mihomo reserved firewall chains are occupied';await button('Stop Mihomo').click();await confirm('Stop Mihomo');
     await said('#mihomo-status .action-status','chains are occupied');assert.equal(await page.locator('#mihomo-status .action-status').getAttribute('data-error'),'true');switchFails=null;

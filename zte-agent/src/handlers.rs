@@ -59,8 +59,14 @@ impl AppState {
         let mihomo = Arc::new(crate::mihomo::Mihomo::new());
         let dashboard = Arc::new(crate::dashboard::Dashboard::default());
         let ota = crate::ota::OtaManager::system(Arc::downgrade(&dashboard));
+        let tailscale = Arc::new(crate::tailscale::TailscaleManager::new());
+        let wifi_relay = Arc::new(
+            crate::wifi_relay::WifiRelay::with_core(Arc::clone(&network_lock), Arc::clone(&mihomo))
+                .with_tailscale(Arc::clone(&tailscale)),
+        );
+        tailscale.set_relay(&wifi_relay);
         Self {
-            wifi_relay: Arc::new(crate::wifi_relay::WifiRelay::with_core(Arc::clone(&network_lock), Arc::clone(&mihomo))),
+            wifi_relay,
             mihomo,
             network_lock,
             cellular_control: crate::modem_ext::CellularControl::default(),
@@ -80,7 +86,7 @@ impl AppState {
             speedtest: crate::speedtest::SpeedTest::new(),
             charge_limit: Arc::new(ChargeLimitEnforcer::new()),
             sms_forward: Arc::new(SmsForwarder::new()),
-            tailscale: Arc::new(crate::tailscale::TailscaleManager::new()),
+            tailscale,
             ttl: Arc::new(crate::ttl::TtlManager::new()),
             wireguard: Arc::new(crate::wireguard::WireGuardManager::new()),
             ota,

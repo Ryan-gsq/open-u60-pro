@@ -5,23 +5,21 @@
 
 use maud::{html, Markup};
 
-/// The browser tabs; Relay is a web-only addition to the app's five tabs.
+/// The app's five tabs (iOS `TabBarView`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Tab {
     Dashboard,
     Sms,
     Tools,
     Router,
-    Relay,
     Settings,
 }
 
-const TABS: [(Tab, &str, &str, Icon); 6] = [
+const TABS: [(Tab, &str, &str, Icon); 5] = [
     (Tab::Dashboard, "/ui/", "Dashboard", Icon::Gauge),
     (Tab::Sms, "/ui/sms", "SMS", Icon::Message),
     (Tab::Tools, "/ui/tools", "Tools", Icon::Tools),
     (Tab::Router, "/ui/router", "Router", Icon::Router),
-    (Tab::Relay, "/ui/relay", "Relay", Icon::Wifi),
     (Tab::Settings, "/ui/settings", "Settings", Icon::Gear),
 ];
 
@@ -31,7 +29,7 @@ pub fn tab_bar(cur: Tab) -> Markup {
     html! {
         nav.tabs aria-label="Tabs" {
             @for (tab, href, label, i) in TABS {
-                a href=(href) aria-current=[(tab == cur).then_some("page")] title=[(tab != cur).then_some(label)] { (icon(i)) span { (label) } }
+                a href=(href) aria-current=[(tab == cur).then_some("page")] { (icon(i)) span { (label) } }
             }
         }
     }

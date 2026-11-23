@@ -66,16 +66,22 @@ pub(super) fn owner_off(iface: &str) -> bool {
     fs::read_to_string("/etc/config/wireless").is_ok_and(|text| configured_off(&text, iface))
 }
 
-/// Whether the hotspot is off by the owner's own choice, which cancels the
-/// relay's restart choice, and not only off for now. The vendor keeps the
-/// owner's Wi-Fi switch in `zte_mbb.wifi_onoff_by_user` (its boot and scan
-/// scripts read that one) and the present state in `wifi_onoff`, which it
-/// also sets to 0 where the owner turned nothing off: in power-off charging
-/// mode after a low-battery shutdown, where it does not start Wi-Fi (B31,
-/// 2026-11-12: the restart choice was cleared for it). A firmware without
-/// the owner's key leaves only `wifi_onoff` to tell.
-pub(super) fn off_by_owner(iface: &str) -> bool {
-    fs::read_to_string("/etc/config/wireless").is_ok_and(|text| configured_off_by_owner(&text, iface))
+/// Reads `/etc/config/wireless` once and returns `(off, by_owner)` for the
+/// hotspot interfaces a relay depends on (`wlan2`, plus `wlan0` on 2.4 GHz).
+///
+/// `by_owner` distinguishes an owner OFF (which clears the relay's restart
+/// target) from firmware-driven stops. On B31, `zte_topsw_wlan` keeps the
+/// owner's master switch in `zte_mbb.wifi_onoff_by_user` while `mode_power_off`
+/// (UI reboot, shutdown, low-battery power-off, fast-boot standby) and
+/// firmware band-down save each radio's prior `disabled` into `disabled_bk`,
+/// set `wifi0/wifi1.disabled='1'`, and then flip `zte_mbb.wifi_onoff='0'`.
+/// On boot, `/sbin/zte_start_wlan_at_boot.sh` restores radios from
+/// `disabled_bk='0'` (or restores both radios when both are `'1'` without
+/// `disabled_bk` and `wifi_onoff_by_user='1'`). A firmware without
+/// `wifi_onoff_by_user` falls back to `wifi_onoff`.
+pub(super) fn status(two_ghz: bool) -> (bool, bool) {
+    fs::read_to_string("/etc/config/wireless")
+        .map_or((false, false), |text| configured_status(&text, two_ghz))
 }
 
 fn sections(iface: &str) -> (&'static str, &'static str) {
@@ -94,14 +100,35 @@ fn configured_off(text: &str, iface: &str) -> bool {
         || option(ssid, "disabled").as_deref() == Some("1")
 }
 
+fn configured_status(text: &str, two_ghz: bool) -> (bool, bool) {
+    let off = configured_off(text, "wlan2") || (two_ghz && configured_off(text, "wlan0"));
+    let by_owner = off
+        && (configured_off_by_owner(text, "wlan2")
+            || (two_ghz && configured_off_by_owner(text, "wlan0")));
+    (off, by_owner)
+}
+
 fn configured_off_by_owner(text: &str, iface: &str) -> bool {
     let option = |section, key| crate::wifi_watchdog::config_option(text, section, key);
     let (radio, ssid) = sections(iface);
-    let switched_off = match option("zte_mbb", "wifi_onoff_by_user") {
-        Some(by_user) => by_user == "0",
-        None => option("zte_mbb", "wifi_onoff").as_deref() == Some("0"),
+    let by_user = option("zte_mbb", "wifi_onoff_by_user");
+    let live_off = option("zte_mbb", "wifi_onoff").as_deref() == Some("0");
+    let switched_off = match by_user.as_deref() {
+        Some(value) => value == "0",
+        None => live_off,
     };
-    switched_off || option(radio, "disabled").as_deref() == Some("1") || option(ssid, "disabled").as_deref() == Some("1")
+    let radio_off_by_owner = option(radio, "disabled").as_deref() == Some("1")
+        && match option(radio, "disabled_bk").as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => !(live_off
+                && by_user.as_deref() == Some("1")
+                && option("wifi0", "disabled").as_deref() == Some("1")
+                && option("wifi1", "disabled").as_deref() == Some("1")
+                && matches!(option("wifi0", "disabled_bk").as_deref(), None | Some(""))
+                && matches!(option("wifi1", "disabled_bk").as_deref(), None | Some(""))),
+        };
+    switched_off || radio_off_by_owner || option(ssid, "disabled").as_deref() == Some("1")
 }
 
 /// All hotspot undos (including journals from older releases) share this
@@ -380,17 +407,75 @@ mod tests {
         let charging = "config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '1'\n";
         assert!(configured_off(charging, "wlan2"), "the hotspot is off");
         assert!(!configured_off_by_owner(charging, "wlan2"), "but the restart choice stays");
+
+        // mode_power_off mid-shutdown: zte_topsw_wlan saves disabled_bk='0' and sets
+        // disabled='1' ~6 s before wifi_onoff flips from '1' to '0'.
+        let shutting_down_early = "\
+config wifi-device 'wifi0'\n option disabled '1'\n option disabled_bk '0'\n\
+config wifi-device 'wifi1'\n option disabled '1'\n option disabled_bk '0'\n\
+config zte_mbb 'zte_mbb'\n option wifi_onoff '1'\n option wifi_onoff_by_user '1'\n";
+        assert_eq!(configured_status(shutting_down_early, false), (true, false));
+        assert_eq!(configured_status(shutting_down_early, true), (true, false));
+
+        // mode_power_off after wifi_onoff='0' (and at boot before zte_start_wlan_at_boot.sh).
+        let shutting_down = "\
+config wifi-device 'wifi0'\n option disabled '1'\n option disabled_bk '0'\n\
+config wifi-device 'wifi1'\n option disabled '1'\n option disabled_bk '0'\n\
+config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '1'\n";
+        assert_eq!(configured_status(shutting_down, false), (true, false));
+        assert_eq!(configured_status(shutting_down, true), (true, false));
+
+        // mode_power_off when the owner had previously disabled 2.4 GHz (wifi0) only.
+        let two_off_before_shutdown = "\
+config wifi-device 'wifi0'\n option disabled '1'\n option disabled_bk '1'\n\
+config wifi-device 'wifi1'\n option disabled '1'\n option disabled_bk '0'\n\
+config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '1'\n";
+        assert_eq!(configured_status(two_off_before_shutdown, false), (true, false), "5 GHz relay stays");
+        assert_eq!(configured_status(two_off_before_shutdown, true), (true, true), "2.4 GHz was off by owner");
+
+        // Both radios disabled without disabled_bk while wifi_onoff='0' and wifi_onoff_by_user='1':
+        // zte_start_wlan_at_boot.sh restores both radios to disabled='0'.
+        let both_off_without_bk = "\
+config wifi-device 'wifi0'\n option disabled '1'\n\
+config wifi-device 'wifi1'\n option disabled '1'\n\
+config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '1'\n";
+        assert_eq!(configured_status(both_off_without_bk, false), (true, false));
+        assert_eq!(configured_status(both_off_without_bk, true), (true, false));
+
+        // Firmware temporary single-band down (e.g. thermal) keeps disabled_bk='0'.
+        let single_band_firmware_down = "\
+config wifi-device 'wifi0'\n option disabled '0'\n\
+config wifi-device 'wifi1'\n option disabled '1'\n option disabled_bk '0'\n\
+config zte_mbb 'zte_mbb'\n option wifi_onoff '1'\n option wifi_onoff_by_user '1'\n";
+        assert_eq!(configured_status(single_band_firmware_down, false), (true, false));
+
         for text in [
             "config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '0'\n",
             "config zte_mbb 'zte_mbb'\n option wifi_onoff '1'\n option wifi_onoff_by_user '0'\n",
             "config zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n",
             "config wifi-device 'wifi1'\n option disabled '1'\n",
             "config zte_mbb 'zte_mbb'\n option wifi_onoff_by_user '1'\nconfig wifi-iface 'main_5g'\n option disabled '1'\n",
+            // Owner master OFF wins even if disabled_bk='0' is present.
+            "config wifi-device 'wifi1'\n option disabled '1'\n option disabled_bk '0'\nconfig zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '0'\n",
+            // Owner main SSID OFF wins even during firmware mode_power_off.
+            "config wifi-device 'wifi1'\n option disabled '1'\n option disabled_bk '0'\nconfig wifi-iface 'main_5g'\n option disabled '1'\nconfig zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '1'\n",
+            // Owner turned off only 5 GHz radio (wifi0 stays enabled), even with wifi_onoff='0'.
+            "config wifi-device 'wifi0'\n option disabled '0'\nconfig wifi-device 'wifi1'\n option disabled '1'\nconfig zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '1'\n",
+            // Partial backup where wifi0 has disabled_bk='1' and wifi1 has no disabled_bk:
+            // zte_start_wlan_at_boot.sh does not restore wifi1.
+            "config wifi-device 'wifi0'\n option disabled '1'\n option disabled_bk '1'\nconfig wifi-device 'wifi1'\n option disabled '1'\nconfig zte_mbb 'zte_mbb'\n option wifi_onoff '0'\n option wifi_onoff_by_user '1'\n",
         ] {
             assert!(configured_off_by_owner(text, "wlan2"), "{text}");
         }
         assert!(!configured_off_by_owner("", "wlan2"), "unknown config is not owner OFF");
         assert!(!configured_off_by_owner("config zte_mbb 'zte_mbb'\n option wifi_onoff '1'\n option wifi_onoff_by_user '1'\n", "wlan2"));
+        assert_eq!(
+            configured_status(
+                "config wifi-device 'wifi0'\n option disabled '0'\nconfig wifi-device 'wifi1'\n option disabled '0'\nconfig zte_mbb 'zte_mbb'\n option wifi_onoff '1'\n option wifi_onoff_by_user '1'\n",
+                true
+            ),
+            (false, false)
+        );
     }
 
     #[test]

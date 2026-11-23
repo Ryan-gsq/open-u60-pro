@@ -178,10 +178,10 @@ agent 恢复中继后、厂商处于硬件模式时 205 MB 只有 155 个包走�
   WAN 的下线：先改文件、再删 main 路由，WAN 规则和 PDN 都还在，新连接照样被卸载（回程内核包 221–416）。
   只关开关（不改文件）则立即回到 CPU（约 20 万）。所以不要在中继连着时改这个文件。
 
-### 4. Mihomo 的 DIRECT 规则在内核绕过（`POST /api/mihomo/cn-direct`）
+### 4. Mihomo 的 DIRECT 规则在内核绕过（`POST /api/mihomo/direct-bypass`）
 
-这是用户可选的开关，Mihomo 页面上叫 "Bypass Mihomo for DIRECT rules"（接口和状态文件
-`/data/zte-agent-mihomo/cn-direct` 沿用最初"国内直连"时的名字）。owner decision 64：哪些 IPv4
+这是用户可选的开关，Mihomo 页面上叫 "Bypass Mihomo for DIRECT rules"（状态文件
+`/data/zte-agent-mihomo/direct-bypass`，读取时兼容旧版 `/data/zte-agent-mihomo/cn-direct`）。owner decision 64：哪些 IPv4
 在内核里绕过核心，按 Mihomo 当前的模式、规则和策略组选择决定（`mihomo/routing.rs`），DNS 固定用
 fake-ip：
 

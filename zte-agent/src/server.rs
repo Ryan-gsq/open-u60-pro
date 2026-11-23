@@ -514,7 +514,7 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Post, "/api/mihomo/install") => crate::mihomo::change(state, "install", body),
         (&Method::Put, "/api/mihomo/config") => crate::mihomo::change(state, "config", body),
         (&Method::Post, "/api/mihomo/switch") => crate::mihomo::change(state, "switch", body),
-        (&Method::Post, "/api/mihomo/cn-direct") => crate::mihomo::change(state, "cn-direct", body),
+        (&Method::Post, "/api/mihomo/direct-bypass") => crate::mihomo::change(state, "direct-bypass", body),
         (&Method::Get, "/api/wifi-relay/status") => crate::wifi_relay::status(state),
         (&Method::Post, "/api/wifi-relay/scan") => crate::wifi_relay::change(state, "scan", body),
         (&Method::Post, "/api/wifi-relay/connect") => crate::wifi_relay::change(state, "connect", body),
@@ -869,6 +869,7 @@ mod tests {
             (Method::Post, "/api/mihomo/proxies/delay"),
             (Method::Post, "/api/mihomo/mode"),
             (Method::Post, "/api/mihomo/profiles"),
+            (Method::Post, "/api/mihomo/direct-bypass"),
             (Method::Post, "/api/wifi-relay/connect"),
             (Method::Post, "/api/wifi-relay/scan"),
         ] {

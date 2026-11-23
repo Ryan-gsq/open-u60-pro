@@ -312,12 +312,13 @@ pub struct WifiRelay {
     shared: Arc<Shared>,
     commands: OnceLock<std::sync::mpsc::Sender<Message>>,
     mihomo: Option<Arc<crate::mihomo::Mihomo>>,
+    tailscale: Option<Arc<crate::tailscale::TailscaleManager>>,
 }
 
 impl WifiRelay {
     pub fn new(lock: NetworkLock) -> Self {
-        let relay = Self { lock, shared: Arc::new(Shared::new()), commands: OnceLock::new(), mihomo: None };
-        let mut port = DevicePort { control: None, settings: None, shared: Arc::clone(&relay.shared), mihomo: None };
+        let relay = Self { lock, shared: Arc::new(Shared::new()), commands: OnceLock::new(), mihomo: None, tailscale: None };
+        let mut port = DevicePort { control: None, settings: None, shared: Arc::clone(&relay.shared), mihomo: None, tailscale: None };
         let mut state = State::default();
         if recovery_pending(Path::new(JOURNAL)) { state.phase = Phase::RecoveryPending; }
         port.publish(&state);
@@ -328,12 +329,17 @@ impl WifiRelay {
         Self { mihomo: Some(core), ..Self::new(lock) }
     }
 
+    pub fn with_tailscale(mut self, tailscale: Arc<crate::tailscale::TailscaleManager>) -> Self {
+        self.tailscale = Some(tailscale);
+        self
+    }
+
     pub fn start(self: &Arc<Self>) {
         let (sender, receiver) = std::sync::mpsc::channel();
         let (reply, _) = std::sync::mpsc::sync_channel(1);
         controller::boot(&sender, reply);
         if self.commands.set(sender.clone()).is_err() { return; }
-        let port = DevicePort { control: None, settings: None, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone() };
+        let port = DevicePort { control: None, settings: None, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone(), tailscale: self.tailscale.clone() };
         let controller = controller::Controller::new(port, receiver, sender.clone(), Arc::clone(&self.shared), Arc::clone(&self.lock), controller::Timings::default());
         crate::system::spawn_named("relay", move || controller.supervised(|_| {
             crate::netlog!("[relay] the controller thread panicked; ending the agent so that its guard starts it again and it adopts the connection");
@@ -386,7 +392,7 @@ impl WifiRelay {
     }
 
     pub fn recover(&self) -> Result<(), String> {
-        DevicePort { control: None, settings: None, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone() }.recover()
+        DevicePort { control: None, settings: None, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone(), tailscale: self.tailscale.clone() }.recover()
     }
 
     pub fn recover_idle(&self) { let _ = controller::request(self, RelayCommand::Boot, None); }
@@ -464,6 +470,7 @@ struct DevicePort {
     settings: Option<Value>,
     shared: Arc<Shared>,
     mihomo: Option<Arc<crate::mihomo::Mihomo>>,
+    tailscale: Option<Arc<crate::tailscale::TailscaleManager>>,
 }
 
 impl DevicePort {
@@ -596,6 +603,7 @@ impl DevicePort {
 impl DevicePort {
     fn uplink_changed(&self) {
         if let Some(core) = &self.mihomo { core.uplink_changed(); }
+        if let Some(tailscale) = &self.tailscale { tailscale.relay_uplink_changed(); }
     }
 
     fn check(&self, cancel: &Cancellation) -> Result<(), String> {
@@ -614,6 +622,19 @@ impl DevicePort {
         let cancel = self.shared.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.shared.publish(state, value, pending, &cancel);
     }
+}
+
+fn finish_join_hotspot_failure(
+    shared: &Shared,
+    by_owner: bool,
+    clear_target: impl FnOnce() -> Result<(), String>,
+) -> Option<String> {
+    if !by_owner {
+        return None;
+    }
+    let clear_error = clear_target().err();
+    shared.cancel_restore();
+    clear_error
 }
 
 impl controller::Port for DevicePort {
@@ -650,7 +671,7 @@ impl controller::Port for DevicePort {
     fn pending(&self) -> bool { recovery_pending(Path::new(JOURNAL)) }
     fn target(&mut self) -> Option<resume::Resume> { resume::load(Path::new(JOURNAL)) }
     fn clear(&mut self) -> Result<(), String> { self.settings = None; resume::clear(Path::new(JOURNAL)) }
-    fn hotspot(&mut self) -> (bool, bool) { (hotspot::owner_off("wlan2"), hotspot::off_by_owner("wlan2")) }
+    fn hotspot(&mut self) -> (bool, bool) { hotspot::status(false) }
     fn recover(&mut self) -> Result<(), String> {
         let routed = routes_journaled(Path::new(JOURNAL));
         let recovered = DevicePort::recover(self);
@@ -810,10 +831,8 @@ impl controller::Port for DevicePort {
             Ok(())
         })();
         if let Err(e) = result {
-            let off = hotspot::owner_off("wlan2") || (selected.frequency < 3000 && hotspot::owner_off("wlan0"));
-            let by_owner = off && (hotspot::off_by_owner("wlan2") || (selected.frequency < 3000 && hotspot::off_by_owner("wlan0")));
-            let clear_error = if by_owner { resume::clear(root).err() } else { None };
-            if off { self.shared.cancel_restore(); }
+            let (_off, by_owner) = hotspot::status(selected.frequency < 3000);
+            let clear_error = finish_join_hotspot_failure(&self.shared, by_owner, || resume::clear(root));
             self.set_phase(Phase::Disconnecting);
             let e = cleanup(&mut session, || self.uplink_changed()).err().unwrap_or(e);
             state.error = clear_error.or_else(|| (e != RESTORE_CANCELLED).then(|| e.clone()));
@@ -851,8 +870,7 @@ impl controller::Port for DevicePort {
         let change = session.lease.as_ref().map_or(LeaseChange::Replaced, |installed| lease_change(installed, lease.as_ref()));
         let resolvers_valid = match change { LeaseChange::Resolvers(ref next) => resolvers_acceptable(next), _ => true };
         let two = session.selected.as_ref().is_some_and(|network| network.frequency < 3000);
-        let hotspot_off = hotspot::owner_off("wlan2") || (two && hotspot::owner_off("wlan0"));
-        let by_owner = hotspot_off && (hotspot::off_by_owner("wlan2") || (two && hotspot::off_by_owner("wlan0")));
+        let (hotspot_off, by_owner) = hotspot::status(two);
         Observation { #[cfg(test)] link: None, lease, helpers, resolvers_valid, hotspot_off, by_owner }
     }
     fn renew(&mut self, session: &mut Session) { session.renew_lease(); }
@@ -2274,4 +2292,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn temporary_hotspot_off_during_join_keeps_resume_and_restore_generation() {
+        let root = std::env::temp_dir().join(format!("u60-relay-join-hotspot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let candidate = Network {
+            id: "home".into(),
+            ssid: "Home".into(),
+            frequency: 5180,
+            signal: -45,
+            security: "open",
+            supported: true,
+            bssid: "02:00:00:00:00:11".into(),
+        };
+        resume::save(&root, &candidate, false).unwrap();
+        let shared = Shared::new();
+
+        assert_eq!(finish_join_hotspot_failure(&shared, false, || resume::clear(&root)), None);
+        assert!(shared.generation_matches(0));
+        assert!(resume::load(&root).is_some());
+
+        assert_eq!(finish_join_hotspot_failure(&shared, true, || resume::clear(&root)), None);
+        assert!(!shared.generation_matches(0));
+        assert!(resume::load(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

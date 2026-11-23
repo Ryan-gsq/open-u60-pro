@@ -33,7 +33,7 @@ Mihomo 和中继各用一个串行控制器线程。中继的会话、扫描列�
 | `net-guard`、`net-guard-sample` | 订阅 inotify/ubus、合并触发，只负责唤醒：各 owner 在自己的循环里问 `Cursor::due()`，所以一个 owner 忙时不挡别的 owner。采样线程在触发后的 3 s 内维护已登记的 sysctl。`relay-neigh` / `relay-lan` 归当前 IPA 会话，退出后不能再操作下一次会话。 |
 | HTTP、页面、Zashboard | Mihomo 页面读控制器发布的不可变快照；车主命令交给控制器。重启或热重载期间，普通控制命令排队，桥接写回 503。已放行的在途写必须与切换排序，不能凭请求开始时读到的 Running 快照跨代写入。保留桥接的现有认证、同源和端点限制。 |
 
-中继的 `resume.json`、已保存网络、IPv6/省电和 IPA 开关表达车主意图。Mihomo 的 `enabled`、`cn-direct`、`profiles.json` 表达启用、绕过和配置选择。索引引用私有 `profile-bodies/<sha256>`，先持久化内容再原子替换索引；计划更新只写索引。旧内联库可直接读取，正常 OTA 切槽前重新导出内联格式，试运行期间保持旧槽可读。托管配置开启 `profile.store-selected` 和 `profile.store-fake-ip`；`selected.json` 只为启动前生成配置提供初值，第一张带 DIRECT 放行的运行表必须依据**本代就绪后**实际读到的模式和选组。
+中继的 `resume.json`、已保存网络、IPv6/省电和 IPA 开关表达车主意图。Mihomo 的 `enabled`、`direct-bypass`（读取时兼容旧 `cn-direct`）、`profiles.json` 表达启用、绕过和配置选择。索引引用私有 `profile-bodies/<sha256>`，先持久化内容再原子替换索引；计划更新只写索引。旧内联库可直接读取，正常 OTA 切槽前重新导出内联格式，试运行期间保持旧槽可读。托管配置开启 `profile.store-selected` 和 `profile.store-fake-ip`；`selected.json` 只为启动前生成配置提供初值，第一张带 DIRECT 放行的运行表必须依据**本代就绪后**实际读到的模式和选组。
 
 其他线程只共享状态/扫描列表快照、`active`/`owned` 原子值、取消单元、队列发送端、合并 Tick 的标志及准入登记。取消单元保存恢复代次、恢复目标、待断开、工作/拆除状态和空闲断开的回复。锁序为取消单元 → 请求开始握手 → 快照。请求的开始与放弃在同一握手锁下决定，控制器执行期间登记 `RELAY_OPERATION`。
 
@@ -137,7 +137,7 @@ guard 修复日志列应用命令或资源描述，例如 `iptables -t nat hook 
 
 `controller` 持有意图和已发布快照，记着内核可能持有的表（最后确认的一张，加上之后声明而未确认的各张：`reconcile` 以后可能把最后一张载入），收紧与否和“失去 DIRECT”的范围（`routing::lost_from`）都按这些表算，`reconcile` 载入的表也反映到发布的 bypass；它并决定保持、换链、重载或重启：写前收紧及审计读回由 `follow::plan/decide` 判定，`Controller` 执行换链、重载或重启；`core` 独占进程、托管 `config.yaml` 和控制器写操作；`intercept` 生成网络资源；`routing` 编译订阅规则及 DNS 过滤表，`routing::lost` 算出需清除的连接范围；`egress` 负责出口观测与去抖。慢操作在控制器线程上同步执行（§3），没有带代次的后台结果（§8）。
 
-每个核心代次在 `Prepared.bypass` 保存实际采用的绕过设置；所有计划都用它，`cn-direct` 文件只表示车主意图。`geodata-mode` 保留订阅原值；绕过打开而核心使用 `geoip.metadb` 时，状态 `notice` 说明 GEOIP 规则不能在内核绕过。强制改用 `GeoIP.dat` 会让离线启动依赖可能缺失的文件，所以不这样做。托管配置仅在 `keep-alive-idle`、`keep-alive-interval`、`disable-keep-alive` 三键全部缺省时写入 120 s 空闲和 30 s 间隔（`mihomo.rs::config_with_lan_host`）。路由器的 `TcpExt TCPKeepAlive` 计数从 60 s 内 88 次（核心打开 87 个描述符）降为 120 s 内 12 次，即每分钟 6 次（核心打开 99 个描述符，启动后 441 s）；来源为 `measurements/b4-final/mihomo-refresh.txt`、`keepalive-later.txt`，位置和条件见[批次 4](relay-mihomo-implementation.md#batch-4)。
+每个核心代次在 `Prepared.bypass` 保存实际采用的绕过设置；所有计划都用它，`direct-bypass` 文件只表示车主意图。`geodata-mode` 保留订阅原值；绕过打开而核心使用 `geoip.metadb` 时，状态 `notice` 说明 GEOIP 规则不能在内核绕过。强制改用 `GeoIP.dat` 会让离线启动依赖可能缺失的文件，所以不这样做。托管配置仅在 `keep-alive-idle`、`keep-alive-interval`、`disable-keep-alive` 三键全部缺省时写入 120 s 空闲和 30 s 间隔（`mihomo.rs::config_with_lan_host`）。路由器的 `TcpExt TCPKeepAlive` 计数从 60 s 内 88 次（核心打开 87 个描述符）降为 120 s 内 12 次，即每分钟 6 次（核心打开 99 个描述符，启动后 441 s）；来源为 `measurements/b4-final/mihomo-refresh.txt`、`keepalive-later.txt`，位置和条件见[批次 4](relay-mihomo-implementation.md#batch-4)。
 
 `mihomo::geoip` 按当前文件保留已载入代码的缓存（范围最多 8 MiB、最多 1024 个代码），解析先读国家代码，不为不需要的国家分配 CIDR 范围；`ranges::subtract` 和 `union` 线性扫描，`v6_only_in_use` 复用已解析的规则目标。这些优化的计时仅来自 Mac release 测试，未在路由器上测时（批次 4）。
 

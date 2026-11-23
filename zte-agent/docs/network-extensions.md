@@ -141,7 +141,7 @@ The managed configuration preserves `geodata-mode`. When bypass is on but the
 core uses `geoip.metadb`, status `notice` explains why GEOIP rules cannot bypass
 the core in the kernel; forcing `GeoIP.dat` could break an offline start when the
 file is absent. Every plan uses the running generation's `Prepared.bypass`, not
-the `cn-direct` intent file. If `keep-alive-idle`, `keep-alive-interval` and
+the `direct-bypass` intent file. If `keep-alive-idle`, `keep-alive-interval` and
 `disable-keep-alive` are all absent, managed defaults are 120 s idle and 30 s
 between probes. On the router, `TcpExt TCPKeepAlive` in `/proc/net/netstat`
 counted 88 probes in 60 s before (87 core descriptors; core defaults translated
@@ -302,8 +302,8 @@ database or subscription is embedded in the Rust binary.
 - UDP and IPv6 destination reachability still require capable nodes/services.
   Dual-stack interception is an implementation target, not a tested no-leak
   guarantee. Unsupported TPROXY/nftables fails startup and triggers rollback.
-- Bypass Mihomo for DIRECT rules (`cn-direct`, the name of its first, China-only
-  form; owner choice): IPv4 the core would send DIRECT by address skips it in the
+- Bypass Mihomo for DIRECT rules (`direct-bypass`, reading the legacy `cn-direct`
+  flag file as fallback; owner choice): IPv4 the core would send DIRECT by address skips it in the
   kernel (kernel NAT, so on the relay IPA can carry it). Rule mode: the rules are
   compiled top-down, in the core's order, after the private ranges return
   (`Routes::compile`): a rule matching by address, port or network (`IP-CIDR`,
@@ -1110,7 +1110,7 @@ never URLs. Zashboard's bridge uses the pass cookie instead of a bearer token.
 | POST | `/api/mihomo/install` | Install the pinned core and dashboard |
 | PUT | `/api/mihomo/config` | Validate and save `{"yaml":"..."}` |
 | POST | `/api/mihomo/switch` | Start/stop with `{"enabled":true/false}` |
-| POST | `/api/mihomo/cn-direct` | `{"enabled":true/false}`: the DIRECT bypass, IPv4 the core's mode and rules send DIRECT skips it in the kernel; a running core keeps running, LAN IPv4 connections are reset; status `kernel` (`bypass`, `returns`, `reason`) |
+| POST | `/api/mihomo/direct-bypass` | `{"enabled":true/false}`: the DIRECT bypass, IPv4 the core's mode and rules send DIRECT skips it in the kernel; a running core keeps running, LAN IPv4 connections are reset; status `direct_bypass`, `direct_bypass_active`, and `kernel` (`bypass`, `returns`, `reason`) |
 | GET | `/api/wifi-relay/status` | Memory-only state and last scan; `phase` as listed below, `connected`, `recovery_required`, `autostart`, saved networks, offload/power-save state and `connection_resets`; no BSSID/password |
 | POST | `/api/wifi-relay/scan` | Explicit scan, no background scanning; bounded admission/operation wait, busy 409 with `phase` |
 | POST | `/api/wifi-relay/connect` | `{"network":"opaque scan id","password":"...","confirmed":true,"ipv6":true}`; omitted IPv6 defaults on; validate selection, cancel pending restore, then bounded admission/operation wait (409) |

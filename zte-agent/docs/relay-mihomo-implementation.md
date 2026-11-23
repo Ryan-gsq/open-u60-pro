@@ -345,7 +345,7 @@
 | 只读状态与页面 | `publish` 预先计算恢复选择、残留日志、IPACM 配置与开关、省电意图和已保存网络；GET 只读内存。conntrack 历史移到独立 `RESULTS` 短锁，不在删除期间持有。页面显示扫描、连接、恢复、断开，操作中仍可断开；接受异步取消时显示“Disconnect requested”，不提前报已断开。 |
 | 订阅刷新 | `profiles::refresh_source` 对字节相同的源只更新刷新元数据，不编译、不校验。变更的选中订阅经控制器用 `candidate.yaml` 校验一次，不覆盖服务中的 `config.yaml`；先准备、再收紧、写配置、`PUT /configs?force=false`、读回、只重置失去 DIRECT 的范围、装新计划。切换配置、修改生效配置内容和修改扩展仍按配置变更重启。 |
 | 重载与重启选择 | `mihomo/reload.rs::needs_restart` 为纯函数：经典监听/LAN 访问、外部控制器及其认证/TLS/界面、QUIC GSO/ECN、入站 TFO/MPTCP 变化或删除 `geodata-mode: true` 时重启。核心拒绝、核验失败或变更订阅的结果未知时，用已校验候选重启；起不来用 `Run.prepared` 的最后应用配置回退，删除控制器独立的 `previous` 副本。 |
-| 每代的绕过设置与 geodata | 所有计划使用 `Prepared.bypass`，`cn-direct` 文件只表示意图。`geodata-mode` 保留订阅原值；绕过开启且核心使用 `geoip.metadb` 时，`notice` 说明 GEOIP 不能在内核绕过。不会为此强制使用离线时可能缺失的 `GeoIP.dat`。 |
+| 每代的绕过设置与 geodata | 所有计划使用 `Prepared.bypass`，`direct-bypass` 文件（兼容旧 `cn-direct`）只表示意图。`geodata-mode` 保留订阅原值；绕过开启且核心使用 `geoip.metadb` 时，`notice` 说明 GEOIP 不能在内核绕过。不会为此强制使用离线时可能缺失的 `GeoIP.dat`。 |
 | TCP keep-alive | 仅当订阅三个键 `keep-alive-idle`、`keep-alive-interval`、`disable-keep-alive` 全部缺省时，托管配置写空闲 120 s、间隔 30 s；保留任何显式设置。核心原缺省值为 0，Go 实际按空闲 15 s、间隔 15 s 探测（`I-doc-changes-4.md` 的核心源码核对记录）。真机计数见下表。 |
 | 规则计算 | `geoip` 缓存同一当前文件中已载入的代码，范围上限 8 MiB、代码上限 1024 个；先读代码，不为非目标国家分配 CIDR 范围。`ranges::subtract`/`union` 线性扫描，`v6_only_in_use` 复用已解析目标。上限见 `mihomo/geoip.rs` 的 `MAX_CACHE_BYTES`、`MAX_CACHE_CODES`。 |
 | I1 源码扫描 | `netfx::boundary` 在命令构造处识别所有 `ip` 对象、iptables/ip6tables/restore、nft、conntrack、sysctl 和 `/proc/sys` 写入；轻量扫描跳过注释、无关字符串与测试，不依赖 Rust 语法解析器。11 项例外按文件、函数、命令和原因登记，未再命中的例外使测试失败；当前清单见[架构 §4](relay-mihomo-architecture.md#4-网络效果层netfxeffecteffectset)（批次 5 为 10 项）。 |

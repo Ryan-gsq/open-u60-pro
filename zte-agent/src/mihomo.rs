@@ -66,9 +66,10 @@ const TPROXY_PORT: u16 = ids::TPROXY_PORT;
 /// `ip` and `ip6` tables of this name (B31 lacks inet `fib`). ZTE rewrites
 /// only legacy iptables, never nftables.
 const NFT_TABLE: &str = ids::MIHOMO_NFT;
-/// Present while the owner lets IPv4 the rules send DIRECT skip the core
-/// (`routing`); the name is from when this was China IP direct.
-const BYPASS: &str = "cn-direct";
+/// Present while the owner lets IPv4 traffic matched as DIRECT skip the core
+/// in the kernel (`routing`).
+const BYPASS: &str = "direct-bypass";
+const LEGACY_BYPASS: &str = "cn-direct";
 /// The tables' batch file (`netfx::effect::NftTables`).
 const NFT_FILE: &str = "nft-tables.nft";
 pub const MAX_CONFIG: usize = 512 * 1024;
@@ -141,6 +142,10 @@ impl Mihomo {
         self.root.join("network.json")
     }
 
+    fn direct_bypass_enabled(&self) -> bool {
+        self.root.join(BYPASS).is_file() || self.root.join(LEGACY_BYPASS).is_file()
+    }
+
     fn snapshot(&self) -> Snapshot {
         self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
@@ -170,8 +175,8 @@ impl Mihomo {
             "direct_fallback": s.phase == Phase::Backoff,
             "failures": s.failures,
             "retry_in_s": s.retry_at.map(|at| at.saturating_duration_since(Instant::now()).as_secs()),
-            "cn_direct": self.root.join(BYPASS).is_file(),
-            "cn_direct_active": running && s.bypass.as_ref().is_some_and(|b| !matches!(b, controller::Bypass::None(_))),
+            "direct_bypass": self.direct_bypass_enabled(),
+            "direct_bypass_active": running && s.bypass.as_ref().is_some_and(|b| !matches!(b, controller::Bypass::None(_))),
             "kernel": kernel, "tables": s.tables, "generation": s.generation,
             "autostart": self.wants_restore(), "recovery_required": s.phase == Phase::CleanupPending || (s.phase == Phase::Off && journal),
             "connections_reset": s.last_reset, "connection_resets": crate::netfx::conntrack::history()})
@@ -465,14 +470,18 @@ impl Mihomo {
     /// core in the kernel (`routing`). DNS changes with it (`Routes::dns`).
     pub fn set_direct_bypass(&self, enabled: bool) -> Result<(), String> {
         let flag = self.root.join(BYPASS);
+        let legacy = self.root.join(LEGACY_BYPASS);
         if enabled {
             net::write_private(&flag, b"1")?;
+            let _ = fs::remove_file(&legacy);
         } else {
-            match fs::remove_file(&flag) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    return Err("Cannot clear the DIRECT bypass setting".into())
+            for path in [&flag, &legacy] {
+                match fs::remove_file(path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err("Cannot clear the DIRECT bypass setting".into())
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         crate::events::touch(crate::events::Topic::Mihomo);
@@ -572,7 +581,7 @@ impl controller::Port for DevicePort {
                 let lan = lan_address()?;
                 self.lan = Some(lan);
                 let refresh = matches!(source, Source::Refresh(_));
-                let bypass = if refresh { previous.bypass } else { m.root.join(BYPASS).is_file() };
+                let bypass = if refresh { previous.bypass } else { m.direct_bypass_enabled() };
                 let source = if refresh { m.selected_source()? } else { previous.source.clone() };
                 let (mut config, routes) = managed_mapping(&source, &previous.secret, Some((&previous.local, lan)), bypass)?;
                 let running = &previous.facts.runtime;
@@ -602,7 +611,7 @@ impl controller::Port for DevicePort {
                 let secret: String = random.iter().map(|b| format!("{b:02x}")).collect();
                 let lan = lan_address()?;
                 self.lan = Some(lan);
-                let bypass = m.root.join(BYPASS).is_file();
+                let bypass = m.direct_bypass_enabled();
                 let (mut config, routes) = managed_mapping(&source, &secret, Some((&local, lan)), bypass)?;
                 let dns = routes.dns(bypass);
                 // A user may have disabled cellular data while Wi-Fi is offline. Keep
@@ -1424,7 +1433,7 @@ pub fn change(state: &crate::handlers::AppState, action: &str, body: &[u8]) -> (
             Some(false) => state.mihomo.disable(),
             _ => Err("enabled must be a boolean".into()),
         },
-        "cn-direct" => match serde_json::from_slice::<Value>(body)
+        "direct-bypass" => match serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|v| v["enabled"].as_bool())
         {
@@ -1640,6 +1649,26 @@ mod tests {
         m.disable().unwrap();
         assert!(started.elapsed() < Duration::from_secs(5), "{:?} with the relay's lock held", started.elapsed());
         drop(held);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_bypass_flag_status_and_legacy_fallback() {
+        let dir = std::env::temp_dir().join(format!("u60-direct-bypass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = Mihomo::at(dir.clone());
+        assert_eq!(m.status()["direct_bypass"], Value::Bool(false));
+        assert_eq!(m.status()["direct_bypass_active"], Value::Bool(false));
+        net::write_private(&dir.join(LEGACY_BYPASS), b"1").unwrap();
+        assert_eq!(m.status()["direct_bypass"], Value::Bool(true));
+        m.set_direct_bypass(true).unwrap();
+        assert!(dir.join(BYPASS).is_file());
+        assert!(!dir.join(LEGACY_BYPASS).exists());
+        assert_eq!(m.status()["direct_bypass"], Value::Bool(true));
+        m.set_direct_bypass(false).unwrap();
+        assert!(!dir.join(BYPASS).exists());
+        assert!(!dir.join(LEGACY_BYPASS).exists());
+        assert_eq!(m.status()["direct_bypass"], Value::Bool(false));
         let _ = std::fs::remove_dir_all(dir);
     }
 

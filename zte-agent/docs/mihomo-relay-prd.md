@@ -5,7 +5,7 @@
 [network-extensions.md](network-extensions.md)（功能、安全、API、恢复）、
 [relay-hw-offload.md](relay-hw-offload.md)（IPA 硬件转发、Mihomo 的 DIRECT 绕过）、
 [relay-lifecycle.md](relay-lifecycle.md)（中继连接、断开和恢复流程）、
-[web-ui.md](web-ui.md)（页面）。这里的数字都来自那些文档的实测记录，本文没有单独验收。
+[responsive-console.md](responsive-console.md)（页面）。这里的数字都来自那些文档的实测记录，本文没有单独验收。
 
 ## 1. 目标
 
@@ -52,7 +52,7 @@
 
 ### 3.3 在内核绕过 DIRECT 流量
 
-页面上叫 "Bypass Mihomo for DIRECT rules"，接口 `POST /api/mihomo/cn-direct`，**默认关**。
+页面上叫 "Bypass Mihomo for DIRECT rules"，接口 `POST /api/mihomo/direct-bypass`，**默认关**。
 
 | 模式 | 在内核绕过的 IPv4 |
 | --- | --- |
@@ -156,7 +156,7 @@
 | --- | --- | --- |
 | Mihomo 开关 | 关；打开后重启路由器仍会自动恢复 | `POST /api/mihomo/switch` |
 | Mihomo 模式 | 跟随配置 | `POST /api/mihomo/mode` |
-| DIRECT 绕过 | 关 | `POST /api/mihomo/cn-direct` |
+| DIRECT 绕过 | 关 | `POST /api/mihomo/direct-bypass` |
 | DNS | fake-ip（固定，不能改） | — |
 | 连接表单：记住网络 / IPv6 / 确认提示 | 都勾选 | `POST /api/wifi-relay/connect` |
 | 带宽 | 保持协商带宽（不可调） | — |

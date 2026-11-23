@@ -14,13 +14,77 @@ const core={
  clients:{hosts:{'02:00:00:00:00:01':{name:'Studio laptop',ipaddrs:['192.168.0.102']},'02:00:00:00:00:02':{name:'Daily phone',ipaddrs:['192.168.0.104']}},dhcp_leases:[{hostname:'Living room TV',ipaddr:'192.168.0.108',macaddr:'02:00:00:00:00:03'}]}
 };
 const clients={inventory_complete:true,router_macs:[],sample_interval_seconds:2,sources:{wireless:true,wired:true,stations:{wlan2:true}},devices:[{mac:'02:00:00:00:00:01',name:'Studio laptop',ipv4:'192.168.0.102',ipv6:'2001:db8::102',connected:true,connection_type:'wifi',band:'5G',interface:'wlan2',connected_seconds:2400,traffic:{download_bps:24.8e6,upload_bps:3.2e6,download_bytes:804e6,upload_bytes:96e6,scope:'wifi_link'},peaks:{download_bps:128e6,upload_bps:18e6,since:1793085600000},limits:{download_bps:null,upload_bps:null,status:'not_reported'},link:{signal_dbm:-45,download_mbps:2161.3,upload_mbps:1921.5}},{mac:'02:00:00:00:00:02',name:'Daily phone',ipv4:'192.168.0.104',connected:true,connection_type:'wifi',band:'5G',interface:'wlan2',traffic:{download_bps:8.6e6,upload_bps:1.2e6},peaks:{download_bps:72e6,upload_bps:9e6},limits:{download_bps:null,upload_bps:null,status:'not_reported'},link:{signal_dbm:-52}},{mac:'02:00:00:00:00:03',name:'Living room TV',ipv4:'192.168.0.108',connected:true,connection_type:'wifi',band:'2.4G',interface:'wlan0',traffic:{download_bps:12e6,upload_bps:0.2e6},peaks:{download_bps:32e6,upload_bps:2e6},limits:{download_bps:null,upload_bps:null,status:'not_reported'}}]};
+const nowSec=Math.floor(Date.now()/1000);
+const relay={
+ connected:true,network_id:'studio5',saved_network_id:'k-studio',ssid:'Studio Fiber 5G',frequency:5260,address:'192.168.8.23',gateway:'192.168.8.1',
+ networks:[
+  {id:'studio5',ssid:'Studio Fiber 5G',frequency:5260,signal:-48,security:'wpa2',supported:true,remembered:true},
+  {id:'hotel5',ssid:'Hotel Guest 5G',frequency:5180,signal:-56,security:'wpa2',supported:true,remembered:true},
+  {id:'cafe24',ssid:'Cafe Guest',frequency:2437,signal:-68,security:'open',supported:true,remembered:true},
+  {id:'office5',ssid:'Office Mesh',frequency:5745,signal:-61,security:'unsupported',supported:false,remembered:false}
+ ],
+ internet:'not_verified',ipv6_relay:true,
+ ipv6:{requested:true,state:'configured',upstream:true,nat66:true,address:'2001:db8:48::2',lan_prefix:'fd00:1::/64',internet:'not_verified',error:null},
+ cellular_fallback:true,restoring:null,experimental:true,error:null,clock_error:null,recovery_required:false,autostart:true,
+ saved_networks:[
+  {id:'k-studio',ssid:'Studio Fiber 5G',security:'wpa2',remembered:true},
+  {id:'k-hotel',ssid:'Hotel Guest 5G',security:'wpa2',remembered:true},
+  {id:'k-cafe',ssid:'Cafe Guest',security:'open',remembered:true}
+ ]
+};
+const mihomo={
+ installed:true,configured:true,running:true,version:'1.19.33',dashboard_version:'3.29.1',dashboard:{url:'/ui/mihomo/dashboard/#/proxies'},
+ scope:'lan_tcp_udp_dual_stack_tproxy',experimental:true,error:null,autostart:true,recovery_required:false,
+ direct_bypass:true,direct_bypass_active:true,kernel:{mode:'rule',bypass:'rules',returns:14,reason:null}
+};
+const mihomoProfiles={
+ selected:'a001',
+ profiles:[
+  {id:'a001',name:'Primary Subscription',remote:true,interval_hours:24,updated:nowSec-1800,attempted:nowSec-1800,error:null},
+  {id:'a002',name:'Travel Fallback',remote:false,interval_hours:0,updated:nowSec-86400*3,attempted:0,error:null}
+ ],
+ merge_enabled:true,script_enabled:false,merge_saved:true,script_saved:false
+};
+const mihomoExtensions={merge_enabled:true,script_enabled:false,merge:'dns:\n  respect-rules: true\n',script:''};
+const mihomoProxies={
+ mode:'rule',
+ groups:[
+  {name:'Proxy',type:'Selector',now:'Auto',selectable:true,all:['Auto','HK 01','SG 02','JP 03','US 04','DIRECT']},
+  {name:'Auto',type:'URLTest',now:'HK 01',selectable:false,all:['HK 01','SG 02','JP 03']},
+  {name:'Streaming',type:'Selector',now:'JP 03',selectable:true,all:['JP 03','HK 01','SG 02','US 04']},
+  {name:'Direct Rules',type:'Selector',now:'DIRECT',selectable:true,all:['DIRECT','Proxy']}
+ ],
+ nodes:{
+  'HK 01':{type:'Shadowsocks',delay:42},
+  'SG 02':{type:'Vless',delay:68},
+  'JP 03':{type:'Trojan',delay:95},
+  'US 04':{type:'Vmess',delay:186},
+  DIRECT:{type:'Direct',delay:12}
+ }
+};
+const tailscale={
+ installed:true,enabled:true,enrolled:true,daemon_running:true,state:'healthy',backend_state:'Running',healthy:true,health:[],
+ tailscale_ips:['100.64.0.10','fd7a:115c:a1e0::10'],dns_name:'u60-pro.tail1234.ts.net.',relay:'hkg',direct:true,
+ key_expiry:'0001-01-01T00:00:00Z',expired:false,client_version:'1.86.2',login_url:null,wakelock_held:true,updating:false,
+ last_update:{version:'1.86.2',ok:true,finished_at:nowSec-1800},
+ hostname:'u60-pro',advertise_routes:['192.168.0.0/24'],tailscale_ssh:false,hold_wakelock:true,pinned_version:'1.86.2'
+};
+const apiFixtures={
+ '/api/esim/profiles':inventory,
+ '/api/wifi-relay/status':relay,
+ '/api/mihomo/status':mihomo,
+ '/api/mihomo/profiles':mihomoProfiles,
+ '/api/mihomo/extensions':mihomoExtensions,
+ '/api/mihomo/proxies':mihomoProxies,
+ '/api/tailscale/status':tailscale
+};
 const streams=new Set();
 const server=http.createServer((req,res)=>{
  if(req.url.startsWith('/api/')){
   if(req.url==='/api/auth/login'){req.resume();req.on('end',()=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify(ok({token:'documentation-preview-session'})));});return;}
   if(req.headers.authorization!=='Bearer documentation-preview-session'){res.writeHead(401,{'Content-Type':'application/json'});res.end(JSON.stringify({ok:false,error:'unauthorized'}));return;}
   if(req.url.startsWith('/api/dashboard/events')){const query=new URL(req.url,'http://localhost').searchParams,readings=Object.fromEntries(Object.entries(core).map(([key,data])=>[key,ok(data)]));if(query.get('topics')==='clients')readings.client_details=ok(clients);if(query.get('topics')==='esim')readings.esim_status=ok({agent_instance:1,inventory_loaded:true,inventory,switch:{state:'idle'},download:{state:'idle'},receipts:{count:0,pending:[],retrying:false},password_required:false});res.writeHead(200,{'Content-Type':'text/event-stream'});res.write(`event: snapshot\ndata: ${JSON.stringify({readings})}\n\n`);streams.add(res);res.on('close',()=>streams.delete(res));return;}
-  res.setHeader('Content-Type','application/json');res.end(JSON.stringify(ok(req.url==='/api/esim/profiles'?inventory:{})));return;
+  res.setHeader('Content-Type','application/json');res.end(JSON.stringify(ok(apiFixtures[req.url]||{})));return;
  }
  const file=req.url==='/'?'index.html':/^\/(?:ui|console\/a)\/[\w.-]+$/.test(req.url)?req.url.split('/').pop():'',full=path.join(source,file);if(!file||!fs.existsSync(full)){res.writeHead(404);res.end();return;}res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':'text/html');res.end(fs.readFileSync(full));
 });
@@ -28,8 +92,20 @@ const server=http.createServer((req,res)=>{
  fs.mkdirSync(output,{recursive:true});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const heartbeat=setInterval(()=>{for(const stream of streams)stream.write(': heartbeat\n\n');},1000);const browser=await chromium.launch({headless:true,channel:'chrome'}),context=await browser.newContext({viewport:{width:1440,height:1100},reducedMotion:'reduce',locale:'en-US',timezoneId:'Asia/Manila'}),page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
  try{
   await page.goto(`http://127.0.0.1:${server.address().port}/`);await page.locator('#password').fill('preview-only');await page.locator('#login-form button[type=submit]').click();await page.waitForFunction(()=>OpenU60Console.connected&&document.querySelector('#wan-ipv6').textContent.includes('2001:db8'));
-  const captures=[['dashboard-desktop-light','dashboard/overview','light',1440,1100],['dashboard-desktop-dark','dashboard/overview','dark',1440,1100],['dashboard-mobile-light','dashboard/overview','light',390,1000],['signal-tablet-dark','network/signal','dark',820,1180],['devices-desktop-light','network/clients','light',1440,1150],['esim-desktop-dark','network/esim','dark',1440,1150]];
-  for(const [name,key,theme,width,height]of captures){await page.setViewportSize({width,height});await page.evaluate(()=>OpenU60Navigation.go('settings/appearance'));await page.waitForFunction(()=>OpenU60Navigation.current.key==='settings/appearance');await page.locator(`input[name=appearance][value=${theme}]`).check();await page.evaluate(key=>OpenU60Navigation.go(key),key);await page.waitForFunction(key=>OpenU60Navigation.current.key===key&&OpenU60Console.connected,key);if(key==='network/clients')await page.waitForFunction(()=>document.querySelectorAll('.client-card').length===3);if(key==='network/esim')await page.waitForFunction(()=>document.querySelectorAll('#esim-profile-list .rule-card').length===3);await page.evaluate(()=>{scrollTo({top:0,behavior:'instant'});return new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));});await page.waitForTimeout(120);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,name);await page.screenshot({path:path.join(output,name+'.png')});console.log(name);}
+  const filter=new Set(process.argv.slice(2));
+  const captures=[
+   ['dashboard-desktop-light','dashboard/overview','light',1440,1100],
+   ['dashboard-desktop-dark','dashboard/overview','dark',1440,1100],
+   ['dashboard-mobile-light','dashboard/overview','light',390,1000],
+   ['signal-tablet-dark','network/signal','dark',820,1180],
+   ['devices-desktop-light','network/clients','light',1440,1150],
+   ['esim-desktop-dark','network/esim','dark',1440,1150],
+   ['relay-desktop-dark','network/relay','dark',1440,1360],
+   ['mihomo-desktop-dark','network/mihomo','dark',1440,1320],
+   ['mihomo-proxies-desktop-dark','network/proxies','dark',1440,1360],
+   ['tailscale-desktop-dark','network/tailscale','dark',1440,1260]
+  ].filter(([name])=>filter.size===0||filter.has(name));
+  for(const [name,key,theme,width,height]of captures){await page.setViewportSize({width,height});await page.evaluate(()=>OpenU60Navigation.go('settings/appearance'));await page.waitForFunction(()=>OpenU60Navigation.current.key==='settings/appearance');await page.locator(`input[name=appearance][value=${theme}]`).check();await page.evaluate(key=>OpenU60Navigation.go(key),key);await page.waitForFunction(key=>OpenU60Navigation.current.key===key&&OpenU60Console.connected,key);if(key==='network/clients')await page.waitForFunction(()=>document.querySelectorAll('.client-card').length===3);if(key==='network/esim')await page.waitForFunction(()=>document.querySelectorAll('#esim-profile-list .rule-card').length===3);if(key==='network/relay')await page.waitForFunction(()=>document.querySelectorAll('.relay-network').length===4);if(key==='network/mihomo')await page.waitForFunction(()=>document.querySelector('#mihomo-status h3')?.textContent.includes('Mihomo is running')&&document.querySelectorAll('.mihomo-profile').length===2);if(key==='network/proxies')await page.waitForFunction(()=>document.querySelectorAll('.proxy-group').length===4);if(key==='network/tailscale')await page.waitForFunction(()=>document.querySelector('#tailscale-status h3')?.textContent.includes('u60-pro.tail1234.ts.net'));await page.evaluate(()=>{scrollTo({top:0,behavior:'instant'});return new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));});await page.waitForTimeout(120);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,name);await page.screenshot({path:path.join(output,name+'.png')});console.log(name);}
   assert.deepEqual(errors,[]);
  }finally{await browser.close();clearInterval(heartbeat);for(const stream of streams)stream.destroy();server.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

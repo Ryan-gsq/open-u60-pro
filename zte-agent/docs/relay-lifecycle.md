@@ -103,7 +103,7 @@ Disconnect 先更新取消代次和待断开标志，立即发布 `disconnecting
 | 入口 | 行为 |
 |---|---|
 | 本项目 API/网页修改或关闭热点 | 中继活动或恢复未完成时返回 409，提示先断开/恢复中继；清理后才执行热点设置 |
-| 原厂界面、设备控制等直接关 Wi-Fi/相关频段 | `relay` 控制器在下一轮 tick 检测到明确 OFF 并清理中继；只有车主自己的开关（`wifi_onoff_by_user`，或射频、SSID 的 `disabled`，`hotspot::off_by_owner`）才取消恢复选择；撤销时跳过已关闭/移除热点的旧快照，不重新启用它 |
+| 原厂界面、设备控制等直接关 Wi-Fi/相关频段 | `relay` 控制器在下一轮 tick 检测到明确 OFF 并清理中继；只有车主自己的开关（`wifi_onoff_by_user`，或未带固件恢复备份 `disabled_bk='0'` 的射频、SSID `disabled`，见 `hotspot::status`）才取消恢复选择；撤销时跳过已关闭/移除热点的旧快照，不重新启用它 |
 | 在连接/雷达等待期间关热点 | 中止正在进行的操作；OFF 使热点快照失效，继续释放其他中继资源 |
 | 重新打开热点 | 由原厂配置重新创建热点；之前因 OFF 取消的中继不会自动重连，需要重新选择 |
 
@@ -129,12 +129,14 @@ Disconnect 先更新取消代次和待断开标志，立即发布 `disconnecting
   （`measurements/b4-final/agent-boot.log`）。两次是各自构建的记录，不是恢复时限。
 - **和 2026-11-12 之前的版本（站点叫 `u60sta0`）互相更换**：两边都不认对方留下的中继（旧接口名的助手、日志和
   规则不再识别，车主决定不留兼容，2026-11-12）。更换之前先断开中继，或者更换之后重启。
-- **低电量关机后的关机充电模式**：恢复供电后路由器进入厂商的关机充电模式，Wi-Fi 不启动，厂商把
-  `wireless.zte_mbb.wifi_onoff` 设成 0，而车主自己的开关 `wifi_onoff_by_user` 仍是 1
-  （`measurements/observations-2026-11-12.md`）。之前的版本按 `wifi_onoff` 判断，把它当作车主关了热点，清除了
-  `resume.json`，之后正常重启也不再恢复中继（2026-11-12 实测一次）。现在按 `hotspot::off_by_owner` 判断：
-  开机恢复在 Wi-Fi 被固件关着时跳过这次尝试，保留重启选择；连接中途 Wi-Fi 被固件关掉而失败时也保留。这个修复
-  只有单元测试，路由器上没有复现。
+- **固件电源管理关 Wi-Fi（UI 重启、低电量关机、快启待机、关机充电模式）**：进入 `mode_power_off` 时，
+  `zte_topsw_wlan` 会先把各射频原本的 `disabled` 备份到 `wifi0/wifi1.disabled_bk`，再把
+  `wifi0/wifi1.disabled` 设为 `1`，数秒后把 `wireless.zte_mbb.wifi_onoff` 设为 `0`，同时保持车主开关
+  `wifi_onoff_by_user` 为 `1`（下次正常开机由 `/sbin/zte_start_wlan_at_boot.sh` 按 `disabled_bk` 恢复）。
+  旧判断在 `wifi0/wifi1.disabled='1'` 时一律当作车主手动关闭热点，导致关机前 `Controller::tick()` 或开机
+  早期 `restore_attempt()` 误删 `resume.json`。现在 `hotspot::status` 一次读取配置并结合 `wifi_onoff_by_user`
+  与 `disabled_bk` 区分固件停机与车主关闭：固件关 Wi-Fi 时正常清理当前会话或跳过当次恢复尝试，但保留
+  `resume.json`，等下次开机 Wi-Fi 恢复后按退避策略自动重连。
 - **清理中途失败**：已完成的步骤不重做，未完成 undo 留在日志；操作结束后阶段为
   `recovery_pending`，才显示 `recovery_required`，可以再次断开/清理，必要时 USB 执行 `network-recover`。
 

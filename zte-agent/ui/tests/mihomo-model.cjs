@@ -16,6 +16,14 @@ assert.equal(M.view({running:true,recovery_required:true}).key,'running');assert
 assert.deepEqual([true,false,undefined].map(autostart=>M.autostartLabel({autostart})),['Automatic start enabled','Stays off','Unknown']);
 assert.deepEqual(M.facts({installed:true,version:'1.19.33',configured:true,autostart:false}).map(f=>f[1]),['Installed · 1.19.33','Saved privately','Stays off','LAN TCP/UDP · IPv4/IPv6']);
 assert.equal(M.facts({}).find(f=>f[0]==='Core')[1],'Not installed');
+assert.match(M.directBypassSummary({direct_bypass:false}),/^Off\./);
+assert.equal(M.directBypassSummary({direct_bypass:true,running:false}),'Enabled. Takes effect when Mihomo starts.');
+assert.equal(M.directBypassSummary({direct_bypass:true,running:true,kernel:{bypass:'all'}}),'Active · All IPv4 bypasses the core in Direct mode.');
+assert.equal(M.directBypassSummary({direct_bypass:true,running:true,kernel:{bypass:'rules',returns:12}}),'Active · 12 rules compiled in kernel.');
+assert.equal(M.directBypassSummary({direct_bypass:true,running:true,kernel:{bypass:'rules',returns:1,reason:'truncated at IP-ASN'}}),'Active · 1 rule compiled in kernel (truncated at IP-ASN).');
+assert.equal(M.directBypassSummary({direct_bypass:true,running:true,kernel:{bypass:'none',reason:'global mode'}}),'Enabled · Inactive (global mode).');
+assert.match(M.directBypassConfirmation(true,true)[1],/LAN IPv4 connections are reset/);
+assert.doesNotMatch(M.directBypassConfirmation(true,false)[1],/connections are reset/);
 
 // Profile freshness and schedule labels.
 const now=1_800_000_000;
