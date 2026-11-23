@@ -69,6 +69,16 @@ const tailscale={
  last_update:{version:'1.86.2',ok:true,finished_at:nowSec-1800},
  hostname:'u60-pro',advertise_routes:['192.168.0.0/24'],tailscale_ssh:false,hold_wakelock:true,pinned_version:'1.86.2'
 };
+const tailscaleVersions={
+ latest:'1.104.7',
+ versions:[
+  {version:'1.104.7',published_at:'2026-11-12T22:56:51Z'},
+  {version:'1.104.6',published_at:'2026-11-11T00:29:49Z'},
+  {version:'1.102.5',published_at:'2026-09-29T18:47:23Z'},
+  {version:'1.86.2',published_at:'2025-07-15T18:00:00Z'}
+ ],
+ source:'github+pkgs',warning:null,fetched_at:nowSec-60
+};
 const apiFixtures={
  '/api/esim/profiles':inventory,
  '/api/wifi-relay/status':relay,
@@ -76,7 +86,8 @@ const apiFixtures={
  '/api/mihomo/profiles':mihomoProfiles,
  '/api/mihomo/extensions':mihomoExtensions,
  '/api/mihomo/proxies':mihomoProxies,
- '/api/tailscale/status':tailscale
+ '/api/tailscale/status':tailscale,
+ '/api/tailscale/versions':tailscaleVersions
 };
 const streams=new Set();
 const server=http.createServer((req,res)=>{

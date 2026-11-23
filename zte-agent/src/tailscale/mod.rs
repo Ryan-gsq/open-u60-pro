@@ -58,6 +58,55 @@ const LOCALAPI_MAX_BYTES: usize = 1024 * 1024;
 const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// 2025-01-01 UTC — clock earlier than this means NTP hasn't synced yet.
 const SANE_CLOCK_EPOCH: i64 = 1_735_689_600;
+const VERSIONS_CACHE_TTL: Duration = Duration::from_secs(600);
+const VERSIONS_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const VERSIONS_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
+const SHA256_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_LISTED_VERSIONS: usize = 15;
+const PKGS_INDEX_MAX_BYTES: usize = 64 * 1024;
+const GITHUB_RELEASES_MAX_BYTES: usize = 512 * 1024;
+const SHA256_FILE_MAX_BYTES: usize = 1024;
+const TAILSCALE_PKGS_INDEX_URL: &str = "https://pkgs.tailscale.com/stable/?mode=json";
+const TAILSCALE_GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/tailscale/tailscale/releases?per_page=30";
+const TAILSCALE_USER_AGENT: &str = concat!("open-u60-tailscale/", env!("CARGO_PKG_VERSION"));
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReleaseEntry {
+    version: String,
+    published_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VersionCatalog {
+    latest: String,
+    versions: Vec<ReleaseEntry>,
+    source: String,
+    warning: Option<String>,
+    fetched_at: i64,
+}
+
+impl VersionCatalog {
+    fn to_json(&self) -> Value {
+        let versions: Vec<Value> = self
+            .versions
+            .iter()
+            .map(|entry| {
+                json!({
+                    "version": entry.version,
+                    "published_at": entry.published_at,
+                })
+            })
+            .collect();
+        json!({
+            "latest": self.latest,
+            "versions": versions,
+            "source": self.source,
+            "warning": self.warning,
+            "fetched_at": self.fetched_at,
+        })
+    }
+}
 
 #[derive(Default)]
 struct RelayWatchState {
@@ -225,6 +274,7 @@ pub struct TailscaleManager {
     /// Outcome of the most recent update attempt (surfaced in /status).
     last_update: Mutex<Option<Value>>,
     login_url: Mutex<Option<String>>,
+    versions_cache: Mutex<Option<(VersionCatalog, Instant)>>,
     wakelock_held: AtomicBool,
     /// Supervisor wake-up: writers of `running` / `paused` notify so the
     /// thread parks instead of polling. The mutex guards no data; holding
@@ -445,6 +495,7 @@ impl TailscaleManager {
             status_refresh_cv: Condvar::new(),
             last_update: Mutex::new(None),
             login_url: Mutex::new(None),
+            versions_cache: Mutex::new(None),
             wakelock_held: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
             wake_cv: Condvar::new(),
@@ -2071,23 +2122,348 @@ pub fn logout(state: &AppState) -> (u16, Value) {
     (200, json!({"ok": true, "data": {"status": "logged_out", "warning": warning}}))
 }
 
-/// POST /api/tailscale/update — body: {"version": "1.98.9", "sha256": "<hex>"}
+fn is_valid_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn parse_stable_semver(raw: &str) -> Option<(String, semver::Version)> {
+    let trimmed = raw.trim();
+    let clean = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    if !is_valid_version(clean) {
+        return None;
+    }
+    let parsed = semver::Version::parse(clean).ok()?;
+    if !parsed.pre.is_empty() || !parsed.build.is_empty() {
+        return None;
+    }
+    Some((clean.to_string(), parsed))
+}
+
+fn parse_pkgs_latest(body: &Value) -> Result<String, String> {
+    if let Some(tarballs) = body.get("Tarballs").and_then(Value::as_object) {
+        let arm64 = tarballs
+            .get("arm64")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if arm64.is_empty() {
+            return Err("pkgs.tailscale.com index is missing an arm64 tarball".into());
+        }
+    }
+    let candidate = body["TarballsVersion"]
+        .as_str()
+        .or_else(|| body["Version"].as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if is_valid_version(candidate) {
+        Ok(candidate.to_string())
+    } else {
+        Err("pkgs.tailscale.com returned an invalid latest version".into())
+    }
+}
+
+fn parse_github_releases(body: &Value) -> Result<Vec<ReleaseEntry>, String> {
+    let list = body
+        .as_array()
+        .ok_or_else(|| "GitHub releases payload is not an array".to_string())?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in list {
+        if item["draft"].as_bool().unwrap_or(false) || item["prerelease"].as_bool().unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(tag) = item["tag_name"].as_str() else {
+            continue;
+        };
+        let Some((version, _)) = parse_stable_semver(tag) else {
+            continue;
+        };
+        if !seen.insert(version.clone()) {
+            continue;
+        }
+        let published_at = item["published_at"]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        out.push(ReleaseEntry {
+            version,
+            published_at,
+        });
+    }
+    Ok(out)
+}
+
+fn compare_release_desc(left: &ReleaseEntry, right: &ReleaseEntry) -> std::cmp::Ordering {
+    match (
+        semver::Version::parse(&left.version),
+        semver::Version::parse(&right.version),
+    ) {
+        (Ok(left_sv), Ok(right_sv)) => right_sv
+            .cmp(&left_sv)
+            .then_with(|| right.version.cmp(&left.version)),
+        _ => right.version.cmp(&left.version),
+    }
+}
+
+fn merge_version_catalog(
+    pkgs: Result<String, String>,
+    github: Result<Vec<ReleaseEntry>, String>,
+    fetched_at: i64,
+) -> Result<VersionCatalog, String> {
+    match (pkgs, github) {
+        (Ok(latest), Ok(gh_entries)) => {
+            let latest_sv = semver::Version::parse(&latest).ok();
+            let mut versions: Vec<ReleaseEntry> = gh_entries
+                .into_iter()
+                .filter(|entry| match (&latest_sv, semver::Version::parse(&entry.version).ok()) {
+                    (Some(max_sv), Some(entry_sv)) => entry_sv <= *max_sv,
+                    _ => true,
+                })
+                .collect();
+            let warning = if versions.is_empty() {
+                Some(
+                    "GitHub returned no matching stable releases; showing latest stable from pkgs.tailscale.com."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            if !versions.iter().any(|entry| entry.version == latest) {
+                versions.push(ReleaseEntry {
+                    version: latest.clone(),
+                    published_at: None,
+                });
+            }
+            versions.sort_by(compare_release_desc);
+            versions.dedup_by(|left, right| left.version == right.version);
+            versions.truncate(MAX_LISTED_VERSIONS);
+            Ok(VersionCatalog {
+                latest,
+                versions,
+                source: "github+pkgs".to_string(),
+                warning,
+                fetched_at,
+            })
+        }
+        (Ok(latest), Err(gh_err)) => Ok(VersionCatalog {
+            versions: vec![ReleaseEntry {
+                version: latest.clone(),
+                published_at: None,
+            }],
+            latest,
+            source: "pkgs".to_string(),
+            warning: Some(format!(
+                "Could not load release history from GitHub ({gh_err}); showing latest stable from pkgs.tailscale.com."
+            )),
+            fetched_at,
+        }),
+        (Err(pkgs_err), Ok(mut gh_entries)) if !gh_entries.is_empty() => {
+            gh_entries.sort_by(compare_release_desc);
+            gh_entries.dedup_by(|left, right| left.version == right.version);
+            gh_entries.truncate(MAX_LISTED_VERSIONS);
+            let latest = gh_entries[0].version.clone();
+            Ok(VersionCatalog {
+                latest,
+                versions: gh_entries,
+                source: "github".to_string(),
+                warning: Some(format!(
+                    "Could not verify latest package index at pkgs.tailscale.com ({pkgs_err}); showing GitHub releases."
+                )),
+                fetched_at,
+            })
+        }
+        (Err(pkgs_err), Err(gh_err)) => Err(format!(
+            "failed to load Tailscale releases: pkgs.tailscale.com ({pkgs_err}); GitHub ({gh_err})"
+        )),
+        (Err(pkgs_err), Ok(_)) => Err(format!(
+            "failed to load Tailscale releases: pkgs.tailscale.com ({pkgs_err}); GitHub returned no stable releases"
+        )),
+    }
+}
+
+fn parse_sha256_text(text: &str) -> Result<String, String> {
+    let token = text.split_whitespace().next().unwrap_or("");
+    if token.len() == 64 && token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Ok(token.to_ascii_lowercase())
+    } else {
+        Err("official checksum response is not a valid 64-character SHA-256 digest".into())
+    }
+}
+
+fn read_bounded_string(
+    resp: ureq::http::Response<ureq::Body>,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let mut raw = Vec::new();
+    resp.into_body()
+        .into_reader()
+        .take((max_bytes as u64) + 1)
+        .read_to_end(&mut raw)
+        .map_err(|err| format!("read response: {err}"))?;
+    if raw.len() > max_bytes {
+        return Err(format!("response exceeded {max_bytes}-byte limit"));
+    }
+    String::from_utf8(raw).map_err(|err| format!("invalid UTF-8 response: {err}"))
+}
+
+fn fetch_json_url(
+    agent: &ureq::Agent,
+    url: &str,
+    accept: Option<&str>,
+    max_bytes: usize,
+) -> Result<Value, String> {
+    let mut req = agent.get(url).header("User-Agent", TAILSCALE_USER_AGENT);
+    if let Some(header_val) = accept {
+        req = req.header("Accept", header_val);
+    }
+    let resp = req.call().map_err(|err| err.to_string())?;
+    let text = read_bounded_string(resp, max_bytes)?;
+    serde_json::from_str(&text).map_err(|err| format!("parse JSON: {err}"))
+}
+
+fn fetch_versions_from_urls(pkgs_url: &str, github_url: &str) -> Result<VersionCatalog, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(VERSIONS_CONNECT_TIMEOUT))
+        .timeout_global(Some(VERSIONS_FETCH_TIMEOUT))
+        .build()
+        .into();
+    let (pkgs_res, gh_res) = thread::scope(|scope| {
+        let pkgs_handle = scope.spawn(|| {
+            let body = fetch_json_url(&agent, pkgs_url, None, PKGS_INDEX_MAX_BYTES)?;
+            parse_pkgs_latest(&body)
+        });
+        let gh_handle = scope.spawn(|| {
+            let body = fetch_json_url(
+                &agent,
+                github_url,
+                Some("application/vnd.github+json"),
+                GITHUB_RELEASES_MAX_BYTES,
+            )?;
+            parse_github_releases(&body)
+        });
+        let pkgs_out = pkgs_handle
+            .join()
+            .unwrap_or_else(|_| Err("pkgs.tailscale.com lookup panicked".into()));
+        let gh_out = gh_handle
+            .join()
+            .unwrap_or_else(|_| Err("GitHub releases lookup panicked".into()));
+        (pkgs_out, gh_out)
+    });
+    merge_version_catalog(pkgs_res, gh_res, unix_now())
+}
+
+fn fetch_versions_live() -> Result<VersionCatalog, String> {
+    if cfg!(test) {
+        return Err("version lookup disabled in tests".into());
+    }
+    fetch_versions_from_urls(TAILSCALE_PKGS_INDEX_URL, TAILSCALE_GITHUB_RELEASES_URL)
+}
+
+impl TailscaleManager {
+    fn versions_catalog_with<F>(&self, force_refresh: bool, fetch: F) -> Result<VersionCatalog, String>
+    where
+        F: FnOnce() -> Result<VersionCatalog, String>,
+    {
+        if !force_refresh {
+            let guard = self
+                .versions_cache
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if let Some((catalog, fetched_instant)) = guard.as_ref() {
+                if fetched_instant.elapsed() < VERSIONS_CACHE_TTL {
+                    return Ok(catalog.clone());
+                }
+            }
+        }
+        let fresh = fetch()?;
+        let mut guard = self
+            .versions_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *guard = Some((fresh.clone(), Instant::now()));
+        Ok(fresh)
+    }
+}
+
+/// GET /api/tailscale/versions — recent official stable ARM64 versions
+/// (cached in memory for 10 minutes).
+pub fn versions(state: &AppState) -> (u16, Value) {
+    match state
+        .tailscale
+        .versions_catalog_with(false, fetch_versions_live)
+    {
+        Ok(catalog) => (200, json!({"ok": true, "data": catalog.to_json()})),
+        Err(err) => (502, json!({"ok": false, "error": err})),
+    }
+}
+
+/// POST /api/tailscale/versions/refresh — bypass cache and fetch recent
+/// official stable ARM64 versions immediately.
+pub fn versions_refresh(state: &AppState) -> (u16, Value) {
+    match state
+        .tailscale
+        .versions_catalog_with(true, fetch_versions_live)
+    {
+        Ok(catalog) => (200, json!({"ok": true, "data": catalog.to_json()})),
+        Err(err) => (502, json!({"ok": false, "error": err})),
+    }
+}
+
+fn parse_update_request(body: &[u8]) -> Result<(String, Option<String>), String> {
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| "invalid JSON".to_string())?;
+    let version = match parsed["version"].as_str().map(str::trim) {
+        Some(ver) if is_valid_version(ver) => ver.to_string(),
+        _ => return Err("missing or invalid 'version'".into()),
+    };
+    let sha256 = match parsed.get("sha256") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.len() == 64 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                Some(trimmed.to_ascii_lowercase())
+            } else {
+                return Err("missing or invalid 'sha256' (64 hex chars)".into());
+            }
+        }
+        _ => return Err("missing or invalid 'sha256' (64 hex chars)".into()),
+    };
+    Ok((version, sha256))
+}
+
+fn fetch_official_sha256_at(url: &str) -> Result<String, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(VERSIONS_CONNECT_TIMEOUT))
+        .timeout_global(Some(SHA256_FETCH_TIMEOUT))
+        .build()
+        .into();
+    let resp = agent
+        .get(url)
+        .header("User-Agent", TAILSCALE_USER_AGENT)
+        .call()
+        .map_err(|err| format!("fetch official sha256 {url}: {err}"))?;
+    let body = read_bounded_string(resp, SHA256_FILE_MAX_BYTES)?;
+    parse_sha256_text(&body)
+}
+
+/// POST /api/tailscale/update — body: {"version": "1.104.7", "sha256": "<optional hex>"}
 /// Installs when absent; upgrades with rollback when present. Runs in the
 /// background (multi-minute download on cellular) — poll /status for
 /// "updating" and "last_update".
 pub fn update(state: &AppState, body: &[u8]) -> (u16, Value) {
     let mgr = &state.tailscale;
-    let parsed: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
-    };
-    let version = match parsed["version"].as_str() {
-        Some(v) if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.') => v.to_string(),
-        _ => return (400, json!({"ok": false, "error": "missing or invalid 'version'"})),
-    };
-    let sha256 = match parsed["sha256"].as_str() {
-        Some(s) if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) => s.to_lowercase(),
-        _ => return (400, json!({"ok": false, "error": "missing or invalid 'sha256' (64 hex chars)"})),
+    let (version, sha256) = match parse_update_request(body) {
+        Ok(req) => req,
+        Err(err) => return (400, json!({"ok": false, "error": err})),
     };
 
     if mgr
@@ -2103,7 +2479,7 @@ pub fn update(state: &AppState, body: &[u8]) -> (u16, Value) {
 
     let mgr2 = Arc::clone(&state.tailscale);
     thread::spawn(move || {
-        let result = run_update(&mgr2, &version, &sha256);
+        let result = run_update(&mgr2, &version, sha256.as_deref());
         if let Err(ref e) = result {
             eprintln!("[tailscale] update to {version} failed: {e}");
         }
@@ -2119,10 +2495,14 @@ pub fn update(state: &AppState, body: &[u8]) -> (u16, Value) {
     (202, json!({"ok": true, "data": {"status": "updating"}}))
 }
 
-fn run_update(mgr: &Arc<TailscaleManager>, version: &str, sha256: &str) -> Result<(), String> {
+fn run_update(
+    mgr: &Arc<TailscaleManager>,
+    version: &str,
+    expected_sha256: Option<&str>,
+) -> Result<(), String> {
     let tgz_path = "/tmp/tailscale-update.tgz";
     let extract_dir = "/tmp/tailscale-update";
-    let result = run_update_inner(mgr, version, sha256, tgz_path, extract_dir);
+    let result = run_update_inner(mgr, version, expected_sha256, tgz_path, extract_dir);
     // Never leak tmpfs space, whatever the exit path
     let _ = std::fs::remove_file(tgz_path);
     let _ = std::fs::remove_dir_all(extract_dir);
@@ -2135,20 +2515,32 @@ fn run_update(mgr: &Arc<TailscaleManager>, version: &str, sha256: &str) -> Resul
 fn run_update_inner(
     mgr: &Arc<TailscaleManager>,
     version: &str,
-    sha256: &str,
+    expected_sha256: Option<&str>,
     tgz_path: &str,
     extract_dir: &str,
 ) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let url = format!("https://pkgs.tailscale.com/stable/tailscale_{version}_arm64.tgz");
+    let sha256 = match expected_sha256 {
+        Some(digest) => digest.to_string(),
+        None => {
+            let sha_url = format!("{url}.sha256");
+            fetch_official_sha256_at(&sha_url)?
+        }
+    };
 
     // 1. Download (streamed to tmpfs, 120 MB cap)
     let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_global(Some(Duration::from_secs(600)))
         .build()
         .into();
-    let resp = agent.get(&url).call().map_err(|e| format!("download {url}: {e}"))?;
+    let resp = agent
+        .get(&url)
+        .header("User-Agent", TAILSCALE_USER_AGENT)
+        .call()
+        .map_err(|err| format!("download {url}: {err}"))?;
     let mut reader = resp.into_body().into_reader().take(120 * 1024 * 1024);
     let mut out = std::fs::File::create(tgz_path).map_err(|e| format!("create {tgz_path}: {e}"))?;
     std::io::copy(&mut reader, &mut out).map_err(|e| format!("download stream: {e}"))?;
@@ -2475,6 +2867,7 @@ mod tests {
             status_refresh_cv: Condvar::new(),
             last_update: Mutex::new(None),
             login_url: Mutex::new(None),
+            versions_cache: Mutex::new(None),
             wakelock_held: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
             wake_cv: Condvar::new(),
@@ -3066,5 +3459,218 @@ mod tests {
         let (latest, _, seq) = manager.last_status.lock().unwrap().clone();
         assert_eq!(seq, 5);
         assert_eq!(latest["state"], "disabled");
+    }
+
+    fn serve_http_once(response: &'static str) -> (String, thread::JoinHandle<String>) {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 4096];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let _ = stream.write_all(response.as_bytes());
+            String::from_utf8_lossy(&buf[..read]).into_owned()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn parse_update_request_accepts_optional_sha256_and_rejects_malformed_inputs() {
+        let digest = "A1b2c3d4".repeat(8);
+        assert_eq!(
+            parse_update_request(br#"{"version":"1.104.7"}"#).unwrap(),
+            ("1.104.7".to_string(), None)
+        );
+        assert_eq!(
+            parse_update_request(br#"{"version":" 1.104.7 ","sha256":null}"#).unwrap(),
+            ("1.104.7".to_string(), None)
+        );
+        assert_eq!(
+            parse_update_request(br#"{"version":"1.104.7","sha256":"   "}"#).unwrap(),
+            ("1.104.7".to_string(), None)
+        );
+        let body = format!(r#"{{"version":"1.104.7","sha256":" {digest} "}}"#);
+        assert_eq!(
+            parse_update_request(body.as_bytes()).unwrap(),
+            ("1.104.7".to_string(), Some(digest.to_ascii_lowercase()))
+        );
+        for bad in [
+            r#"{"version":"v1.104.7"}"#,
+            r#"{"version":"1..2"}"#,
+            r#"{"version":""}"#,
+            r#"{"version":"1.104.7","sha256":"short"}"#,
+            r#"{"version":"1.104.7","sha256":123}"#,
+            "not-json",
+        ] {
+            assert!(parse_update_request(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_sha256_text_accepts_bare_and_sha256sum_formats() {
+        let digest = "D6BED2720310B328B861F943D7B4016C5358A9BAD60575EB51E8143B79068484";
+        assert_eq!(
+            parse_sha256_text(&format!("{digest}\n")).unwrap(),
+            digest.to_ascii_lowercase()
+        );
+        assert_eq!(
+            parse_sha256_text(&format!("  {digest}  tailscale_1.104.7_arm64.tgz\n")).unwrap(),
+            digest.to_ascii_lowercase()
+        );
+        assert!(parse_sha256_text("not-a-hash").is_err());
+        assert!(parse_sha256_text("").is_err());
+    }
+
+    #[test]
+    fn parse_github_releases_filters_prereleases_drafts_and_non_semver_tags() {
+        let payload = json!([
+            {"tag_name": "v1.104.7", "draft": false, "prerelease": false, "published_at": "2026-11-12T22:56:51Z"},
+            {"tag_name": "v1.105.0-pre", "draft": false, "prerelease": false, "published_at": "2026-11-13T00:00:00Z"},
+            {"tag_name": "v1.104.8", "draft": true, "prerelease": false, "published_at": "2026-11-13T00:00:00Z"},
+            {"tag_name": "v1.104.6", "draft": false, "prerelease": true, "published_at": "2026-11-11T00:00:00Z"},
+            {"tag_name": "cmd/cigocacher/deadbeef", "draft": false, "prerelease": false},
+            {"tag_name": "v1.104.5", "draft": false, "prerelease": false, "published_at": "2026-11-03T00:29:40Z"},
+            {"tag_name": "v1.104.5", "draft": false, "prerelease": false, "published_at": "2026-11-03T00:29:40Z"}
+        ]);
+        let releases = parse_github_releases(&payload).unwrap();
+        assert_eq!(
+            releases,
+            vec![
+                ReleaseEntry {
+                    version: "1.104.7".to_string(),
+                    published_at: Some("2026-11-12T22:56:51Z".to_string()),
+                },
+                ReleaseEntry {
+                    version: "1.104.5".to_string(),
+                    published_at: Some("2026-11-03T00:29:40Z".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_version_catalog_caps_to_pkgs_latest_and_handles_partial_fallbacks() {
+        let combined = merge_version_catalog(
+            Ok("1.104.7".to_string()),
+            Ok(vec![
+                ReleaseEntry {
+                    version: "1.104.8".to_string(),
+                    published_at: Some("2026-11-20T00:00:00Z".to_string()),
+                },
+                ReleaseEntry {
+                    version: "1.98.10".to_string(),
+                    published_at: Some("2026-07-28T23:02:06Z".to_string()),
+                },
+                ReleaseEntry {
+                    version: "1.104.7".to_string(),
+                    published_at: Some("2026-11-12T22:56:51Z".to_string()),
+                },
+                ReleaseEntry {
+                    version: "1.104.6".to_string(),
+                    published_at: Some("2026-11-11T00:29:49Z".to_string()),
+                },
+            ]),
+            1_800_000_000,
+        )
+        .unwrap();
+        assert_eq!(combined.latest, "1.104.7");
+        assert_eq!(combined.source, "github+pkgs");
+        assert_eq!(combined.warning, None);
+        let ordered: Vec<&str> = combined
+            .versions
+            .iter()
+            .map(|entry| entry.version.as_str())
+            .collect();
+        assert_eq!(ordered, vec!["1.104.7", "1.104.6", "1.98.10"]);
+
+        let pkgs_only = merge_version_catalog(
+            Ok("1.104.7".to_string()),
+            Err("rate limited".to_string()),
+            1_800_000_000,
+        )
+        .unwrap();
+        assert_eq!(pkgs_only.latest, "1.104.7");
+        assert_eq!(pkgs_only.source, "pkgs");
+        assert_eq!(pkgs_only.versions.len(), 1);
+        assert!(pkgs_only.warning.as_deref().unwrap().contains("rate limited"));
+
+        let github_only = merge_version_catalog(
+            Err("timeout".to_string()),
+            Ok(vec![ReleaseEntry {
+                version: "1.104.6".to_string(),
+                published_at: Some("2026-11-11T00:29:49Z".to_string()),
+            }]),
+            1_800_000_000,
+        )
+        .unwrap();
+        assert_eq!(github_only.latest, "1.104.6");
+        assert_eq!(github_only.source, "github");
+        assert!(github_only.warning.as_deref().unwrap().contains("timeout"));
+
+        assert!(merge_version_catalog(
+            Err("pkgs down".to_string()),
+            Err("gh down".to_string()),
+            1_800_000_000,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn versions_catalog_caches_until_forced_refresh() {
+        use std::sync::atomic::AtomicUsize;
+
+        let manager = test_manager(false, None);
+        let calls = AtomicUsize::new(0);
+        let make = |version: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(VersionCatalog {
+                latest: version.to_string(),
+                versions: vec![ReleaseEntry {
+                    version: version.to_string(),
+                    published_at: None,
+                }],
+                source: "pkgs".to_string(),
+                warning: None,
+                fetched_at: 100,
+            })
+        };
+        let first = manager.versions_catalog_with(false, || make("1.104.6")).unwrap();
+        let second = manager.versions_catalog_with(false, || make("1.104.7")).unwrap();
+        assert_eq!(first.latest, "1.104.6");
+        assert_eq!(second.latest, "1.104.6");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let refreshed = manager.versions_catalog_with(true, || make("1.104.7")).unwrap();
+        assert_eq!(refreshed.latest, "1.104.7");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fetch_versions_and_official_sha256_work_over_local_http() {
+        let (pkgs_url, pkgs_srv) = serve_http_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"TarballsVersion\":\"1.104.7\",\"Tarballs\":{\"arm64\":\"tailscale_1.104.7_arm64.tgz\"}}",
+        );
+        let (gh_url, gh_srv) = serve_http_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n[{\"tag_name\":\"v1.104.7\",\"draft\":false,\"prerelease\":false,\"published_at\":\"2026-11-12T22:56:51Z\"},{\"tag_name\":\"v1.104.6\",\"draft\":false,\"prerelease\":false,\"published_at\":\"2026-11-11T00:29:49Z\"}]",
+        );
+        let catalog = fetch_versions_from_urls(&pkgs_url, &gh_url).unwrap();
+        let pkgs_req = pkgs_srv.join().unwrap();
+        let gh_req = gh_srv.join().unwrap();
+        assert!(pkgs_req.contains("open-u60-tailscale/"), "{pkgs_req}");
+        assert!(gh_req.contains("open-u60-tailscale/"), "{gh_req}");
+        assert_eq!(catalog.latest, "1.104.7");
+        assert_eq!(catalog.versions.len(), 2);
+        assert_eq!(catalog.versions[1].version, "1.104.6");
+
+        let digest = "d6bed2720310b328b861f943d7b4016c5358a9bad60575eb51e8143b79068484";
+        let (sha_url, sha_srv) = serve_http_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nd6bed2720310b328b861f943d7b4016c5358a9bad60575eb51e8143b79068484\n",
+        );
+        assert_eq!(fetch_official_sha256_at(&sha_url).unwrap(), digest);
+        assert!(sha_srv.join().unwrap().contains("open-u60-tailscale/"));
     }
 }

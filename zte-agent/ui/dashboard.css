@@ -3451,6 +3451,11 @@ dialog[data-motion="closing"]::backdrop { animation: dialog-scrim-out .12s ease-
 .tailscale-choice-copy { display:grid; gap:3px; min-width:0; }
 .tailscale-choice-copy strong { font-size:11px; }
 .tailscale-choice-copy small { color:var(--muted); font-size:9px; line-height:1.5; }
+.tailscale-manual { grid-column:1/-1; padding-top:8px; border-top:1px solid var(--line); }
+.tailscale-manual summary { cursor:pointer; padding:10px 0; font-size:12px; font-weight:600; color:var(--muted); }
+.tailscale-manual[open] summary { color:var(--ink); margin-bottom:14px; }
+.tailscale-manual-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px 24px; }
+@media (max-width:767px) { .tailscale-manual-grid { grid-template-columns:minmax(0,1fr); } }
 .tailscale-update-banner { margin:0 0 18px; padding:12px 14px; border-left:3px solid var(--line-strong); background:var(--surface-soft); font-size:10px; line-height:1.6; overflow-wrap:anywhere; }
 .tailscale-update-banner[hidden] { display:none; }
 .tailscale-update-banner[data-state="ok"] { border-left-color:var(--accent); background:var(--live-surface); }

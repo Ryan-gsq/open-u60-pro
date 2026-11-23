@@ -191,7 +191,7 @@
     route,
     'tailscale-update',
     'Install & upgrade',
-    'Download official ARM64 Tailscale binaries from pkgs.tailscale.com, verify SHA-256 and swap atomically with 120-second automatic rollback for enrolled nodes.'
+    'Choose an official ARM64 Tailscale release from pkgs.tailscale.com. The router fetches and verifies the official SHA-256 checksum automatically, then swaps binaries with 120-second rollback for enrolled nodes.'
   );
   const updateBanner = el('p', 'tailscale-update-banner');
   updateBanner.hidden = true;
@@ -203,17 +203,31 @@
   updateFields.id = 'tailscale-update-fields';
   updateFields.append(el('legend', 'sr-only', 'Install or upgrade Tailscale'));
 
+  const versionSelect = el('select');
+  versionSelect.id = 'tailscale-version-select';
+  versionSelect.name = 'version-select';
+  const versionSelectField = field(
+    'Tailscale version',
+    versionSelect,
+    'Loading recent stable releases…'
+  );
+  versionSelectField.wrapper.classList.add('tailscale-wide-field');
+
+  const manualDetails = el('details', 'tailscale-manual');
+  manualDetails.id = 'tailscale-manual';
+  const manualSummary = el('summary', '', 'Manual version or custom SHA-256');
+  const manualGrid = el('div', 'tailscale-manual-grid');
+
   const versionInput = el('input', 'mono');
   versionInput.id = 'tailscale-version';
   versionInput.name = 'version';
   versionInput.type = 'text';
   versionInput.spellcheck = false;
-  versionInput.required = true;
-  versionInput.placeholder = '1.86.2';
+  versionInput.placeholder = '1.104.7';
   const versionField = field(
-    'Tailscale version',
+    'Custom version (optional)',
     versionInput,
-    'Exact version from pkgs.tailscale.com/stable/#static (without a leading “v”).'
+    'Leave blank to install the selected release above, or enter an exact version without a leading “v”.'
   );
 
   const sha256Input = el('input', 'mono');
@@ -222,36 +236,40 @@
   sha256Input.type = 'text';
   sha256Input.maxLength = 64;
   sha256Input.spellcheck = false;
-  sha256Input.required = true;
-  sha256Input.placeholder = '64 hexadecimal characters';
+  sha256Input.placeholder = 'Optional · 64 hexadecimal characters';
   const sha256Field = field(
-    'SHA-256 checksum',
+    'Custom SHA-256 checksum (optional)',
     sha256Input,
-    'SHA-256 digest of the arm64 .tgz archive. Verified before extracting or replacing binaries.'
+    'Leave blank to fetch and verify the official .sha256 digest from pkgs.tailscale.com automatically.'
   );
-  updateFields.append(versionField.wrapper, sha256Field.wrapper);
+  manualGrid.append(versionField.wrapper, sha256Field.wrapper);
+  manualDetails.append(manualSummary, manualGrid);
+  updateFields.append(versionSelectField.wrapper, manualDetails);
 
   const updateActions = el('div', 'form-actions');
   const installBtn = button('Install Tailscale', null, 'primary');
   installBtn.type = 'submit';
-  const clearUpdateBtn = button('Clear', clearUpdateDraft);
-  const packagesLink = el('a', 'button', 'Versions & SHA-256 ↗');
+  const refreshVersionsBtn = button('Refresh versions', () => loadVersions({force: true}));
+  const clearUpdateBtn = button('Clear manual', clearUpdateDraft);
+  const packagesLink = el('a', 'button', 'Official packages ↗');
   packagesLink.href = M.PACKAGES_URL;
   packagesLink.target = '_blank';
   packagesLink.rel = 'noopener noreferrer';
-  updateActions.append(installBtn, clearUpdateBtn, packagesLink);
+  updateActions.append(installBtn, refreshVersionsBtn, clearUpdateBtn, packagesLink);
   updateForm.append(updateFields, updateActions);
   const updateText = UI.status(updatePanel);
   const updateNote = el(
     'p',
     'panel-note',
-    'Downloads stream to tmpfs (120 MB cap), verify SHA-256, smoke-test tailscaled --version and swap atomically. If an enrolled node does not return to Running within 120 seconds, the previous binary is restored automatically.'
+    'Downloads stream to tmpfs (120 MB cap), verify the SHA-256 digest, smoke-test tailscaled --version and swap atomically. If an enrolled node does not return to Running within 120 seconds, the previous binary is restored automatically.'
   );
   updatePanel.append(updateBanner, updateForm, updateText, updateNote);
 
   // ── State ───────────────────────────────────────────────────────────────
   let status = null, baseline = null, loading = false, attempted = false, busy = false, lastLoad = 0, loadId = 0;
   let pendingLoginUrl = '', loginPending = false, logoutWarning = '';
+  let versionCatalog = null, selectedVersion = '', versionsLoading = false, versionsAttempted = false, versionsError = '', versionsLoadId = 0;
+  let versionSelectSignature = '';
   const READING_STATUS_MESSAGE = 'Reading Tailscale status…';
   const onRoute = () => OpenU60Navigation.current.key === route;
 
@@ -267,6 +285,7 @@
   const authDirty = () => authKeyInput.value.trim().length > 0;
   const updateDirty = () => versionInput.value.trim().length > 0 || sha256Input.value.trim().length > 0;
   const dirty = () => configDirty() || authDirty() || updateDirty();
+  const effectiveUpdateVersion = () => versionInput.value.trim() || selectedVersion;
 
   function populateConfig(data) {
     baseline = M.configBaseline(data);
@@ -384,16 +403,82 @@
   function drawUpdate(view = M.view(status)) {
     const inactive = busy || !API.connected || API.locked || !status;
     const isDirty = updateDirty();
+    const installed = M.installedVersion(status);
+    const entries = versionCatalog?.versions || [];
+    const selectState = entries.length
+      ? `list:${versionCatalog.latest}:${installed}:${entries.map(item => `${item.version}@${item.published_at}`).join(',')}`
+      : versionsLoading
+        ? 'loading'
+        : versionsError
+          ? 'error'
+          : 'idle';
+    if (selectState !== versionSelectSignature) {
+      versionSelectSignature = selectState;
+      if (entries.length) {
+        if (!selectedVersion || !entries.some(item => item.version === selectedVersion)) {
+          selectedVersion = versionCatalog.latest || entries[0].version;
+        }
+        versionSelect.replaceChildren(...entries.map(entry =>
+          new Option(M.versionOptionLabel(entry, {latest: versionCatalog.latest, installed}), entry.version)
+        ));
+        versionSelect.value = selectedVersion;
+      } else {
+        selectedVersion = '';
+        const placeholder = versionsLoading
+          ? 'Loading recent stable releases…'
+          : versionsError
+            ? 'Version list unavailable — use manual entry below'
+            : 'Connect and unlock to load versions';
+        const opt = new Option(placeholder, '');
+        opt.disabled = true;
+        versionSelect.replaceChildren(opt);
+        versionSelect.value = '';
+      }
+    }
+
+    const manualVersion = versionInput.value.trim();
+    const targetVersion = effectiveUpdateVersion();
+    const validTarget = M.validVersion(targetVersion);
+    const intent = validTarget ? M.updateIntent(targetVersion, status) : (view.installed ? 'upgrade' : 'install');
+    const actionLabels = {
+      install: validTarget ? `Install v${targetVersion}` : 'Install Tailscale',
+      upgrade: validTarget ? `Upgrade to v${targetVersion}` : 'Download & upgrade',
+      downgrade: validTarget ? `Downgrade to v${targetVersion}` : 'Download & install',
+      reinstall: validTarget ? `Reinstall v${targetVersion}` : 'Reinstall Tailscale'
+    };
     updateFields.disabled = inactive || !view.canUpdate;
-    installBtn.textContent = view.installed ? 'Download & upgrade' : 'Install Tailscale';
-    installBtn.disabled = inactive || !view.canUpdate || !versionInput.value.trim() || !sha256Input.value.trim();
+    versionSelect.disabled = inactive || !view.canUpdate || !entries.length;
+    installBtn.textContent = actionLabels[intent];
+    installBtn.disabled = inactive || !view.canUpdate || !targetVersion;
+    refreshVersionsBtn.disabled = versionsLoading || busy || !API.connected || API.locked;
+    refreshVersionsBtn.textContent = versionsLoading ? 'Refreshing…' : 'Refresh versions';
     clearUpdateBtn.disabled = inactive || !isDirty;
     updatePanel.dataset.dirty = String(isDirty);
+
+    if (manualVersion) {
+      versionSelectField.help.textContent = `Using custom version override (${manualVersion}) below. Clear manual inputs to use the dropdown selection.`;
+    } else if (versionsLoading && !entries.length) {
+      versionSelectField.help.textContent = 'Fetching recent stable releases from pkgs.tailscale.com and GitHub…';
+    } else if (entries.length) {
+      const parts = [];
+      if (installed && selectedVersion === installed) {
+        parts.push(`v${selectedVersion} is currently installed. Official .sha256 checksum is fetched and verified automatically.`);
+      } else if (selectedVersion) {
+        parts.push(`Official ARM64 package tailscale_${selectedVersion}_arm64.tgz · SHA-256 fetched and verified automatically.`);
+      }
+      if (versionCatalog.warning) parts.push(versionCatalog.warning);
+      if (versionsError) parts.push(`Last refresh failed: ${versionsError}.`);
+      versionSelectField.help.textContent = parts.join(' ');
+    } else if (versionsError) {
+      versionSelectField.help.textContent = `Could not load release list: ${versionsError}. Retry with “Refresh versions” or enter a version manually below.`;
+    } else {
+      versionSelectField.help.textContent = 'Connect and unlock the console to load official Tailscale releases.';
+    }
 
     const previewUrl = M.packageUrl(versionInput.value);
     versionField.help.textContent = previewUrl
       ? `Package URL: ${previewUrl}`
-      : 'Exact version from pkgs.tailscale.com/stable/#static (without a leading “v”).';
+      : 'Leave blank to install the selected release above, or enter an exact version without a leading “v”.';
 
     if (view.updating) {
       updateBanner.hidden = false;
@@ -427,6 +512,7 @@
     loading = true;
     attempted = true;
     lastLoad = Date.now();
+    if (!versionsAttempted && !versionsLoading) loadVersions({force: false});
     draw();
     if (!quiet) say(statusText, READING_STATUS_MESSAGE);
     let failure = '';
@@ -453,6 +539,42 @@
       if (live()) applyStatus(data);
     } catch {
       /* SSE or manual refresh will follow. */
+    }
+  }
+
+  async function loadVersions({force = false} = {}) {
+    if (versionsLoading || API.locked || !API.connected) return;
+    const epoch = UI.epoch, id = ++versionsLoadId;
+    const current = () => UI.current(epoch) && id === versionsLoadId;
+    versionsLoading = true;
+    versionsAttempted = true;
+    versionsError = '';
+    drawUpdate();
+    try {
+      const data = force
+        ? await request('/api/tailscale/versions/refresh', {...json('POST', {}), timeoutMs: 25000})
+        : await request('/api/tailscale/versions', {timeoutMs: 25000});
+      if (!current()) return;
+      const normalized = M.normalizeVersions(data);
+      if (!normalized.versions.length) {
+        throw new Error('The router returned no stable Tailscale releases');
+      }
+      versionCatalog = normalized;
+      if (!selectedVersion || !normalized.versions.some(item => item.version === selectedVersion)) {
+        selectedVersion = normalized.latest || normalized.versions[0].version;
+      }
+      versionsError = '';
+      if (force) {
+        say(updateText, `Loaded ${normalized.versions.length} official release${normalized.versions.length === 1 ? '' : 's'} (latest v${normalized.latest}).`);
+      }
+    } catch (error) {
+      if (!current()) return;
+      versionsError = error.message || 'Release lookup failed';
+      if (!versionCatalog?.versions?.length) manualDetails.open = true;
+      if (force) say(updateText, `Could not refresh Tailscale versions: ${versionsError}`, true);
+    } finally {
+      if (id === versionsLoadId) versionsLoading = false;
+      if (current()) drawUpdate();
     }
   }
 
@@ -646,16 +768,39 @@
     say(updateText, '');
   });
 
+  versionSelect.addEventListener('change', () => {
+    selectedVersion = versionSelect.value;
+    drawUpdate();
+    say(updateText, '');
+  });
+
   updateForm.addEventListener('submit', async event => {
     event.preventDefault();
     if (!status || busy) return;
-    const draft = {version: versionInput.value, sha256: sha256Input.value};
+    const draft = {version: effectiveUpdateVersion(), sha256: sha256Input.value};
     const issue = M.updateProblem(draft);
     if (issue) { say(updateText, issue, true); return; }
     const req = M.updateRequest(draft);
     const url = M.packageUrl(req.version);
-    const actionLabel = status.installed ? `Upgrade to v${req.version}` : `Install v${req.version}`;
-    const copy = `Download ${url} and verify SHA-256 ${req.sha256.slice(0, 12)}…${req.sha256.slice(-8)}. ${status.installed ? 'Tailscale briefly disconnects while swapping binaries, and rolls back automatically if an enrolled node fails to reconnect within 120 seconds.' : 'Binaries are verified and smoke-tested before installation.'}`;
+    const intent = M.updateIntent(req.version, status);
+    const installed = M.installedVersion(status);
+    const actionLabels = {
+      install: `Install v${req.version}`,
+      upgrade: `Upgrade to v${req.version}`,
+      downgrade: `Downgrade to v${req.version}`,
+      reinstall: `Reinstall v${req.version}`
+    };
+    const actionLabel = actionLabels[intent];
+    const downgradeLead = intent === 'downgrade' && installed
+      ? `You are switching from v${installed} to an older release (v${req.version}). `
+      : '';
+    const checksumCopy = req.sha256
+      ? `verify custom SHA-256 ${req.sha256.slice(0, 12)}…${req.sha256.slice(-8)}`
+      : 'verify against the official .sha256 checksum from pkgs.tailscale.com';
+    const swapCopy = status.installed
+      ? 'Tailscale briefly disconnects while swapping binaries, and rolls back automatically if an enrolled node fails to reconnect within 120 seconds.'
+      : 'Binaries are verified and smoke-tested before installation.';
+    const copy = `${downgradeLead}Download ${url} and ${checksumCopy}. ${swapCopy}`;
     if (!await confirm(`${actionLabel}?`, copy, {label: actionLabel})) return;
     await mutate(updateText, async live => {
       busy = true;
@@ -668,7 +813,8 @@
         sha256Input.value = '';
         await refreshAfterMutation(live);
         if (!live()) return;
-        say(updateText, `Background ${status?.installed ? 'upgrade' : 'install'} to v${req.version} started. Status updates automatically when finished.`);
+        const verb = intent === 'install' ? 'install' : intent === 'downgrade' ? 'downgrade' : intent === 'reinstall' ? 'reinstall' : 'upgrade';
+        say(updateText, `Background ${verb} to v${req.version} started. Status updates automatically when finished.`);
       } catch (error) {
         if (live()) say(updateText, error.message, true);
       } finally {
@@ -697,6 +843,7 @@
         if (statusText.textContent === READING_STATUS_MESSAGE) say(statusText, '');
       }
       applyStatus(sample.data);
+      if (!versionsAttempted && !versionsLoading) loadVersions({force: false});
     },
     get loaded() { return attempted; },
     get dirty() { return dirty(); },
@@ -704,8 +851,11 @@
     refresh: () => load(true),
     clear() {
       loadId++;
+      versionsLoadId++;
       status = null; baseline = null; loading = false; attempted = false; busy = false;
       pendingLoginUrl = ''; loginPending = false; logoutWarning = '';
+      versionCatalog = null; selectedVersion = ''; versionsLoading = false; versionsAttempted = false; versionsError = ''; versionSelectSignature = '';
+      manualDetails.open = false;
       authKeyInput.value = '';
       hostnameInput.value = '';
       routesInput.value = '';

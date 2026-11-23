@@ -35,11 +35,45 @@ const {start, envelope} = require('./fixture.cjs');
   let loginUrlMode = 'pending';
   let setupMode = 'ok';
   let holdSetupReply = null;
+  let versionsCatalog = {
+    latest: '1.104.7',
+    versions: [
+      {version: '1.104.7', published_at: '2026-11-12T22:56:51Z'},
+      {version: '1.104.6', published_at: '2026-11-11T00:29:49Z'},
+      {version: '1.102.5', published_at: '2026-09-29T18:47:23Z'}
+    ],
+    source: 'github+pkgs',
+    warning: null,
+    fetched_at: Math.floor(Date.now() / 1000)
+  };
+  let versionsFail = false;
 
   const fixture = await start(({method, url, body}, reply, fail) => {
+    if (method === 'POST' && url === '/api/auth/login') {
+      reply({token: 'fixture-session-2'});
+      return true;
+    }
     if (method === 'GET' && url === '/api/tailscale/status') {
       if (holdStatusReply === 'arm') { holdStatusReply = reply; return true; }
       reply(status);
+      return true;
+    }
+    if (method === 'GET' && url === '/api/tailscale/versions') {
+      if (versionsFail) { fail('GitHub and pkgs unavailable', 502); return true; }
+      reply(versionsCatalog);
+      return true;
+    }
+    if (method === 'POST' && url === '/api/tailscale/versions/refresh') {
+      if (versionsFail) { fail('upstream timeout', 502); return true; }
+      versionsCatalog = {
+        ...versionsCatalog,
+        latest: '1.104.8',
+        versions: [
+          {version: '1.104.8', published_at: '2026-11-20T12:00:00Z'},
+          ...versionsCatalog.versions
+        ]
+      };
+      reply(versionsCatalog);
       return true;
     }
     if (method === 'POST' && url === '/api/tailscale/update') {
@@ -159,21 +193,60 @@ const {start, envelope} = require('./fixture.cjs');
     assert.equal(await button('Get login link').isDisabled(), true);
     assert.equal(await button('Enroll with auth key').isDisabled(), true);
 
-    await page.locator('#tailscale-version').fill('v1.86.2');
-    await page.locator('#tailscale-sha256').fill('short');
-    await button('Install Tailscale').click();
-    await said('#tailscale-update .action-status', 'without a leading');
-    assert.equal(fixture.count('POST', '/api/tailscale/update'), 0);
+    // Release list auto-loads into the dropdown with latest pre-selected (without marking panel dirty).
+    await page.waitForFunction(() => document.querySelector('#tailscale-version-select')?.value === '1.104.7');
+    assert.equal(await page.locator('#tailscale-update').getAttribute('data-dirty'), 'false');
+    assert.match(await text('#tailscale-version-select'), /v1\.104\.7 — Latest · 2026-11-12/);
+    assert.equal(await page.locator('#tailscale-manual').evaluate(node => node.open), false);
 
-    // 2. Valid install triggers POST /api/tailscale/update, transitions to updating, then SSE completes install.
-    await page.locator('#tailscale-version').fill('1.86.2');
-    await page.locator('#tailscale-sha256').fill(sha.toUpperCase());
-    assert.match(await text('#tailscale-version-help'), /tailscale_1\.86\.2_arm64\.tgz/);
-    await button('Install Tailscale').click();
-    await confirm('Install v1.86.2');
+    // Picking an older release from the dropdown installs with auto-SHA256 (omits sha256 field).
+    await page.locator('#tailscale-version-select').selectOption('1.102.5');
+    await button('Install v1.102.5').click();
+    assert.match(await text('.confirm-dialog'), /official \.sha256 checksum from pkgs\.tailscale\.com/);
+    await confirm('Install v1.102.5');
     await said('#tailscale-status .tailscale-state', 'UPDATING');
     assert.deepEqual(
       fixture.requests.find(item => item.method === 'POST' && item.url === '/api/tailscale/update').body,
+      {version: '1.102.5'}
+    );
+
+    status = {
+      ...status,
+      installed: true,
+      updating: false,
+      state: 'disabled',
+      client_version: '1.102.5',
+      pinned_version: '1.102.5',
+      last_update: {version: '1.102.5', ok: true, error: null, finished_at: Math.floor(Date.now() / 1000)}
+    };
+    fixture.patch({tailscale_status: envelope(status)});
+    await said('#tailscale-status .tailscale-state', 'NOT ENROLLED');
+    assert.match(await text('#tailscale-update .tailscale-update-banner'), /Installed v1\.102\.5/);
+    assert.match(await text('#tailscale-version-select'), /v1\.102\.5 — Installed · 2026-09-29/);
+
+    // Refreshing versions updates the dropdown and selecting latest offers Upgrade.
+    await button('Refresh versions').click();
+    await page.waitForFunction(() => document.querySelector('#tailscale-version-select')?.textContent.includes('v1.104.8'));
+    await page.locator('#tailscale-version-select').selectOption('1.104.8');
+    assert.equal(await button('Upgrade to v1.104.8').isVisible(), true);
+
+    // 2. Manual override validates inputs and sends custom version + SHA-256 when provided.
+    await page.locator('#tailscale-manual summary').click();
+    await page.locator('#tailscale-version').fill('v1.86.2');
+    await page.locator('#tailscale-sha256').fill('short');
+    await button('Download & upgrade').click();
+    await said('#tailscale-update .action-status', 'without a leading');
+    assert.equal(fixture.count('POST', '/api/tailscale/update'), 1);
+
+    await page.locator('#tailscale-version').fill('1.86.2');
+    await page.locator('#tailscale-sha256').fill(sha.toUpperCase());
+    assert.match(await text('#tailscale-version-help'), /tailscale_1\.86\.2_arm64\.tgz/);
+    await button('Downgrade to v1.86.2').click();
+    assert.match(await text('.confirm-dialog'), /older release/);
+    await confirm('Downgrade to v1.86.2');
+    await said('#tailscale-status .tailscale-state', 'UPDATING');
+    assert.deepEqual(
+      fixture.requests.filter(item => item.method === 'POST' && item.url === '/api/tailscale/update').at(-1).body,
       {version: '1.86.2', sha256: sha}
     );
     assert.equal(await page.locator('#tailscale-version').inputValue(), '');
@@ -353,6 +426,9 @@ const {start, envelope} = require('./fixture.cjs');
 
     // 8. Lock clears drafts & private status, and a delayed status response cannot repopulate after Lock.
     await page.locator('#tailscale-auth-key').fill('tskey-auth-unsaved-secret');
+    if (!await page.locator('#tailscale-manual').evaluate(node => node.open)) {
+      await page.locator('#tailscale-manual summary').click();
+    }
     await page.locator('#tailscale-version').fill('1.90.0');
     holdStatusReply = 'arm';
     await button('Read current status').click();
@@ -366,7 +442,23 @@ const {start, envelope} = require('./fixture.cjs');
     await page.waitForTimeout(150);
     assert.equal(await page.locator('#tailscale-auth-key').inputValue(), '');
     assert.equal(await page.locator('#tailscale-version').inputValue(), '');
+    assert.equal(await page.locator('#tailscale-version-select').inputValue(), '');
+    assert.equal(await page.locator('#tailscale-manual').evaluate(node => node.open), false);
     assert.doesNotMatch(await text('#tailscale-status'), /100\.99\.99\.99|leaked\.ts\.net/);
+
+    // 9. When version lookup fails on unlock, manual entry opens automatically and Refresh versions recovers.
+    holdStatusReply = null;
+    versionsFail = true;
+    await page.locator('#password').fill('fixture-pass');
+    await page.locator('#login-form button[type=submit]').click();
+    await page.waitForFunction(() => !OpenU60Console.locked);
+    await said('#tailscale-version-select-help', 'GitHub and pkgs unavailable');
+    assert.equal(await page.locator('#tailscale-manual').evaluate(node => node.open), true);
+
+    versionsFail = false;
+    await button('Refresh versions').click();
+    await page.waitForFunction(() => document.querySelector('#tailscale-version-select')?.value === '1.104.8');
+    await said('#tailscale-update .action-status', 'Loaded 4 official releases');
 
     assert.deepEqual(errors, []);
     console.log('Passed: Tailscale install/upgrade via SSE, enable, safe HTTPS login URL, auth key enrollment & redaction, preferences diff & draft preservation, responsive light/dark layout, disable/logout warning, and Lock cleanup.');

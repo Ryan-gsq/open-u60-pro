@@ -835,6 +835,8 @@ mod tests {
             (Put, "/api/tailscale/config"),
             (Post, "/api/tailscale/logout"),
             (Post, "/api/tailscale/update"),
+            (Get, "/api/tailscale/versions"),
+            (Post, "/api/tailscale/versions/refresh"),
             (Post, "/api/ussd/send"),
             (Post, "/api/stk/select"),
             (Post, "/api/stk/respond"),

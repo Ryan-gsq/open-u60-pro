@@ -151,9 +151,51 @@ assert.equal(M.packageUrl('1.86.2'), 'https://pkgs.tailscale.com/stable/tailscal
 assert.equal(M.packageUrl('v1.86.2'), '');
 assert.match(M.versionProblem('v1.86.2'), /without a leading/);
 assert.match(M.versionProblem('1..2'), /digits and dots/);
+assert.equal(M.sha256Problem(''), '');
 assert.match(M.sha256Problem('1234'), /64 hexadecimal/);
+assert.equal(M.updateProblem({version: '1.104.7', sha256: ''}), '');
+assert.deepEqual(M.updateRequest({version: ' 1.104.7 ', sha256: ''}), {version: '1.104.7'});
 assert.equal(M.updateProblem({version: '1.86.2', sha256: goodSha}), '');
 assert.deepEqual(M.updateRequest({version: ' 1.86.2 ', sha256: ` ${goodSha} `}), {version: '1.86.2', sha256: 'a'.repeat(64)});
+
+// Release catalog normalization, version comparison, option labels, and install intent.
+assert.equal(M.cleanVersion('v1.104.7-t8491b4291-g123456'), '1.104.7');
+assert.equal(M.installedVersion({installed: true, client_version: '1.102.5-tabcdef'}), '1.102.5');
+assert.equal(M.installedVersion({installed: true, client_version: null, pinned_version: '1.98.9'}), '1.98.9');
+assert.equal(M.installedVersion({installed: false, pinned_version: '1.98.9'}), '');
+assert.equal(M.compareVersions('1.104.7', '1.98.10'), 1);
+assert.equal(M.compareVersions('1.98.10', '1.104.7'), -1);
+assert.equal(M.compareVersions('1.104.7', '1.104.7'), 0);
+assert.equal(M.compareVersions('bad', '1.104.7'), null);
+assert.equal(M.formatReleaseDate('2026-11-12T22:56:51Z'), '2026-11-12');
+assert.equal(M.formatReleaseDate(''), '');
+
+const catalog = M.normalizeVersions({
+  latest: '1.104.7',
+  versions: [
+    {version: '1.104.7', published_at: '2026-11-12T22:56:51Z'},
+    {version: '1.104.6', published_at: '2026-11-11T00:29:49Z'},
+    {version: 'bad-ver', published_at: '2026-11-10T00:00:00Z'},
+    {version: '1.104.6', published_at: '2026-11-11T00:29:49Z'}
+  ],
+  source: 'github+pkgs',
+  warning: null,
+  fetched_at: 1_800_000_000
+});
+assert.equal(catalog.latest, '1.104.7');
+assert.deepEqual(catalog.versions.map(item => item.version), ['1.104.7', '1.104.6']);
+assert.equal(
+  M.versionOptionLabel(catalog.versions[0], {latest: '1.104.7', installed: '1.104.7'}),
+  'v1.104.7 — Latest · Installed · 2026-11-12'
+);
+assert.equal(
+  M.versionOptionLabel(catalog.versions[1], {latest: '1.104.7', installed: '1.104.7'}),
+  'v1.104.6 — 2026-11-11'
+);
+assert.equal(M.updateIntent('1.104.7', {installed: false}), 'install');
+assert.equal(M.updateIntent('1.104.7', {installed: true, client_version: '1.104.6'}), 'upgrade');
+assert.equal(M.updateIntent('1.104.6', {installed: true, client_version: '1.104.7'}), 'downgrade');
+assert.equal(M.updateIntent('1.104.7', {installed: true, client_version: '1.104.7-t1234'}), 'reinstall');
 
 // Last update summary formatting.
 const nowSec = 1_800_000_000;

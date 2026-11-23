@@ -524,6 +524,8 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Post, "/api/wifi-relay/offload") => crate::wifi_relay::change(state, "offload", body),
         (&Method::Post, "/api/wifi-relay/power-save") => crate::wifi_relay::change(state, "power-save", body),
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
+        (&Method::Get, "/api/tailscale/versions") => tailscale::versions(state),
+        (&Method::Post, "/api/tailscale/versions/refresh") => tailscale::versions_refresh(state),
         // LAN HTTPS (docs/web-ui.md, "LAN HTTPS"): read-only for the apps.
         (&Method::Get, "/api/https") => state.tls.status_json(),
         (&Method::Post, path @ ("/api/https/on" | "/api/https/renew" | "/api/https/reset")) => https_change(state, path, body),

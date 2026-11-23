@@ -26,6 +26,84 @@
     return text.length > 0 && VERSION_RE.test(text);
   }
 
+  function cleanVersion(raw) {
+    const text = String(raw || '').trim().replace(/^[vV]/, '').split(/[-+]/)[0];
+    return validVersion(text) ? text : '';
+  }
+
+  function installedVersion(status) {
+    if (!status || status.installed !== true) return '';
+    return cleanVersion(status.client_version) || cleanVersion(status.pinned_version);
+  }
+
+  function compareVersions(left, right) {
+    const leftClean = cleanVersion(left), rightClean = cleanVersion(right);
+    if (!leftClean || !rightClean) return null;
+    const leftParts = leftClean.split('.').map(Number);
+    const rightParts = rightClean.split('.').map(Number);
+    const count = Math.max(leftParts.length, rightParts.length);
+    for (let index = 0; index < count; index++) {
+      const leftNum = leftParts[index] || 0;
+      const rightNum = rightParts[index] || 0;
+      if (leftNum !== rightNum) return leftNum > rightNum ? 1 : -1;
+    }
+    return 0;
+  }
+
+  function formatReleaseDate(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return '';
+    const parsed = Date.parse(text);
+    if (!Number.isFinite(parsed)) return '';
+    return new Date(parsed).toISOString().slice(0, 10);
+  }
+
+  function normalizeVersions(payload) {
+    const data = payload && typeof payload === 'object' ? payload : {};
+    const seen = new Set(), versions = [];
+    for (const item of Array.isArray(data.versions) ? data.versions : []) {
+      const version = validVersion(item?.version) ? String(item.version).trim() : '';
+      if (!version || seen.has(version)) continue;
+      seen.add(version);
+      versions.push({
+        version,
+        published_at: typeof item?.published_at === 'string' ? item.published_at.trim() : ''
+      });
+    }
+    const rawLatest = validVersion(data.latest) ? String(data.latest).trim() : '';
+    const latest = rawLatest || (versions[0]?.version || '');
+    if (latest && !seen.has(latest)) {
+      versions.unshift({version: latest, published_at: ''});
+    }
+    return {
+      latest,
+      versions,
+      source: typeof data.source === 'string' ? data.source.trim() : '',
+      warning: typeof data.warning === 'string' ? data.warning.trim() : '',
+      fetchedAt: Number.isFinite(Number(data.fetched_at)) ? Number(data.fetched_at) : 0
+    };
+  }
+
+  function versionOptionLabel(entry, {latest = '', installed = ''} = {}) {
+    const version = String(entry?.version || '').trim();
+    if (!version) return '';
+    const tags = [];
+    if (latest && version === latest) tags.push('Latest');
+    if (installed && version === installed) tags.push('Installed');
+    const releaseDate = formatReleaseDate(entry?.published_at);
+    if (releaseDate) tags.push(releaseDate);
+    return tags.length ? `v${version} — ${tags.join(' · ')}` : `v${version}`;
+  }
+
+  function updateIntent(targetVersion, status) {
+    if (!status || status.installed !== true) return 'install';
+    const installed = installedVersion(status);
+    const cmp = compareVersions(targetVersion, installed);
+    if (cmp === 0) return 'reinstall';
+    if (cmp !== null && cmp < 0) return 'downgrade';
+    return 'upgrade';
+  }
+
   function packageUrl(version) {
     const text = String(version || '').trim();
     return validVersion(text) ? `https://pkgs.tailscale.com/stable/tailscale_${text}_arm64.tgz` : '';
@@ -117,7 +195,7 @@
 
   function sha256Problem(raw) {
     const value = String(raw || '').trim();
-    if (!value) return 'Enter the 64-character SHA-256 checksum for the arm64 .tgz archive.';
+    if (!value) return '';
     if (!HEX64_RE.test(value)) return 'SHA-256 checksum must be exactly 64 hexadecimal characters.';
     return '';
   }
@@ -127,10 +205,10 @@
   }
 
   function updateRequest({version, sha256}) {
-    return {
-      version: String(version || '').trim(),
-      sha256: String(sha256 || '').trim().toLowerCase()
-    };
+    const req = {version: String(version || '').trim()};
+    const digest = String(sha256 || '').trim().toLowerCase();
+    if (digest) req.sha256 = digest;
+    return req;
   }
 
   function formatExpiry(raw, expired, nowMs = Date.now()) {
@@ -310,6 +388,13 @@
     cleanDnsName,
     safeLoginUrl,
     validVersion,
+    cleanVersion,
+    installedVersion,
+    compareVersions,
+    formatReleaseDate,
+    normalizeVersions,
+    versionOptionLabel,
+    updateIntent,
     packageUrl,
     validCidr,
     parseRoutes,
