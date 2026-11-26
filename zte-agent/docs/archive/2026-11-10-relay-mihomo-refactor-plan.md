@@ -1,6 +1,9 @@
 # Wi-Fi 中继与 Mihomo：版本与验收
 
-定稿：2026-11-10。行为以[架构规范](relay-mihomo-architecture.md)为准；本文件规定按什么顺序交付、每版怎样证明可用和可回退。v1–v6 指本次重构的交付批次，不是已发布的 OTA 标签。工作区已有部分 v1 改动；下面的门槛不等于已验收或已部署。
+> **历史计划 · 2026-11-10，含 11 月 12 日补记。** 实施现状见[架构](../relay-mihomo-architecture.md)，
+> 设备覆盖见[验收索引](../README.md#device-acceptance)。
+
+定稿：2026-11-10。行为以[架构规范](../relay-mihomo-architecture.md)为准；本文件规定按什么顺序交付、每版怎样证明可用和可回退。v1–v6 指本次重构的交付批次，不是已发布的 OTA 标签。工作区已有部分 v1 改动；下面的门槛不等于已验收或已部署。
 
 ## 1. 验收基线
 
@@ -20,7 +23,7 @@
 | 12 | v1.19.33 源码确认热重载会暂停接入、更新 DNS 并保留可用映射；204 不能证明 provider、实际选组或监听正常。旧 UDP、hy2、长时间内存及重载耗时须实测。 |
 | 13 | 核心按 interval 更新 provider 时即便内容相同也可改 mtime。测试订阅有 11 个每日更新的 rule-provider；相同内容不能引发重编、换表或重置。 |
 
-reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-test/`；它和 IPACM、zwrt_router 的旧备份已于 2026-11-11 按车主要求删除（[项目约定](../../CLAUDE.md)）。更多原理与实测见[硬件转发](relay-hw-offload.md)、[网络扩展](network-extensions.md)和[TPROXY 单流测量](../../docs/research/2026-11-08-mihomo-tproxy-single-flow.md)。
+reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-test/`；它和 IPACM、zwrt_router 的旧备份已于 2026-11-11 按车主要求删除（[项目约定](../../../CLAUDE.md)）。更多原理与实测见[硬件转发](../relay-hw-offload.md)、[网络扩展](../network-extensions.md)和[TPROXY 单流测量](../../../docs/research/2026-11-08-mihomo-tproxy-single-flow.md)。
 
 ## 2. 发布顺序
 
@@ -31,7 +34,7 @@ reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-tes
 | [v3](#v3) | 4 | 同一配置的 DNS 过滤表热重载 | 204 之外核对运行状态与真实 DNS/出口；失败/超时可恢复 |
 | [v4](#v4) | 5、6 | 中继控制器、准入、IPA 状态机 | 中继 CAC 不能阻塞 Mihomo 的退出处理或 brnf 核对；开关/限制/崩溃的资源能正确释放 |
 | [v5](#v5) | 7 | nft/legacy 防火墙布局、ZTE 恢复和 DNS 标志位 | 合法双向转发、上游全周期防护、NAT66 与 IPA 都有数据面验证 |
-| [v6](#v6) | 8 | 删除带宽调优、完成模块和界面整理 | 已保存网络可迁移，关联复位仍在，文档与已发布行为一致 |
+| [v6](#v6) | 8 | 删除带宽调优、完成模块和界面整理 | 已保存网络可迁移，关联复位仍在（原计划，2026-11-12 已删除），文档与已发布行为一致 |
 
 以下保留实施条目编号（N 网络、M 核心、R 中继、H IPA、S 结构、U 界面/文档），方便现有代码和测试引用。各版本都执行 §3 的共同门槛。
 
@@ -49,7 +52,7 @@ reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-tes
 
 实现 `EffectSet` 及内部效果注册（S1、S2）；串行 Mihomo 控制器、退避、启动和保留拦截的重启（M1、M3、U3）；纯规则规划、两族整表替换、差集与实际重置（M4–M6、D10）；出口去抖（M9、D7）、桥接写排序及 503（M11）、保留 `no-resolve`（M12）。在 v4 迁移中继前，既有中继仍通过同一入口发布出口观测。此版 DNS 过滤变化可走受保护的重启，不以热重载尚未交付为由撤拦截。
 
-> 2026-11-12 批次 5 注：`EffectSet` 已实现，资源分类型声明，自有 legacy 链整链核对/替换，钩子查恰一份。门户 RETURN 持续排在厂商规则前，其他钩子保留厂商后来插入的前置过滤（D8）。旧版撤新日志已在隔离 Linux 验证，新版撤旧日志/接管有主机和真机证据，范围见[批次 5](relay-mihomo-implementation.md#batch-5)。
+> 2026-11-12 批次 5 注：`EffectSet` 已实现，资源分类型声明，自有 legacy 链整链核对/替换，钩子查恰一份。门户 RETURN 持续排在厂商规则前，其他钩子保留厂商后来插入的前置过滤（D8）。旧版撤新日志已在隔离 Linux 验证，新版撤旧日志/接管有主机和真机证据，范围见[批次 5](2026-11-12-relay-mihomo-implementation.md#batch-5)。
 
 **四项发布阻断：**
 
@@ -68,7 +71,7 @@ reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-tes
 
 **交付（M7）。** 仅对同一配置的 `fake-ip-filter` 变化调用 `PUT /configs?force=false`。沿用 v2 的先收紧、核验后再扩大；保留运行时 mode、log-level、出口接口、凭据和已确认的旧配置。实际状态不符或 PUT 结果无法确认时，保留拦截，走经校验的重启。热重载用于切换整份订阅不属于本版通过条件。
 
-> 2026-11-12 批次 4 补记：以上保留 v3 的原交付范围。当前选中订阅的手动/定时刷新也使用热重载，相同源跳过编译/校验；改变的源由控制器校验候选一次，失败重启直接复用该候选，起不来回退最后应用配置。启动设置变化仍重启，切换配置、修改生效配置内容和修改扩展仍按配置变更重启。全新持久缓存第一次重载可能丢 fake-ip 映射，只在本机真实核心复现；成功刷新已在路由器验证，失败回退未在路由器验证。证据与边界见[批次 4](relay-mihomo-implementation.md#batch-4)，不能将本条补记当成下面完整发布门槛都已通过。
+> 2026-11-12 批次 4 补记：以上保留 v3 的原交付范围。当前选中订阅的手动/定时刷新也使用热重载，相同源跳过编译/校验；改变的源由控制器校验候选一次，失败重启直接复用该候选，起不来回退最后应用配置。启动设置变化仍重启，切换配置、修改生效配置内容和修改扩展仍按配置变更重启。全新持久缓存第一次重载可能丢 fake-ip 映射，只在本机真实核心复现；成功刷新已在路由器验证，失败回退未在路由器验证。证据与边界见[批次 4](2026-11-12-relay-mihomo-implementation.md#batch-4)，不能将本条补记当成下面完整发布门槛都已通过。
 
 **发布门槛。** 核对 `/configs`、`/proxies`、所需 provider/监听及 1053 的真实/假地址答案；测试 204 但 provider 为空、意外退到 `COMPATIBLE`、客户端超时而核心已 apply、保留旧选择和运行时接口。用 §3 双出口探针、已有 TCP 与 UDP/QUIC/hy2 分别观测；运行 10 次重载记录暂停时长、实际丢包和内存趋势。新查 DNS 与复用切换前缓存的真实 A 必须是**两个**测试：先通过路由器 DNS 获得真实 A，再把其域名从 DIRECT 切为代理，同时保留覆盖 A 的 DIRECT 地址前缀；客户端不再查 DNS，用旧 A 新建连接。代理可用时目的端应观测到代理出口，切换或不能判定时可暂时阻断，绝不能观测到直连出口。
 
@@ -78,7 +81,7 @@ reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-tes
 
 **交付。** 中继会话、取消和开机恢复串行；3 s 观测与决策分开，DNS/resolv 只由 uplink 声明（R1、R3、R6、N7）。实际装过/撤过路由才发布新出口，单纯换 DHCP DNS 也更新下载器；核心不运行时同样可用。实施按操作区分的 Admission 与异步 reload 的占用期，取消不被占满的 Slow lane 拦在门外。`IpacmPort`、显式状态、有效吞吐核验、固件指纹和 UI 归属在此版完成（H1–H5）。
 
-> 2026-11-12 批次 5 注：中继控制器线程已实现。车主请求取得准入后排入 `relay`，准入与开始执行共用 3 s 等待，放弃的请求随后跳过。Connect 从发布的扫描快照校验，断开由控制器拆除，工作中立即接受，空闲时等待拆完。设备工作经 `controller::Port`，恢复等待用定时器，锁序为取消单元 → 请求开始握手 → 快照。出口快照和 IPv6 自己的端口仍待实现。IPA 的 HW 模式切换、车主限制和“有效吞吐核验”（回程计数、重新挂载）已删除，模式交给路由器的工作模式（[硬件转发](relay-hw-offload.md)）。下面 IPA 矩阵中的“车主限制”“原模式”“回程计数”“Software/Engaging”各项随之不再适用。IPACM 配置的安装也已删除，站点 `ath20` 已在原厂配置里，“首次安装需重启”“同 boot 再装”“移除”和配置写入各项同样不再适用。最终版的真实 LAN 客户端硬件转发未测，见[批次 5](relay-mihomo-implementation.md#batch-5)。
+> 2026-11-12 批次 5 注：中继控制器线程已实现。车主请求取得准入后排入 `relay`，准入与开始执行共用 3 s 等待，放弃的请求随后跳过。Connect 从发布的扫描快照校验，断开由控制器拆除，工作中立即接受，空闲时等待拆完。设备工作经 `controller::Port`，恢复等待用定时器，锁序为取消单元 → 请求开始握手 → 快照。出口快照和 IPv6 自己的端口仍待实现。IPA 的 HW 模式切换、车主限制和“有效吞吐核验”（回程计数、重新挂载）已删除，模式交给路由器的工作模式（[硬件转发](../relay-hw-offload.md)）。下面 IPA 矩阵中的“车主限制”“原模式”“回程计数”“Software/Engaging”各项随之不再适用。IPACM 配置的安装也已删除，站点 `ath20` 已在原厂配置里，“首次安装需重启”“同 boot 再装”“移除”和配置写入各项同样不再适用。最终版的真实 LAN 客户端硬件转发未测，见[批次 5](2026-11-12-relay-mihomo-implementation.md#batch-5)。
 
 **发布阻断：** 在 wireless 撤销阻塞最长 CAC 的同时，触发另一个 owner 的 sysctl 修复和核心退出。guard 须跳过忙 set 并核对 Mihomo；退出检测目标 2 s 内，之后遵守自己的退避。不能只证明两个控制器线程都活着。模拟迟到的核对，不得在释放 brnf 之后又写回运行值。
 
@@ -100,7 +103,7 @@ reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-tes
 
 ### v6 · 无线调优退役与发布文档（阶段 8）
 
-**交付（S3–S5、R5、U4；D5、D8）。** 完成剩余模块拆分；删除 `width` 自动调优、对应采样器、`/api/wifi-relay/tuning` 和页面选项。保留关联时的宽度复位，以及热点需要的解析/窄化函数；已存 `auto` 读作 `off`。同步实际部署行为到[产品说明](mihomo-relay-prd.md)、[网络扩展](network-extensions.md)、[硬件转发](relay-hw-offload.md)、[中继生命周期](relay-lifecycle.md)、[Web UI](web-ui.md)及仓库约定。提示 ZTE 家长控制/网址过滤、IPv6 CPU 路径和硬件状态的真实适用范围。
+**交付（S3–S5、R5、U4；D5、D8）。** 完成剩余模块拆分；删除 `width` 自动调优、对应采样器、`/api/wifi-relay/tuning` 和页面选项。保留关联时的宽度复位，以及热点需要的解析/窄化函数；已存 `auto` 读作 `off`。同步实际部署行为到[产品说明](../mihomo-relay-prd.md)、[网络扩展](../network-extensions.md)、[硬件转发](../relay-hw-offload.md)、[中继生命周期](../relay-lifecycle.md)、[Web UI](../web-ui.md)及仓库约定。提示 ZTE 家长控制/网址过滤、IPv6 CPU 路径和硬件状态的真实适用范围。
 
 **验收。** 使用含旧选项的已保存网络连接，验证凭据/恢复选择仍有效、一次性宽度复位仍执行；W_Game 5 GHz 和另约时段的 W 2.4 GHz 都测一次，验证热点恢复和硬件路径。检查页面/API 与旧设置迁移、release 大小；不能把删除行数当作性能或体积达标。
 
@@ -109,7 +112,7 @@ reload 前规则/sysctl 快照曾在设备 `/data/zte-agent-backup/fw-reload-tes
 ## 3. 共同门槛及维护窗口
 
 - **写入边界**：随各版本迁移把相应路径纳入源码扫描测试；绕过 `netfx` 直接写上述网络资源时，全套 host 测试应失败。放行例外以架构 §4、§4.7 为准。
-- **每阶段**：开发机 `cargo test --locked -p zte-agent -- --test-threads=4`；发布构建 `cargo build --locked --release --target aarch64-unknown-linux-musl -p zte-agent`。记录同一产物的 `aarch64-linux-musl-size -A` Total（本 Mac 可用 `xcrun llvm-size -A`）和 `gzip -n -9` 字节数。涉及网络状态的版本先跑假端口/时钟和一次性 Linux QA，再按[部署规范](../../CLAUDE.md)在约定的空闲窗口部署验收。没有设备结果就标未验，不根据单测或代码存在标记“已发布”。
+- **每阶段**：开发机 `cargo test --locked -p zte-agent -- --test-threads=4`；发布构建 `cargo build --locked --release --target aarch64-unknown-linux-musl -p zte-agent`。记录同一产物的 `aarch64-linux-musl-size -A` Total（本 Mac 可用 `xcrun llvm-size -A`）和 `gzip -n -9` 字节数。涉及网络状态的版本先跑假端口/时钟和一次性 Linux QA，再按[部署规范](../../../CLAUDE.md)在约定的空闲窗口部署验收。没有设备结果就标未验，不根据单测或代码存在标记“已发布”。
 - **代理出口实证**：用两个可控、可区分直连与代理源地址的目的端，从 LAN 每 100–200 ms 新建请求；一个真实 IP 按规则必须代理，一个明确 DIRECT 作对照。分别测计划内重启、切组、热重载、agent/桥接入口。允许暂时失败的切换阶段，代理探针只能看到代理出口或失败，不能看到酒店/蜂窝出口。另测域名、旧真实 A、新查 fake-ip、已有 TCP、UDP 和失去 DIRECT 的 IPA 流；记录切换时间线。PID、conntrack 快照、保持一个无关下载都不能独立证明没有漏包。
 - **恢复与回退**：在隔离环境注入部分提交、外部占用、权限错误、控制器响应丢失、过期消息；核对日志、状态页和内核实际状态。设备上至少一次新版活动时异常终止、启动受支持的旧二进制，模拟 OTA 自动回旧槽。确认干净撤销或按持久意图重新取得资源，两者应有可区分的观测点。不同版本是否能独立回退以此为准，不要求新版先活着关闭功能。冷启动另验 boot id、原厂启动同步和 owner 意图。
 - **开销与隐私**：同网络、带宽、模式和客户端对照吞吐、回程包数及 CPU。状态/日志带单调时间、代次、失败原因和结果，不输出凭据、secret 或 cookie。临时测试和备份按项目固定目录处理。

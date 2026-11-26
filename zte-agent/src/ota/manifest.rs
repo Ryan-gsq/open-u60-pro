@@ -219,15 +219,7 @@ fn validate_release_url(value: &str, tag: &str, binary: bool) -> Result<(), Mani
     Ok(())
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
-}
+pub(crate) use crate::common::hex_lower as hex;
 
 #[cfg(test)]
 mod tests {

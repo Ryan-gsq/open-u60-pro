@@ -161,6 +161,14 @@ impl DohProxy {
     }
 
     pub fn update_config(&self, body: &[u8]) -> Result<(), String> {
+        self.update_config_with(body, config::save)
+    }
+
+    fn update_config_with(
+        &self,
+        body: &[u8],
+        save: impl FnOnce(&DohConfig) -> Result<(), String>,
+    ) -> Result<(), String> {
         let patch: config::DohConfigPatch =
             serde_json::from_slice(body).map_err(|e| format!("invalid config JSON: {e}"))?;
         let mut cfg = self.config.lock().unwrap();
@@ -171,7 +179,7 @@ impl DohProxy {
             dot.set_timeout(cfg.timeout_ms);
             dot.reset();
         }
-        config::save(&cfg)?;
+        save(&cfg)?;
         Ok(())
     }
 
@@ -499,16 +507,6 @@ mod listener_tests {
         s.parse().unwrap()
     }
 
-    /// Pick a currently free UDP port on loopback so the tests never collide
-    /// with the default 5353 (mDNS on the development machine).
-    fn free_loopback_port() -> u16 {
-        UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     fn proxy_on(listen_addr: &str) -> Arc<DohProxy> {
         let cfg = DohConfig {
             listen_addr: listen_addr.to_string(),
@@ -578,13 +576,13 @@ mod listener_tests {
 
     #[test]
     fn listener_serves_cache_then_stops_promptly_and_rebinds_same_port() {
-        let port = free_loopback_port();
-        let proxy = proxy_on(&format!("127.0.0.1:{port}"));
+        let proxy = proxy_on("127.0.0.1:0");
 
         proxy.start().expect("first start");
         assert_eq!(proxy.start().unwrap_err(), "already running");
         let bound = proxy.bound_addr.lock().unwrap().expect("bound_addr set");
-        assert_eq!(bound, addr(&format!("127.0.0.1:{port}")));
+        assert!(bound.ip().is_loopback());
+        assert_ne!(bound.port(), 0);
 
         // Seed the cache so the query is answered without touching the network.
         let query = build_query(0x1234, "example.com", 1);
@@ -617,10 +615,12 @@ mod listener_tests {
         assert!(proxy.bound_addr.lock().unwrap().is_none());
 
         // disable -> enable must re-bind the very same port (no EADDRINUSE).
+        proxy.config.lock().unwrap().listen_addr = bound.to_string();
         for i in 0..3 {
             proxy
                 .start()
                 .unwrap_or_else(|e| panic!("re-bind #{i} failed: {e}"));
+            assert_eq!(*proxy.bound_addr.lock().unwrap(), Some(bound));
             proxy.stop();
         }
 
@@ -635,14 +635,40 @@ mod listener_tests {
     fn update_config_changes_timeout_without_restart() {
         let proxy = proxy_on("127.0.0.1:0");
         proxy.start().expect("start");
-        // save() targets the on-device path and fails here; the in-memory
-        // config and the agent must already be updated by then.
-        let _ = proxy.update_config(br#"{"timeout_ms": 1234}"#);
+        let bound = *proxy.bound_addr.lock().unwrap();
+        let mut saved = None;
+        proxy
+            .update_config_with(br#"{"timeout_ms": 1234}"#, |cfg| {
+                saved = Some(cfg.timeout_ms);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(saved, Some(1234));
+        assert!(proxy.running.load(Ordering::Relaxed));
+        assert_eq!(*proxy.bound_addr.lock().unwrap(), bound);
         assert_eq!(proxy.config().timeout_ms, 1234);
-        let mut agent = proxy.agent.lock().unwrap();
-        assert_eq!(agent.configured_timeout_ms(), 1234);
-        assert!(agent.checkout().is_ok());
+        {
+            let mut agent = proxy.agent.lock().unwrap();
+            assert_eq!(agent.configured_timeout_ms(), 1234);
+            assert!(agent.checkout().is_ok());
+        }
         proxy.stop();
+    }
+
+    #[test]
+    fn update_config_reports_save_failure_after_updating_timeout() {
+        let proxy = proxy_on("127.0.0.1:0");
+        let error = proxy
+            .update_config_with(br#"{"timeout_ms": 2345}"#, |cfg| {
+                assert_eq!(cfg.timeout_ms, 2345);
+                let mut agent = proxy.agent.lock().unwrap();
+                assert_eq!(agent.configured_timeout_ms(), 2345);
+                assert!(agent.checkout().is_ok());
+                Err("fixture save failure".into())
+            })
+            .unwrap_err();
+        assert_eq!(error, "fixture save failure");
+        assert_eq!(proxy.config().timeout_ms, 2345);
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod build_info;
 mod cache;
 mod cell;
 mod charge_policy;
+pub mod common;
 mod conn_watchdog;
 mod client_details;
 mod console;
@@ -105,10 +106,12 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("guard") {
         std::process::exit(guard::cli(&args[2..]));
     }
-    if args.get(1).map(String::as_str) == Some("network-recover") {
-        let lock = Arc::new(crate::netfx::admission::Gate::new());
-        let result = mihomo::Mihomo::new().recover()
-            .and_then(|_| wifi_relay::WifiRelay::new(lock).recover());
+    if let Some(result) = network_recover_cli(
+        args.get(1).map(String::as_str),
+        || Arc::new(crate::netfx::admission::Gate::new()),
+        || mihomo::Mihomo::new().recover(),
+        |lock| wifi_relay::WifiRelay::new(lock).recover(),
+    ) {
         if let Err(e) = result { eprintln!("{e}"); std::process::exit(1); }
         return;
     }
@@ -256,17 +259,50 @@ fn main() {
 /// a reboot). The relay's journals are rolled back first: Mihomo started on
 /// a stale relay route would bind to the relay's station interface.
 fn restore_network(state: &Arc<AppState>) {
-    if !state.wifi_relay.wants_restore() && !state.mihomo.wants_restore() {
-        return;
+    if let Some(restore) = network_restore_work(state) {
+        system::spawn_named("net-restore", restore);
     }
-    let state = Arc::clone(state);
-    system::spawn_named("net-restore", move || {
-        wait_for_boot();
-        state.wifi_relay.recover_idle();
-        state.mihomo.restore(state.tls.name());
-        state.wifi_relay.restore();
+}
 
-    });
+trait NetworkRestore: Clone {
+    fn relay_wants_restore(&self) -> bool;
+    fn mihomo_wants_restore(&self) -> bool;
+    fn wait_for_boot(&self);
+    fn recover_idle(&self);
+    fn restore_mihomo(&self);
+    fn restore_relay(&self);
+}
+
+impl NetworkRestore for Arc<AppState> {
+    fn relay_wants_restore(&self) -> bool { self.wifi_relay.wants_restore() }
+    fn mihomo_wants_restore(&self) -> bool { self.mihomo.wants_restore() }
+    fn wait_for_boot(&self) { wait_for_boot(); }
+    fn recover_idle(&self) { self.wifi_relay.recover_idle(); }
+    fn restore_mihomo(&self) { self.mihomo.restore(self.tls.name()); }
+    fn restore_relay(&self) { self.wifi_relay.restore(); }
+}
+
+fn network_restore_work(state: &impl NetworkRestore) -> Option<impl FnOnce()> {
+    if !state.relay_wants_restore() && !state.mihomo_wants_restore() {
+        return None;
+    }
+    let state = state.clone();
+    Some(move || {
+        state.wait_for_boot();
+        state.recover_idle();
+        state.restore_mihomo();
+        state.restore_relay();
+    })
+}
+
+fn network_recover_cli<L>(
+    action: Option<&str>, lock: impl FnOnce() -> L, recover_mihomo: impl FnOnce() -> Result<(), String>,
+    recover_relay: impl FnOnce(L) -> Result<(), String>,
+) -> Option<Result<(), String>> {
+    (action == Some("network-recover")).then(|| {
+        let lock = lock();
+        recover_mihomo().and_then(|()| recover_relay(lock))
+    })
 }
 
 /// Until `zte_topsw_daemon` releases its boot barrier the vendor daemons are
@@ -341,6 +377,66 @@ fn clcc_confirms_idle(resp: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::clcc_confirms_idle;
+
+    #[derive(Clone)]
+    struct RestoreFixture {
+        relay: bool,
+        mihomo: bool,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl RestoreFixture {
+        fn step(&self, name: &'static str) { self.calls.lock().unwrap().push(name); }
+    }
+
+    impl super::NetworkRestore for RestoreFixture {
+        fn relay_wants_restore(&self) -> bool { self.step("relay.wants_restore"); self.relay }
+        fn mihomo_wants_restore(&self) -> bool { self.step("mihomo.wants_restore"); self.mihomo }
+        fn wait_for_boot(&self) { self.step("wait_for_boot"); }
+        fn recover_idle(&self) { self.step("recover_idle"); }
+        fn restore_mihomo(&self) { self.step("mihomo.restore"); }
+        fn restore_relay(&self) { self.step("wifi_relay.restore"); }
+    }
+
+    #[test]
+    fn network_restore_waits_only_when_needed_then_recovers_relay_before_mihomo() {
+        for (relay, mihomo) in [(false, false), (false, true), (true, false), (true, true)] {
+            let state = RestoreFixture { relay, mihomo, calls: Default::default() };
+            let mut expected = vec!["relay.wants_restore"];
+            if !relay { expected.push("mihomo.wants_restore"); }
+            let work = super::network_restore_work(&state);
+            assert_eq!(*state.calls.lock().unwrap(), expected);
+            if relay || mihomo {
+                crate::system::spawn_named("net-restore", work.unwrap()).join().unwrap();
+                expected.extend(["wait_for_boot", "recover_idle", "mihomo.restore", "wifi_relay.restore"]);
+            } else {
+                assert!(work.is_none());
+            }
+            assert_eq!(*state.calls.lock().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn network_recover_cli_recovers_synchronously_in_order_and_stops_on_failure() {
+        use std::cell::RefCell;
+        for (action, core_ok, relay_ok, expected) in [
+            (Some("guard"), true, true, None),
+            (Some("network-recover"), false, true, Some(Err("core error".to_owned()))),
+            (Some("network-recover"), true, false, Some(Err("relay error".to_owned()))),
+            (Some("network-recover"), true, true, Some(Ok(()))),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let result = super::network_recover_cli(action, || { calls.borrow_mut().push("lock"); 42 },
+                || { calls.borrow_mut().push("mihomo.recover"); if core_ok { Ok(()) } else { Err("core error".into()) } },
+                |lock| { assert_eq!(lock, 42); calls.borrow_mut().push("wifi_relay.recover"); if relay_ok { Ok(()) } else { Err("relay error".into()) } },
+            );
+            assert_eq!(result, expected);
+            let trace = calls.into_inner();
+            if expected.is_none() { assert!(trace.is_empty()); }
+            else if !core_ok { assert_eq!(trace, ["lock", "mihomo.recover"]); }
+            else { assert_eq!(trace, ["lock", "mihomo.recover", "wifi_relay.recover"]); }
+        }
+    }
 
     #[test]
     fn clcc_idle_only_on_final_ok_without_calls() {

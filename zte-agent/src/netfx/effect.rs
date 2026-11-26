@@ -20,9 +20,9 @@
 //! check reads both families once (`Nft::list_both`; on the router one
 //! `nft -t list ruleset`), for the marker and the rule counts alike.
 //!
-//! EffectSet journals typed resources before applying them and keeps their
-//! desired state for reconcile for both relay and Mihomo.
-//! NftTables implements a set's NftTable resource and the relay's tables.
+//! `EffectSet` journals typed resources before applying them and keeps their
+//! desired state for reconciliation. `NftTables` implements the `NftTable`
+//! resource.
 //! Journal undos retain the previous build's command vocabulary.
 
 use std::path::PathBuf;
@@ -330,7 +330,7 @@ fn holds_rules(text: &str, listings: &[Option<String>; 2]) -> bool {
 /// The `nft -f` batch that replaces both families of table `name` with
 /// `families` and marks it generation `generation`: the marker and the text.
 pub fn batch(owner: &str, name: &str, generation: u64, families: [String; 2]) -> Result<(String, String), String> {
-    let marker = format!("zte-agent {owner} {generation} {}", &hex(&Sha256::digest(families.concat()))[..16]);
+    let marker = format!("zte-agent {owner} {generation} {}", &crate::common::hex_lower(&Sha256::digest(families.concat()))[..16]);
     let mut text = String::new();
     for (family, definition) in FAMILIES.iter().zip(families) {
         // Create if absent, delete, define: one atomic replacement.
@@ -346,10 +346,6 @@ fn marker_in(listing: &str, prefix: &str) -> Option<String> {
     let start = listing.find(&format!("comment \"{prefix}"))? + "comment \"".len();
     let end = start + listing[start..].find('"')?;
     Some(listing[start..end].to_owned())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -571,7 +567,7 @@ mod tests {
     /// checks built on it hold (same content not loaded again, a flushed
     /// chain loaded again).
     #[test]
-    #[ignore]
+    #[ignore = "requires real nft in the isolated Linux Mihomo QA namespace"]
     fn isolated_one_ruleset_read_matches_the_per_table_reads() {
         assert_eq!(std::env::var("U60_MIHOMO_QA_ISOLATED").as_deref(), Ok("1"));
         let mut nft = Device;

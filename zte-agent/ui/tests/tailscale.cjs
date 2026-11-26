@@ -1,7 +1,7 @@
 // Tailscale console page end-to-end checks against a local fake router.
 const assert = require('node:assert/strict');
-const {chromium} = require('playwright');
-const {start, envelope} = require('./fixture.cjs');
+const {launchChrome}=require('./browser.cjs');
+const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require('./fixture.cjs');
 
 (async () => {
   const sha = 'a1b2c3d4'.repeat(8);
@@ -31,10 +31,8 @@ const {start, envelope} = require('./fixture.cjs');
     hold_wakelock: true,
     pinned_version: ''
   };
-  let holdStatusReply = null;
   let loginUrlMode = 'pending';
   let setupMode = 'ok';
-  let holdSetupReply = null;
   let versionsCatalog = {
     latest: '1.104.7',
     versions: [
@@ -54,7 +52,6 @@ const {start, envelope} = require('./fixture.cjs');
       return true;
     }
     if (method === 'GET' && url === '/api/tailscale/status') {
-      if (holdStatusReply === 'arm') { holdStatusReply = reply; return true; }
       reply(status);
       return true;
     }
@@ -100,7 +97,6 @@ const {start, envelope} = require('./fixture.cjs');
     if (method === 'POST' && url === '/api/tailscale/setup') {
       if (!body?.auth_key) { fail('missing auth_key', 400); return true; }
       if (setupMode === 'fail') { fail('tailscale up: invalid auth key', 502); return true; }
-      if (setupMode === 'hold') { holdSetupReply = fail; return true; }
       status = {
         ...status,
         enabled: true,
@@ -170,10 +166,12 @@ const {start, envelope} = require('./fixture.cjs');
     return false;
   });
 
-  const browser = await chromium.launch({headless: true, channel: 'chrome'});
+  const browser = await launchChrome();
   const page = await browser.newPage({viewport: {width: 1440, height: 1200}});
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  await watchApiResponses(page);
+  await page.clock.install();
   await page.addInitScript(() => sessionStorage.setItem('openu60.session', 'fixture-session'));
 
   const text = selector => page.locator(selector).textContent();
@@ -312,18 +310,14 @@ const {start, envelope} = require('./fixture.cjs');
     assert.equal(await page.locator('.tailscale-login-box a').getAttribute('href'), null);
 
     // 3c. Manual status refresh notice clears when SSE preempts the in-flight GET.
-    holdStatusReply = 'arm';
-    await button('Read current status').click();
+    const [preempted] = await Promise.all([
+      fixture.holdRequest('GET','/api/tailscale/status'),
+      button('Read current status').click(),
+    ]);
     await said('#tailscale-status .action-status', 'Reading Tailscale status…');
-    for (let tick = 0; typeof holdStatusReply !== 'function' && tick < 50; tick++) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    assert.equal(typeof holdStatusReply, 'function', 'manual status refresh is in flight');
     fixture.patch({tailscale_status: envelope({...status})});
     await page.waitForFunction(() => document.querySelector('#tailscale-status .action-status')?.textContent === '');
-    holdStatusReply({...status});
-    holdStatusReply = null;
-    await page.waitForTimeout(100);
+    await releaseResponse(page,preempted,{...status});
     assert.equal(await text('#tailscale-status .action-status'), '');
 
     // 3d. Auth key clears immediately on confirmed submit, including failure and timeout paths.
@@ -337,18 +331,15 @@ const {start, envelope} = require('./fixture.cjs');
     assert.doesNotMatch(await page.content(), new RegExp(failedKey), 'failed auth key never lingers in DOM');
 
     const timedOutKey = 'tskey-auth-timeout-secret-must-clear';
-    setupMode = 'hold';
-    holdSetupReply = null;
     await page.locator('#tailscale-auth-key').fill(timedOutKey);
     await button('Enroll with auth key').click();
-    await confirm('Enroll router');
-    for (let tick = 0; typeof holdSetupReply !== 'function' && tick < 50; tick++) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    assert.equal(typeof holdSetupReply, 'function', 'setup request is in flight');
+    const [setup] = await Promise.all([
+      fixture.holdRequest('POST','/api/tailscale/setup'),
+      confirm('Enroll router'),
+    ]);
+    assert.equal(setup.body.auth_key,timedOutKey);
     assert.equal(await page.locator('#tailscale-auth-key').inputValue(), '', 'auth key clears immediately while setup is in flight');
-    holdSetupReply('tailscale up: timed out after 90s', 504);
-    holdSetupReply = null;
+    await releaseResponse(page,setup,'tailscale up: timed out after 90s',504);
     await said('#tailscale-auth .action-status', 'timed out after 90s');
     assert.equal(await page.locator('#tailscale-auth-key').inputValue(), '', 'auth key stays cleared after timeout');
     assert.doesNotMatch(await page.content(), new RegExp(timedOutKey), 'timed-out auth key never lingers in DOM');
@@ -385,6 +376,13 @@ const {start, envelope} = require('./fixture.cjs');
     // Live SSE update must preserve unsaved config edits.
     fixture.patch({tailscale_status: envelope({...status, relay: 'sin'})});
     await said('#tailscale-status .tailscale-facts', 'DERP sin');
+    assert.equal(await page.locator('#tailscale-hostname').inputValue(), 'u60-home');
+    assert.equal(await page.locator('#tailscale-routes').inputValue(), '192.168.0.0/24, 10.10.0.0/24');
+
+    await page.clock.runFor(1200);
+    status = {...status, relay: 'fra'};
+    await refreshOn(page,fixture,'focus','/api/tailscale/status');
+    await said('#tailscale-status .tailscale-facts', 'DERP fra');
     assert.equal(await page.locator('#tailscale-hostname').inputValue(), 'u60-home');
     assert.equal(await page.locator('#tailscale-routes').inputValue(), '192.168.0.0/24, 10.10.0.0/24');
 
@@ -430,16 +428,13 @@ const {start, envelope} = require('./fixture.cjs');
       await page.locator('#tailscale-manual summary').click();
     }
     await page.locator('#tailscale-version').fill('1.90.0');
-    holdStatusReply = 'arm';
-    await button('Read current status').click();
-    for (let tick = 0; typeof holdStatusReply !== 'function' && tick < 50; tick++) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    assert.equal(typeof holdStatusReply, 'function', 'status read is in flight');
+    const [lateStatus] = await Promise.all([
+      fixture.holdRequest('GET','/api/tailscale/status'),
+      button('Read current status').click(),
+    ]);
     await page.locator('#signout').click();
     await page.waitForFunction(() => OpenU60Console.locked);
-    holdStatusReply({...status, state: 'healthy', backend_state: 'Running', tailscale_ips: ['100.99.99.99'], dns_name: 'leaked.ts.net.'});
-    await page.waitForTimeout(150);
+    await releaseResponse(page,lateStatus,{...status, state: 'healthy', backend_state: 'Running', tailscale_ips: ['100.99.99.99'], dns_name: 'leaked.ts.net.'});
     assert.equal(await page.locator('#tailscale-auth-key').inputValue(), '');
     assert.equal(await page.locator('#tailscale-version').inputValue(), '');
     assert.equal(await page.locator('#tailscale-version-select').inputValue(), '');
@@ -447,7 +442,6 @@ const {start, envelope} = require('./fixture.cjs');
     assert.doesNotMatch(await text('#tailscale-status'), /100\.99\.99\.99|leaked\.ts\.net/);
 
     // 9. When version lookup fails on unlock, manual entry opens automatically and Refresh versions recovers.
-    holdStatusReply = null;
     versionsFail = true;
     await page.locator('#password').fill('fixture-pass');
     await page.locator('#login-form button[type=submit]').click();

@@ -1,5 +1,9 @@
 # Wi-Fi relay IPv6 / NAT66 assessment
 
+> **Historical assessment · 2026-10-25.** “Current implementation” below
+> describes the IPv4 baseline on that date. See the
+> [current IPv6/NAT66 contract](../network-extensions.md#wi-fi-relay).
+
 > 2026-11-12 note: the station named `u60sta0` here is `ath20` since 2026-11-12.
 
 Date: 2026-10-25. Scope: design and primary-source research, not an implemented
@@ -7,7 +11,7 @@ feature or hardware acceptance. No router settings or production code changed.
 
 Historical assessment: this describes the IPv4-only baseline before the user's
 subsequent request to implement upstream IPv6 and downstream NAT66. The local
-Rust implementation now exists; see [network-extensions.md](network-extensions.md)
+Rust implementation now exists; see [network-extensions.md](../network-extensions.md)
 for its actual behavior and current acceptance limits. The feasibility/benefit
 analysis below remains useful, but its "current implementation" section is not
 the latest implementation status. Later read-only B31 checks confirmed odhcp6c,

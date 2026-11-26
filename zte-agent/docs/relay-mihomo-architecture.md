@@ -1,6 +1,6 @@
 # Wi-Fi 中继与 Mihomo：架构
 
-定稿：2026-11-10，原是目标规范；2026-11-12 起改为描述代码现状。规定了但没有实现的部分集中在[第 8 节](#8-规定了但未实现)，正文在相应位置写“未实现（§8）”。车主在 2026-11-12 决定实现的 `EffectSet` 层和中继控制器线程已在批次 5 完成，验证范围见[实现记录](relay-mihomo-implementation.md#batch-5)。[版本与验收](relay-mihomo-refactor-plan.md)是 v1–v6 的交付顺序。[产品说明](mihomo-relay-prd.md)描述已发布行为；[设备约束](../../CLAUDE.md)适用于全部版本。车主已确定自动恢复、provider 自主刷新零误直连和旧真实地址保护；[验收条件](relay-mihomo-refactor-plan.md#owner-decisions)同样适用于 v2/v3。
+定稿：2026-11-10，原是目标规范；2026-11-12 起改为描述代码现状。规定了但没有实现的部分集中在[第 8 节](#8-规定了但未实现)，正文在相应位置写“未实现（§8）”。车主在 2026-11-12 决定实现的 `EffectSet` 层和中继控制器线程已在批次 5 完成，验证范围见[实现记录](archive/2026-11-12-relay-mihomo-implementation.md#batch-5)。[版本与验收](archive/2026-11-10-relay-mihomo-refactor-plan.md)是 v1–v6 的交付顺序。[产品说明](mihomo-relay-prd.md)描述已发布行为；[设备约束](../../CLAUDE.md)适用于全部版本。车主已确定自动恢复、provider 自主刷新零误直连和旧真实地址保护；[验收条件](archive/2026-11-10-relay-mihomo-refactor-plan.md#owner-decisions)同样适用于 v2/v3。
 
 ## 1. 不变式
 
@@ -28,7 +28,7 @@ Mihomo 和中继各用一个串行控制器线程。中继的会话、扫描列�
 | 执行者 | 代码现状 |
 | --- | --- |
 | `relay` | 按到达顺序处理带回复的 Boot、Restore、Scan、Connect、PowerSave、Offload、Forget、Clock，以及 Disconnect、Tick、内部 Retry/Wake。设备操作经 `controller::Port`，实际为 `wifi_relay.rs::DevicePort`，测试用脚本化假端口和假时钟。会话选定网络后每 3 s 检查，`net_guard` 安静后立即排 Tick，长操作中的触发合并成一次后续检查。车主请求等待准入与开始执行合计最多 3 s，开始后等结果，放弃的请求不会迟到执行。断开由本线程拆除（§6.1）。线程 panic 记日志并 abort，由 guard 重启 agent 后接管连接。 |
-| `mihomo` | 串行执行影响路由的写操作。`mihomo-validate` 在独立线程准备 geodata、运行 `mihomo -t` 并返回校验编号。等待时处理 Guard 和 Exited，收到断开请求或正在服务的代次消失后丢弃候选。选中订阅变化时只校验一次。规则集 PUT、热重载 PUT、nft 写入和 conntrack 仍串行。 |
+| `mihomo` | 串行执行影响路由的写操作。`mihomo-validate` 在独立线程准备 geodata、运行 `mihomo -t` 并返回 `Validated { ticket, result }`。等待时继续处理 Guard 和 Exited。结果必须匹配本次校验的 ticket，且仍为发起校验时的核心 generation。排队中的 Disable 同样使结果作废。选中订阅变化时只校验一次。规则集 PUT、热重载 PUT、nft 写入和 conntrack 仍串行。 |
 | `mihomo-core-wait` | 每个子进程只有一个回收者。停止路径给已确认属于该代的进程发信号；等待者负责 wait/reap，回送 `Exited { generation, how }`。控制器忽略旧代退出和已取消的定时器。 |
 | `net-guard`、`net-guard-sample` | 订阅 inotify/ubus、合并触发，只负责唤醒：各 owner 在自己的循环里问 `Cursor::due()`，所以一个 owner 忙时不挡别的 owner。采样线程在触发后的 3 s 内维护已登记的 sysctl。`relay-neigh` / `relay-lan` 归当前 IPA 会话，退出后不能再操作下一次会话。 |
 | HTTP、页面、Zashboard | Mihomo 页面读控制器发布的不可变快照；车主命令交给控制器。重启或热重载期间，普通控制命令排队，桥接写回 503。已放行的在途写必须与切换排序，不能凭请求开始时读到的 Running 快照跨代写入。保留桥接的现有认证、同源和端点限制。 |
@@ -64,7 +64,7 @@ nft 撤销由所属 set 记账，Mihomo 为 `@u60-mihomo-nft remove`，中继为
 | 资源 | 取得后如何维护 |
 | --- | --- |
 | nft 表（族、表名） | 一个表一个 owner。用 `nft -f` 整表原子替换，过期集合随之消失；两族放入同一 nft 批处理。分别保留目标代次和最后一次读回确认的代次。写失败时目标仍待重试；读回失败是“未确认”。内容与已确认目标相同、且读回仍在内核里时不再载入。核对用一次 `nft -t list ruleset` 读两族（ZTE 不写 nft，里面只有 agent 的表），比对代次标记和每条链的**规则条数**；集合元素被清空或规则被等量替换查不出来（内容核验未实现，§8；没有别的写入者碰 nft）。 |
-| `LegacyChain` | 描述一条自有 `U60_*` 链及有序规则。首次用 `-N` 创建，替换/修复时将 `:NAME - [0:0]` 和全部规则放进同一 restore 事务，核对内容和顺序，undo 为 `-X`。B31 两族实测该声明会清空再填充自有链，证据为 `measurements/b5-qa-scripts/restore-chain-probe.txt`。 |
+| `LegacyChain` | 描述一条自有 `U60_*` 链及有序规则。首次用 `-N` 创建，替换/修复时将 `:NAME - [0:0]` 和全部规则放进同一 restore 事务，核对内容和顺序，undo 为 `-X`。B31 两族均测得该声明清空再填充自有链，见[批次 5](archive/2026-11-12-relay-mihomo-implementation.md#batch-5)。 |
 | `LegacyHook` | 描述厂商链里跳向自有链或带 `zte-agent*` 注释的一条规则，核对恰有一份，重复时修复。`InsertFirst` 在添加/补回时插第一条，之后保留厂商在其前面插入的规则（INPUT、FORWARD）。`BeforeVendor` 每次检查位置，将排在厂商 DNAT 后的门户 RETURN 在同一 restore 事务里删除并插到第一条。目标链就位后才应用钩子，undo 为精确 `-D`。 |
 | `Route`、`Rule`、`Addr`、`Sysctl` | 从族、接口、表、优先级等描述生成 `ip … add`/`del` 及核验。sysctl 首次记原值，向 guard 登记采样，undo 为 `@u60-sysctl key original`。IPv6 寿命、DAD 和冲突由会话根据活租约核验（§6.2）。 |
 | `Internal`（`@u60-*`） | 名称对应 `netfx/effect/internal.rs` 的处理表，`Cmd::run`/`Cmd::undo` 据此调用无线、漫游、RA、DNS、门户开关、steering、省电和 nft 等处理器。处理器声明可核对性，射频切换等命令式操作只在操作流程中执行。 |
@@ -111,9 +111,9 @@ guard 修复日志列应用命令或资源描述，例如 `iptables -t nat hook 
 
 只有 `netfx::conntrack` 删除条目，直接执行 `conntrack`，不经 shell。范围为 `Lan { v4, v6 }` 或 `Destinations(IPv4 前缀)`；后者也必须限定 LAN 来源，不能删路由器或其他接口的连接。每个请求带原因、范围及相应路径改变的代次/时刻。
 
-- 同时考虑新旧计划的**首条命中结果**。只有两边直到最后一个放行点的有效判定都能以纯目的 IPv4 区间表达时，才用“旧 DIRECT 减新 DIRECT”。例如在原 DIRECT /24 前加 `DST-PORT,443,PROXY`，虽然 DIRECT 条文本身没变，已有 443 硬件流也必须退出。来源、端口、协议、复合条件或全域兜底无法可靠求差时，退回 LAN IPv4；超过 64 段同样退回（D10）。纯目的集合没有失去放行时，不为了重编同一张表清连接。UDP 不享受已有 TCP 的 socket 固定；需改路径时也纳入相应范围。
+- 同时考虑新旧计划的**首条命中结果**。将可能已放行的旧 DIRECT 范围取并集，再扣除新表可证明的 DIRECT 目的 IPv4 范围。旧表无法表达时回退到 LAN IPv4，新表无法表达时按空放行集合计算。例如在原 DIRECT /24 前加 `DST-PORT,443,PROXY`，虽然 DIRECT 条文本身没变，已有 443 硬件流也必须退出。旧表中的来源、端口、协议、复合条件或全域兜底无法按目的地址表达时，退回 LAN IPv4。结果超过 64 段时也回退（D10）。纯目的集合没有失去放行时，不为了重编同一张表清连接。UDP 不享受已有 TCP 的 socket 固定；需改路径时也纳入相应范围。
 - 收集 200 ms 内到达的请求，合并范围，按最晚的策略变化时间发起删除。已完成的一次删除只有在**它开始于本次路径变化之后**、成功并覆盖全部请求范围时才可抵账；失败待重试的请求与下一个请求取并集，一次删除了结两者。删除在状态锁内依次进行。保留有界诊断，区分“成功删除、有证据的零匹配、操作失败”：conntrack-tools 1.4.8 的退出码 1 也可能是 netlink 错误，不能单凭返回码判断。部分失败记录待重试，不报告“已重置”。[conntrack-tools 1.4.8 源码包](https://www.netfilter.org/projects/conntrack-tools/files/conntrack-tools-1.4.8.tar.xz) 中的 `print_stats`（零匹配）和 `OTHER_PROBLEM`（操作失败）是两个不同分支。
-- 删除 conntrack 不是给 TCP 发送 RST，也不是清理客户端 DNS 缓存。UI 按实际范围及结果显示。已卸载的流要以失去 DIRECT 的真实硬件流验证；B31 实测删除后活跃流仍持续超过 12 秒（454 MB），IPA SRAM 条目一直为 `Enable=true`。成功删除只证明软件 conntrack 条目已清理。
+- 删除 conntrack 不是给 TCP 发送 RST，也不是清理客户端 DNS 缓存。UI 按实际范围及结果显示。已卸载的流要以失去 DIRECT 的真实硬件流验证；B31 实测删除后活跃流仍持续超过 12 秒（454 MB），IPA SRAM 条目一直为 `Enable=true`。成功删除只证明软件 conntrack 条目已清理，报告中的 `hardware_eviction_confirmed` 固定为 `false`。
 
 ### 4.6 准入 `Admission`
 
@@ -135,9 +135,9 @@ guard 修复日志列应用命令或资源描述，例如 `iptables -t nat hook 
 
 ### 5.1 意图、核心与规则规划
 
-`controller` 持有意图和已发布快照，记着内核可能持有的表（最后确认的一张，加上之后声明而未确认的各张：`reconcile` 以后可能把最后一张载入），收紧与否和“失去 DIRECT”的范围（`routing::lost_from`）都按这些表算，`reconcile` 载入的表也反映到发布的 bypass；它并决定保持、换链、重载或重启：写前收紧及审计读回由 `follow::plan/decide` 判定，`Controller` 执行换链、重载或重启；`core` 独占进程、托管 `config.yaml` 和控制器写操作；`intercept` 生成网络资源；`routing` 编译订阅规则及 DNS 过滤表，`routing::lost` 算出需清除的连接范围；`egress` 负责出口观测与去抖。慢操作在控制器线程上同步执行（§3），没有带代次的后台结果（§8）。
+`controller` 持有意图和已发布快照，记着内核可能持有的表（最后确认的一张，加上之后声明而未确认的各张：`reconcile` 以后可能把最后一张载入），收紧与否和“失去 DIRECT”的范围（`routing::lost_from`）都按这些表算，`reconcile` 载入的表也反映到发布的 bypass；它并决定保持、换链、重载或重启：写前收紧及审计读回由 `follow::plan/decide` 判定，`Controller` 执行换链、重载或重启；`core` 独占进程、托管 `config.yaml` 和控制器写操作；`intercept` 生成网络资源；`routing` 编译订阅规则及 DNS 过滤表，`routing::lost` 算出需清除的连接范围；`egress` 负责出口观测与去抖。候选校验由 `mihomo-validate` 异步执行（§3）。规则集 PUT、热重载 PUT、nft 写入和 conntrack 清理仍在控制器内串行完成。
 
-每个核心代次在 `Prepared.bypass` 保存实际采用的绕过设置；所有计划都用它，`direct-bypass` 文件只表示车主意图。`geodata-mode` 保留订阅原值；绕过打开而核心使用 `geoip.metadb` 时，状态 `notice` 说明 GEOIP 规则不能在内核绕过。强制改用 `GeoIP.dat` 会让离线启动依赖可能缺失的文件，所以不这样做。托管配置仅在 `keep-alive-idle`、`keep-alive-interval`、`disable-keep-alive` 三键全部缺省时写入 120 s 空闲和 30 s 间隔（`mihomo.rs::config_with_lan_host`）。路由器的 `TcpExt TCPKeepAlive` 计数从 60 s 内 88 次（核心打开 87 个描述符）降为 120 s 内 12 次，即每分钟 6 次（核心打开 99 个描述符，启动后 441 s）；来源为 `measurements/b4-final/mihomo-refresh.txt`、`keepalive-later.txt`，位置和条件见[批次 4](relay-mihomo-implementation.md#batch-4)。
+每个核心代次在 `Prepared.bypass` 保存实际采用的绕过设置；所有计划都用它，`direct-bypass` 文件只表示车主意图。`geodata-mode` 保留订阅原值；绕过打开而核心使用 `geoip.metadb` 时，状态 `notice` 说明 GEOIP 规则不能在内核绕过。强制改用 `GeoIP.dat` 会让离线启动依赖可能缺失的文件，所以不这样做。托管配置仅在 `keep-alive-idle`、`keep-alive-interval`、`disable-keep-alive` 三键全部缺省时写入 120 s 空闲和 30 s 间隔（`mihomo.rs::config_with_lan_host`）。路由器的 `TcpExt TCPKeepAlive` 计数从 60 s 内 88 次降为 120 s 内 12 次。构建、拓扑和计数范围见[批次 4](archive/2026-11-12-relay-mihomo-implementation.md#batch-4)。
 
 `mihomo::geoip` 按当前文件保留已载入代码的缓存（范围最多 8 MiB、最多 1024 个代码），解析先读国家代码，不为不需要的国家分配 CIDR 范围；`ranges::subtract` 和 `union` 线性扫描，`v6_only_in_use` 复用已解析的规则目标。这些优化的计时仅来自 Mac release 测试，未在路由器上测时（批次 4）。
 
@@ -154,7 +154,7 @@ guard 修复日志列应用命令或资源描述，例如 `iptables -t nat hook 
 
 启用意图仍在就自动重试：依次等 5、15、30、60 s，此后每 5 min；60 s 内退出连续 3 次，直接进入 5 min 档。稳定后清零；车主关闭使已排队的旧重试失效。开机先等厂商启动同步并回滚上个进程的中继日志，清理孤儿和残留路由；回滚失败且旧路由仍在时，不用该路由启动核心。随后按意图恢复 Mihomo，再重连最近一次符合条件的中继。若 agent 本身意外退出，须由进程外的恢复机制自动拉起，按持久意图恢复可用网络：处理失效的 1053 重定向、拦截、策略路由与 brnf，不等车主操作。恢复不得产生第二个网络 owner、对抗显式停止或与 OTA 试运行/回旧槽竞争。只有已确认的核心故障才走 D3，不能仅靠等待客户端重试消除黑洞。
 
-开机顺序与上面一致：`Mihomo::start` 只发 `Boot`（同一次开机里接管旧表，否则回滚上个进程留下的）；全新启动等 `net-restore` 线程的 `restore`（`wait_for_boot` → 中继 `recover_idle` → `mihomo.restore` → 中继 `restore`，中继连上后再 `mihomo.restore` 一次）。在 Backoff（或撤销待重试的 CleanupPending）中，开机恢复的 `restore` 和一个新的 IPv4 出口都会立即重试，不等 D2 的下一档。重试时没有持有任何效果（启动在取得效果之前就失败了，或接管失败），就重新取得，而不是要求“从 Backoff 恢复”。接管失败时先回滚上一个 agent 的表（`Port::recover`）再进 Backoff；回滚也失败则 CleanupPending 并重试。
+开机顺序与上面一致：`Mihomo::start` 只发 `Boot`（同一次开机里接管旧表，否则回滚上个进程留下的）；全新启动等 `net-restore` 线程的 `restore`（`wait_for_boot` → 中继 `recover_idle` → `mihomo.restore` → 中继 `restore`），其中 `mihomo.restore` 只调用一次。后续由控制器按 D2 定时重试。中继装好路由后通知 Mihomo 检查出口，在 Backoff（或故障撤销待重试的 CleanupPending）中，`egress_while_direct` 观测到有效的新 IPv4 出口时立即重试。重试时没有持有任何效果（启动在取得效果之前就失败了，或接管失败），就重新取得，而不是要求“从 Backoff 恢复”。接管失败时先回滚上一个 agent 的表（`Port::recover`）再进 Backoff；回滚也失败则 CleanupPending 并重试。
 
 ### 5.3 拦截表
 
@@ -168,7 +168,7 @@ rule 模式按订阅顺序编译，select 的实际选择最终到 DIRECT 才可
 
 一次切换分三个可核验的步骤：
 
-1. 对车主可控的写操作，先在同一控制器内登记新代次，收紧旧 DIRECT（拿不准就暂时取消相关绕过），使新连接按新表处理。B31 上存续的 IPA 流未能由 conntrack 清理确认驱逐，状态中的 `hardware_eviction_confirmed` 恒为 false（§4.5）。桥接的模式/选组/规则 provider 写操作遵守同一顺序。例外：`domain` 规则集的刷新不经收紧和换表直接交给核心，因为内核链从不读它，它的名字在 DNS 过滤表里本来就是假地址。
+1. 对车主可控的写操作，先在同一控制器内登记新代次，收紧旧 DIRECT（拿不准就暂时取消相关绕过），使新连接按新表处理。B31 上存续的 IPA 流未能由 conntrack 清理确认驱逐，状态中的 `hardware_eviction_confirmed` 恒为 false（§4.5）。桥接的模式/选组/规则 provider 写操作遵守同一顺序。例外：`domain` 规则集的刷新不经收紧和换表直接交给核心，因为内核链从不读它，它的名字在 DNS 过滤表里本来就是假地址。HTTP 规则集刷新失败后，按配置间隔与 10 分钟之间的较小值重试。
 2. 改核心状态，读回 `/configs`、`/proxies` 及实际 provider；DNS 过滤表变化才热重载。读取、应用或核对失败，保持保守表并重试。外部 provider 的内容、成员或选组可以自主改变。无法在更新前证明始终 DIRECT 的动态范围，从首次开放绕过前就留在核心，或让更新先经过控制器收紧放行；不得等看到文件变化才补救已误放的包。按内容而非 mtime 跟随替换，60 s 兜底只用于核对，不是允许直连的宽限。
 3. 新 DNS/选组/规则确认一致后才扩大允许绕过的范围。客户端用路由器 DNS 先前发出的真实 A **新建连接**，也按新策略处理：对可能切换的域名稳定使用 fake-ip，并覆盖已发出、可能命中不变 DIRECT 前缀的旧地址。无法可靠区分时收起相关绕过；若核心也不能判明可直连，不能回落到 DIRECT。允许因此少用部分硬件加速。清 conntrack、只测新 DNS 回答或固定等几分钟，都不构成旧地址已受保护的证据。
 
@@ -178,7 +178,7 @@ rule 模式按订阅顺序编译，select 的实际选择最终到 DIRECT 才可
 
 `PUT /configs?force=false` 的 JSON `payload` 是完整托管配置，保留实际 mode、log-level、`interface-name` 和 secret；秘密不入日志。`reload::needs_restart` 是纯函数，将热重载不能应用的变化送去计划内重启：经典监听及 LAN 访问设置、外部控制器及认证/TLS/界面设置、QUIC GSO/ECN、入站 TFO/MPTCP，以及删除原有的 `geodata-mode: true`。v1.19.33 的 `ApplyConfig` 暂停新连接，替换代理、规则、provider 和 DNS，不关闭已有连接；`force=false` 保留经典监听。通常继承 fake-ip 映射并按缓存恢复选组，但全新持久缓存的第一次热重载可能清空一次 fake-ip 池，后续重载保留映射（`component/fakeip/pool.go::restoreState`；本机真实核心脚本已复现，未在路由器验证，未作规避）。暂停期间既有 UDP/QUIC 的上行包也可能丢失。
 
-204 只证明入口完成调用：provider 初始化错误可能只写日志，节点组为空时默认 `COMPATIBLE` 可直连。收到 204 后核对实际模式和接口、实际选组及必要 provider（不得意外退回 COMPATIBLE）、监听/下载代理状态；DNS 过滤表改变时还向 1053 查询答案必须改变的测试域名。原成员仍在时选组必须保留；订阅删除了旧成员时核验新选择。核心拒绝重载或核验失败时保持收紧，用已经通过校验的候选重启，不再校验一遍。**订阅内容改变后的 PUT 超时是结果未知，直接走上述重启**；同一源的 DNS 过滤表重载超时仍可由读回证明成功。新核心起不来时，用 `Run.prepared` 中最后应用的配置回退，控制器不再另存 `previous`。失败回退和首次重载丢映射均未在路由器验证；成功刷新及验证范围见批次 4。[配置入口](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/hub/route/configs.go#L405-L454) · [provider 加载](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/hub/executor/executor.go#L318-L338) · [UDP 检查](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/tunnel/tunnel.go#L420-L441)
+204 只证明入口完成调用：provider 初始化错误可能只写日志，节点组为空时默认 `COMPATIBLE` 可直连。收到 204 后核对实际模式和接口、实际选组及必要 provider（不得意外退回 COMPATIBLE）、监听/下载代理状态；DNS 过滤表改变时还向 1053 查询答案必须改变的测试域名。原成员仍在时选组必须保留；订阅删除了旧成员时核验新选择。核心拒绝重载或核验失败时保持收紧，用已经通过校验的候选重启，不再校验一遍。**订阅内容改变后的 PUT 超时是结果未知，直接走上述重启**；同一源的 DNS 过滤表重载超时仍可由读回证明成功。新核心起不来时，用 `Run.prepared` 中最后应用的配置回退，控制器不再另存 `previous`。失败回退和首次重载丢映射均未在路由器验证；成功刷新及验证范围见[批次 4](archive/2026-11-12-relay-mihomo-implementation.md#batch-4)。[配置入口](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/hub/route/configs.go#L405-L454) · [provider 加载](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/hub/executor/executor.go#L318-L338) · [UDP 检查](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/tunnel/tunnel.go#L420-L441)
 
 ### 5.6 出口变化
 
@@ -190,7 +190,7 @@ rule 模式按订阅顺序编译，select 的实际选择最终到 DIRECT 才可
 
 会话发布 `phase`：`idle`、`scanning`、`connecting`、`active`、`recovering`、`disconnecting`、`recovery_pending`。`recovering` 包括等待关联恢复和 agent 启动后的恢复；恢复任务中的实际扫描/连接仍显示对应阶段。`connected` 仍是“有选中的网络且有租约”，不能代替阶段。`recovery_required` 只有在日志尚存、阶段为 `idle` 或 `recovery_pending` 且没有待断开时才为真，操作中不显示“需要恢复”。无读者的恒定顶层字段 `experimental`、`cellular_fallback`、`internet` 已删除，`ipv6.internet` 保留。活动会话上的扫描保留其路由。掉关联由 `Association` 计时：12 s 内（`ASSOCIATION_GRACE`）回来且旧租约及助手仍有效则续约，否则拆除。车主断开、有效地址变更、热点关闭或连接取消走同一拆除路径；撤销失败时日志保留。运行中不后台重连；开机只恢复最近一次符合条件的成功连接，不轮询全部已保存网络。
 
-Disconnect 先更新取消代次和待断开标志，发布 `disconnecting`，走 General lane。控制器工作中立即回 HTTP 200，控制器在处理下一条消息和发布被取消操作的结果之前拆除。控制器空闲时调用方等待拆除回复，可能等热点返回原信道，批次 5 真机为 65.17 s。拆除中的额外断开合并。页面异步接受后写“Disconnect requested”，拆完才写“Relay disconnected”，测量范围见批次 5。
+Disconnect 先更新取消代次和待断开标志，发布 `disconnecting`，走 General lane。控制器工作中立即回 HTTP 200，控制器在处理下一条消息和发布被取消操作的结果之前拆除。控制器空闲时调用方等待拆除回复，可能等热点返回原信道，批次 5 真机为 65.17 s。拆除中的额外断开合并。页面异步接受后写“Disconnect requested”，拆完才写“Relay disconnected”，测量范围见[批次 5](archive/2026-11-12-relay-mihomo-implementation.md#batch-5)。
 
 Connect 从已发布扫描列表校验选择，然后取消待恢复，再取得准入并入队，整个请求共用一个 3 s 等待期限。选择校验只取快照短锁，tick 的设备工作可以同时进行；超时放弃后不会迟到运行设备操作（单元测试 `a_connect_validates_during_tick_and_uses_the_same_wait_without_late_device_work`）。车主 Connect 抢占正在 join 的开机恢复仍未在真机验证。join 的步骤之间、扫描轮次之间和最终发布前检查取消代次。已开始的热点信道切换必须运行到结束，批次 5 曾因在切换内部检查取消而导致撤销被拒，修复和回归见实现记录。
 
@@ -226,51 +226,21 @@ Connect 从已发布扫描列表校验选择，然后取消待恢复，再取得
 
 | 规范 | 代码现状 | 为什么没做 |
 | --- | --- | --- |
-| 中继发布带代次的出口快照（§3） | `Message::Egress` 不带内容，Mihomo 自己观测；租约 DNS 经 `set_subscription_dns` 传给下载器 | 评审 D 第 2 节认为影响小，没有单独安排 |
-| 将其余慢操作移出控制器 | `mihomo -t` 校验已支持异步结果；规则集 PUT、热重载 PUT、nft 加载和 conntrack 清理仍在控制器线程完成 | 这些写入仍须同路由收紧和读回排序 |
-| nft 表的内容核验（§4.2：首次应用、集合变更或异常后核验全量内容） | 只比代次标记和每条链的规则条数 | 评审 E 第 11 条：ZTE 不碰 nft，没有别的写入者，可以接受 |
+| 中继发布带代次的出口快照（§3） | `Message::Egress` 不带内容，Mihomo 自己观测；租约 DNS 经 `set_subscription_dns` 传给下载器 | 接收通知后，控制器按实际可用出口重新观测 |
+| 将其余慢操作移出控制器 | `mihomo-validate` 已按 ticket 和核心 generation 接收结果。规则集 PUT、热重载 PUT、nft 加载和 conntrack 清理仍在控制器线程完成 | 这些写入仍须同路由收紧和读回排序 |
+| nft 表的内容核验（§4.2：首次应用、集合变更或异常后核验全量内容） | 只比代次标记和每条链的规则条数 | B31 的厂商规则走 legacy，`u60_mihomo` 和 `u60_relay` 由 agent 持有 |
 
 批次 5 已完成中继控制器和 `EffectSet`，其中尚待实现的是中继出口快照、IPv6 自己的设备端口，以及门户 RETURN 以外钩子的持续位置约束，后者按 D8 保留厂商后来插到前面的过滤规则，使车主开启的过滤继续生效。
 
-D11 的 B31 公网 CN 下载为 nft 240.3 Mbit/s、CPU 15.0%，legacy 为 249.6 Mbit/s、CPU 17.7%，IPA 两者均卸载。接管旧会话时先标记租约格式、撤销旧日志中的精确 legacy 规则，再加载 nft；旧槽无法接管新版租约，会先执行原有日志恢复再重连。M13 的 B31 标记核验已通过。本段数值来自车主测量。
+nft 的 IPv4 伪装和本机核心出站标记都已启用。接管顺序见[防火墙布局](network-extensions.md#firewall-layout)。旧槽遇到新版租约会按旧日志恢复流程清理，再重连。B31 实测范围见[后续 NAT 与 DNS 标记核验](archive/2026-11-12-relay-mihomo-implementation.md#later-nat-and-dns-mark)。
 
-2026-11-12 批次 4 已完成原表中的“中继会话阶段”和“HTTP 只读快照”，所以从未实现清单移除；验证范围见[实现记录](relay-mihomo-implementation.md#batch-4)。
+2026-11-12 批次 4 已完成原表中的“中继会话阶段”和“HTTP 只读快照”，所以从未实现清单移除；验证范围见[实现记录](archive/2026-11-12-relay-mihomo-implementation.md#batch-4)。
 
 ## 9. 实验过、没有采用的两种接入厂商防火墙的办法（2026-11-12）
 
-两项都在车主的 B31 上做了实验，都是易失的（重启即消失），实验后防火墙规则与实验前逐行相同。记录在
-`measurements/b4-fw3/`（`fwprobe.log`、`nf-nat-warning-times.txt`、`second-masquerade-control.txt`）。
+2026-11-12 的 B31 实验否决了两种做法：
 
-### 9.1 让 fw3 在每次重载后运行我们的脚本
+- **fw3 的 ubus include**：fw3 先执行该脚本，随后厂商 `firewall_init.sh` 又写回 brnf 并清空门户链。现行 guard 在厂商写入后恢复。
+- **把 `ath20` 加入 fw3 `wan` 区**：每次连接会多一次重载和 brnf 中断。厂商转发策略也会放宽上游 IPv6 和端口转发；双伪装并存会导致 B31 丢包。brnf 和门户 RETURN 仍需要独立维护。
 
-- **做法**：`ubus call service add '{"name":…,"data":{"firewall":[{"type":"script","path":…,"family":"any","reload":true}]}}'`。
-  fw3 每次运行都读 procd 的 `firewall` 数据，确实运行了这个脚本；`service delete` 之后数据消失。
-- **结果**：脚本在重载开始后 0.06 秒就运行了，那时 brnf 还是 0、`redirect_chain` 还有我们的 RETURN。厂商的
-  `firewall_init.sh` 排在它之后，又跑了约 3 秒，把 brnf 写成 1、清空 `redirect_chain`。这个版本的 fw3 先运行
-  ubus 提供的 include，再运行 UCI 里的 include。
-- **结论**：没法用它在厂商脚本之后同步补回，所以没有采用。现在的做法（inotify 加 0.5 秒采样）在 brnf 被改后
-  0.2–0.9 秒内改回，RETURN 在重载结束后约 2 秒补回。
-
-### 9.2 让中继站点成为 fw3 `wan` 区的成员
-
-- **做法**：`ubus call network add_dynamic '{"name":"u60relay","proto":"none"}'`，
-  `network.interface.u60relay set_data '{"zone":"wan"}'`，再 `add_device '{"name":"ath20","link-ext":true}'`
-  （`link-ext` 让 netifd 不清空接口上已有的地址和路由）。接口约 1.5 秒后 up，`20-firewall` 自动执行一次
-  `fw3 reload`，fw3 生成了 `zone_wan_input`、`zone_wan_forward`、`zone_wan_dest_ACCEPT -o ath20`、
-  nat `zone_wan_postrouting`（MASQUERADE）和 mangle 的 TCPMSS 规则，IPv4 和 IPv6 都有。
-- **对中继和 IPA 的影响**：没有。站点的地址、关联、路由都没动，中继保持连接；103 MB 下载只有 83 个包走内核
-  （全走 CPU 约 70,857 个），`close_ipa_acce=0`。删掉我们自己的 FORWARD 跳转和 MASQUERADE 之后，新连接正常，
-  51 MB 下载只有 60 个包走内核。`network.interface.u60relay remove` 不影响站点，区规则在下一次 fw3 reload 消失。
-- **没有采用的原因**：
-  1. 能去掉的只有两条转发放行链和 IPv4 MASQUERADE。fw3 reload 本来就不删这些（它只删带 `!fw3` 注释的规则），
-     每次 reload 被改回去的是 brnf 和门户 RETURN，这两样进了区也还是我们自己维护。
-  2. 每次连接多一次 fw3 reload（约 3 秒）。每次 reload 把 brnf 写成 1 两次，各持续 0.3–0.9 秒，这期间 Mihomo 的
-     TPROXY 在桥接路径上失效。
-  3. 两条匹配站点的 MASQUERADE 同时存在时内核报 `nf_nat_setup_info` 警告并丢掉新连接：区规则和我们的规则并存的
-     23 秒里 19 次，其中有 Mihomo 自己发起的连接；去掉我们的规则后是 0 次。对照实验（不进区，只多加一条
-     MASQUERADE）12 秒 9 次。所以两套规则在更新、接管这些过渡时刻绝不能并存。
-  4. fw3 的 `wan` 区比我们现在放得宽：LAN 到上游的 IPv6 不限源地址，厂商的端口转发（`zone_wan_prerouting`）对上游
-     一侧生效。要保持现在的行为，得在 nft 表里补拒绝规则，并重做 `tests/relay-firewall-qa` 的验收。
-  5. 要多管一个 netifd 动态接口的生命周期（netifd 重启会丢掉它，要能发现并重建）。
-- **会得到的好处**：厂商的家长控制和网址过滤（`forwarding_rule`）会像对蜂窝一样对中继流量生效；`fw3 restart`
-  之后转发不用等我们补规则。车主需要这两样时再做，按一次独立的防火墙改版来验收。
+测量、命令和环境见 [fw3 接入实验](archive/2026-11-12-fw3-integration-experiments.md)。

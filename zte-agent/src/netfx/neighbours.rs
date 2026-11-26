@@ -1,5 +1,5 @@
-//! Read the current IPv4 neighbour table with RTM_GETNEIGH. Never use a
-//! partial dump after an interrupt, truncation, or missing NLMSG_DONE.
+//! Read the IPv4 neighbour table and update individual entries through
+//! rtnetlink. A dump must reach `NLMSG_DONE` without interruption or truncation.
 use std::net::Ipv4Addr;
 
 pub struct Entry {
@@ -10,24 +10,14 @@ pub struct Entry {
 
 #[cfg(target_os = "linux")]
 fn open(device: &str) -> Result<(std::os::fd::OwnedFd, u32), String> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
     let device = std::ffi::CString::new(device).map_err(|e| e.to_string())?;
     let index = unsafe { libc::if_nametoindex(device.as_ptr()) };
     let os_error = || std::io::Error::last_os_error().to_string();
     if index == 0 {
         return Err(os_error());
     }
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_ROUTE,
-        )
-    };
-    if fd < 0 {
-        return Err(os_error());
-    }
-    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    let socket = super::netlink::open_route().map_err(|error| error.to_string())?;
     let fd = socket.as_raw_fd();
     let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     kernel.nl_family = libc::AF_NETLINK as _;
@@ -305,6 +295,19 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_neighbour_attribute_rejects_the_dump() {
+        let mut msg = [0; 32];
+        msg[..4].copy_from_slice(&32u32.to_ne_bytes());
+        msg[4..6].copy_from_slice(&28u16.to_ne_bytes());
+        msg[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        msg[16] = 2;
+        msg[20..24].copy_from_slice(&7u32.to_ne_bytes());
+        msg[24..26].copy_from_slice(&2u16.to_ne_bytes());
+        msg[28..30].copy_from_slice(&8u16.to_ne_bytes());
+        assert_eq!(decode(&msg, 7, &mut vec![]), Err("Invalid neighbour attribute".into()));
+    }
+
+    #[test]
     fn interrupted_or_truncated_dumps_are_never_complete() {
         let mut done = [0; 16];
         done[..4].copy_from_slice(&16u32.to_ne_bytes());
@@ -312,6 +315,9 @@ mod tests {
         done[8..12].copy_from_slice(&1u32.to_ne_bytes());
         assert!(decode(&done, 1, &mut vec![]).unwrap());
         assert!(decode(&done[..12], 1, &mut vec![]).is_err());
+        done[8..12].copy_from_slice(&2u32.to_ne_bytes());
+        assert_eq!(decode(&done, 1, &mut vec![]), Err("Interrupted neighbour dump".into()));
+        done[8..12].copy_from_slice(&1u32.to_ne_bytes());
         done[6..8].copy_from_slice(&16u16.to_ne_bytes());
         assert!(decode(&done, 1, &mut vec![]).is_err());
     }

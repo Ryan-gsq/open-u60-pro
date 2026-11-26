@@ -299,7 +299,8 @@ mod tests {
         for other in [Ok("1".to_owned()), Ok("0".into()), Ok("7".into()), Err("no zte_genl".to_owned())] {
             assert!(web_redirect_with(&unheld, |_| other.clone()).is_empty(), "{other:?}");
         }
-        let dir = std::env::temp_dir().join(format!("u60-portal-redirect-{}", std::process::id()));
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-portal-redirect");
+        let dir = temp.path();
         let path = dir.join("dns.json");
         for offline in OFFLINE {
             let mut dns = EffectSet::new("relay", path.clone());
@@ -321,7 +322,6 @@ mod tests {
             }
             crate::net_guard::release(&path.to_string_lossy(), None);
         }
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

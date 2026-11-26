@@ -21,8 +21,8 @@ QA="$(mktemp -d)"
 export QA
 docker build -t u60-relay-ipv6-qa:local zte-agent/tests/relay-ipv6
 python3 zte-agent/tests/relay-ipv6/prepare_openwrt.py "$QA"
-cargo build -p zte-agent --release --target aarch64-unknown-linux-musl
-cargo test -p zte-agent --release --target aarch64-unknown-linux-musl \
+cargo build --locked -p zte-agent --release --target aarch64-unknown-linux-musl
+cargo test --locked -p zte-agent --release --target aarch64-unknown-linux-musl \
   --no-run --message-format=json > "$QA/test-artifacts.jsonl"
 AGENT_TESTS="$(python3 -c '
 import json, os
@@ -50,9 +50,10 @@ firewall. It covers off/no-upstream/start/configure/refresh, recovery when an
 owned finite route is lost, disconnect, reconnect, stale callbacks, IPv6 lease
 withdrawal and restoring the original configuration/main routes.
 
-Use the same command with `-e U60_OPENWRT_QA_MODE=runtime-ra` to run
-`ra_runtime.py`. It uses actual netifd, one odhcpd and a bridge client to assert
-RA prefix/lifetime/MTU/RDNSS, vendor edits+commits, same-boot crash cleanup,
+The default `U60_OPENWRT_QA_MODE=lifecycle` runs the full lifecycle. The only
+other mode is `runtime-ra`. Add `-e U60_OPENWRT_QA_MODE=runtime-ra` to the same
+Docker command to run `ra_runtime.py`. It uses actual netifd, one odhcpd and a
+bridge client to assert RA prefix/lifetime/MTU/RDNSS, vendor edits+commits, same-boot crash cleanup,
 unrelated runtime data and fresh configuration after netifd replacement.
 MTU cases assert 1480 from the upstream, a changed upstream value of 1400,
 and a 1360 LAN cap on a 1480 upstream. The full lifecycle test also changes
@@ -61,10 +62,10 @@ supervisor rebuilds the advertised value without persisting DHCP edits.
 Normal RA operation creates no UCI delta or persistent DHCP write. JSON null
 releases typed overrides; it does not delete keys from netifd's runtime map.
 
-`b31-ra-runtime.sh` is the explicitly gated physical-firmware equivalent:
-push only its named test executable/script into `/tmp/u60-ra-runtime-qa`, then
-invoke over USB. It uses private mount/network namespaces, private config and
-ubus; it never operates physical br-lan, Wi-Fi or SIM. Pull results/*.pcap and
+For a separately authorized B31 USB session with `ANDROID_SERIAL` set, copy
+`$AGENT_TESTS` to `/tmp/u60-ra-runtime-qa/agent-tests` and make it executable.
+Copy `b31-ra-runtime.sh` into the same directory and invoke it over USB. It uses
+private mount/network namespaces, config and ubus. Pull `results/*.pcap` and
 assert decoded packet fields before accepting the adapter. Cleanup unmounts,
 removes namespaces and the `/var/run/netns` mount it caused; archive evidence
 on the computer, check `mount` lists nothing under the QA directory and then
@@ -90,8 +91,19 @@ requires both an explicit environment marker and a disposable-chroot marker.
 `/agent-tests`. It starts real dnsmasq+udhcpc on a veth/bridge, invokes production
 Rust add/remove, asserts the requested fixed lease, refuses a duplicate address,
 and checks unrelated `/etc/ethers` bytes and the dnsmasq PID survive unchanged.
-No physical client or host network is used. The B31 client-renewal and UI test
-still needs a user-connected hotspot client.
+Use the `$AGENT_TESTS` path from the build step above and supply an ARM64
+OpenWrt image with UCI, dnsmasq, udhcpc and namespace-capable `ip` as
+`$OPENWRT_QA_IMAGE`. The Debian QA image uses OpenWrt only inside the chroot
+for the lifecycle and runtime-RA checks.
+
+```sh
+docker run --rm --privileged --network none \
+  -v "$PWD/zte-agent/tests/relay-ipv6:/qa:ro" \
+  -v "$AGENT_TESTS:/agent-tests:ro" \
+  --entrypoint /bin/sh "$OPENWRT_QA_IMAGE" /qa/reservations.sh
+```
+
+The B31 client-renewal and UI test still needs a user-connected hotspot client.
 
 ## Include the real port-9090 panel
 
@@ -109,7 +121,7 @@ Keep credentials in a mode-0600 file, not command history, logs or this repo.
 
 Verify from a LAN client (not merely ADB forwarding): login, Router, Relay and
 Mihomo setup; then exercise the real browser scan/connect/disconnect forms,
-Clash start/stop, Zashboard direct entry without Setup, and old-link refusal when
+Mihomo start/stop, Zashboard direct entry without Setup, and old-link refusal when
 off. Require dual-stack TCP/UDP local DNS readiness, inspect recovery state and
 confirm the original AP geometry/DHCP settings and cellular enable value after
 cleanup. An authenticated desktop browser through USB can supplement this with

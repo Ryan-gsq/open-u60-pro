@@ -357,6 +357,18 @@ fn saved_string(value: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(super) fn b31_listing_sections() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
+    [
+        include_str!("../../net_tools/testdata/iptables-v4.txt"),
+        include_str!("../../net_tools/testdata/iptables-v6.txt"),
+    ].into_iter().flat_map(|text| text.split("### ").skip(1)).map(|section| {
+        let (header, listing) = section.split_once('\n').unwrap();
+        let (program, table) = header.split_once(" -t ").unwrap();
+        (program, table, listing.trim())
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     const LOCKED: (i32, &str) = (4, "Another app is currently holding the xtables lock.");
@@ -378,6 +390,26 @@ mod tests {
         let tcp = rule(false, "U60_RELAY_FWD", &["-i", "ath20", "-o", "br-lan", "-p", "tcp", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]).unwrap();
         assert_ne!(full, tcp);
         assert_ne!(rule(false, "X", &["-p", "udp", "--sport", "67", "--dport", "68", "-j", "ACCEPT"]), rule(false, "X", &["-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT"]));
+    }
+
+    #[test]
+    fn listed_matches_owned_rules_in_the_b31_captures_without_conflating_tcp() {
+        let cases = [
+            ("iptables", "nat", "POSTROUTING", "-o ath20 -m comment --comment zte-agent-wifi-relay -j MASQUERADE"),
+            ("iptables", "filter", "U60_RELAY_FWD", "-i ath20 -o br-lan -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"),
+            ("iptables", "filter", "U60_RELAY_FWD", "-i ath20 -o br-lan -p tcp -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"),
+            ("ip6tables", "filter", "U60_R6_IN", "-s fe80::/10 -p ipv6-icmp --icmpv6-type 134 -m hl --hl-eq 255 -j ACCEPT"),
+            ("ip6tables", "filter", "U60_RELAY_IN", "-j U60_R6_IN"),
+        ];
+        let mut previous = String::new();
+        for (program, table, chain, rule) in cases {
+            let (_, _, text) = b31_listing_sections().find(|section| (section.0, section.1) == (program, table)).unwrap();
+            let args: Vec<_> = rule.split_whitespace().map(String::from).collect();
+            let line = listed(program == "ip6tables", chain, &args).unwrap();
+            assert_eq!(text.lines().filter(|listed| *listed == line).count(), 1, "{line}");
+            assert_ne!(previous, line);
+            previous = line;
+        }
     }
 
     /// iptables as far as an undo sees it: per table, chains holding their

@@ -181,7 +181,7 @@ impl Ctrl {
         crate::httpd::gate::debug_assert_may_block();
         let mut nonce = [0u8; 8];
         getrandom::getrandom(&mut nonce).map_err(|_| "Cannot open Wi-Fi control")?;
-        let local = dir.join(format!("ctrl-{}", nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+        let local = dir.join(format!("ctrl-{}", crate::common::hex_lower(&nonce)));
         let socket = UnixDatagram::bind(&local).map_err(|_| "Cannot open Wi-Fi control")?;
         let ctrl = Self { socket, local, attached: false, answer, events: VecDeque::new(), buf: vec![0; 16 * 1024] };
         ctrl.socket.connect(server).map_err(|_| "Wi-Fi control is unavailable")?;
@@ -364,16 +364,10 @@ mod tests {
         assert_eq!(run(&mut Refusing, &Channels::parse(CHANNELS).plan(), || Ok(())).unwrap_err(), "Wi-Fi scan was refused");
     }
 
-    fn socket_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("u60-ctrl-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn status_is_one_plain_request_like_wpa_cli() {
-        let dir = socket_dir("status");
+        let temp = crate::wifi_relay::test_dir::TestDir::new("status");
+        let dir = temp.path();
         let server = UnixDatagram::bind(dir.join("ath20")).unwrap();
         let supplicant = std::thread::spawn(move || {
             let mut buf = [0u8; 256];
@@ -388,18 +382,17 @@ mod tests {
         assert_eq!(crate::net_tools::key(&reply, "wpa_state"), Some("COMPLETED"));
         assert_eq!(supplicant.join().unwrap(), ("STATUS".to_owned(), None));
         assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| e.file_name() == "ath20"), "the client socket is removed");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn unreachable_or_silent_supplicants_fail_the_status_within_its_bound() {
-        let dir = socket_dir("silent");
+        let temp = crate::wifi_relay::test_dir::TestDir::new("silent");
+        let dir = temp.path();
         assert!(status(&dir.join("ath20"), &dir).is_err(), "no supplicant socket");
         let _silent = UnixDatagram::bind(dir.join("ath20")).unwrap();
         let started = Instant::now();
         assert_eq!(status(&dir.join("ath20"), &dir).unwrap_err(), "Wi-Fi control did not answer");
         let waited = started.elapsed();
         assert!(waited >= STATUS_WAIT && waited < STATUS_WAIT + Duration::from_secs(1), "{waited:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,6 +1,6 @@
 # Mihomo tables and journal: isolated Linux acceptance (v2)
 
-Disposable checks for `relay-mihomo-refactor-plan.md` v2 that need a real
+Disposable checks for [v2 of the refactor plan](../../docs/archive/2026-11-10-relay-mihomo-refactor-plan.md#v2) that need a real
 Linux kernel and real `nft`/`ip`, but no router and no Mihomo core: the
 exact table batches the agent loads (exported from the production
 generators), a transparent listener standing in for the core, and the
@@ -10,25 +10,28 @@ order as `ef58bd4`. Before sending test traffic it waits for the IPv6
 gateway's neighbour entry, avoiding an occasional first-packet failure.
 **Never run this on the U60, a host or a
 shared container**: it creates network namespaces and changes their
-routing. Use a disposable Docker VM (`--privileged --network none`).
+routing. Use a disposable ARM64 Linux Docker VM (`--privileged --network none`).
+The fixture, shared namespace helper, export and both agent binaries are mounted
+read-only.
 
 ```sh
 QA="$(mktemp -d)"
-U60_MIHOMO_QA="$QA" cargo test -p zte-agent export_for_isolated_linux_acceptance -- --ignored
+U60_MIHOMO_QA="$QA" cargo test --locked -p zte-agent export_for_isolated_linux_acceptance -- --ignored
 cargo build --locked --release --target aarch64-unknown-linux-musl -p zte-agent
 # The previous agent (the one an update may roll back to), built the same way
 # from `git archive <commit>` into its own target directory: $OLD_AGENT.
 docker build -t u60-relay-ipv6-qa:local zte-agent/tests/relay-ipv6
 docker run --rm --privileged --network none \
+  -e PYTHONPATH=/qa-common -e PYTHONDONTWRITEBYTECODE=1 \
+  -v "$PWD/zte-agent/tests/qa_netns.py:/qa-common/qa_netns.py:ro" \
   -v "$PWD/zte-agent/tests/mihomo-qa:/qa:ro" -v "$QA:/qa-data:ro" \
   -v "$PWD/target/aarch64-unknown-linux-musl/release/zte-agent:/new-agent:ro" \
   -v "$OLD_AGENT:/old-agent:ro" \
   u60-relay-ipv6-qa:local python3 /qa/qa.py
 ```
 
-The final batch 5 run passed 23/23 checks in isolated Linux
-(`measurements/b5-final/summary.txt` beside the handoff). It covers the
-following cases.
+The [final batch 5 run](../../docs/archive/2026-11-12-relay-mihomo-implementation.md#batch-5) passed 23/23 checks in
+isolated Linux on the batch 5 build. The current harness covers the following cases.
 
 - Every exported batch loads with the real `nft` and its generation marker
   reads back from both families with `nft -t`; a batch whose IPv6 half is
@@ -49,7 +52,8 @@ following cases.
 
 The `qa.py` checks above do not cover the real core (DNS, fake-ip, provider
 refreshes), IPA or ZTE's firewall rewrites. The local real-core check below
-has a separate, narrower scope; it does not replace device acceptance.
+has a separate, narrower scope. The [relay firewall harness](../relay-firewall-qa/README.md)
+uses this suite’s export for dual-service DNS and portal checks.
 
 ## Real-core hot reload (2026-11-12)
 
@@ -81,4 +85,4 @@ fake-ip pool on the first reload with a brand-new persistent cache
 locally and is not worked around. This script does not test the agent's
 controller/fallback, nft TPROXY, UDP/QUIC continuity, provider failures, long-run
 memory or the router's IPA. Router refresh evidence, unit-test coverage and
-remaining gaps are in [implementation batch 4](../../docs/relay-mihomo-implementation.md#batch-4).
+remaining gaps are in [implementation batch 4](../../docs/archive/2026-11-12-relay-mihomo-implementation.md#batch-4).

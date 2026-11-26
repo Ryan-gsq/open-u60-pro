@@ -1,5 +1,5 @@
 // Real-browser configuration tests. All writes terminate at this local fake router.
-const {chromium} = require('playwright');
+const {launchChrome,capture}=require('./browser.cjs');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
@@ -56,7 +56,7 @@ const path = require('node:path');
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const heart = setInterval(()=>{for(const stream of streams)stream.write(': heartbeat\n\n');},1000);
-  const browser = await chromium.launch({headless:true,channel:'chrome'}), context = await browser.newContext({viewport:{width:1440,height:1100}}), page = await context.newPage();
+  const browser = await launchChrome(), context = await browser.newContext({viewport:{width:1440,height:1100}}), page = await context.newPage();
   const errors=[];page.on('pageerror',error=>errors.push(error.message));
   const go = async key=>{await page.evaluate(key=>OpenU60Navigation.go(key),key);await page.waitForFunction(key=>document.documentElement.dataset.route === key,key);};
   const feedback = id=>page.locator(`#${id} .action-status`);
@@ -127,7 +127,7 @@ const path = require('node:path');
   for(const width of [320,390,768,820,1440]) for(const theme of ['light','dark']) {
     await page.setViewportSize({width,height:1000});await go('settings/appearance');await page.locator(`input[name=appearance][value=${theme}]`).check();
     for(const key of ['network/wifi','network/mobile','network/apn','network/bands','sms/compose','sms/inbox','settings/device']) {await go(key);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`${key} overflow at ${width} ${theme}`);}
-    if([390,820,1440].includes(width)) {await go('network/wifi');await page.evaluate(()=>scrollTo({top:0,behavior:'instant'}));await page.screenshot({path:`/tmp/zte-controls-${theme}-${width}.png`});}
+    if([390,820,1440].includes(width)) {await go('network/wifi');await page.evaluate(()=>scrollTo({top:0,behavior:'instant'}));await capture(page,{path:`zte-controls-${theme}-${width}.png`});}
   }
   await go('network/wifi');await page.locator('#wifi-config-key_2g').fill('unsavedpassword');rejectAuth=true;await page.locator('#wifi-config-ssid_2g').fill('Auth expired');await save('wifi-config');await page.waitForFunction(()=>document.querySelector('#login-dialog').open);assert.equal(await page.locator('#wifi-config-key_2g').inputValue(),'');assert.equal(await page.locator('#sms-compose-message').inputValue(),'');assert.equal(await page.locator('#wifi-config fieldset').evaluate(fieldset=>fieldset.disabled),true);
   assert.deepEqual(errors,[]);

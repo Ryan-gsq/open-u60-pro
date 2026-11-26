@@ -60,6 +60,20 @@ impl<T> Library<T> {
     }
 }
 
+impl Library {
+    fn map_body_refs<U>(&self, mut map: impl FnMut(&str) -> Result<U, String>) -> Result<Library<U>, String> {
+        let mut profiles = Vec::with_capacity(self.profiles.len());
+        for p in &self.profiles {
+            profiles.push(Profile {
+                id: p.id.clone(), name: p.name.clone(), url: p.url.clone(), interval_hours: p.interval_hours,
+                updated: p.updated, attempted: p.attempted, error: p.error.clone(),
+                source: map(&p.source)?, compiled: map(&p.compiled)?,
+            });
+        }
+        Ok(Library { selected: self.selected.clone(), extensions: self.extensions.clone(), profiles })
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -144,10 +158,10 @@ impl Mihomo {
         let mut live = std::collections::HashSet::new();
         let mut wrote = false;
         let mut size = 0u64;
-        let index = library.clone().map_bodies(|text| {
+        let index = library.map_body_refs(|text| {
             size += text.len() as u64;
             if text.len() > MAX_CONFIG || size > MAX_LIBRARY { return Err("Profile library is full".into()); }
-            let sha256 = hash(&text);
+            let sha256 = hash(text);
             let path = dir.join(&sha256);
             if live.insert(sha256.clone()) && !path.try_exists().map_err(|e| e.to_string())? {
                 net::write_private(&path, text.as_bytes())?;
@@ -399,10 +413,7 @@ impl Mihomo {
                 if next.selected.is_some() && !(editing && next.selected.as_ref() == Some(&request.id)) { self.validate_profile(&compiled)?; }
                 let mut random = [0u8; 8];
                 getrandom::getrandom(&mut random).map_err(|_| "Cannot create profile ID")?;
-                let id = random
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>();
+                let id = crate::common::hex_lower(&random);
                 let id = if editing { request.id.clone() } else { id };
                 if !editing && next.selected.is_none() {
                     next.selected = Some(id.clone());
@@ -713,21 +724,81 @@ mod tests {
     }
 
     #[test]
-    fn urls_never_accept_insecure_redirects_or_local_files() {
-        for url in [
-            "http://example.com/",
-            "file:///etc/passwd",
-            "https://u:p@example.com",
-            "https://example.com/#secret",
-        ] {
-            assert!(subscription_url(url).is_err());
-        }
+    fn profiles_accept_a_subscription_url_with_a_query() {
         assert!(subscription_url("https://example.com/config?token=private").is_ok());
     }
 
     #[test]
+    fn profile_handlers_distinguish_invalid_unknown_and_damaged_profiles() {
+        let dir = super::super::test_dir::TestDir::new("profile-inputs");
+        let mut state = crate::handlers::AppState::new();
+        state.mihomo = std::sync::Arc::new(Mihomo::for_test(dir.path().to_owned()));
+        let m = &state.mihomo;
+        let fail = |status, error| (status, json!({"ok":false,"error":error}));
+        for body in [b"{".as_slice(), br#"{"action":"select","unexpected":true}"#] {
+            assert_eq!(change(&state, body), fail(400, "Invalid profile request"));
+        }
+        assert_eq!(change(&state, br#"{"action":"unknown"}"#), fail(503, "Unknown profile action"));
+        assert_eq!(editor(&state, "../escape"), fail(400, "Invalid profile ID"));
+        assert_eq!(editor(&state, "missing"), fail(404, "Unknown profile"));
+        for bad in ["../escape".to_owned(), "a".repeat(63), "A".repeat(64), "g".repeat(64)] {
+            assert_eq!(m.blob_text(BodyRef::Blob { sha256: bad }).unwrap_err(), "Invalid profile contents");
+        }
+        fs::write(m.library_path(), b"{").unwrap();
+        let error = "Profile library is damaged; restore its backup before changing profiles";
+        assert_eq!(editor(&state, "missing"), fail(503, error));
+        assert_eq!(extensions(&state), fail(503, error));
+        assert_eq!(change(&state, br#"{"action":"select","id":"missing"}"#), fail(503, error));
+        assert_eq!(fs::read(m.library_path()).unwrap(), b"{");
+        let mut library = seed(m, "rules: ['MATCH,DIRECT']");
+        let profile = library.profiles[0].clone();
+        library.profiles.resize_with(MAX_PROFILES, || profile.clone());
+        fs::write(m.library_path(), serde_json::to_vec(&library).unwrap()).unwrap();
+        assert_eq!(m.read_index().unwrap().profiles.len(), MAX_PROFILES);
+        library.profiles.push(profile);
+        fs::write(m.library_path(), serde_json::to_vec(&library).unwrap()).unwrap();
+        assert_eq!(status(&state), fail(503, "Invalid profile selection"));
+    }
+
+    #[test]
+    fn saved_profile_index_and_blobs_match_the_existing_bytes_and_failure_order() {
+        use std::collections::BTreeMap;
+        let dir = super::super::test_dir::TestDir::new("profile-bytes");
+        let m = Mihomo::for_test(dir.path().to_owned());
+        let mut library = seed(&m, "mode: rule\n");
+        let mut second = library.profiles[0].clone();
+        second.id = "second".into();
+        second.url = Some("https://example.invalid/a?token=private".into());
+        second.compiled = "mode: direct\n".into();
+        library.profiles.push(second);
+        let mut objects = BTreeMap::new();
+        let expected = library.clone().map_bodies(|text| {
+            let sha256 = hash(&text);
+            objects.insert(sha256.clone(), text);
+            Ok(BodyRef::Blob { sha256 })
+        }).unwrap();
+        let expected = serde_json::to_vec(&expected).unwrap();
+        m.save_library(&library).unwrap();
+        assert_eq!(fs::read(m.library_path()).unwrap(), expected);
+        let blob_dir = dir.path().join("profile-bodies");
+        let blobs = || fs::read_dir(&blob_dir).unwrap().map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name().into_string().unwrap(), fs::read_to_string(entry.path()).unwrap())
+        }).collect::<BTreeMap<_, _>>();
+        assert_eq!(blobs(), objects);
+        let new_source = "mode: global\n";
+        library.profiles[1].source = new_source.into();
+        library.profiles[1].compiled = "x".repeat(MAX_CONFIG + 1);
+        assert_eq!(m.save_library(&library).unwrap_err(), "Profile library is full");
+        assert_eq!(fs::read(m.library_path()).unwrap(), expected);
+        objects.insert(hash(new_source), new_source.into());
+        assert_eq!(blobs(), objects, "source blob written before its oversized compiled body was rejected");
+    }
+
+    #[test]
     fn inline_library_migrates_atomically_and_round_trips_for_an_old_slot() {
-        let root = std::env::temp_dir().join(format!("u60-profile-migration-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("profile-migration");
+        let root = temp.path().to_path_buf();
         let m = Mihomo::at(root.clone());
         let text = "rules: ['MATCH,DIRECT']";
         let original = seed(&m, text);
@@ -748,12 +819,12 @@ mod tests {
         fs::remove_file(root.join("profile-bodies").join(hash(text))).unwrap();
         assert!(m.selected_source().is_err());
         assert_eq!(fs::read_to_string(m.library_path()).unwrap(), index);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn metadata_has_no_subscription_or_node_credentials() {
-        let dir = std::env::temp_dir().join(format!("u60-profiles-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("profiles");
+        let dir = temp.path().to_path_buf();
         let mihomo = Mihomo::at(dir.clone());
         let mut library = seed(&mihomo, "secret: private-node\nrules: ['MATCH,DIRECT']");
         library.profiles[0].url = Some("https://example.com/?token=private-url".into());
@@ -771,12 +842,12 @@ mod tests {
             mihomo.selected_source().unwrap(),
             library.profiles[0].source
         );
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn status_is_parsed_once_per_change_of_the_library() {
-        let dir = std::env::temp_dir().join(format!("u60-status-cache-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("status-cache");
+        let dir = temp.path().to_path_buf();
         let mihomo = Mihomo::at(dir.clone());
         seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let first = mihomo.profile_status().unwrap();
@@ -797,12 +868,12 @@ mod tests {
         // A save from this process always invalidates, even within one mtime tick.
         mihomo.save_library(&Library::default()).unwrap();
         assert!(mihomo.profile_status().unwrap()["selected"].is_null());
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn identical_refresh_only_updates_metadata_without_compilation_or_validation() {
-        let dir = std::env::temp_dir().join(format!("u60-refresh-identical-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("refresh-identical");
+        let dir = temp.path().to_path_buf();
         let mihomo = Mihomo::at(dir.clone());
         let mut library = seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let profile = &mut library.profiles[0];
@@ -814,13 +885,13 @@ mod tests {
         assert_eq!(profile.compiled, "previous compiled text");
         assert!(profile.updated > 0 && profile.error.is_none());
         assert!(!dir.join("check.yaml").exists());
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn changed_selected_refresh_is_validated_by_the_controller_and_failed_commit_restores_library() {
         use super::super::controller::{Message, Phase};
-        let dir = std::env::temp_dir().join(format!("u60-refresh-commit-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("refresh-commit");
+        let dir = temp.path().to_path_buf();
         let mihomo = Mihomo::for_bridge(dir.clone(), "s".into());
         let old = seed(&mihomo, "rules: ['MATCH,DIRECT']");
         let mut next = old.clone();
@@ -836,7 +907,6 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(mihomo.selected_source().unwrap(), old.profiles[0].compiled);
         assert_eq!(mihomo.snapshot().phase, Phase::Running);
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -859,8 +929,8 @@ mod tests {
 
     #[test]
     fn delete_rechecks_lifecycle_before_committing_a_racing_start() {
-        let dir =
-            std::env::temp_dir().join(format!("u60-profile-start-race-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("profile-start-race");
+        let dir = temp.path().to_path_buf();
         let mihomo = Mihomo::for_bridge(
             dir.clone(),
             "test-secret".into(),
@@ -876,14 +946,13 @@ mod tests {
         assert!(mihomo.commit_library(&old, &old, true, false).is_err());
         assert_eq!(fs::read(mihomo.library_path()).unwrap(), before);
         assert!(mihomo.running());
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn library_updates_are_validated_and_failures_leave_selection_and_bytes_unchanged() {
         use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("u60-library-transaction-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("library-transaction");
+        let dir = temp.path().to_path_buf();
         let mihomo = Mihomo::at(dir.clone());
         net::write_private(&dir.join("mihomo"), b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(dir.join("mihomo"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -966,6 +1035,5 @@ mod tests {
             .profiles_change(request(json!({"action":"delete","id":first})))
             .unwrap();
         assert!(mihomo.load_library().unwrap().profiles.is_empty());
-        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -406,16 +406,10 @@ mod netlink {
 
     #[cfg(target_os = "linux")]
     fn ask(to: IpAddr) -> Option<Answer> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::fd::AsRawFd;
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // SAFETY: plain socket(2); the descriptor is owned (closed) below.
-        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: `fd` is a new descriptor nothing else owns.
-        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        let socket = crate::netfx::netlink::open_route().ok()?;
         let timeout = libc::timeval { tv_sec: 2, tv_usec: 0 };
         // SAFETY: a valid descriptor and a `timeval` of the size given.
         unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, std::ptr::from_ref(&timeout).cast(), std::mem::size_of::<libc::timeval>() as libc::socklen_t) };
@@ -851,8 +845,9 @@ mod tests {
     /// Inside a Linux namespace (`tests/mihomo-qa`, or any disposable
     /// container with `iproute2`): the kernel's answer over rtnetlink is what
     /// `ip -j route get` and `ip -j addr show` say.
+    #[cfg(target_os = "linux")]
     #[test]
-    #[ignore]
+    #[ignore = "requires iproute2 and a disposable Linux namespace with an IPv4 default route"]
     fn isolated_netlink_observation_matches_ip() {
         let observed = Uplink::observe(false);
         let routes = [("-4", PROBES[0]), ("-6", PROBES[1])].map(|(family, to)| Cmd::new("ip", &["-j", family, "route", "get", to]).run().ok().and_then(|s| Uplink::route(&s)));

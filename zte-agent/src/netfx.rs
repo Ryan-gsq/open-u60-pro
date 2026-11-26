@@ -1,9 +1,12 @@
 //! The agent's single writer of router network state
-//! (`zte-agent/docs/relay-mihomo-architecture.md`, section 4): bounded tool
-//! runs (`exec`), private files (`files`), the registry of every name and
-//! number the network features use (`ids`), the only conntrack writer
-//! (`conntrack`), owned nftables tables (`effect`) and admission of
-//! conflicting owner writes (`admission`).
+//! (`zte-agent/docs/relay-mihomo-architecture.md`, section 4). `EffectSet`
+//! manages legacy firewall chains and hooks, routes, policy rules, addresses,
+//! sysctls, internal steps and nftables tables (`effect`). `neighbours` reads
+//! and updates IPv4 neighbour entries. On Linux, `netlink` opens the routing
+//! socket used by neighbour and egress queries. The other modules cover bounded
+//! tool runs (`exec`), private files (`files`), shared resource names and numbers
+//! (`ids`), conntrack deletion (`conntrack`) and admission of conflicting owner
+//! writes (`admission`).
 
 pub mod admission;
 pub mod conntrack;
@@ -11,6 +14,8 @@ pub mod effect;
 pub mod exec;
 pub mod files;
 pub mod neighbours;
+#[cfg(target_os = "linux")]
+pub(crate) mod netlink;
 pub mod ids;
 
 use crate::boottime::{BootClock, Clock};

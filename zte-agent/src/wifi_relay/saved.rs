@@ -22,7 +22,7 @@ struct Saved {
 
 pub(super) fn key(ssid: &str, security: &str) -> String {
     let hash = Sha256::digest(format!("{security}\0{ssid}"));
-    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
+    crate::common::hex_lower(&hash[..8])
 }
 
 fn load(root: &Path) -> Result<Vec<Saved>, String> {
@@ -115,22 +115,21 @@ mod tests {
     /// passwords, and the status never carries a password.
     #[test]
     fn an_unchecked_remember_stores_nothing_and_passwords_stay_private() {
-        let root = std::env::temp_dir().join(format!("u60-saved-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-saved");
+        let root = temp.path();
         std::fs::write(root.join("saved-wifi.json"), r#"[{"ssid":"Home","security":"wpa2","password":"private-password"},{"ssid":"Cafe","security":"wpa2","password":""}]"#).unwrap();
-        let stored = load(&root).unwrap();
+        let stored = load(root).unwrap();
         assert_eq!((stored[0].password.as_str(), stored.len()), ("private-password", 2));
         let network = Network { id: "scan".into(), ssid: "Other".into(), security: "wpa2", bssid: "02:00:00:00:00:01".into(), frequency: 5260, supported: true, signal: -40 };
-        remember_at(&root, &network, None).unwrap();
-        assert_eq!(load(&root).unwrap().len(), 2, "an unchecked Remember stores nothing");
-        remember_at(&root, &network, Some("other-password")).unwrap();
+        remember_at(root, &network, None).unwrap();
+        assert_eq!(load(root).unwrap().len(), 2, "an unchecked Remember stores nothing");
+        remember_at(root, &network, Some("other-password")).unwrap();
         let text = std::fs::read_to_string(root.join("saved-wifi.json")).unwrap();
         assert!(text.contains("private-password") && text.contains("other-password"));
         let mut status = json!({"networks":[{"ssid":"Home","security":"wpa2"},{"ssid":"Cafe","security":"wpa2"}]});
-        annotate_with(&mut status, &load(&root).unwrap());
+        annotate_with(&mut status, &load(root).unwrap());
         assert_eq!((status["networks"][0]["remembered"].as_bool(), status["networks"][1]["remembered"].as_bool()), (Some(true), Some(false)));
         assert!(!status.to_string().contains("private-password"));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -150,14 +149,15 @@ mod tests {
     #[test]
     fn saved_credentials_survive_reload_with_private_permissions_and_can_be_forgotten() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("u60-remembered-{}", std::process::id()));
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-remembered");
+        let root = temp.path();
         let saved = vec![Saved {
             ssid: "Test".into(),
             security: "wpa2".into(),
             password: "qa-password".into(),
         }];
-        write(&root, &saved).unwrap();
-        assert_eq!(load(&root).unwrap()[0].password, "qa-password");
+        write(root, &saved).unwrap();
+        assert_eq!(load(root).unwrap()[0].password, "qa-password");
         assert_eq!(
             std::fs::metadata(root.join("saved-wifi.json"))
                 .unwrap()
@@ -167,11 +167,10 @@ mod tests {
             0o600
         );
         assert_eq!(
-            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        write(&root, &[]).unwrap();
-        assert!(load(&root).unwrap().is_empty());
-        std::fs::remove_dir_all(root).unwrap();
+        write(root, &[]).unwrap();
+        assert!(load(root).unwrap().is_empty());
     }
 }

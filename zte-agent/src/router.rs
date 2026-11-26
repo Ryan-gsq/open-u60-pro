@@ -6,6 +6,15 @@ use std::sync::Mutex;
 use crate::handlers::AppState;
 use crate::ubus;
 
+use ports::{
+    build_port_forward_switch_payload, build_port_mapping_write, normalize_port_rules,
+    reviewed_port_rules_match,
+};
+use qos::{
+    build_legacy_qos_switch_payload, build_legacy_router_qos_payload, build_qos_mode_payload,
+    normalize_legacy_qos_para, qos_data_from_smart_mode,
+};
+
 pub fn router_dns_get(_state: &AppState) -> (u16, Value) {
     match ubus::call("zwrt_router.api", "router_get_dns_para", Some("{}")) {
         Ok(data) => {
@@ -442,8 +451,15 @@ pub fn router_qos_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
 }
 
 fn read_smart_qos_mode() -> Option<String> {
-    ubus::committed_option("zwrt_smart_mng", "smart_qos", "mode")
-        .or_else(|| ubus::uci_get("zwrt_smart_mng.smart_qos.mode").ok())
+    read_smart_qos_mode_with(ubus::committed_option, ubus::uci_get)
+}
+
+fn read_smart_qos_mode_with(
+    committed: impl FnOnce(&str, &str, &str) -> Option<String>,
+    uci_get: impl FnOnce(&str) -> Result<String, String>,
+) -> Option<String> {
+    committed("zwrt_smart_mng", "smart_qos", "mode")
+        .or_else(|| uci_get("zwrt_smart_mng.smart_qos.mode").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -721,35 +737,6 @@ fn strict_compute_dhcp_end(base_ip: &str, netmask: &str, start: &str, limit: &st
     Some(Ipv4Addr::from(network.checked_add(end)?).to_string())
 }
 
-fn reviewed_port_rules_match(expected: &Value, current: &Value, id: &str) -> bool {
-    let Some(rules) = current.get("rule_list").and_then(Value::as_array) else {
-        return false;
-    };
-    if !rules.iter().all(Value::is_object) {
-        return false;
-    }
-    if current.get("rule_list") != Some(expected) {
-        return false;
-    }
-    if id.is_empty() {
-        return false;
-    }
-    rules
-        .iter()
-        .enumerate()
-        .filter(|(index, rule)| {
-            let reported = rule.get("id");
-            match reported {
-                Some(Value::String(value)) => value == id,
-                Some(Value::Number(value)) => value.to_string() == id,
-                None | Some(Value::Null) => index.to_string() == id,
-                _ => false,
-            }
-        })
-        .count()
-        == 1
-}
-
 fn parse_switch_flag(value: &Value) -> Option<i64> {
     match value {
         Value::Bool(flag) => Some(i64::from(*flag)),
@@ -782,14 +769,6 @@ fn value_as_id_string(value: &Value) -> Option<String> {
             }
         }
         Value::Number(number) if number.is_i64() || number.is_u64() => Some(number.to_string()),
-        _ => None,
-    }
-}
-
-fn value_as_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
         _ => None,
     }
 }
@@ -865,44 +844,6 @@ fn validate_lan_host(
     Ok(())
 }
 
-fn parse_single_port(raw: &str) -> Option<u16> {
-    if raw.is_empty() || raw.len() > 5 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let port = raw.parse::<u16>().ok()?;
-    (port >= 1).then_some(port)
-}
-
-fn parse_port_spec(value: &Value) -> Result<String, &'static str> {
-    match value {
-        Value::Number(number) => {
-            let port = number.as_u64().ok_or("invalid port")?;
-            if !(1..=65535).contains(&port) {
-                return Err("port must be between 1 and 65535");
-            }
-            Ok(port.to_string())
-        }
-        Value::String(text) => {
-            let trimmed = text.trim();
-            if let Some((start_raw, end_raw)) = trimmed.split_once('-') {
-                if end_raw.contains('-') {
-                    return Err("invalid port range");
-                }
-                let start = parse_single_port(start_raw).ok_or("invalid port range")?;
-                let end = parse_single_port(end_raw).ok_or("invalid port range")?;
-                if start > end {
-                    return Err("invalid port range");
-                }
-                Ok(format!("{start}-{end}"))
-            } else {
-                let port = parse_single_port(trimmed).ok_or("port must be between 1 and 65535")?;
-                Ok(port.to_string())
-            }
-        }
-        _ => Err("invalid port"),
-    }
-}
-
 fn validate_safe_label(text: &str, max_bytes: usize, err: &'static str) -> Result<(), &'static str> {
     if text.len() > max_bytes {
         return Err(err);
@@ -917,27 +858,6 @@ fn validate_safe_label(text: &str, max_bytes: usize, err: &'static str) -> Resul
         return Err(err);
     }
     Ok(())
-}
-
-fn parse_src_ip_spec(raw: &str) -> Result<String, &'static str> {
-    let trimmed = raw.trim();
-    if let Some((ip_part, prefix_part)) = trimmed.split_once('/') {
-        let ip = parse_usable_unicast_ipv4(ip_part).map_err(|_| "invalid src_ip")?;
-        if prefix_part.is_empty()
-            || prefix_part.len() > 2
-            || !prefix_part.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err("invalid src_ip");
-        }
-        let prefix: u8 = prefix_part.parse().map_err(|_| "invalid src_ip")?;
-        if !(1..=32).contains(&prefix) {
-            return Err("invalid src_ip");
-        }
-        Ok(format!("{ip}/{prefix}"))
-    } else {
-        let ip = parse_usable_unicast_ipv4(trimmed).map_err(|_| "invalid src_ip")?;
-        Ok(ip.to_string())
-    }
 }
 
 fn parse_switch_from_keys(
@@ -1168,330 +1088,6 @@ fn normalize_protocol_from_firmware(raw: &str) -> String {
     }
 }
 
-fn protocol_to_firmware(raw: &str) -> Result<&'static str, &'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "tcp" => Ok("tcp"),
-        "udp" => Ok("udp"),
-        "tcp+udp" | "tcp udp" | "udp tcp" | "tcp_udp" | "tcp/udp" | "tcpudp" | "both" | "all" => {
-            Ok("tcp udp")
-        }
-        _ => Err("invalid protocol"),
-    }
-}
-
-fn normalize_port_rule_entry(
-    section_id: Option<&str>,
-    entry: &serde_json::Map<String, Value>,
-) -> Value {
-    let mut rule = serde_json::Map::new();
-    if let Some(id) = entry
-        .get("id")
-        .or_else(|| entry.get("section_id"))
-        .and_then(value_as_id_string)
-        .or_else(|| section_id.map(str::to_string))
-    {
-        rule.insert("id".to_string(), Value::String(id));
-    }
-    let name = entry
-        .get("comment")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .or_else(|| entry.get("name").and_then(Value::as_str))
-        .unwrap_or("");
-    let protocol = entry
-        .get("protocol")
-        .or_else(|| entry.get("proto"))
-        .and_then(Value::as_str)
-        .map(normalize_protocol_from_firmware)
-        .unwrap_or_default();
-    let wan_port = entry
-        .get("wan_port")
-        .or_else(|| entry.get("src_dport"))
-        .and_then(value_as_text)
-        .unwrap_or_default();
-    let lan_ip = entry
-        .get("lan_ip")
-        .or_else(|| entry.get("dest_ip"))
-        .and_then(value_as_text)
-        .unwrap_or_default();
-    let lan_port = entry
-        .get("lan_port")
-        .or_else(|| entry.get("dest_port"))
-        .or_else(|| entry.get("src_dport"))
-        .and_then(value_as_text)
-        .unwrap_or_default();
-    let enabled = entry
-        .get("enabled")
-        .and_then(parse_switch_flag)
-        .map(switch_str)
-        .unwrap_or("1");
-    rule.insert("name".to_string(), Value::String(name.to_string()));
-    rule.insert("protocol".to_string(), Value::String(protocol));
-    rule.insert("wan_port".to_string(), Value::String(wan_port));
-    rule.insert("lan_ip".to_string(), Value::String(lan_ip));
-    rule.insert("lan_port".to_string(), Value::String(lan_port));
-    rule.insert("enabled".to_string(), Value::String(enabled.to_string()));
-    for (key, value) in entry {
-        if !matches!(
-            key.as_str(),
-            "id" | "section_id"
-                | "name"
-                | "comment"
-                | "protocol"
-                | "proto"
-                | "wan_port"
-                | "src_dport"
-                | "lan_ip"
-                | "dest_ip"
-                | "lan_port"
-                | "dest_port"
-                | "enabled"
-        ) {
-            rule.insert(key.clone(), value.clone());
-        }
-    }
-    Value::Object(rule)
-}
-
-fn normalize_port_rules(data: Value) -> Result<Value, &'static str> {
-    let Some(map) = data.as_object() else {
-        return Err("router returned a malformed port-forward rule list");
-    };
-    if let Some(raw_list) = map.get("rule_list") {
-        let Some(list) = raw_list.as_array() else {
-            return Err("router returned a malformed port-forward rule list");
-        };
-        let mut rules = Vec::with_capacity(list.len());
-        for entry in list {
-            let Some(obj) = entry.as_object() else {
-                return Err("router returned a malformed port-forward rule list");
-            };
-            rules.push(normalize_port_rule_entry(None, obj));
-        }
-        return Ok(json!({"rule_list": rules}));
-    }
-    let mut rules = Vec::with_capacity(map.len());
-    for (section_id, entry) in map {
-        let Some(obj) = entry.as_object() else {
-            return Err("router returned a malformed port-forward rule list");
-        };
-        rules.push(normalize_port_rule_entry(Some(section_id), obj));
-    }
-    Ok(json!({"rule_list": rules}))
-}
-
-fn resolve_section_ids(map: &serde_json::Map<String, Value>) -> Result<Vec<String>, &'static str> {
-    let from_id = match map.get("id") {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(value_as_id_string(value).ok_or("invalid rule id")?),
-    };
-    let from_section = match map.get("section_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::Array(array)) => {
-            if array.is_empty() {
-                return Err("missing rule id");
-            }
-            let mut ids = Vec::with_capacity(array.len());
-            for item in array {
-                ids.push(value_as_id_string(item).ok_or("invalid rule id")?);
-            }
-            Some(ids)
-        }
-        Some(value) => Some(vec![value_as_id_string(value).ok_or("invalid rule id")?]),
-    };
-    match (from_id, from_section) {
-        (Some(single), Some(section_ids)) => {
-            if section_ids.len() == 1 && section_ids[0] == single {
-                Ok(section_ids)
-            } else {
-                Err("conflicting rule id and section_id")
-            }
-        }
-        (Some(single), None) => Ok(vec![single]),
-        (None, Some(section_ids)) => Ok(section_ids),
-        (None, None) => Err("missing rule id"),
-    }
-}
-
-fn resolve_aliased_field<T, F>(
-    map: &serde_json::Map<String, Value>,
-    primary: &str,
-    alias: &str,
-    parse: F,
-    conflict_err: &'static str,
-) -> Result<Option<T>, &'static str>
-where
-    T: PartialEq,
-    F: Fn(&Value) -> Result<T, &'static str>,
-{
-    let first = match map.get(primary) {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(parse(value)?),
-    };
-    let second = match map.get(alias) {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(parse(value)?),
-    };
-    match (first, second) {
-        (Some(lhs), Some(rhs)) => {
-            if lhs == rhs {
-                Ok(Some(lhs))
-            } else {
-                Err(conflict_err)
-            }
-        }
-        (Some(val), None) | (None, Some(val)) => Ok(Some(val)),
-        (None, None) => Ok(None),
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct PortMappingWrite {
-    payload: Value,
-    delete_target: Option<String>,
-    lan_host: Option<Ipv4Addr>,
-}
-
-fn build_port_mapping_write(
-    parsed: &Value,
-    has_expected_rules: bool,
-) -> Result<PortMappingWrite, &'static str> {
-    let map = parsed.as_object().ok_or("expected JSON object")?;
-    let action = map
-        .get("action")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .ok_or("missing action")?;
-    match action {
-        "delete" => {
-            let ids = resolve_section_ids(map)?;
-            if has_expected_rules && ids.len() != 1 {
-                return Err("expected_rules requires a single rule id");
-            }
-            let delete_target = if ids.len() == 1 {
-                Some(ids[0].clone())
-            } else {
-                None
-            };
-            Ok(PortMappingWrite {
-                payload: json!({"action": "delete", "section_id": ids}),
-                delete_target,
-                lan_host: None,
-            })
-        }
-        "add" | "modify" => {
-            let mut payload = serde_json::Map::new();
-            payload.insert("action".to_string(), Value::String(action.to_string()));
-            if action == "modify" {
-                let ids = resolve_section_ids(map)?;
-                if ids.len() != 1 {
-                    return Err("modify requires a single rule id");
-                }
-                payload.insert("section_id".to_string(), json!(ids));
-            }
-            let src_dport = resolve_aliased_field(
-                map,
-                "src_dport",
-                "wan_port",
-                parse_port_spec,
-                "conflicting external port fields",
-            )?
-            .ok_or("missing external port")?;
-            let dest_ip = resolve_aliased_field(
-                map,
-                "dest_ip",
-                "lan_ip",
-                |value| {
-                    let text = value.as_str().ok_or("invalid destination IP")?;
-                    parse_usable_unicast_ipv4(text).map_err(|_| "invalid destination IP")
-                },
-                "conflicting destination IP fields",
-            )?
-            .ok_or("missing destination IP")?;
-            let dest_port = resolve_aliased_field(
-                map,
-                "dest_port",
-                "lan_port",
-                parse_port_spec,
-                "conflicting internal port fields",
-            )?
-            .unwrap_or_else(|| src_dport.clone());
-            let proto = resolve_aliased_field(
-                map,
-                "proto",
-                "protocol",
-                |value| {
-                    let text = value.as_str().ok_or("invalid protocol")?;
-                    protocol_to_firmware(text)
-                },
-                "conflicting protocol fields",
-            )?
-            .ok_or("missing protocol")?;
-            let enabled = match map.get("enabled") {
-                Some(value) if !value.is_null() => {
-                    parse_switch_flag(value).ok_or("invalid enabled flag")?
-                }
-                _ => 1,
-            };
-            let raw_comment = match map.get("comment") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(text)) => Some(text.trim().to_string()),
-                Some(_) => return Err("invalid rule name"),
-            };
-            let raw_name = match map.get("name") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(text)) => Some(text.trim().to_string()),
-                Some(_) => return Err("invalid rule name"),
-            };
-            let comment = match (raw_comment, raw_name) {
-                (Some(lhs), Some(rhs)) if !lhs.is_empty() && !rhs.is_empty() && lhs != rhs => {
-                    return Err("conflicting name and comment");
-                }
-                (Some(lhs), _) if !lhs.is_empty() => lhs,
-                (_, Some(rhs)) => rhs,
-                (Some(lhs), None) => lhs,
-                (None, None) => String::new(),
-            };
-            validate_safe_label(&comment, 64, "invalid rule name")?;
-            payload.insert("src_dport".to_string(), Value::String(src_dport));
-            payload.insert("dest_ip".to_string(), Value::String(dest_ip.to_string()));
-            payload.insert("dest_port".to_string(), Value::String(dest_port));
-            payload.insert("proto".to_string(), Value::String(proto.to_string()));
-            payload.insert("enabled".to_string(), json!(enabled));
-            payload.insert("comment".to_string(), Value::String(comment));
-            if let Some(raw_src_ip) = map.get("src_ip").filter(|value| !value.is_null()) {
-                let text = raw_src_ip.as_str().ok_or("invalid src_ip")?.trim();
-                if !text.is_empty() {
-                    let src_ip = parse_src_ip_spec(text)?;
-                    payload.insert("src_ip".to_string(), Value::String(src_ip));
-                }
-            }
-            Ok(PortMappingWrite {
-                payload: Value::Object(payload),
-                delete_target: None,
-                lan_host: Some(dest_ip),
-            })
-        }
-        _ => Err("invalid action"),
-    }
-}
-
-fn build_port_forward_switch_payload(parsed: &Value) -> Result<Value, &'static str> {
-    let map = parsed.as_object().ok_or("expected JSON object")?;
-    let flag = parse_switch_from_keys(
-        map,
-        &[
-            "portmapping_enable",
-            "portforward_enable",
-            "port_forward_switch",
-            "enable",
-        ],
-        "invalid port_forward_switch",
-        "conflicting port_forward_switch fields",
-    )?;
-    Ok(json!({"portmapping_enable": flag}))
-}
-
 fn normalize_filter_rule_entry(
     section_id: Option<&str>,
     entry: &serde_json::Map<String, Value>,
@@ -1545,117 +1141,557 @@ fn normalize_filter_rules(data: Value) -> Result<Value, &'static str> {
     Ok(json!({"rule_list": rules}))
 }
 
-fn qos_data_from_smart_mode(mode: &str) -> Value {
-    let trimmed = mode.trim();
-    let enabled = !matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "nomal_mode" | "normal_mode" | "stop" | "off" | "0" | ""
-    );
-    json!({
-        "qos_switch": switch_str(i64::from(enabled)),
-        "qos_mode": trimmed
-    })
-}
+mod ports {
+    use std::net::Ipv4Addr;
 
-fn normalize_legacy_qos_para(mut data: Value) -> Option<Value> {
-    let map = data.as_object_mut()?;
-    let flag = first_non_null(map, &["qos_switch", "qos_smart_switch"])
-        .and_then(parse_switch_flag)?;
-    map.insert(
-        "qos_switch".to_string(),
-        Value::String(switch_str(flag).to_string()),
-    );
-    Some(data)
-}
+    use serde_json::{json, Value};
 
-fn build_qos_mode_payload(parsed: &Value) -> Result<Value, &'static str> {
-    let map = parsed.as_object().ok_or("expected JSON object")?;
-    if let Some(raw) = map.get("qos_mode").filter(|value| !value.is_null()) {
-        let mode_raw = raw.as_str().ok_or("invalid qos_mode")?;
-        let mode = match mode_raw.trim() {
-            "Nomal_mode" => "Nomal_mode",
-            "Ai_mode" => "Ai_mode",
-            "Game_mode" => "Game_mode",
-            "Video_mode" => "Video_mode",
-            "Live_mode" => "Live_mode",
-            "Chat_mode" => "Chat_mode",
-            _ => return Err("invalid qos_mode"),
+    use super::{
+        normalize_protocol_from_firmware, parse_switch_flag, parse_switch_from_keys,
+        parse_usable_unicast_ipv4, switch_str, validate_safe_label, value_as_id_string,
+    };
+
+    pub(super) fn reviewed_port_rules_match(expected: &Value, current: &Value, id: &str) -> bool {
+        let Some(rules) = current.get("rule_list").and_then(Value::as_array) else {
+            return false;
         };
-        return Ok(json!({"qos_mode": mode}));
+        if !rules.iter().all(Value::is_object) {
+            return false;
+        }
+        if current.get("rule_list") != Some(expected) {
+            return false;
+        }
+        if id.is_empty() {
+            return false;
+        }
+        rules
+            .iter()
+            .enumerate()
+            .filter(|(index, rule)| {
+                let reported = rule.get("id");
+                match reported {
+                    Some(Value::String(value)) => value == id,
+                    Some(Value::Number(value)) => value.to_string() == id,
+                    None | Some(Value::Null) => index.to_string() == id,
+                    _ => false,
+                }
+            })
+            .count()
+            == 1
     }
-    let flag = parse_switch_from_keys(
-        map,
-        &["qos_switch", "qos_smart_switch", "enable"],
-        "invalid qos_switch",
-        "conflicting qos_switch fields",
-    )?;
-    let mode = if flag == 0 { "Nomal_mode" } else { "Ai_mode" };
-    Ok(json!({"qos_mode": mode}))
+
+    fn value_as_text(value: &Value) -> Option<String> {
+        match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }
+    }
+
+    fn parse_single_port(raw: &str) -> Option<u16> {
+        if raw.is_empty() || raw.len() > 5 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let port = raw.parse::<u16>().ok()?;
+        (port >= 1).then_some(port)
+    }
+
+    fn parse_port_spec(value: &Value) -> Result<String, &'static str> {
+        match value {
+            Value::Number(number) => {
+                let port = number.as_u64().ok_or("invalid port")?;
+                if !(1..=65535).contains(&port) {
+                    return Err("port must be between 1 and 65535");
+                }
+                Ok(port.to_string())
+            }
+            Value::String(text) => {
+                let trimmed = text.trim();
+                if let Some((start_raw, end_raw)) = trimmed.split_once('-') {
+                    if end_raw.contains('-') {
+                        return Err("invalid port range");
+                    }
+                    let start = parse_single_port(start_raw).ok_or("invalid port range")?;
+                    let end = parse_single_port(end_raw).ok_or("invalid port range")?;
+                    if start > end {
+                        return Err("invalid port range");
+                    }
+                    Ok(format!("{start}-{end}"))
+                } else {
+                    let port =
+                        parse_single_port(trimmed).ok_or("port must be between 1 and 65535")?;
+                    Ok(port.to_string())
+                }
+            }
+            _ => Err("invalid port"),
+        }
+    }
+
+    fn parse_src_ip_spec(raw: &str) -> Result<String, &'static str> {
+        let trimmed = raw.trim();
+        if let Some((ip_part, prefix_part)) = trimmed.split_once('/') {
+            let ip = parse_usable_unicast_ipv4(ip_part).map_err(|_| "invalid src_ip")?;
+            if prefix_part.is_empty()
+                || prefix_part.len() > 2
+                || !prefix_part.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err("invalid src_ip");
+            }
+            let prefix: u8 = prefix_part.parse().map_err(|_| "invalid src_ip")?;
+            if !(1..=32).contains(&prefix) {
+                return Err("invalid src_ip");
+            }
+            Ok(format!("{ip}/{prefix}"))
+        } else {
+            let ip = parse_usable_unicast_ipv4(trimmed).map_err(|_| "invalid src_ip")?;
+            Ok(ip.to_string())
+        }
+    }
+
+    fn protocol_to_firmware(raw: &str) -> Result<&'static str, &'static str> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "tcp" => Ok("tcp"),
+            "udp" => Ok("udp"),
+            "tcp+udp" | "tcp udp" | "udp tcp" | "tcp_udp" | "tcp/udp" | "tcpudp" | "both"
+            | "all" => Ok("tcp udp"),
+            _ => Err("invalid protocol"),
+        }
+    }
+
+    fn normalize_port_rule_entry(
+        section_id: Option<&str>,
+        entry: &serde_json::Map<String, Value>,
+    ) -> Value {
+        let mut rule = serde_json::Map::new();
+        if let Some(id) = entry
+            .get("id")
+            .or_else(|| entry.get("section_id"))
+            .and_then(value_as_id_string)
+            .or_else(|| section_id.map(str::to_string))
+        {
+            rule.insert("id".to_string(), Value::String(id));
+        }
+        let name = entry
+            .get("comment")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| entry.get("name").and_then(Value::as_str))
+            .unwrap_or("");
+        let protocol = entry
+            .get("protocol")
+            .or_else(|| entry.get("proto"))
+            .and_then(Value::as_str)
+            .map(normalize_protocol_from_firmware)
+            .unwrap_or_default();
+        let wan_port = entry
+            .get("wan_port")
+            .or_else(|| entry.get("src_dport"))
+            .and_then(value_as_text)
+            .unwrap_or_default();
+        let lan_ip = entry
+            .get("lan_ip")
+            .or_else(|| entry.get("dest_ip"))
+            .and_then(value_as_text)
+            .unwrap_or_default();
+        let lan_port = entry
+            .get("lan_port")
+            .or_else(|| entry.get("dest_port"))
+            .or_else(|| entry.get("src_dport"))
+            .and_then(value_as_text)
+            .unwrap_or_default();
+        let enabled = entry
+            .get("enabled")
+            .and_then(parse_switch_flag)
+            .map(switch_str)
+            .unwrap_or("1");
+        rule.insert("name".to_string(), Value::String(name.to_string()));
+        rule.insert("protocol".to_string(), Value::String(protocol));
+        rule.insert("wan_port".to_string(), Value::String(wan_port));
+        rule.insert("lan_ip".to_string(), Value::String(lan_ip));
+        rule.insert("lan_port".to_string(), Value::String(lan_port));
+        rule.insert("enabled".to_string(), Value::String(enabled.to_string()));
+        for (key, value) in entry {
+            if !matches!(
+                key.as_str(),
+                "id" | "section_id"
+                    | "name"
+                    | "comment"
+                    | "protocol"
+                    | "proto"
+                    | "wan_port"
+                    | "src_dport"
+                    | "lan_ip"
+                    | "dest_ip"
+                    | "lan_port"
+                    | "dest_port"
+                    | "enabled"
+            ) {
+                rule.insert(key.clone(), value.clone());
+            }
+        }
+        Value::Object(rule)
+    }
+
+    pub(super) fn normalize_port_rules(data: Value) -> Result<Value, &'static str> {
+        let Some(map) = data.as_object() else {
+            return Err("router returned a malformed port-forward rule list");
+        };
+        if let Some(raw_list) = map.get("rule_list") {
+            let Some(list) = raw_list.as_array() else {
+                return Err("router returned a malformed port-forward rule list");
+            };
+            let mut rules = Vec::with_capacity(list.len());
+            for entry in list {
+                let Some(obj) = entry.as_object() else {
+                    return Err("router returned a malformed port-forward rule list");
+                };
+                rules.push(normalize_port_rule_entry(None, obj));
+            }
+            return Ok(json!({"rule_list": rules}));
+        }
+        let mut rules = Vec::with_capacity(map.len());
+        for (section_id, entry) in map {
+            let Some(obj) = entry.as_object() else {
+                return Err("router returned a malformed port-forward rule list");
+            };
+            rules.push(normalize_port_rule_entry(Some(section_id), obj));
+        }
+        Ok(json!({"rule_list": rules}))
+    }
+
+    fn resolve_section_ids(
+        map: &serde_json::Map<String, Value>,
+    ) -> Result<Vec<String>, &'static str> {
+        let from_id = match map.get("id") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value_as_id_string(value).ok_or("invalid rule id")?),
+        };
+        let from_section = match map.get("section_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(array)) => {
+                if array.is_empty() {
+                    return Err("missing rule id");
+                }
+                let mut ids = Vec::with_capacity(array.len());
+                for item in array {
+                    ids.push(value_as_id_string(item).ok_or("invalid rule id")?);
+                }
+                Some(ids)
+            }
+            Some(value) => Some(vec![value_as_id_string(value).ok_or("invalid rule id")?]),
+        };
+        match (from_id, from_section) {
+            (Some(single), Some(section_ids)) => {
+                if section_ids.len() == 1 && section_ids[0] == single {
+                    Ok(section_ids)
+                } else {
+                    Err("conflicting rule id and section_id")
+                }
+            }
+            (Some(single), None) => Ok(vec![single]),
+            (None, Some(section_ids)) => Ok(section_ids),
+            (None, None) => Err("missing rule id"),
+        }
+    }
+
+    fn resolve_aliased_field<T, F>(
+        map: &serde_json::Map<String, Value>,
+        primary: &str,
+        alias: &str,
+        parse: F,
+        conflict_err: &'static str,
+    ) -> Result<Option<T>, &'static str>
+    where
+        T: PartialEq,
+        F: Fn(&Value) -> Result<T, &'static str>,
+    {
+        let first = match map.get(primary) {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(parse(value)?),
+        };
+        let second = match map.get(alias) {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(parse(value)?),
+        };
+        match (first, second) {
+            (Some(lhs), Some(rhs)) => {
+                if lhs == rhs {
+                    Ok(Some(lhs))
+                } else {
+                    Err(conflict_err)
+                }
+            }
+            (Some(val), None) | (None, Some(val)) => Ok(Some(val)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct PortMappingWrite {
+        pub(super) payload: Value,
+        pub(super) delete_target: Option<String>,
+        pub(super) lan_host: Option<Ipv4Addr>,
+    }
+
+    pub(super) fn build_port_mapping_write(
+        parsed: &Value,
+        has_expected_rules: bool,
+    ) -> Result<PortMappingWrite, &'static str> {
+        let map = parsed.as_object().ok_or("expected JSON object")?;
+        let action = map
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .ok_or("missing action")?;
+        match action {
+            "delete" => {
+                let ids = resolve_section_ids(map)?;
+                if has_expected_rules && ids.len() != 1 {
+                    return Err("expected_rules requires a single rule id");
+                }
+                let delete_target = if ids.len() == 1 {
+                    Some(ids[0].clone())
+                } else {
+                    None
+                };
+                Ok(PortMappingWrite {
+                    payload: json!({"action": "delete", "section_id": ids}),
+                    delete_target,
+                    lan_host: None,
+                })
+            }
+            "add" | "modify" => {
+                let mut payload = serde_json::Map::new();
+                payload.insert("action".to_string(), Value::String(action.to_string()));
+                if action == "modify" {
+                    let ids = resolve_section_ids(map)?;
+                    if ids.len() != 1 {
+                        return Err("modify requires a single rule id");
+                    }
+                    payload.insert("section_id".to_string(), json!(ids));
+                }
+                let src_dport = resolve_aliased_field(
+                    map,
+                    "src_dport",
+                    "wan_port",
+                    parse_port_spec,
+                    "conflicting external port fields",
+                )?
+                .ok_or("missing external port")?;
+                let dest_ip = resolve_aliased_field(
+                    map,
+                    "dest_ip",
+                    "lan_ip",
+                    |value| {
+                        let text = value.as_str().ok_or("invalid destination IP")?;
+                        parse_usable_unicast_ipv4(text).map_err(|_| "invalid destination IP")
+                    },
+                    "conflicting destination IP fields",
+                )?
+                .ok_or("missing destination IP")?;
+                let dest_port = resolve_aliased_field(
+                    map,
+                    "dest_port",
+                    "lan_port",
+                    parse_port_spec,
+                    "conflicting internal port fields",
+                )?
+                .unwrap_or_else(|| src_dport.clone());
+                let proto = resolve_aliased_field(
+                    map,
+                    "proto",
+                    "protocol",
+                    |value| {
+                        let text = value.as_str().ok_or("invalid protocol")?;
+                        protocol_to_firmware(text)
+                    },
+                    "conflicting protocol fields",
+                )?
+                .ok_or("missing protocol")?;
+                let enabled = match map.get("enabled") {
+                    Some(value) if !value.is_null() => {
+                        parse_switch_flag(value).ok_or("invalid enabled flag")?
+                    }
+                    _ => 1,
+                };
+                let raw_comment = match map.get("comment") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(text)) => Some(text.trim().to_string()),
+                    Some(_) => return Err("invalid rule name"),
+                };
+                let raw_name = match map.get("name") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(text)) => Some(text.trim().to_string()),
+                    Some(_) => return Err("invalid rule name"),
+                };
+                let comment = match (raw_comment, raw_name) {
+                    (Some(lhs), Some(rhs)) if !lhs.is_empty() && !rhs.is_empty() && lhs != rhs => {
+                        return Err("conflicting name and comment");
+                    }
+                    (Some(lhs), _) if !lhs.is_empty() => lhs,
+                    (_, Some(rhs)) => rhs,
+                    (Some(lhs), None) => lhs,
+                    (None, None) => String::new(),
+                };
+                validate_safe_label(&comment, 64, "invalid rule name")?;
+                payload.insert("src_dport".to_string(), Value::String(src_dport));
+                payload.insert("dest_ip".to_string(), Value::String(dest_ip.to_string()));
+                payload.insert("dest_port".to_string(), Value::String(dest_port));
+                payload.insert("proto".to_string(), Value::String(proto.to_string()));
+                payload.insert("enabled".to_string(), json!(enabled));
+                payload.insert("comment".to_string(), Value::String(comment));
+                if let Some(raw_src_ip) = map.get("src_ip").filter(|value| !value.is_null()) {
+                    let text = raw_src_ip.as_str().ok_or("invalid src_ip")?.trim();
+                    if !text.is_empty() {
+                        let src_ip = parse_src_ip_spec(text)?;
+                        payload.insert("src_ip".to_string(), Value::String(src_ip));
+                    }
+                }
+                Ok(PortMappingWrite {
+                    payload: Value::Object(payload),
+                    delete_target: None,
+                    lan_host: Some(dest_ip),
+                })
+            }
+            _ => Err("invalid action"),
+        }
+    }
+
+    pub(super) fn build_port_forward_switch_payload(parsed: &Value) -> Result<Value, &'static str> {
+        let map = parsed.as_object().ok_or("expected JSON object")?;
+        let flag = parse_switch_from_keys(
+            map,
+            &[
+                "portmapping_enable",
+                "portforward_enable",
+                "port_forward_switch",
+                "enable",
+            ],
+            "invalid port_forward_switch",
+            "conflicting port_forward_switch fields",
+        )?;
+        Ok(json!({"portmapping_enable": flag}))
+    }
 }
 
-fn build_legacy_router_qos_payload(
-    parsed: &Value,
-    current: &Value,
-) -> Result<Value, &'static str> {
-    let map = parsed.as_object().ok_or("expected JSON object")?;
-    if map.get("qos_mode").is_some_and(|value| !value.is_null()) {
-        return Err("qos_mode is not supported on this router");
+mod qos {
+    use serde_json::{json, Value};
+
+    use super::{first_non_null, parse_switch_flag, parse_switch_from_keys, switch_str};
+
+    pub(super) fn qos_data_from_smart_mode(mode: &str) -> Value {
+        let trimmed = mode.trim();
+        let enabled = !matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "nomal_mode" | "normal_mode" | "stop" | "off" | "0" | ""
+        );
+        json!({
+            "qos_switch": switch_str(i64::from(enabled)),
+            "qos_mode": trimmed
+        })
     }
-    let flag = parse_switch_from_keys(
-        map,
-        &["qos_switch", "qos_smart_switch", "enable"],
-        "invalid qos_switch",
-        "conflicting qos_switch fields",
-    )?;
-    let mut payload = serde_json::Map::new();
-    payload.insert("qos_smart_switch".to_string(), json!(flag));
-    for key in [
-        "qos_smart_pri_type",
-        "upload_total_limit_rate",
-        "upload_total_limit_unit",
-        "download_total_limit_rate",
-        "download_total_limit_unit",
-    ] {
-        let candidate = map
-            .get(key)
-            .filter(|value| !value.is_null())
-            .or_else(|| {
+
+    pub(super) fn normalize_legacy_qos_para(mut data: Value) -> Option<Value> {
+        let map = data.as_object_mut()?;
+        let flag =
+            first_non_null(map, &["qos_switch", "qos_smart_switch"]).and_then(parse_switch_flag)?;
+        map.insert(
+            "qos_switch".to_string(),
+            Value::String(switch_str(flag).to_string()),
+        );
+        Some(data)
+    }
+
+    pub(super) fn build_qos_mode_payload(parsed: &Value) -> Result<Value, &'static str> {
+        let map = parsed.as_object().ok_or("expected JSON object")?;
+        if let Some(raw) = map.get("qos_mode").filter(|value| !value.is_null()) {
+            let mode_raw = raw.as_str().ok_or("invalid qos_mode")?;
+            let mode = match mode_raw.trim() {
+                "Nomal_mode" => "Nomal_mode",
+                "Ai_mode" => "Ai_mode",
+                "Game_mode" => "Game_mode",
+                "Video_mode" => "Video_mode",
+                "Live_mode" => "Live_mode",
+                "Chat_mode" => "Chat_mode",
+                _ => return Err("invalid qos_mode"),
+            };
+            return Ok(json!({"qos_mode": mode}));
+        }
+        let flag = parse_switch_from_keys(
+            map,
+            &["qos_switch", "qos_smart_switch", "enable"],
+            "invalid qos_switch",
+            "conflicting qos_switch fields",
+        )?;
+        let mode = if flag == 0 { "Nomal_mode" } else { "Ai_mode" };
+        Ok(json!({"qos_mode": mode}))
+    }
+
+    pub(super) fn build_legacy_router_qos_payload(
+        parsed: &Value,
+        current: &Value,
+    ) -> Result<Value, &'static str> {
+        let map = parsed.as_object().ok_or("expected JSON object")?;
+        if map.get("qos_mode").is_some_and(|value| !value.is_null()) {
+            return Err("qos_mode is not supported on this router");
+        }
+        let flag = parse_switch_from_keys(
+            map,
+            &["qos_switch", "qos_smart_switch", "enable"],
+            "invalid qos_switch",
+            "conflicting qos_switch fields",
+        )?;
+        let mut payload = serde_json::Map::new();
+        payload.insert("qos_smart_switch".to_string(), json!(flag));
+        for key in [
+            "qos_smart_pri_type",
+            "upload_total_limit_rate",
+            "upload_total_limit_unit",
+            "download_total_limit_rate",
+            "download_total_limit_unit",
+        ] {
+            let candidate = map.get(key).filter(|value| !value.is_null()).or_else(|| {
                 (key == "qos_smart_pri_type")
                     .then(|| current.get(key))
                     .flatten()
                     .filter(|value| !value.is_null())
             });
-        if let Some(raw) = candidate {
-            if raw.as_str().is_some_and(|text| text.trim().is_empty()) {
-                continue;
+            if let Some(raw) = candidate {
+                if raw.as_str().is_some_and(|text| text.trim().is_empty()) {
+                    continue;
+                }
+                let number = raw
+                    .as_i64()
+                    .or_else(|| {
+                        raw.as_str()
+                            .and_then(|text| text.trim().parse::<i64>().ok())
+                    })
+                    .filter(|value| *value >= 0)
+                    .ok_or("invalid QoS numeric parameter")?;
+                payload.insert(key.to_string(), json!(number));
             }
-            let number = raw
-                .as_i64()
-                .or_else(|| raw.as_str().and_then(|text| text.trim().parse::<i64>().ok()))
-                .filter(|value| *value >= 0)
-                .ok_or("invalid QoS numeric parameter")?;
-            payload.insert(key.to_string(), json!(number));
         }
+        Ok(Value::Object(payload))
     }
-    Ok(Value::Object(payload))
-}
 
-fn build_legacy_qos_switch_payload(parsed: &Value) -> Result<Value, &'static str> {
-    let map = parsed.as_object().ok_or("expected JSON object")?;
-    if map.get("qos_mode").is_some_and(|value| !value.is_null()) {
-        return Err("qos_mode is not supported on this router");
+    pub(super) fn build_legacy_qos_switch_payload(parsed: &Value) -> Result<Value, &'static str> {
+        let map = parsed.as_object().ok_or("expected JSON object")?;
+        if map.get("qos_mode").is_some_and(|value| !value.is_null()) {
+            return Err("qos_mode is not supported on this router");
+        }
+        let flag = parse_switch_from_keys(
+            map,
+            &["qos_switch", "qos_smart_switch", "enable"],
+            "invalid qos_switch",
+            "conflicting qos_switch fields",
+        )?;
+        Ok(json!({"qos_switch": switch_str(flag)}))
     }
-    let flag = parse_switch_from_keys(
-        map,
-        &["qos_switch", "qos_smart_switch", "enable"],
-        "invalid qos_switch",
-        "conflicting qos_switch fields",
-    )?;
-    Ok(json!({"qos_switch": switch_str(flag)}))
 }
 
 #[cfg(test)]
 mod console_routing_tests {
+    use super::ports::PortMappingWrite;
     use super::*;
 
     #[test]
@@ -1977,6 +2013,41 @@ mod console_routing_tests {
     }
 
     #[test]
+    fn port_forward_reads_only_the_required_state_before_writing() {
+        use std::cell::RefCell;
+
+        let steps = RefCell::new(Vec::new());
+        let wan_rule = json!({"cfgA": {"comment": "A", "proto": "udp", "src_dport": "53", "dest_ip": "192.168.0.10", "dest_port": "5300"}});
+        let reviewed = json!([{"id": "cfgA", "name": "A", "protocol": "udp", "wan_port": "53", "lan_ip": "192.168.0.10", "lan_port": "5300", "enabled": "1"}]);
+        let add = json!({"action": "add", "name": "A", "protocol": "udp", "wan_port": "53", "lan_ip": "192.168.0.10", "lan_port": "5300", "enabled": "1"});
+        let delete = json!({"action": "delete", "id": "cfgA", "expected_rules": reviewed});
+        for (input, expected_steps, expected_write) in [
+            (add, ["lan", "set"], json!({"action": "add", "comment": "A", "proto": "udp", "src_dport": "53", "dest_ip": "192.168.0.10", "dest_port": "5300", "enabled": 1})),
+            (delete, ["get", "set"], json!({"action": "delete", "section_id": ["cfgA"]})),
+        ] {
+            let response = router_firewall_port_forward_set_with(
+                input.to_string().as_bytes(),
+                || {
+                    steps.borrow_mut().push("lan");
+                    Ok((Ipv4Addr::new(192, 168, 0, 1), Ipv4Addr::new(255, 255, 255, 0)))
+                },
+                || {
+                    steps.borrow_mut().push("get");
+                    Ok(wan_rule.clone())
+                },
+                |payload| {
+                    steps.borrow_mut().push("set");
+                    assert_eq!(serde_json::from_str::<Value>(payload).unwrap(), expected_write);
+                    Ok(json!({"status": "applied"}))
+                },
+            );
+            assert_eq!(response, (200, json!({"ok": true, "data": {"status": "applied"}})));
+            assert_eq!(*steps.borrow(), expected_steps);
+            steps.borrow_mut().clear();
+        }
+    }
+
+    #[test]
     fn guarded_port_forward_delete_enforces_single_target_and_rejects_malformed_lists() {
         let lan = || Ok((Ipv4Addr::new(192, 168, 0, 1), Ipv4Addr::new(255, 255, 255, 0)));
         let mut called = false;
@@ -2097,6 +2168,74 @@ mod console_routing_tests {
         );
         assert!(normalize_filter_rules(json!({"rule_list": ["bad"]})).is_err());
         assert!(normalize_filter_rules(json!({"cfg0": "bad"})).is_err());
+    }
+
+    #[test]
+    fn qos_reads_committed_mode_then_uci_then_legacy_ubus_in_order() {
+        use std::cell::RefCell;
+
+        for (committed, uci, expected_steps, expected_data) in [
+            (
+                Some(" Game_mode "),
+                Err("unused"),
+                &[][..],
+                json!({"qos_mode": "Game_mode", "qos_switch": "1"}),
+            ),
+            (
+                None,
+                Ok(" Nomal_mode "),
+                &["uci"][..],
+                json!({"qos_mode": "Nomal_mode", "qos_switch": "0"}),
+            ),
+            (
+                None,
+                Err("mode unavailable"),
+                &["uci", "router_get_qos", "router_get_qos_switch"][..],
+                json!({"qos_switch": "1", "vendor_key": 42}),
+            ),
+            (
+                Some(" "),
+                Ok("unused"),
+                &["router_get_qos", "router_get_qos_switch"][..],
+                json!({"qos_switch": "1", "vendor_key": 42}),
+            ),
+        ] {
+            let steps = RefCell::new(Vec::new());
+            let response = router_qos_get_with(
+                || {
+                    read_smart_qos_mode_with(
+                        |package, section, key| {
+                            assert_eq!((package, section, key), ("zwrt_smart_mng", "smart_qos", "mode"));
+                            steps.borrow_mut().push("committed");
+                            committed.map(str::to_owned)
+                        },
+                        |key| {
+                            assert_eq!(key, "zwrt_smart_mng.smart_qos.mode");
+                            steps.borrow_mut().push("uci");
+                            uci.map(str::to_owned).map_err(str::to_owned)
+                        },
+                    )
+                },
+                |object, method, params| {
+                    assert_eq!((object, params), ("zwrt_router.api", "{}"));
+                    match method {
+                        "router_get_qos" => {
+                            steps.borrow_mut().push("router_get_qos");
+                            Ok(json!({}))
+                        }
+                        "router_get_qos_switch" => {
+                            steps.borrow_mut().push("router_get_qos_switch");
+                            Ok(json!({"qos_switch": true, "vendor_key": 42}))
+                        }
+                        _ => panic!("unexpected method: {method}"),
+                    }
+                },
+            );
+            assert_eq!(response, (200, json!({"ok": true, "data": expected_data})));
+            let mut expected = vec!["committed"];
+            expected.extend_from_slice(expected_steps);
+            assert_eq!(steps.into_inner(), expected);
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@ const assert=require('node:assert/strict');
 const http=require('node:http');
 const fs=require('node:fs');
 const path=require('node:path');
-const {chromium}=require('playwright');
+const {launchChrome,capture}=require('./browser.cjs');
 (async()=>{
   const streams=new Set(),requests=[];
   const lan={lan_ipaddr:'192.168.0.1',lan_netmask:'255.255.255.0',dhcp_enable:'1',dhcp_start:'100',dhcp_end:'192.168.0.149',dhcp_lease_time:'12h'};
@@ -57,11 +57,11 @@ const {chromium}=require('playwright');
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const heartbeat=setInterval(()=>{for(const res of streams)res.write(': heartbeat\n\n');},1000);
-  const browser=await chromium.launch({headless:true,channel:'chrome'}),context=await browser.newContext({viewport:{width:1440,height:1100}}),page=await context.newPage(),errors=[];
+  const browser=await launchChrome(),context=await browser.newContext({viewport:{width:1440,height:1100}}),page=await context.newPage(),errors=[];
   page.on('pageerror',error=>{errors.push(error.message);console.error('Browser error:',error.message);});page.on('dialog',dialog=>dialog.dismiss());
   const go=async key=>{await page.evaluate(key=>OpenU60Navigation.go(key),key);await page.waitForFunction(key=>document.documentElement.dataset.route===key,key);await page.waitForFunction(()=>document.querySelector('#stream-state').textContent==='Live');};
   const confirm=async label=>page.locator('.confirm-dialog').getByRole('button',{name:label,exact:true}).click();
-  const status=async(id,text)=>{try{await page.waitForFunction(([id,text])=>document.querySelector(`#${id} > .action-status`).textContent.includes(text),[id,text]);}catch(error){console.error({id,text,actual:await page.locator(`#${id} > .action-status`).textContent(),errors,recent:requests.slice(-5)});await page.screenshot({path:'/tmp/zte-routing-failure.png'});throw error;}};
+  const status=async(id,text)=>{try{await page.waitForFunction(([id,text])=>document.querySelector(`#${id} > .action-status`).textContent.includes(text),[id,text]);}catch(error){console.error({id,text,actual:await page.locator(`#${id} > .action-status`).textContent(),errors,recent:requests.slice(-5)});await capture(page,{path:'zte-routing-failure.png'});throw error;}};
   const submit=id=>page.locator(`#${id} button[type=submit]`).click();
   const count=(url,method)=>requests.filter(item=>item.url===url&&(!method||item.method===method)).length;
   const last=(url,method)=>requests.filter(item=>item.url===url&&(!method||item.method===method)).at(-1);
@@ -104,9 +104,9 @@ const {chromium}=require('playwright');
       await page.setViewportSize({width,height:1100});await go('settings/appearance');await page.locator(`input[name=appearance][value=${theme}]`).check();
       for(const route of ['network/lan','network/firewall','network/ports','network/qos','network/ttl']){
         await go(route);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`${route} overflows ${theme} ${width}`);
-        if(width===390 && route==='network/lan' && theme==='dark')await page.screenshot({path:'/tmp/zte-routing-lan-phone-dark.png',fullPage:true});
-        if(width===390 && route==='network/ttl' && theme==='light')await page.screenshot({path:'/tmp/zte-routing-ttl-phone-light.png',fullPage:true});
-        if(width===1440 && route==='network/ports' && theme==='light')await page.screenshot({path:'/tmp/zte-routing-ports-desktop-light.png',fullPage:true});
+        if(width===390 && route==='network/lan' && theme==='dark')await capture(page,{path:'zte-routing-lan-phone-dark.png',fullPage:true});
+        if(width===390 && route==='network/ttl' && theme==='light')await capture(page,{path:'zte-routing-ttl-phone-light.png',fullPage:true});
+        if(width===1440 && route==='network/ports' && theme==='light')await capture(page,{path:'zte-routing-ports-desktop-light.png',fullPage:true});
       }
     }
     await go('network/ports');await page.evaluate(()=>scrollTo({top:0,behavior:'instant'}));rules.push({name:'Live change',protocol:'udp',wan_port:'40000',lan_ip:'192.168.5.25',lan_port:'40000',enabled:'1'});push();await page.waitForFunction(()=>document.querySelector('#ports-overview dd.animated-number')?.hasAttribute('data-number-animating'));assert.match(await page.locator('#ports-overview').textContent(),/Reported rules/);

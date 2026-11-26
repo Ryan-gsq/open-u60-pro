@@ -1,5 +1,5 @@
 // Run with Playwright available in NODE_PATH; uses a real streaming HTTP fixture.
-const { chromium } = require('playwright');
+const {launchChrome,capture}=require('./browser.cjs');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
@@ -69,7 +69,7 @@ const path = require('node:path');
   await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
   let fragmentedFrame = false;
   const heartbeat = setInterval(() => { if (!fragmentedFrame) for (const response of streams) response.write(': heartbeat\n\n'); },1000);
-  const browser = await chromium.launch({headless:true,channel:process.env.PLAYWRIGHT_CHANNEL || 'chrome'});
+  const browser = await launchChrome();
   const context = await browser.newContext({viewport:{width:1440,height:1100}});
   const page = await context.newPage();
   const errors = []; page.on('pageerror',error => errors.push(error.message));
@@ -100,7 +100,7 @@ const path = require('node:path');
   await page.setViewportSize({width:390,height:900});
   assert.equal(await page.locator('#operator-signal').isVisible(),true,'mobile operator card keeps its signal meter');
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth),false,'mobile operator telemetry does not overflow');
-  await page.screenshot({path:'/tmp/zte-dashboard-operator-mobile.png'});
+  await capture(page,{path:'zte-dashboard-operator-mobile.png'});
   await page.setViewportSize({width:1440,height:1100});
   await page.waitForFunction(()=>document.querySelectorAll('#dashboard-esim-profiles .dashboard-esim-profile').length===2);
   assert.equal(await page.locator('#dashboard-esim-profiles .dashboard-esim-profile[aria-current="true"] strong').textContent(),'SMART');
@@ -168,10 +168,10 @@ const path = require('node:path');
     for (const theme of ['light','dark']) {
       await page.locator(`input[name="appearance"][value="${theme}"]`).check();
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth),false,`${theme} appearance overflow at ${width}px`);
-      await page.screenshot({path:`/tmp/zte-appearance-${theme}-${width}.png`});
+      await capture(page,{path:`zte-appearance-${theme}-${width}.png`});
       await navigate('network','signal');
       assert.ok(await page.locator('#cellular').isVisible());
-      await page.screenshot({path:`/tmp/zte-theme-${theme}-${width}.png`});
+      await capture(page,{path:`zte-theme-${theme}-${width}.png`});
       await navigate('settings','appearance');
     }
   }
@@ -271,18 +271,18 @@ const path = require('node:path');
     }
     await page.mouse.move(width - 5, 5);
     if (preview) {
-      await page.screenshot({path:`/tmp/zte-dashboard-${layout}.png`});
+      await capture(page,{path:`zte-dashboard-${layout}.png`});
       await navigate('network','signal');
       await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth),false,`carrier inventory overflow at ${width}px`);
-      await page.screenshot({path:`/tmp/zte-cellular-${layout}.png`});
+      await capture(page,{path:`zte-cellular-${layout}.png`});
     }
     await navigate('network','clients');
     await page.waitForFunction(() => location.hash === '#network/clients');
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     assert.ok(await page.locator('#device-search').isVisible(), `device search reachable at ${width}px`);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth),false,`content overflow at ${width}px`);
-    if (layout === 'mobile' && preview) await page.screenshot({path:'/tmp/zte-dashboard-mobile-devices.png'});
+    if (layout === 'mobile' && preview) await capture(page,{path:'zte-dashboard-mobile-devices.png'});
   }
   // Long router-provided names must wrap without making the page wider.
   fixtures.wifi.ssid_2g = 'A'.repeat(64);
@@ -329,7 +329,7 @@ const path = require('node:path');
   await page.locator('#sms-search').fill('');
   fixtures.sms.messages.unshift({id:3,number:'New sender',content:'004E00650077',date:'26,10,25,12,40,00,+32',tag:'1'}); push(['sms']);
   await page.waitForFunction(() => document.querySelector('#sms-count').textContent === '3');
-  await page.screenshot({path:'/tmp/zte-navigation-sms.png'});
+  await capture(page,{path:'zte-navigation-sms.png'});
   await navigate('network','signal'); await live();
   assert.equal(await page.locator('.message-card').count(),0,'message content is cleared when leaving SMS');
   assert.ok(requests.some(request => request.url === '/api/dashboard/events?sms=1'));
@@ -363,17 +363,17 @@ const path = require('node:path');
   assert.equal(await page.locator('#download').textContent(),'—');
   assert.equal(await page.locator('#received').textContent(),'8.40 GB');
   await page.locator('#availability').scrollIntoViewIfNeeded();
-  await page.screenshot({path:'/tmp/zte-dashboard-offline-mobile.png'});
+  await capture(page,{path:'zte-dashboard-offline-mobile.png'});
   await page.setViewportSize({width:1440,height:1100});
   await page.locator('#availability').scrollIntoViewIfNeeded();
-  await page.screenshot({path:'/tmp/zte-dashboard-offline.png'});
+  await capture(page,{path:'zte-dashboard-offline.png'});
   await navigate('settings','appearance');
   await page.locator('input[name="appearance"][value="dark"]').check();
   await navigate('dashboard','overview');
   await page.locator('#availability').scrollIntoViewIfNeeded();
   assert.ok(await contrast('.availability-panel h2') >= 4.5,'dark offline heading contrast');
   assert.ok(await contrast('#cellular-freshness') >= 4.5,'dark stale-reading text contrast');
-  await page.screenshot({path:'/tmp/zte-theme-dark-offline.png'});
+  await capture(page,{path:'zte-theme-dark-offline.png'});
   fixtures.signal = servingSignal; fixtures.wan.up = true; push(['signal','wan','speed']);
   await page.waitForFunction(() => document.querySelector('#connection-title').textContent === 'Cellular connection active');
   assert.equal(await page.locator('#availability-title').textContent(),'Connection restored');
@@ -398,7 +398,7 @@ const path = require('node:path');
   await page.waitForFunction(() => document.querySelector('#login-dialog').open);
   assert.equal(await page.locator('#download').textContent(),'—');
   assert.ok(await contrast('dialog input') >= 4.5,'dark login input contrast');
-  await page.screenshot({path:'/tmp/zte-theme-dark-login.png'});
+  await capture(page,{path:'zte-theme-dark-login.png'});
   await page.locator('#password').fill('wrong'); await page.locator('#login-form button[type=submit]').click();
   await page.waitForFunction(() => document.querySelector('#login-error').textContent.includes('Incorrect'));
   await page.locator('#password').fill('test-password'); await page.locator('#login-form button[type=submit]').click();

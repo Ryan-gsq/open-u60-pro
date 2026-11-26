@@ -66,6 +66,7 @@ fn start_with_state<A: Admit + 'static>(world: World, conns: usize, side: impl F
 /// Native mock of the loopback controller. The requests still traverse the
 /// real listener, session/origin checks, Rust bridge and upgrade machinery.
 struct CoreMock {
+    addr: SocketAddr,
     stop: Arc<std::sync::atomic::AtomicBool>,
     requests: Arc<Mutex<Vec<String>>>,
     accept: Option<std::thread::JoinHandle<()>>,
@@ -73,7 +74,8 @@ struct CoreMock {
 
 impl CoreMock {
     fn start() -> Self {
-        let listener = std::net::TcpListener::bind(crate::mihomo::CONTROLLER).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -128,7 +130,7 @@ impl CoreMock {
                 }
             }
         });
-        Self { stop, requests, accept: Some(accept) }
+        Self { addr, stop, requests, accept: Some(accept) }
     }
 }
 
@@ -434,7 +436,7 @@ fn actual_mihomo_bridge_checks_auth_origin_redacts_configs_and_upgrades_over_tls
     let world = World::new("https-mihomo-bridge");
     let root = world.dir().join("mihomo-test");
     let s = start_with_state(world, 8, || |_: SocketAddr, _: &tokio::net::TcpStream| true, |state| {
-        state.mihomo = Arc::new(crate::mihomo::Mihomo::for_bridge(root, "private-mock-core-key".into()));
+        state.mihomo = Arc::new(crate::mihomo::Mihomo::for_bridge_at(root, "private-mock-core-key".into(), core.addr));
     });
     let addr = on(&s);
     let cfg = client(&s.tls.ca_der().unwrap(), &[&rustls::version::TLS13]);
@@ -475,7 +477,13 @@ fn actual_mihomo_bridge_checks_auth_origin_redacts_configs_and_upgrades_over_tls
     let upgrade = format!("GET /ui/mihomo/api/traffic?token=old-browser-token&%74oken=also-old HTTP/1.1\r\n{head}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==");
     let r = request(&mut ws, &upgrade, "");
     assert_eq!((r.status, r.header("sec-websocket-accept")), (101, Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")));
-    assert!(core.requests.lock().unwrap().iter().any(|h| h.starts_with("GET /traffic HTTP/1.1")));
+    let upstream = core.requests.lock().unwrap();
+    for request in ["GET /configs HTTP/1.1", "PATCH /configs HTTP/1.1", "GET /traffic HTTP/1.1"] {
+        let head = upstream.iter().find(|h| h.starts_with(request)).unwrap_or_else(|| panic!("missing {request}"));
+        let host = format!("host: {}", core.addr);
+        assert!(head.lines().any(|line| line.eq_ignore_ascii_case(&host)), "{request}");
+    }
+    drop(upstream);
     assert!(core.requests.lock().unwrap().iter().all(|h| !h.contains("old-browser-token") && !h.contains("also-old")));
     // Replacing a pass ends the old stream without waiting for the 15s heartbeat.
     let grant = request(&mut c, &format!("POST /api/mihomo/dashboard HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nAuthorization: Bearer {}", bearer.token.expose()), "");
@@ -705,25 +713,40 @@ fn a_listener_that_ends_by_itself_waits_for_the_next_change() {
 #[test]
 fn the_mobile_side_is_refused_before_the_handshake() {
     use crate::httpd::mobile::{Guard, IfAddr, Lookup};
-    let ifa = |name: &str, addr: &str, prefix| IfAddr { name: name.into(), addr: addr.parse().unwrap(), prefix, scope: 0 };
-    let table = vec![ifa("lo", "127.0.0.1", 8), ifa("br-lan", "192.168.0.1", 24), ifa("rmnet_data0", "198.51.100.10", 24)];
+    use std::net::SocketAddrV6;
+
+    struct LogicalPeer {
+        guard: Guard,
+        peer: Arc<Mutex<SocketAddr>>,
+    }
+
+    impl Admit for LogicalPeer {
+        async fn admit(&mut self, _: SocketAddr, tcp: &tokio::net::TcpStream) -> bool {
+            let peer = *self.peer.lock().unwrap();
+            self.guard.admit(peer, || tcp.local_addr().ok()).await
+        }
+    }
+
+    let ifa = |name: &str, addr: &str, prefix, scope| IfAddr { name: name.into(), addr: addr.parse().unwrap(), prefix, scope };
+    let table = vec![
+        ifa("lo", "127.0.0.1", 8, 0),
+        ifa("br-lan", "fe80::1", 64, 3),
+        ifa("ath20", "fe80::10", 64, 11),
+        ifa("rmnet_data0", "198.51.100.10", 24, 0),
+    ];
     let lookup: Lookup = Arc::new(move || Ok(table.clone()));
     let plain = Guard::new(false, lookup, crate::boottime::FakeClock::at_secs(1000));
-    let seen_as: Arc<std::sync::Mutex<SocketAddr>> = Arc::new(std::sync::Mutex::new("198.51.100.1:40000".parse().unwrap()));
+    let seen_as = Arc::new(Mutex::new("198.51.100.1:40000".parse().unwrap()));
     let who = Arc::clone(&seen_as);
-    let side = move || {
-        let mut g = plain.twin();
-        let who = Arc::clone(&who);
-        move |_: SocketAddr, _: &tokio::net::TcpStream| {
-            let peer = *who.lock().unwrap();
-            g.check(peer, || None).0
-        }
-    };
-    let s = start_with(World::new("https-mobile"), 16, side);
+    let side = move || LogicalPeer { guard: plain.twin(), peer: Arc::clone(&who) };
+    let s = start_with(World::new("https-mobile"), 1, side);
     let addr = on(&s);
     let cfg = client(&s.tls.ca_der().unwrap(), &[&rustls::version::TLS13]);
     assert!(connect(addr, Arc::clone(&cfg), "u60.home.arpa").is_err(), "a mobile-side peer got a handshake");
-    *seen_as.lock().unwrap() = "192.168.0.23:40000".parse().unwrap();
+    let link_local = |scope| SocketAddr::V6(SocketAddrV6::new("fe80::23".parse().unwrap(), 40000, 0, scope));
+    *seen_as.lock().unwrap() = link_local(11);
+    assert!(connect(addr, Arc::clone(&cfg), "u60.home.arpa").is_err(), "an ath20 peer got a handshake");
+    *seen_as.lock().unwrap() = link_local(3);
     let mut c = connect(addr, cfg, "u60.home.arpa").unwrap();
     assert_eq!(request(&mut c, &format!("GET /console/ HTTP/1.1\r\nHost: u60.home.arpa:{}", addr.port()), "").status, 200);
 }

@@ -27,10 +27,7 @@ struct Reservation {
 }
 
 fn id(mac: &str) -> String {
-    Sha256::digest(mac.as_bytes())[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::common::hex_lower(&Sha256::digest(mac.as_bytes())[..8])
 }
 
 fn mac(input: &str) -> Result<String, String> {

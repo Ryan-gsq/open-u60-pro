@@ -11,8 +11,9 @@
 //! `wireless.zte_mbb.dfs_channel_switch_disable=1`, which the script reads
 //! with `uci get` when it starts, makes it leave `disableDfsCS` alone, and
 //! the Wi-Fi scripts then load the driver with `gDisableDFSChSwitch=0`. The
-//! agent sets that key persistently (owner approval, 2026-11-12). A driver
-//! loaded before the key was committed still starts with the flag on, so
+//! agent sets this single key in the existing vendor configuration (owner
+//! approval, 2026-11-12). A driver loaded before the key was committed still
+//! starts with the flag on, so
 //! each join also turns it back on. A script that started before the key
 //! was set has read it already: inside its first second it may still turn
 //! the flag off after a join turned it on.

@@ -1,4 +1,4 @@
-const assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path'),{chromium}=require('playwright');
+const assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path'),{launchChrome}=require('./browser.cjs');
 (async()=>{
   const requests=[],streams=new Set(),errors=[];
   let status={current:{version:'2.4.0',commit:'abc123456789',target:'aarch64-unknown-linux-musl'},channel:'stable',settings:{channel:'stable',automatic_checks:true,automatic_downloads:false,automatic_install:false},phase:'idle',available:null,staged:null,staged_slot:null,last_check:null,last_error:null,progress:{received:0,total:0,percent:0},signing_configured:true,bootstrap_ready:true,rollback_available:false,active_slot:'a',automatic_install_supported:false,restart_scope:'agent_only',install_readiness:{ready:true,battery_percent:80,external_power:false,network_type:'LTE',signal_bars:4,wan_ready:true}};
@@ -27,7 +27,7 @@ const assert=require('node:assert/strict'),http=require('node:http'),fs=require(
     });
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const heartbeat=setInterval(()=>{for(const res of streams)res.write(': heartbeat\n\n');},1000);
-  const browser=await chromium.launch({headless:true,channel:'chrome'}),page=await browser.newPage({viewport:{width:1440,height:1000}});page.on('pageerror',error=>errors.push(error.message));
+  const browser=await launchChrome(),page=await browser.newPage({viewport:{width:1440,height:1000}});page.on('pageerror',error=>errors.push(error.message));
   const confirm=label=>page.locator('.confirm-dialog').getByRole('button',{name:label,exact:true}).click();
   try{
     await page.goto(`http://127.0.0.1:${server.address().port}/#settings/update`);await page.waitForFunction(()=>document.querySelector('#update-current-version')?.textContent==='v2.4.0');

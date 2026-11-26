@@ -337,7 +337,8 @@ mod tests {
 
     #[test]
     fn cached_subsets_and_later_full_requests_do_not_read_the_file() {
-        let root = std::env::temp_dir().join(format!("mh-compute-cache-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("mh-compute-cache");
+        let root = temp.path().to_path_buf();
         fs::create_dir_all(&root).unwrap();
         let path = root.join(SOURCE);
         fs::write(&path, synthetic(4, 12)).unwrap();
@@ -358,12 +359,12 @@ mod tests {
         let refreshed = cache.get(&root, &full).unwrap();
         assert_ne!(*refreshed, *loaded);
         assert_ne!(cache.0.lock().unwrap().as_ref().unwrap().stamp, stamp);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn cache_accumulates_codes_and_respects_its_limits() {
-        let root = std::env::temp_dir().join(format!("mh-compute-bound-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("mh-compute-bound");
+        let root = temp.path().to_path_buf();
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(SOURCE), synthetic(4, 12)).unwrap();
         let cache = Cache::default();
@@ -380,13 +381,13 @@ mod tests {
         cache.0.lock().unwrap().as_mut().unwrap().bytes = MAX_CACHE_BYTES;
         assert_eq!(cache.get(&root, &["C003".into()]).unwrap()["C003"].len(), 12);
         assert!(!cache.0.lock().unwrap().as_ref().unwrap().loaded.contains("C003"));
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "on-demand benchmark constructs a large synthetic GeoIP database"]
     fn benchmark_first_geoip_plan() {
-        let root = std::env::temp_dir().join(format!("mh-compute-bench-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("mh-compute-bench");
+        let root = temp.path().to_path_buf();
         fs::create_dir_all(&root).unwrap();
         let list = synthetic(250, 4250);
         fs::write(root.join(SOURCE), &list).unwrap();
@@ -405,7 +406,6 @@ mod tests {
         let new_time = start.elapsed();
         assert_eq!(old_chain, new_chain);
         println!("Mac first GeoIP plan: {} bytes, 250 countries, old={old_time:?}, new={new_time:?}", list.len());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

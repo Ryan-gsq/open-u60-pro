@@ -1,4 +1,4 @@
-const {chromium}=require('playwright'),assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path');
+const {launchChrome,capture}=require('./browser.cjs'),assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path');
 (async()=>{
 const ok=data=>({ok:true,data}),streams=new Set(),requests=[],errors=[];
 let packet={supplies:ok({battery:{status:'Charging',present:1,capacity:94,temp:340,voltage_now:4400000,current_now:1000000,power_now:55522725,charge_full:10522000,charge_full_design:10214000,cycle_count:6,health:'Good',time_to_full_now:1982},usb:{online:1,voltage_now:4750000,current_now:1400000,usb_type:'SDP [CDP] PD'}}),firmware:ok({battery_time_to_full:35,battery_time_to_empty:-1}),charger:ok({direct_power_supply_mode:'disable',otg_powerbank_state:0}),control:ok({charge_limit_enabled:true,charge_limit:85,hysteresis:5,charging_stopped:false})};
@@ -12,13 +12,13 @@ const server=http.createServer((req,res)=>{
  if(!name){res.writeHead(404);res.end();return;}const file=path.join(__dirname,'..',name);if(!fs.existsSync(file)){res.writeHead(404);res.end();return;}
  res.setHeader('Content-Type',name.endsWith('.js')?'text/javascript':name.endsWith('.css')?'text/css':'text/html');res.end(fs.readFileSync(file));
 });
-await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const browser=await chromium.launch({headless:true,channel:'chrome'}),context=await browser.newContext(),page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
+await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const browser=await launchChrome(),context=await browser.newContext(),page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
 const text=id=>page.locator('#power-'+id).textContent(),push=()=>{for(const res of streams)if(res.power)frame(res,'patch',{battery_details:ok(packet)});};
 try{
  await page.goto(`http://127.0.0.1:${server.address().port}/#tools/battery`);await page.waitForFunction(()=>OpenU60Console.connected&&document.querySelector('#power-power').textContent==='4.40 W');
  assert.equal(await text('usb-power'),'6.65 W');assert.equal(await text('until-full'),'34m');assert.equal(await text('until-empty'),'Not applicable');assert.equal(await text('resume'),'80 %');assert.match(await page.locator('#battery-overview .panel-note').textContent(),/inconsistent/);
  for(const theme of ['light','dark']){await page.evaluate(()=>OpenU60Navigation.go('settings/appearance'));await page.locator(`input[name=appearance][value=${theme}]`).check();await page.evaluate(()=>OpenU60Navigation.go('tools/battery'));await page.waitForFunction(()=>document.querySelector('#power-power').textContent==='4.40 W');for(const width of [390,820,1440]){await page.setViewportSize({width,height:1100});await page.waitForTimeout(120);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);}}
- await page.screenshot({path:'/tmp/openu60-battery-desktop.png',fullPage:true});
+ await capture(page,{path:'openu60-battery-desktop.png',fullPage:true});
  packet.charger.data.otg_powerbank_state=1;packet.control.data.charge_limit_enabled=false;push();await page.waitForFunction(()=>document.querySelector('#power-usb-power').textContent==='Not applicable');assert.equal(await text('limit'),'85 %','configured thresholds remain visible when disabled');packet.charger.data.otg_powerbank_state=0;
  packet.supplies.data.battery.status='Discharging';packet.supplies.data.battery.current_now=-500000;packet.supplies.data.battery.time_to_empty_avg=7200;push();await page.waitForFunction(()=>document.querySelector('#power-power').textContent==='2.20 W');assert.equal(await text('until-full'),'Not applicable');assert.equal(await text('until-empty'),'2h');
  assert.ok(await page.locator('#power-power').evaluate(n=>n.children.length)>0,'live numbers use animated digit markup');

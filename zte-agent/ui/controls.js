@@ -356,6 +356,11 @@
       else if (refresh && !view.dirty) view.load();
     }
   }
+  function listenForVisibility(refresh) {
+    window.addEventListener('focus', refresh);
+    window.addEventListener('pageshow', refresh);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+  }
   // A route activation is an explicit request to see current router state.
   // Dirty drafts stay untouched unless that view provides a safe refresh which
   // updates read-only data while preserving its form fields.
@@ -363,7 +368,7 @@
   window.addEventListener('dashboard:readings',event=>{ loadRoute(event.detail.snapshot===true); for (const view of views) view.sync?.(event.detail.readings); updateSelection(); });
   window.addEventListener('dashboard:locked',()=>{ session++; finishConfirmation(false); selected.clear(); for (const view of views) view.clear(); smsFeedback.textContent = ''; counter.textContent = '0 characters'; updateSelection(); });
   window.addEventListener('beforeunload',event=>{ if (views.some(view=>view.dirty)) { event.preventDefault(); event.returnValue = ''; } });
-  globalThis.OpenU60UI = {el,button,panel,status,say,json,request,confirm,mutate,makeForm,field,choices,onoff,
+  globalThis.OpenU60UI = {el,button,panel,status,say,json,request,confirm,mutate,makeForm,field,choices,onoff,listenForVisibility,
     track:view=>{ views.push(view); loadRoute(); },
     get epoch(){return session;}, get saving(){return mutationBusy;}, current:epoch=>epoch === session && !consoleAPI.locked
   };

@@ -1,3 +1,7 @@
+//! Serializes owner requests and recovery on the relay thread. The controller
+//! admits queued work before its deadline, publishes phase snapshots and lets
+//! Disconnect request cancellation while the device operation is in progress.
+
 use super::*;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 
@@ -131,6 +135,7 @@ pub(super) struct Observation {
 pub(super) trait Port: Send + 'static {
     fn now(&self) -> Instant;
     fn boot_now(&self) -> BootInstant;
+    fn sync_subscription_dns(&self, state: &State);
     fn snapshot(&mut self, state: &State) -> Value;
     fn pending(&self) -> bool;
     fn target(&mut self) -> Option<resume::Resume>;
@@ -219,8 +224,7 @@ impl<P: Port> Controller<P> {
 
     pub fn supervised(self, end: impl FnOnce(String)) {
         if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run())) {
-            let what = panic.downcast_ref::<&str>().map(|text| (*text).to_owned()).or_else(|| panic.downcast_ref::<String>().cloned());
-            end(what.unwrap_or_else(|| "a panic".into()));
+            end(crate::common::panic_message(panic.as_ref()));
         }
     }
 
@@ -377,6 +381,7 @@ impl<P: Port> Controller<P> {
             }
             self.cancelled_restore();
             self.settle();
+            self.port.sync_subscription_dns(&self.state);
             let value = self.port.snapshot(&self.state);
             let pending = self.port.pending();
             let mut cancel = self.shared.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -670,6 +675,7 @@ impl<P: Port> Controller<P> {
     }
 
     fn publish(&mut self) {
+        self.port.sync_subscription_dns(&self.state);
         let value = self.port.snapshot(&self.state);
         let pending = self.port.pending();
         let cancel = self.shared.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

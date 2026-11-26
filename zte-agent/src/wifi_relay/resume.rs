@@ -55,19 +55,19 @@ mod tests {
     #[test]
     fn saved_target_survives_reload_privately_without_a_password() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("u60-relay-resume-{}", std::process::id()));
-        assert_eq!(load(&root), None);
-        save(&root, &network("Home", "aa:bb:cc:dd:ee:01", -50, "wpa2"), false).unwrap();
-        let resume = load(&root).unwrap();
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-relay-resume");
+        let root = temp.path();
+        assert_eq!(load(root), None);
+        save(root, &network("Home", "aa:bb:cc:dd:ee:01", -50, "wpa2"), false).unwrap();
+        let resume = load(root).unwrap();
         assert_eq!(resume, Resume { ssid: "Home".into(), security: "wpa2".into(), bssid: "aa:bb:cc:dd:ee:01".into(), ipv6: false });
         assert_eq!(std::fs::metadata(root.join(FILE)).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(!std::fs::read_to_string(root.join(FILE)).unwrap().contains("password"));
-        clear(&root).unwrap();
-        clear(&root).unwrap();
-        assert_eq!(load(&root), None);
+        clear(root).unwrap();
+        clear(root).unwrap();
+        assert_eq!(load(root), None);
         std::fs::write(root.join(FILE), b"{").unwrap();
-        assert_eq!(load(&root), None, "a damaged file restores nothing");
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(load(root), None, "a damaged file restores nothing");
     }
 
     #[test]

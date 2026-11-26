@@ -741,8 +741,8 @@ pub mod tests {
         // A child that reads, then hangs; one that never reads (the photo's
         // writer must not hold the caller); one that dies; none at all.
         let started = Instant::now();
-        assert_eq!(run(&SLOT, sh("cat >/dev/null; sleep 30"), vec![0; 1 << 20], Duration::from_millis(300)), Err(Fail::TimedOut));
-        assert_eq!(run(&SLOT, sh("sleep 30"), vec![0; 4 << 20], Duration::from_millis(300)), Err(Fail::TimedOut));
+        assert_eq!(run(&SLOT, sh("cat >/dev/null; exec sleep 30"), vec![0; 1 << 20], Duration::from_millis(300)), Err(Fail::TimedOut));
+        assert_eq!(run(&SLOT, sh("exec sleep 30"), vec![0; 4 << 20], Duration::from_millis(300)), Err(Fail::TimedOut));
         assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
         assert_eq!(run(&SLOT, sh("cat >/dev/null; kill -9 $$"), img.clone(), long), Err(Fail::Unreadable));
         assert_eq!(run(&SLOT, sh("cat >/dev/null; printf 'QRD1\\000\\002\\000\\001'"), img.clone(), long), Err(Fail::Unreadable));

@@ -254,7 +254,7 @@ impl Resource {
             Self::NftTable(table) => Key::NftTable(table.name),
             Self::LegacyChain(chain) => Key::LegacyChain(chain.tool, chain.table.clone(), chain.name.clone()),
             Self::LegacyHook(hook) => Key::LegacyHook(hook.tool, hook.table.clone(), hook.chain.clone(), hook.rule.clone()),
-            Self::Route(route) => Key::Route(route.family, route.kind, super::shared::route_destination(&route.destination), super::shared::route_table(&route.table), route.device.clone(), route.metric),
+            Self::Route(route) => Key::Route(route.family, route.kind, super::shared::route_destination(&route.destination), super::shared::route_table(&route.table).into(), route.device.clone(), route.metric),
             Self::Rule(rule) => Key::Rule(rule.family, rule.priority),
             Self::Addr(addr) => Key::Addr(addr.family, addr.device.clone(), addr.address.clone()),
             Self::Sysctl(setting) => Key::Sysctl(setting.key.clone()),

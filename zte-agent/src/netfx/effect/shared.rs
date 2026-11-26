@@ -112,12 +112,12 @@ pub(crate) fn route_destination(text: &str) -> String {
     }
 }
 
-pub(crate) fn route_table(name: &str) -> String {
+pub(crate) fn route_table(name: &str) -> &str {
     match name {
-        "main" => "254".into(),
-        "local" => "255".into(),
-        "default" => "253".into(),
-        _ => name.into(),
+        "main" => "254",
+        "local" => "255",
+        "default" => "253",
+        _ => name,
     }
 }
 

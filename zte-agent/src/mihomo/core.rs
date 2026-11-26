@@ -53,10 +53,6 @@ impl Core {
         Self { generation, pid, reaped }
     }
 
-    pub fn pid(&self) -> u32 {
-        self.pid as u32
-    }
-
     #[cfg(test)]
     pub fn alive(&self) -> bool {
         !*self.reaped.done.lock().unwrap_or_else(PoisonError::into_inner)
@@ -122,6 +118,32 @@ mod tests {
         core.signal(libc::SIGKILL);
         assert!(core.stop(Duration::from_millis(10)), "reaped: no signal, no wait");
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "reported once");
+    }
+
+    #[test]
+    fn stop_escalates_to_sigkill_after_a_term_resistant_child_is_ready() {
+        use std::io::{BufRead, BufReader};
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "trap '' TERM; echo ready; exec sleep 30"]);
+        let mut child = crate::net_tools::owned_reader(cmd).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = ready_tx.send(BufReader::new(stdout).read_line(&mut line).map(|_| line));
+        });
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let core = Core::watch(child.id() as libc::pid_t, 19, move |generation, how| {
+            let _ = exit_tx.send((generation, how));
+        });
+        let ready = ready_rx.recv_timeout(Duration::from_secs(3));
+        let stopped = core.stop(Duration::from_millis(35));
+        reader.join().unwrap();
+        assert_eq!(ready.unwrap().unwrap(), "ready\n");
+        assert!(stopped);
+        assert_eq!(exit_rx.recv_timeout(Duration::from_secs(3)).unwrap(), (19, "signal 9".into()));
+        assert!(!core.alive());
+        assert_eq!(exit_rx.recv_timeout(Duration::from_secs(1)), Err(mpsc::RecvTimeoutError::Disconnected));
     }
 
     #[test]

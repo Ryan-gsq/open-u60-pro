@@ -882,12 +882,16 @@ mod tests {
 
     #[test]
     fn mihomo_editors_validate_ids_and_never_serve_other_methods() {
-        let state = AppState::new();
+        let root = std::env::temp_dir().join(format!("u60-server-mihomo-editors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut state = AppState::new();
+        state.mihomo = std::sync::Arc::new(crate::mihomo::Mihomo::for_test(root.clone()));
         for bad in ["", "../etc", "a b", "x%2Fy", &"a".repeat(65)] {
             let (status, _) = route(&Method::Get, &format!("/api/mihomo/profiles/{bad}"), &state, b"");
             assert_eq!(status, 400, "{bad:?}");
         }
         assert_eq!(route(&Method::Get, "/api/mihomo/profiles/0a1b2c3d4e5f6071", &state, b"").0, 404);
         assert_eq!(route(&Method::Delete, "/api/mihomo/profiles/0a1b2c3d4e5f6071", &state, b"").0, 404);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

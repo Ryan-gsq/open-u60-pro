@@ -1,4 +1,4 @@
-const assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path'),{chromium}=require('playwright');
+const assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path'),{launchChrome}=require('./browser.cjs');
 (async()=>{
   const requests=[],streams=new Set();
   const usage={day:{tx_bytes:632,rx_bytes:224,time_secs:55,tx_packets:11,rx_packets:4},month:{tx_bytes:139854276877,rx_bytes:801800053447,time_secs:6275950,tx_packets:263548858,rx_packets:721312411},total:{tx_bytes:139854276877,rx_bytes:803778820401,time_secs:6275950,tx_packets:263548858,rx_packets:721312411},limit:{available:true,enabled:false,bytes:115964116992,warning_percent:95,exceeded:false,auto_disconnect:false,type:2},cycle:{available:true,enabled:false,reset_day:1},settings_errors:[]};
@@ -10,7 +10,7 @@ const assert=require('node:assert/strict'),http=require('node:http'),fs=require(
     let raw='';req.on('data',chunk=>raw+=chunk);req.on('end',()=>{const body=raw?JSON.parse(raw):null;requests.push({url:req.url,method:req.method,body});if(req.url==='/api/data-usage'&&req.method==='GET'){send(res,usage);return;}if(req.url==='/api/data-usage/limit'&&req.method==='PUT'){usage.limit={...usage.limit,enabled:body.enabled,bytes:body.bytes,warning_percent:body.warning_percent,auto_disconnect:body.auto_disconnect};send(res,usage.limit);return;}if(req.url==='/api/data-usage/cycle'&&req.method==='PUT'){usage.cycle={...usage.cycle,enabled:body.enabled,reset_day:body.reset_day};send(res,usage.cycle);return;}send(res,{});});
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const heartbeat=setInterval(()=>{for(const res of streams)res.write(': heartbeat\n\n');},1000);
-  const browser=await chromium.launch({headless:true,channel:'chrome'}),context=await browser.newContext({viewport:{width:1440,height:1100}}),page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
+  const browser=await launchChrome(),context=await browser.newContext({viewport:{width:1440,height:1100}}),page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
   const status=async(id,text)=>page.waitForFunction(([id,text])=>document.querySelector(`#${id} .action-status`)?.textContent.includes(text),[id,text]);const confirm=label=>page.locator('.confirm-dialog').getByRole('button',{name:label,exact:true}).click();const writes=()=>requests.filter(request=>request.method==='PUT');
   try{
     await page.goto(`http://127.0.0.1:${server.address().port}/#tools/data`);await status('data-limit-settings','Current allowance settings loaded');

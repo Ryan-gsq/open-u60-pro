@@ -1,12 +1,14 @@
 # Third-party notices
 
-zte-agent is licensed under the [MIT License](LICENSE). The binary built from this repository also contains the components below. This file accompanies every release of the `zte-agent` binary.
+zte-agent is licensed under the [MIT License](LICENSE). This file documents the binary’s third-party components, optional downloads and retained fixtures. It accompanies every release of the `zte-agent` binary.
 
 ## Profile JavaScript runtime (MIT)
 
-Global profile scripts execute in QuickJS through `rquickjs` 0.14.0, not Node.js.
-The runtime is linked into the Rust agent with no module loader or host I/O.
-Sources: https://github.com/DelSkayn/rquickjs and https://github.com/quickjs-ng/quickjs.
+Global profile scripts execute in QuickJS-NG 0.16.2, bundled by
+`rquickjs-sys` 0.14.0 and linked through `rquickjs-core` and `rquickjs` 0.14.0.
+The embedded runtime has no module loader or host I/O. See
+[rquickjs](https://github.com/DelSkayn/rquickjs) and
+[QuickJS-NG](https://github.com/quickjs-ng/quickjs) for source.
 The profile pipeline is an independent implementation of the documented
 `main(config, profileName)` contract; no Clash Verge source code is vendored.
 
@@ -37,7 +39,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### QuickJS
+### QuickJS-NG
 
 ```
 The MIT License (MIT)
@@ -146,7 +148,7 @@ SOFTWARE.
 
 ## Datastar (MIT)
 
-`zte-agent/src/web/assets/datastar-1.0.4.js` is [Datastar](https://github.com/starfederation/datastar) v1.0.4, the release bundle `bundles/datastar.js` at tag `v1.0.4`, vendored byte-identical (SHA-256 `727844adfc825ee651fb93c544a2a739986f9a21820a94524b35f0cac470cf91`, checked by `zte-agent/build.rs`). It is embedded in zte-agent and served to browsers by the web UI. Its license, from `LICENSE.md` at that tag:
+`zte-agent/src/web/assets/datastar-1.0.4.js` is [Datastar](https://github.com/starfederation/datastar) v1.0.4, the release bundle `bundles/datastar.js` at tag `v1.0.4`, vendored byte-identical (SHA-256 `727844adfc825ee651fb93c544a2a739986f9a21820a94524b35f0cac470cf91`, checked by `zte-agent/build.rs`). It is used in the retired renderer fixtures. The license at that tag reads as follows.
 
 ```
 Copyright © Star Federation
@@ -160,7 +162,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ## QR Code generator library (MIT)
 
-The web UI's Share Wi-Fi page draws its join QR code with the [`qrcodegen`](https://crates.io/crates/qrcodegen) crate 1.8.0 ([QR Code generator library](https://www.nayuki.io/page/qr-code-generator-library), Rust version). The crate ships no separate license file; its notice, from the head of `src/lib.rs`:
+The retired renderer’s Share Wi-Fi page and the QR decoder fixtures use the [`qrcodegen`](https://crates.io/crates/qrcodegen) crate 1.8.0 ([QR Code generator library](https://www.nayuki.io/page/qr-code-generator-library), Rust version). The crate ships no separate license file; its notice, from the head of `src/lib.rs`:
 
 ```
 QR Code generator library (Rust)
@@ -285,9 +287,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## Optional Network Programs (Not Linked Into zte-agent)
 
-The web-only network extension can download these separately version-pinned
-upstream artifacts at the user's request. No artifact is embedded in the agent
-or automatically installed at boot:
+The agent downloads the following independent upstream artifacts at the user’s
+request. Mihomo and Zashboard are pinned. Tailscale uses the selected official
+version. None is embedded in the agent or automatically installed at boot.
 
 - **Mihomo 1.19.33**, GPL-3.0, distributed by
   [MetaCubeX](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33).
@@ -316,6 +318,12 @@ or automatically installed at boot:
   repository. The runtime records the official download URL, checksum and
   source/license reference beside each database. A release-side checksum is an
   integrity check, not an independent signature or a fixed-version guarantee.
+- **Tailscale** is downloaded on request as a versioned Linux ARM64 package.
+  The console discovers stable versions from the official package index and
+  upstream GitHub releases. The installer verifies the package against the
+  supplied SHA-256 or the official `.sha256` sidecar. The downloaded package
+  has its own upstream terms. See the [official packages](https://pkgs.tailscale.com/stable/)
+  and [upstream releases](https://github.com/tailscale/tailscale/releases).
 
 Wi-Fi relay control was independently implemented in Rust with public
 nl80211/hostapd/wpa interfaces and local device probe observations. No source
@@ -323,26 +331,37 @@ from the GPL-licensed u60-pro-enhanced project is included in this integration.
 
 ## Rust crates
 
-zte-agent links these crates from crates.io (for the router target), each under the license shown. Each crate's license text and copyright notices are in its published source.
+The list follows the locked normal dependency graph of `zte-agent` for
+`aarch64-unknown-linux-musl` with the features in `zte-agent/Cargo.toml`. It
+includes the graph's procedural-macro dependencies, with build-only tooling
+and dependencies used solely in retired renderer or QR test fixtures omitted.
+The local `euicc` crate is covered [above](#euicc-lgpl-21-only). License texts
+and copyright notices are available in each crate's published source.
 
 | Crate | Version | License |
 |---|---|---|
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
+| allocator-api2 | 0.2.21 | MIT OR Apache-2.0 |
+| anyhow | 1.0.104 | MIT OR Apache-2.0 |
 | atomic-waker | 1.1.2 | Apache-2.0 OR MIT |
 | axum | 0.8.9 | MIT |
 | axum-core | 0.5.6 | MIT |
 | base16ct | 0.2.0 | Apache-2.0 OR MIT |
+| base64 | 0.13.1 | MIT/Apache-2.0 |
 | base64 | 0.22.1 | MIT OR Apache-2.0 |
 | base64ct | 1.8.3 | Apache-2.0 OR MIT |
+| bitflags | 1.3.2 | MIT/Apache-2.0 |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 |
+| byteorder | 1.5.0 | Unlicense OR MIT |
 | bytes | 1.11.1 | MIT |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 |
 | const-oid | 0.9.6 | Apache-2.0 OR MIT |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
-| crc32fast | 1.5.3 | MIT OR Apache-2.0 |
+| crc32fast | 1.5.4 | MIT OR Apache-2.0 |
 | crypto-bigint | 0.5.5 | Apache-2.0 OR MIT |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 |
+| curve25519-dalek | 4.1.3 | BSD-3-Clause |
 | der | 0.7.10 | Apache-2.0 OR MIT |
 | digest | 0.10.7 | MIT OR Apache-2.0 |
 | displaydoc | 0.2.5 | MIT OR Apache-2.0 |
@@ -370,6 +389,7 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | h2 | 0.4.19 | MIT |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
+| hex | 0.4.3 | MIT OR Apache-2.0 |
 | hmac | 0.12.1 | MIT OR Apache-2.0 |
 | http | 1.4.0 | MIT OR Apache-2.0 |
 | http-body | 1.1.0 | MIT |
@@ -394,43 +414,55 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | jpeg-decoder | 0.3.2 | MIT OR Apache-2.0 |
 | libc | 0.2.182 | MIT OR Apache-2.0 |
 | litemap | 0.8.1 | Unicode-3.0 |
-| log | 0.4.34 | MIT OR Apache-2.0 |
+| log | 0.4.35 | MIT OR Apache-2.0 |
 | lru | 0.18.5 | MIT |
 | matchit | 0.8.4 | MIT AND BSD-3-Clause |
-| maud | 0.27.0 | MIT OR Apache-2.0 |
-| maud_macros | 0.27.0 | MIT OR Apache-2.0 |
 | memchr | 2.8.0 | Unlicense OR MIT |
+| memoffset | 0.6.5 | MIT |
 | mime | 0.3.17 | MIT OR Apache-2.0 |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | mio | 1.1.1 | MIT |
+| netlink-packet-core | 0.7.0 | MIT |
+| netlink-packet-generic | 0.3.3 | MIT |
+| netlink-packet-route | 0.21.0 | MIT |
+| netlink-packet-utils | 0.5.2 | MIT |
+| netlink-packet-wireguard | 0.2.3 | MIT |
+| netlink-request | 2.0.0 | MIT |
+| netlink-sys | 0.8.8 | MIT |
+| nix | 0.25.1 | MIT |
 | once_cell | 1.21.3 | MIT OR Apache-2.0 |
 | p256 | 0.13.2 | Apache-2.0 OR MIT |
+| paste | 1.0.15 | MIT OR Apache-2.0 |
 | pem-rfc7468 | 0.7.0 | Apache-2.0 OR MIT |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT |
+| pin-utils | 0.1.1 | MIT OR Apache-2.0 |
 | pkcs8 | 0.10.2 | Apache-2.0 OR MIT |
 | png | 0.18.1 | MIT OR Apache-2.0 |
 | potential_utf | 0.1.4 | Unicode-3.0 |
 | primeorder | 0.13.6 | Apache-2.0 OR MIT |
 | proc-macro2 | 1.0.106 | MIT OR Apache-2.0 |
-| proc-macro2-diagnostics | 0.10.1 | MIT/Apache-2.0 |
-| qrcodegen | 1.8.0 | MIT |
 | quote | 1.0.44 | MIT OR Apache-2.0 |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 |
 | reqwest | 0.12.28 | MIT OR Apache-2.0 |
 | rfc6979 | 0.4.0 | Apache-2.0 OR MIT |
 | ring | 0.17.14 | Apache-2.0 AND ISC |
 | rqrr | 0.11.0 | (MIT OR Apache-2.0) AND ISC |
+| rquickjs | 0.14.0 | MIT |
+| rquickjs-core | 0.14.0 | MIT |
+| rquickjs-sys | 0.14.0 | MIT |
 | rustls | 0.23.37 | Apache-2.0 OR ISC OR MIT |
 | rustls-pki-types | 1.14.0 | MIT OR Apache-2.0 |
 | rustls-webpki | 0.103.9 | ISC |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | sec1 | 0.7.3 | Apache-2.0 OR MIT |
+| semver | 1.0.28 | MIT OR Apache-2.0 |
 | serde | 1.0.228 | MIT OR Apache-2.0 |
 | serde_core | 1.0.228 | MIT OR Apache-2.0 |
 | serde_derive | 1.0.228 | MIT OR Apache-2.0 |
 | serde_json | 1.0.149 | MIT OR Apache-2.0 |
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 |
+| serde_yaml_ng | 0.10.0 | MIT |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 |
 | signature | 2.2.0 | Apache-2.0 OR MIT |
 | simd-adler32 | 0.3.10 | MIT |
@@ -440,9 +472,14 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | spki | 0.7.3 | Apache-2.0 OR MIT |
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 |
 | subtle | 2.6.1 | BSD-3-Clause |
+| syn | 2.0.117 | MIT OR Apache-2.0 |
 | syn | 3.0.5 | MIT OR Apache-2.0 |
 | sync_wrapper | 1.0.2 | Apache-2.0 |
 | synstructure | 0.13.2 | MIT |
+| thiserror | 1.0.69 | MIT OR Apache-2.0 |
+| thiserror | 2.0.20 | MIT OR Apache-2.0 |
+| thiserror-impl | 1.0.69 | MIT OR Apache-2.0 |
+| thiserror-impl | 2.0.20 | MIT OR Apache-2.0 |
 | tinystr | 0.8.2 | Unicode-3.0 |
 | tokio | 1.50.0 | MIT |
 | tokio-macros | 2.6.1 | MIT |
@@ -457,6 +494,7 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | try-lock | 0.2.5 | MIT |
 | typenum | 1.19.0 | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
+| unsafe-libyaml | 0.2.11 | MIT |
 | untrusted | 0.9.0 | ISC |
 | ureq | 3.2.0 | MIT OR Apache-2.0 |
 | ureq-proto | 0.5.3 | MIT OR Apache-2.0 |
@@ -465,19 +503,17 @@ zte-agent links these crates from crates.io (for the router target), each under 
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT |
 | want | 0.3.1 | MIT |
 | webpki-roots | 1.0.6 | CDLA-Permissive-2.0 |
+| wireguard-control | 2.0.0 | LGPL-2.1-or-later |
 | writeable | 0.6.2 | Unicode-3.0 |
+| x25519-dalek | 2.0.1 | BSD-3-Clause |
 | yoke | 0.8.1 | Unicode-3.0 |
 | yoke-derive | 0.8.1 | Unicode-3.0 |
 | zerofrom | 0.1.6 | Unicode-3.0 |
 | zerofrom-derive | 0.1.6 | Unicode-3.0 |
 | zeroize | 1.8.2 | Apache-2.0 OR MIT |
+| zeroize_derive | 1.5.0 | Apache-2.0 OR MIT |
 | zerotrie | 0.2.3 | Unicode-3.0 |
 | zerovec | 0.11.5 | Unicode-3.0 |
 | zerovec-derive | 0.11.2 | Unicode-3.0 |
-| zmij | 1.0.21 | MIT |
-| bumpalo | 3.20.3 | MIT OR Apache-2.0 |
-| futures-macro | 0.3.34 | MIT OR Apache-2.0 |
-| serde_yaml_ng | 0.10.0 | MIT |
-| unsafe-libyaml | 0.2.11 | MIT |
 | zip | 2.6.1 | MIT |
-| zopfli | 0.8.4 | Apache-2.0 |
+| zmij | 1.0.21 | MIT |

@@ -1,8 +1,12 @@
 # Wi-Fi 中继与 Mihomo：实现与验收记录
 
-本文记录 [版本与验收](relay-mihomo-refactor-plan.md) 中 v1–v6 在本仓库里的实际落地情况，
+> **历史记录 · 截至 2026-11-12。** 以下验收按当时的构建和环境记录。`measurements/`、
+> `../probe-reports/` 等原始记录在开发机留档，仓库内保留摘要。现行规则见[架构](../relay-mihomo-architecture.md)
+> 和[验收索引](../README.md#device-acceptance)。
+
+本文记录 [版本与验收](2026-11-10-relay-mihomo-refactor-plan.md) 中 v1–v6 在本仓库里的实际落地情况，
 按“源码已实现 / 本机或隔离环境已验证 / 仍待设备验证”分开。行为规范以
-[架构规范](relay-mihomo-architecture.md) 为准；车主选择 Q1=A、Q2=A、Q3=A（2026-11-10）。
+[架构规范](../relay-mihomo-architecture.md) 为准；车主选择 Q1=A、Q2=A、Q3=A（2026-11-10）。
 没有设备结果的项目一律记为未验，不按单测或代码存在算作通过。
 中继的站点接口在 2026-11-12 之前叫 `u60sta0`，现在叫 `ath20`（“批次 3”）；之前各节的记录保留旧名。
 
@@ -26,7 +30,7 @@
 | M2、M10、R4 | 只有装过路由的会话（`Session::routed`）在拆除时通知 Mihomo；扫描、未装路由就失败的连接、重复拆除都不通知；核心关闭/安装中收到通知不报错。 |
 | M8 | 规则集文件按内容哈希判断变化，只改 mtime 不重编（`routing::Source::changed`）。 |
 | R2 | 监视器记录改为“PID + `/proc/<pid>/stat` 启动时间 + boot id”，`stop_strays` 只停记录里的那个进程，发信号前再核对身份。 |
-| H5 | 记录 `IPACM_cfg.xml` 就地截断改写的崩溃/掉电风险（[硬件转发](relay-hw-offload.md) 第 1 节），修复在 v4（2026-11-12 起 agent 不再写这个文件，见“批次 3”）。 |
+| H5 | 记录 `IPACM_cfg.xml` 就地截断改写的崩溃/掉电风险（[硬件转发](../relay-hw-offload.md) 第 1 节），修复在 v4（2026-11-12 起 agent 不再写这个文件，见“批次 3”）。 |
 | 日志兼容 | 省电步骤的撤销改为普通 `iw dev u60sta0 set power_save on`（当时的站点名）：已部署的 HEAD（c253113）能执行它，不再依赖“跳过未知 `@u60-*`”。其余 v1 写入的撤销项与 HEAD 的命令表一致。 |
 
 **本机已验证**：`cargo test --locked -p zte-agent -- --test-threads=4` 1479 通过、0 失败（3 个需设备的忽略）。
@@ -139,7 +143,7 @@
 | 保留 | v6 时 `wifi_relay/width.rs` 只剩每次关联后的一次宽度复位（先窄一档、等 1 s、回到协商宽度并读回）和热点需要的 `parse_channel`；2026-11-12 起复位删除、`width.rs` 删除，`parse_channel` 移到 `hotspot.rs`。 |
 | 迁移 | `saved-wifi.json` 里旧的 `width_mode`（含 `auto`）被忽略，读作保持协商带宽，下次写入时去掉；旧版 agent 读到没有该字段的记录按 `off` 处理。连接请求里旧页面带来的 `width_mode` 被忽略。记住网络现在只保存密码，不勾选“记住”时不再写入仅含偏好的记录。状态不再有 `width_mode`/`width`/`width_state`，`frequency` 取自所选网络。 |
 | D8 提示 | 服务端渲染页与响应式控制台（`ui/relay.js`、`ui/relay-model.js`）在中继连接时说明：路由器的家长控制、网址过滤对经中继的设备不生效（CPU 路径在其之前放行，硬件转发完全绕过），只有中继 IPv4 能硬件转发，IPv6（NAT66）和经 Clash 的流量走 CPU；IPv6 状态写明“由 CPU 转发”。B31 的家长控制存于厂商时间管理数据库而非 UCI（只读查询 `uci show` 只有 `parentctl_display`/`url_filter_display` 显示开关），所以提示在连接时一律显示，没有按开关是否打开来显示。 |
-| 文档 | 同步[产品说明](mihomo-relay-prd.md)（Q1–Q3、D2/D3、热重载、准入、防火墙布局、带宽、D8 与 Q2/Q3 代价）、[网络扩展](network-extensions.md)（API 表、带宽自适应一节标为已删除）、[硬件转发](relay-hw-offload.md)、[中继生命周期](relay-lifecycle.md)、[Web UI](web-ui.md)、[响应式控制台](responsive-console.md)、仓库 `CLAUDE.md` 与 `CHANGELOG.md`（Unreleased）。 |
+| 文档 | 同步[产品说明](../mihomo-relay-prd.md)（Q1–Q3、D2/D3、热重载、准入、防火墙布局、带宽、D8 与 Q2/Q3 代价）、[网络扩展](../network-extensions.md)（API 表、带宽自适应一节标为已删除）、[硬件转发](../relay-hw-offload.md)、[中继生命周期](../relay-lifecycle.md)、[Web UI](../web-ui.md)、[响应式控制台](../responsive-console.md)、仓库 `CLAUDE.md` 与 `CHANGELOG.md`（Unreleased）。 |
 | S3–S5 | 计划正文没有给出 S3–S5 的具体定义。本次已有的拆分：`netfx`（exec/files/ids/conntrack/effect/admission）、`mihomo::{controller,core,intercept,egress,routing}`、`wifi_relay::{uplink,offload,power_save,width}`；未再做无规范依据的拆分，留待车主确认。 |
 
 **本机已验证**：开发机全量 `cargo test --locked -p zte-agent -- --test-threads=4`：1426 通过、0 失败、6 忽略（较 v5 少约 107 个，即删除的调优/采样测试）。新增/改写：`wifi_relay::width::tests`（关联复位经窄一档并读回、信道解析与宽度代码）、`wifi_relay::saved::tests::a_saved_width_choice_is_ignored_and_dropped_and_passwords_stay`、`web::tests::network::{relay_page_offers_no_bandwidth_choice_and_states_what_router_filters_skip, relay_connect_forwards_no_width_choice_and_still_needs_confirmation, relay_shows_the_upstream_band_with_its_negotiated_bandwidth, relay_hides_the_upstream_link_without_a_connected_band, relay_network_names_are_escaped_as_plain_text}`。响应式控制台：`node ui/tests/relay-model.cjs` 通过；`ui/tests/relay.cjs`（Playwright + 本机 Chrome，临时安装在 `/tmp/u60-test`）通过，含无带宽选择、旧状态字段不显示、D8 提示仅在连接时显示、请求体不带 `width_mode`、不访问 `/api/wifi-relay/tuning`；`cellular.cjs`、`mihomo.cjs` 回归通过。
@@ -240,10 +244,12 @@
 
 **仍待设备验证与已知限制**：IPv6 节点提示未在设备上复现（需要再关一次中继 IPv6）。接管期间核心未就绪时，内核按设计把流量全部交给核心（Hold）：核心刚开始监听、整表尚未加载的约 3 s 里，走 CPU 路径的直连 TCP 会被核心的监听端回 RST（最终一次 `kill -9` 中 tuna 长下载因此断开），硬件转发中的流不受影响；保留此行为，避免核心未核验期间有流量绕过它。切到 2.4 GHz 网络和断开时热点仍要回车主的 160 MHz 信道并做 CAC（约 65 s）；换到另一个 5 GHz 网络（含不同信道）未在设备上测（为不改动车主正在用的上游，只测了同一网络重连）；换到另一个 AP 时 IPv6 仍重新获取（约 10 s）。未修复：发现 4（硬件流在 conntrack 删除后仍走旧出口 7.7–9.4 s，取决于 IPACM）、5（核心热重载内存增长）、6（核心按源端口复用 UDP 会话，属 Mihomo 自身行为）、8（节点没有 IPv6 出口）。
 
+<a id="batch-1"></a>
+
 ## 批次 1（2026-11-12）：IPA 模式交还路由器、核对改读列表、DFS 键、删除宽度复位
 
 车主决定（2026-11-12）：agent 不再读、切换、审计或核验 IPACM 的模式，由路由器的工作模式决定（极速模式
-`Nomal_mode` 打开加速，其他工作模式关闭，`Ai_mode`、`Game_mode` 随流量切换；[硬件转发](relay-hw-offload.md)
+`Nomal_mode` 打开加速，其他工作模式关闭，`Ai_mode`、`Game_mode` 随流量切换；[硬件转发](../relay-hw-offload.md)
 “谁决定 HW/SW 模式”）；`wireless.zte_mbb.dfs_channel_switch_disable=1` 可以持久设置；IPv6 自有对象被
 不发厂商触发的写入者删掉时，15 s 内发现即可（原来 3 s）。Mihomo 控制器的修复不在这一批。
 
@@ -260,7 +266,7 @@
 | 宽度 | 删除 `wifi_relay/width.rs` 和关联后的宽度复位，agent 中没有任何地方运行 `iwpriv … chwidth`；`parse_channel` 移到 `hotspot.rs`。 |
 | DFS 开关 | `dfs_switch::allow`：键不是 1 就 `uci set`，只在 `wireless` 没有别的未提交改动时 `uci commit wireless`（否则不提交并记日志，下次连接再提交），然后照旧 `iwpriv wlan2 disableDfsCS 0`。删除扫描 `/proc` 等厂商脚本和最多 10 s 的等待。 |
 
-**验证**：本节只依据源码。本机测试结果、发布构建体积和设备验证没有记在本文。新的设备事实（中继连上后那次 fw3 重载的来源、门户 RETURN 仍然需要）见[硬件转发](relay-hw-offload.md)第 5 节。
+**验证**：本节只依据源码。本机测试结果、发布构建体积和设备验证没有记在本文。新的设备事实（中继连上后那次 fw3 重载的来源、门户 RETURN 仍然需要）见[硬件转发](../relay-hw-offload.md)第 5 节。
 
 ## 批次 2（2026-11-12）：Mihomo 控制器修复、iptables 的第二种“不在”措辞
 
@@ -278,7 +284,7 @@
 | 整表与规则集刷新（E6） | `NftTables::declare`：内容与已确认目标相同、读回仍在时不再载入；每次核对用一次 `nft -t list ruleset` 读两族（中继的 `u60_relay` 也用它）。`domain` 规则集的刷新直接交给核心（`Routes::reaches_kernel`），不收紧、不换表。 |
 | 出口观测（E7） | `mihomo/egress.rs`：路由经 rtnetlink（`RTM_GETROUTE`，与 `ip route get` 相同），地址用 `getifaddrs`；查所连 AP 的 `iw` 只在中继宣布出口变化之后（和等待 IPv6 变化稳定期间）跑，15 s 审计不跑。 |
 | 控制器线程 panic（E8） | `Controller::supervised`：记一行日志后 `abort` 结束 agent，由 `zte-agent guard` 重启，新 agent 接管本次开机的表。 |
-| iptables 的第二种措辞 | `net_tools/firewall.rs::no_rule` 认两种退出 1 的措辞：目标是 ACCEPT/RETURN 或链不存在时 "Bad rule (does a matching rule exist in that chain?)"，跳到一条存在的用户链（每个挂到 `U60_*` 的钩子）或目标是 MASQUERADE 时 "No chain/target/match by that name."（B31，iptables 1.8.8 legacy，两族）。目标链不存在退出 2，不算答案。批次 1 的第一版只认第一种：开机后厂商的防火墙启动清掉了 IPv6 INPUT 钩子，它的撤销读成“查不了”，此后每次中继恢复都以 "Network cleanup paused" 失败，直到装上本修复（约 15 分钟没有上行）。测试 `firewall::tests::a_hook_the_vendor_flushed_is_undone_while_its_chain_stays`。 |
+| iptables 的第二种措辞 | `net_tools/firewall.rs::no_rule`（当时路径，`08274c3` 中为 `netfx::effect::legacy::no_rule`）认两种退出 1 的措辞：目标是 ACCEPT/RETURN 或链不存在时 "Bad rule (does a matching rule exist in that chain?)"，跳到一条存在的用户链（每个挂到 `U60_*` 的钩子）或目标是 MASQUERADE 时 "No chain/target/match by that name."（B31，iptables 1.8.8 legacy，两族）。目标链不存在退出 2，不算答案。批次 1 的第一版只认第一种：开机后厂商的防火墙启动清掉了 IPv6 INPUT 钩子，它的撤销读成“查不了”，此后每次中继恢复都以 "Network cleanup paused" 失败，直到装上本修复（约 15 分钟没有上行）。测试 `firewall::tests::a_hook_the_vendor_flushed_is_undone_while_its_chain_stays`。 |
 
 **设备回归（B31，2026-11-12，批次 1 加本批，站点接口仍是 `u60sta0`）**
 
@@ -290,10 +296,12 @@
 | --- | --- |
 | 稳态开销（中继 5 GHz 带 IPv6、Mihomo rule 模式，120 s） | agent 派生的工具占单核 0.60%（前一晚 2.79%），agent 自身 0.52%（0.78%），全系统 fork 44 次/s（53 次/s）。 |
 | 开机（DFS 键已提交） | 中继开机后 70.9 s 第一次尝试恢复；随后出口变化的计划内重启复用校验，`the restart held traffic for 2264 ms`。 |
-| 硬件转发 | 见[硬件转发](relay-hw-offload.md)“批次 1 回归”：agent 恢复中继后、厂商硬件模式下 205 MB 只有 155 个包走内核；厂商切到软件时 agent 不动模式。 |
+| 硬件转发 | 见[IPA 实测](2026-11-relay-offload-benchmarks.md#批次-1-回归2026-11-12站点接口仍是-u60sta0)的“批次 1 回归”：agent 恢复中继后、厂商硬件模式下 205 MB 只有 155 个包走内核；厂商切到软件时 agent 不动模式。 |
 | 没有厂商触发时的守护 | 删掉的跳转规则和放行规则 34 s 后各补回一份；IPv6 策略规则 2 s 后补回。 |
 | Mihomo | `kill -9` 核心后 28 ms 记下 `direct until the core is back`，6.2 s 后重试，7.3 s 后新核心进程在，状态 running、表已确认。 |
 | 同一上游的交接重连 | 6 s（工程师记录，无原始文件）。 |
+
+<a id="batch-3"></a>
 
 ## 批次 3（2026-11-12）：站点改名 `ath20`、删除 IPACM 安装、交接保留离线门户的抑制、关机充电模式下的重启选择
 
@@ -348,7 +356,7 @@
 | 每代的绕过设置与 geodata | 所有计划使用 `Prepared.bypass`，`direct-bypass` 文件（兼容旧 `cn-direct`）只表示意图。`geodata-mode` 保留订阅原值；绕过开启且核心使用 `geoip.metadb` 时，`notice` 说明 GEOIP 不能在内核绕过。不会为此强制使用离线时可能缺失的 `GeoIP.dat`。 |
 | TCP keep-alive | 仅当订阅三个键 `keep-alive-idle`、`keep-alive-interval`、`disable-keep-alive` 全部缺省时，托管配置写空闲 120 s、间隔 30 s；保留任何显式设置。核心原缺省值为 0，Go 实际按空闲 15 s、间隔 15 s 探测（`I-doc-changes-4.md` 的核心源码核对记录）。真机计数见下表。 |
 | 规则计算 | `geoip` 缓存同一当前文件中已载入的代码，范围上限 8 MiB、代码上限 1024 个；先读代码，不为非目标国家分配 CIDR 范围。`ranges::subtract`/`union` 线性扫描，`v6_only_in_use` 复用已解析目标。上限见 `mihomo/geoip.rs` 的 `MAX_CACHE_BYTES`、`MAX_CACHE_CODES`。 |
-| I1 源码扫描 | `netfx::boundary` 在命令构造处识别所有 `ip` 对象、iptables/ip6tables/restore、nft、conntrack、sysctl 和 `/proc/sys` 写入；轻量扫描跳过注释、无关字符串与测试，不依赖 Rust 语法解析器。11 项例外按文件、函数、命令和原因登记，未再命中的例外使测试失败；当前清单见[架构 §4](relay-mihomo-architecture.md#4-网络效果层netfxeffecteffectset)（批次 5 为 10 项）。 |
+| I1 源码扫描 | `netfx::boundary` 在命令构造处识别所有 `ip` 对象、iptables/ip6tables/restore、nft、conntrack、sysctl 和 `/proc/sys` 写入；轻量扫描跳过注释、无关字符串与测试，不依赖 Rust 语法解析器。11 项例外按文件、函数、命令和原因登记，未再命中的例外使测试失败；当前清单见[架构 §4](../relay-mihomo-architecture.md#4-网络效果层netfxeffecteffectset)（批次 5 为 10 项）。 |
 | 清理遗留入口 | 删除未用网络锁字段、`drop(try_lock())` 探针（改由 `Port::busy` 检查）、`@u60-mihomo-nft release` 和旧命令表、`nft_present`，dashboard 的状态快照不再占 gate；`uplink_changed_locked` 改名 `uplink_changed`。删除旧接口名常量、助手与规则身份例外（批次 3 的后续）；与改名前构建互换仍须先断开或重启，不能以跳过未知 undo 作为兼容验收。 |
 
 **真机已验证（B31，2026-11-12）**
@@ -360,7 +368,7 @@
 | 整机重启恢复 | 第一次尝试在开机 76.053 s 恢复（`measurements/b4-final/agent-boot.log`；外部观测见 `b4-reboot.log`）；随后 154 MB 下载只有 180 个包走内核（`measurements/b4-final/b4-after-reboot.log`）。这次证明恢复后硬件路径可用，不证明全部冷启动条件。 |
 | 选中订阅变更刷新 | 源减少 2 B，一次低优先级校验耗时 3204 ms；随后日志为 `reloading: the selected subscription refreshed`、`reload answered=Ok(204)`，重载与核验耗时 289 ms，核心 PID 不变。跨重载的 6,000,000 B 下载持续 48.9 s，HTTP 200、curl 退出码 0。旧构建同类变更两次校验为 3166 ms、3176 ms，重启持流量 2301 ms；旧构建相同源刷新仍校验 3169 ms（`measurements/b4-final/mihomo-refresh.txt`）。这一条下载不能代替双出口无泄漏和 UDP 验收。 |
 | TCP keep-alive 计数 | 路由器 `/proc/net/netstat` 的 `TcpExt TCPKeepAlive`：旧核心缺省空闲/间隔各 15 s，60 s 内 88 次探针，核心打开 87 个描述符（`measurements/b4-final/mihomo-refresh.txt`）。新核心运行 441 s 后，运行配置空闲 120 s、间隔 30 s，120 s 内 12 次，即每分钟 6 次，核心打开 99 个描述符（`measurements/b4-final/keepalive-later.txt`）。这是路由器总探针计数；两次描述符数量不同。`mihomo-refresh.txt` 中新核心启动较早时的 2 次/60 s 不作可比结果。 |
-| fw3 两种接入实验 | 沿用主线程已写的[架构 §9](relay-mihomo-architecture.md#9-实验过没有采用的两种接入厂商防火墙的办法2026-11-12)，证据为 `measurements/b4-fw3/fwprobe.log`、`nf-nat-warning-times.txt`、`second-masquerade-control.txt`；两种办法均未采用，本次没有重写实验记录。 |
+| fw3 两种接入实验 | 沿用主线程已写的[fw3 实验记录](2026-11-12-fw3-integration-experiments.md)，证据为 `measurements/b4-fw3/fwprobe.log`、`nf-nat-warning-times.txt`、`second-masquerade-control.txt`；两种办法均未采用，本次没有重写实验记录。 |
 
 **开发机与隔离环境已验证**
 
@@ -369,7 +377,7 @@
 - `tests/mihomo-qa/hot_reload.py` 的本机真实 Mihomo v1.19.33 检查证明已有 TCP 可跨重载、经典监听保留、新规则生效；它复现全新持久缓存第一次重载可能清空 fake-ip 池，后续保留映射。该脚本报告首次映射是否保留，不要求为真；源码与复现结论来自 `I-doc-changes-4.md`，`b4-final/` 没有单独保存该脚本的原始输出。未在路由器验证，也未规避核心限制。
 - Mac release 计算测试：16.5 MB 合成 GeoIP 文件的首次计划从 92.0 ms 降为 14.0 ms；4500 段减去自身从 4.12 ms 降为 23 µs（`I-doc-changes-4.md` 的工程师记录；对应忽略测试为 `mihomo::geoip::tests::benchmark_first_geoip_plan` 和 `mihomo::routing::tests::benchmark_subtract_4500_ranges`）。没有单独留存原始计时输出，未在路由器测时。
 - 过时的隔离脚本已于 2026-11-12 删除：`tests/relay-ipv6/netns.py`（第一个 NAT66 TCP 检查超时：导出只有 legacy 计划，NAT66 自 v5 起在 nft；Mihomo 部分还模拟旧 TUN）、`real_core.py`（其 Rust 测试 `isolated_real_core_uplink_transitions` 在第一阶段之前就失败：它绕过 agent 直接改核心的模式，再断言重启保留该模式）、同一测试的真机版 `b31-isolated.sh` 与 `device_peer.rs`，以及只为它们导出的 `export_plans_for_isolated_linux_acceptance`。规则与 NAT66 流量由 `tests/relay-firewall-qa` 覆盖，Mihomo 表与日志由 `tests/mihomo-qa` 覆盖；真实核心经网桥的流量不再有隔离测试，只在真机回归中验证。
-- 同日其余脚本逐个运行：OpenWrt 生命周期原先停在一条过时断言（`U60_R6_DNS` 链自 v5 起不存在），改为删除并修复一条 `U60_R6_FWD` 放行规则后 3 项 Rust 测试通过；OpenWrt 运行时 RA 通过；`b31-ra-runtime.sh` 在 B31 私有命名空间通过 4 次，抓到的 RA 字段符合预期，其清理原先会留下 `/var/run/netns` 的 tmpfs、偶尔留下 `proc` 绑定挂载，现已补上（之后 3 次运行前后 `mount` 输出一致）；`tests/network-ui.cjs`、`tests/mihomo-dashboard.cjs`、`scripts/check-relay-internet.sh`、`scripts/probe-admission.sh` 均可用（`measurements/b5-qa-scripts/summary.txt`；说明见 [README](../tests/relay-ipv6/README.md)）。
+- 同日其余脚本逐个运行：OpenWrt 生命周期原先停在一条过时断言（`U60_R6_DNS` 链自 v5 起不存在），改为删除并修复一条 `U60_R6_FWD` 放行规则后 3 项 Rust 测试通过；OpenWrt 运行时 RA 通过；`b31-ra-runtime.sh` 在 B31 私有命名空间通过 4 次，抓到的 RA 字段符合预期，其清理原先会留下 `/var/run/netns` 的 tmpfs、偶尔留下 `proc` 绑定挂载，现已补上（之后 3 次运行前后 `mount` 输出一致）；`tests/network-ui.cjs`（当时的脚本，现行入口见[控制台检查](../responsive-console.md#source-and-checks)）、`tests/mihomo-dashboard.cjs`、`scripts/check-relay-internet.sh`、`scripts/probe-admission.sh` 均可用（`measurements/b5-qa-scripts/summary.txt`；说明见 [README](../../tests/relay-ipv6/README.md)）。
 
 **发布构建**：文件大小 9,108,448 B，`llvm-size -A` Total 9,114,320 B，较 `82fd0a4` 构建增加 9,044 B；
 `gzip -n -9` 为 4,484,101 B，增加 6,025 B；aarch64 编译有 15 条警告（`measurements/b4-final/build.txt`）。
@@ -444,7 +452,7 @@ Connect 在清理后回 503 `Restore cancelled by the owner`，分别耗时 64.5
 - 最终版主机单元测试 1559 项通过、0 失败、10 忽略，`auth-startup` 1 项通过（`b5-final/summary.txt`）。覆盖假端口/时钟、请求开始与放弃、取消/重试、资源核对及旧日志字面量的撤销/接管。测试覆盖范围以源码为准，真机范围列于上表。
 - 最终版隔离 Linux 的 relay-firewall-qa 39/39、mihomo-qa 23/23，旧二进制为 `ef58bd4` 构建 `05582d93f44d4825`（`b5-final/summary.txt`）。使用真实内核、nft/legacy 工具，包含整链替换、重复钩子归一、门户 RETURN 前移、拒绝外部同名链，以及旧/新二进制完整撤销新日志。Mihomo fixture 先等 IPv6 网关邻居项就绪再发流量，修复偶发首包失败。
 - 同源隔离 OpenWrt 生命周期 PASS，运行时 RA 3 PASS，由工程师运行（`b5-final/summary.txt`）。这些 Docker/Linux 检查覆盖内核规则和 OpenWrt 组件，B31 无线驱动与 IPA 另由真机验收。
-- 批次前的脚本核对为主机 1515 项通过、0 失败、10 忽略，`auth-startup` 1 项通过，防火墙 36/36、Mihomo 23/23（`b5-qa-scripts/summary.txt`）。过时脚本的删除及替代入口见批次 4 末尾和 [IPv6 README](../tests/relay-ipv6/README.md)。B31 RA 私有命名空间检查的清理修复后三次 `mount` 前后相同，每创建一个命名空间会因厂商 `nf_conntrack_pkt_threshold` sysctl 出现一次 `net/sysctl_net.c:156 register_net_sysctl` WARNING。
+- 批次前的脚本核对为主机 1515 项通过、0 失败、10 忽略，`auth-startup` 1 项通过，防火墙 36/36、Mihomo 23/23（`b5-qa-scripts/summary.txt`）。过时脚本的删除及替代入口见批次 4 末尾和 [IPv6 README](../../tests/relay-ipv6/README.md)。B31 RA 私有命名空间检查的清理修复后三次 `mount` 前后相同，每创建一个命名空间会因厂商 `nf_conntrack_pkt_threshold` sysctl 出现一次 `net/sysctl_net.c:156 register_net_sysctl` WARNING。
 
 **发布构建**
 
@@ -460,6 +468,19 @@ Wi-Fi 改连 5 GHz 上游，最终回归只有路由器命名空间客户端。�
 最终版的命名空间 HTTP 200 只覆盖该客户端的连通性。车主 Connect 抢占正在 join 的开机恢复、
 Mihomo 热重载失败回退及完整故障矩阵仍无本批真机结果。
 
-尚未实现的部分为中继出口快照、IPv6 自己的设备端口、Mihomo 带代次的后台结果、`follow::plan/decide`、
+批次 5 当时列为待办：中继出口快照、IPv6 自己的设备端口、Mihomo 带代次的后台结果、`follow::plan/decide`、
 200 ms conntrack 合并窗口及 nft 内容核验。门户 RETURN 以外的钩子只在添加/补回时插首位，
-之后保留厂商后来插入的前置过滤，依据为 D8。详见[架构 §8](relay-mihomo-architecture.md#8-规定了但未实现)。
+之后保留厂商后来插入的前置过滤，依据为 D8。
+
+**后续状态（`08274c3`）**：控制器已调用 `follow::plan/decide`，conntrack 已合并 200 ms 窗口内的请求，
+`mihomo-validate` 已在后台校验并核对结果 ticket 和服务核心 generation。仍待实现的是中继出口快照、
+IPv6 独立设备端口、其余慢操作后台化，以及 nft 全内容核验。详见[现行架构 §8](../relay-mihomo-architecture.md#8-规定了但未实现)。
+后续 IPv4 NAT、核心出站标记和控制面提交的验收范围另计。
+
+<a id="later-nat-and-dns-mark"></a>
+
+### 后续 B31 NAT 与 DNS 标记核验
+
+原架构记录的车主测量（D11）：从公网 CN 下载，nft 为 240.3 Mbit/s、CPU 15.0%，legacy 为
+249.6 Mbit/s、CPU 17.7%，两种布局均观察到 IPA 卸载。M13 的 B31 标记核验也有通过记录。
+这两项摘自原架构记录，未附独立的原始日志或构建指纹。

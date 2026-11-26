@@ -1,4 +1,4 @@
-const assert=require('node:assert/strict'),{chromium}=require('playwright'),{start}=require('./fixture.cjs');
+const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs'),{start,assertQuiet,visibilityEvent,refreshOn}=require('./fixture.cjs');
 (async()=>{
   let status={installed:false,configured:false,running:false,version:'1.19.33',dashboard_version:'3.29.1',dashboard:null,scope:'lan_tcp_udp_dual_stack_tproxy',experimental:true,error:null,autostart:false,recovery_required:false,direct_bypass:false,direct_bypass_active:false,kernel:null};
   let library={selected:null,profiles:[],merge_enabled:false,script_enabled:false,merge_saved:false,script_saved:false};
@@ -32,8 +32,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     }
     return false;
   });
-  const browser=await chromium.launch({headless:true,channel:'chrome'}),page=await browser.newPage({viewport:{width:1440,height:1500}}),errors=[];
+  const browser=await launchChrome(),page=await browser.newPage({viewport:{width:1440,height:1500}}),errors=[];
   page.on('pageerror',error=>errors.push(error.message));
+  await page.clock.install();
   const text=sel=>page.locator(sel).textContent(),posts=()=>fixture.requests.filter(r=>r.method==='POST'),last=()=>posts().at(-1);
   const said=(sel,words)=>page.waitForFunction(([sel,words])=>document.querySelector(sel)?.textContent.includes(words),[sel,words]);
   const confirm=label=>page.locator('.confirm-dialog').getByRole('button',{name:label,exact:true}).click();
@@ -47,7 +48,8 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     assert.equal(await button('Open Zashboard').isHidden(),true,'no dashboard while Mihomo is off');
     assert.equal(await button('Add configuration').isDisabled(),true);assert.match(await text('#mihomo-profiles'),/Install the Mihomo core to add configuration profiles/);
     assert.match(await text('#mihomo-status .mihomo-facts'),/Not installed/);assert.equal(posts().length,0,'opening the page must not start work');
-    const idle=fixture.requests.length;await page.waitForTimeout(1200);assert.equal(fixture.requests.length,idle,'an idle Mihomo page does not poll');
+    await assertQuiet(page,fixture.requests,1200,'an idle Mihomo page does not poll');
+    await refreshOn(page,fixture,'pageshow','/api/mihomo/status');
 
     // Install is an explicit, confirmed download.
     await button('Install Mihomo core').click();assert.match(await text('.confirm-dialog'),/22 MB/);assert.match(await text('.confirm-dialog'),/cellular data/);await confirm('Install');
@@ -59,6 +61,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     await button('Add configuration').click();assert.equal(await page.locator('#mihomo-profile-url').isVisible(),true);assert.equal(await page.locator('#mihomo-profile-yaml').isHidden(),true);
     await button('Validate & add').click();await said('#mihomo-profiles .action-status','profile name');
     await page.locator('#mihomo-profile-name').fill('Home');await page.locator('#mihomo-profile-url').fill('http://sub.example.com/x');await button('Validate & add').click();await said('#mihomo-profiles .action-status','HTTPS');
+    await page.clock.runFor(1200);
+    await assertQuiet(page,fixture.requests,100,'pageshow leaves the Mihomo profile draft alone',()=>visibilityEvent(page,'pageshow'));
+    assert.equal(await page.locator('#mihomo-profile-name').inputValue(),'Home');
     await page.locator('#mihomo-profile-url').fill(url);await page.locator('#mihomo-profile-interval').selectOption('24');
     assert.equal(posts().filter(r=>r.url.endsWith('/profiles')).length,0);
     await button('Validate & add').click();assert.match(await text('.confirm-dialog'),/never turned on/);await confirm('Add profile');

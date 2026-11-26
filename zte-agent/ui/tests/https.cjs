@@ -1,5 +1,5 @@
 // The HTTPS controls use an isolated fixture; no real certificates or router settings change.
-const {chromium}=require('playwright'),assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path');
+const {launchChrome,capture}=require('./browser.cjs'),assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path');
 (async()=>{
  const ok=data=>({ok:true,data}),streams=new Set(),writes=[],errors=[];
  let value={enabled:false,port:9443,name:'u60.home.arpa',clock_utc:1793000000,clock_verified:false};
@@ -13,14 +13,14 @@ const {chromium}=require('playwright'),assert=require('node:assert/strict'),http
   const name=req.url==='/'?'index.html':/^\/console\/a\/[\w.-]+$/.test(req.url)?req.url.split('/').pop():null;
   if(!name){res.writeHead(404);res.end();return;}const file=path.join(__dirname,'..',name);if(!fs.existsSync(file)){res.writeHead(404);res.end();return;}res.setHeader('Content-Type',name.endsWith('.js')?'text/javascript':name.endsWith('.css')?'text/css':'text/html');res.end(fs.readFileSync(file));
  });
- await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const browser=await chromium.launch({headless:true,channel:'chrome'}),page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const browser=await launchChrome(),page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
  try{
   await page.goto(`http://127.0.0.1:${server.address().port}/#settings/https`);await page.waitForFunction(()=>OpenU60Console.connected&&document.querySelector('#https-state').textContent==='Off');
   await page.getByRole('button',{name:'Turn on HTTPS',exact:true}).click();await page.locator('.confirm-dialog').getByRole('button',{name:'Cancel',exact:true}).click();await page.waitForFunction(()=>!document.querySelector('.confirm-dialog').open);assert.equal(writes.length,0);
   await page.getByRole('button',{name:'Turn on HTTPS',exact:true}).click();await page.locator('.confirm-dialog').getByRole('button',{name:'Turn on HTTPS',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#https-state').textContent==='On');assert.deepEqual(writes,[{url:'/api/https/on',body:{confirm:true}}]);assert.ok(await page.locator('#https-install a[download]').first().isVisible());assert.match(await page.locator('#https-fingerprint').textContent(),/^AB:/);
   value.ca_sha256=Array(32).fill('EF').join(':');push();await page.waitForFunction(()=>document.querySelector('#https-fingerprint').textContent.startsWith('EF:'));
   for(const theme of ['light','dark']){await page.evaluate(()=>OpenU60Navigation.go('settings/appearance'));await page.locator(`input[name=appearance][value=${theme}]`).check();await page.evaluate(()=>OpenU60Navigation.go('settings/https'));await page.waitForFunction(()=>document.querySelector('#https-state').textContent==='On');for(const width of[390,820,1440]){await page.setViewportSize({width,height:1100});await page.waitForTimeout(100);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);}}
-  await page.screenshot({path:'/tmp/openu60-https-console.png',fullPage:true});
+  await capture(page,{path:'openu60-https-console.png',fullPage:true});
   await page.getByRole('button',{name:'Renew certificate',exact:true}).click();const renewed=page.waitForResponse(response=>response.url().endsWith('/api/https/renew'));await page.locator('.confirm-dialog').getByRole('button',{name:'Renew certificate',exact:true}).click();await renewed;await page.waitForFunction(()=>!document.documentElement.dataset.saving);assert.equal(writes[1].url,'/api/https/renew');
   await page.getByRole('button',{name:'Reset HTTPS',exact:true}).click();assert.equal(await page.locator('.confirm-dialog').getByRole('button',{name:'Reset HTTPS',exact:true}).isDisabled(),true);assert.equal(writes.length,2);await page.locator('#confirm-reset').fill('RESET');await page.locator('.confirm-dialog').getByRole('button',{name:'Reset HTTPS',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#https-state').textContent==='Off');assert.equal(writes[2].url,'/api/https/reset');assert.equal(await page.locator('#https-install a[download]').first().isVisible(),false);
   await page.getByRole('button',{name:'Turn on HTTPS',exact:true}).click();await page.evaluate(()=>OpenU60Navigation.go('settings/about'));await page.locator('.confirm-dialog').getByRole('button',{name:'Turn on HTTPS',exact:true}).click();await page.waitForTimeout(200);assert.equal(writes.length,3,'navigation cancels an obsolete confirmation');

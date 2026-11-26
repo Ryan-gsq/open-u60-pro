@@ -124,16 +124,21 @@
   const modeLabel = mode => (modes.find(([value]) => value === mode) || ['', 'Rule'])[1];
 
   // A group’s `now` can be another group; follow it to the node that carries traffic.
-  function resolveNode(groups, name, depth = 8) {
+  function makeNodeResolver(groups) {
     const byName = new Map((groups || []).map(group => [group.name, group]));
-    let current = name;
-    for (let step = 0; step < depth; step++) {
-      const group = byName.get(current);
-      if (!group) return current || '';
-      if (!group.now) return '';
-      current = group.now;
-    }
-    return '';
+    return (name, depth = 8) => {
+      let current = name;
+      for (let step = 0; step < depth; step++) {
+        const group = byName.get(current);
+        if (!group) return current || '';
+        if (!group.now) return '';
+        current = group.now;
+      }
+      return '';
+    };
+  }
+  function resolveNode(groups, name, depth = 8) {
+    return makeNodeResolver(groups)(name, depth);
   }
   function memberOptions(group, nodes) {
     return (group.all || []).map(name => {
@@ -169,6 +174,6 @@
     return url.startsWith(DASHBOARD) && !/[\\\s]/.test(url) ? url : '';
   }
 
-  const api = {dashboardTarget, intervals, view, autostartLabel, directBypassSummary, directBypassConfirmation, facts, updatedLabel, intervalLabel, subscriptionProblem, profileProblem, profileRequest, profileAction, scheduleRequest, confirmation, extensionsProblem, extensionsRequest, delayLabel, delayLevel, modes, modeLabel, resolveNode, memberOptions, filterGroups, limited, MAX_CONFIG, MAX_EXTENSION};
+  const api = {dashboardTarget, intervals, view, autostartLabel, directBypassSummary, directBypassConfirmation, facts, updatedLabel, intervalLabel, subscriptionProblem, profileProblem, profileRequest, profileAction, scheduleRequest, confirmation, extensionsProblem, extensionsRequest, delayLabel, delayLevel, modes, modeLabel, makeNodeResolver, resolveNode, memberOptions, filterGroups, limited, MAX_CONFIG, MAX_EXTENSION};
   if (typeof module === 'object' && module.exports) module.exports = api; else globalThis.OpenU60Mihomo = api;
 })(globalThis);

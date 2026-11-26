@@ -1,11 +1,9 @@
 //! The Mihomo controller (`relay-mihomo-architecture.md` sections 3 and 5):
 //! one thread that serializes owner commands, routing writes from the
 //! console and Zashboard, egress changes, core exits, retries, `net_guard`
-//! checks and rule-set refreshes. Nothing here holds the relay's network
-//! lock: a relay association or CAC never delays an exit, a retry or a
-//! repair (I2). HTTP never waits for it on the runtime thread: pages read
-//! the published `Snapshot`, commands wait on the blocking pool, the
-//! dashboard bridge awaits a oneshot.
+//! checks and rule-set refreshes. The relay admission gate is independent of
+//! this controller (I2). Pages read the published `Snapshot`, owner commands
+//! wait on the blocking pool, and dashboard writes await a oneshot.
 //!
 //! Device work goes through `Port`, so tests replay exits, retries, switches
 //! and failures with a fake device and short timings (I6).
@@ -13,8 +11,10 @@
 //! States (section 5.2): `Off`; `Starting` (guard, kernel settings and
 //! policy routes before the core, the plan only from what the ready core
 //! reports); `Running`; `Restarting` (a planned restart: interception stays,
-//! nothing skips the core, `to_core` drops what no core takes); `Backoff`
-//! (D3 after a confirmed core failure: interception withdrawn, fake-ip fails
+//! nothing skips the core, `to_core` drops what no core takes); `Reloading`
+//! (same core, bypass narrowed as needed until readback confirms the new
+//! configuration); `Backoff` (D3 after a confirmed core failure: interception
+//! withdrawn, fake-ip fails
 //! fast, retries at 5, 15, 30, 60 s then every 5 min); `CleanupPending` (a
 //! release failed: the journal and ownership stay; a D3 withdrawal that
 //! failed is retried on the same timers, since until it works the old
@@ -88,6 +88,8 @@ pub(super) enum Message {
     Guard,
     Exited { generation: u64, how: String },
     #[cfg(test)]
+    Barrier(SyncSender<()>),
+    #[cfg(test)]
     Stop,
 }
 
@@ -155,8 +157,6 @@ pub(super) struct Snapshot {
     pub reason: Option<String>,
     pub tables: Value,
     pub generation: u64,
-    /// The running core's process id (diagnostics).
-    pub core_pid: Option<u32>,
     /// What the last connection reset did.
     pub last_reset: Value,
     /// A problem the core does not report as an error: a node in use has
@@ -213,7 +213,6 @@ pub(super) enum Engage {
 
 pub(super) trait CoreHandle: Send {
     fn generation(&self) -> u64;
-    fn pid(&self) -> u32;
     /// TERM, then KILL; true once reaped.
     fn stop(&self) -> bool;
 }
@@ -479,8 +478,7 @@ impl<P: Port> Controller<P> {
     /// again and the new agent adopts this boot's tables.
     pub fn supervised(self, end: impl FnOnce(String)) {
         if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run())) {
-            let what = panic.downcast_ref::<&str>().map(|s| (*s).to_owned()).or_else(|| panic.downcast_ref::<String>().cloned());
-            end(what.unwrap_or_else(|| "a panic".into()));
+            end(crate::common::panic_message(panic.as_ref()));
         }
     }
 
@@ -515,7 +513,6 @@ impl<P: Port> Controller<P> {
         snapshot.reason.clone_from(&self.reason);
         snapshot.tables = tables;
         snapshot.generation = self.generation;
-        snapshot.core_pid = self.run.as_ref().map(|r| r.core.pid());
         snapshot.notice = self.run.as_ref().and_then(|r| r.prepared.notice.clone()).or_else(|| self.run.as_ref().filter(|r| !r.ipv6).and_then(|r| {
             let nodes = r.prepared.routes.v6_only_in_use(r.mode, &r.selected);
             (!nodes.is_empty()).then(|| format!("{} only has an IPv6 server address and the uplink has no IPv6, so connections through it fail. Turn on IPv6 for the relay or choose another node.", nodes.join(", ")))
@@ -585,6 +582,8 @@ impl<P: Port> Controller<P> {
                 self.exited(generation, how);
                 self.publish();
             }
+            #[cfg(test)]
+            Message::Barrier(reply) => { let _ = reply.send(()); }
             #[cfg(test)]
             Message::Stop => {}
         }
@@ -1386,4 +1385,4 @@ pub(super) fn retry_wait(timings: &Timings, failures: u32, recent_exits: usize) 
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

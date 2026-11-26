@@ -1,5 +1,6 @@
-//! Prepare official rule databases outside the shared network lock. The core's
-//! short validation command must not double as a hidden first-run downloader.
+//! Prepare official rule databases before Mihomo validates a configuration.
+//! Validation can fetch missing databases without using the relay admission
+//! gate. The core then checks its configuration against prepared files.
 
 use std::collections::HashMap;
 use std::fs;
@@ -123,8 +124,7 @@ pub(super) fn prepare_assets(root: &Path, assets: &[Asset], download: &super::do
     })
 }
 
-/// Per-database digests, so repeated fingerprints of unchanged files do not
-/// re-read tens of MiB under the network lock.
+/// Per-database digests reuse unchanged file contents across validations.
 #[derive(Default)]
 pub(super) struct Digests(Mutex<HashMap<&'static str, (Stamp, [u8; 32])>>);
 
@@ -243,7 +243,8 @@ mod tests {
 
     #[test]
     fn validation_cache_tracks_database_bytes_even_with_preserved_size_and_mtime() {
-        let dir = std::env::temp_dir().join(format!("u60-geodata-key-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("geodata-key");
+        let dir = temp.path().to_path_buf();
         fs::create_dir_all(&dir).unwrap();
         let config = "geodata-mode: true\nrules: ['GEOIP,CN,DIRECT']";
         let digests = Digests::default();
@@ -267,12 +268,12 @@ mod tests {
             first
         );
         assert!(validation_inputs(&dir, "rules: ['MATCH,DIRECT']", &digests).is_some());
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn unchanged_databases_reuse_their_digest_but_a_replacement_is_rehashed() {
-        let dir = std::env::temp_dir().join(format!("u60-geodata-memo-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("geodata-memo");
+        let dir = temp.path().to_path_buf();
         fs::create_dir_all(&dir).unwrap();
         let config = "rules: ['GEOSITE,cn,DIRECT']";
         let file = dir.join("GeoSite.dat");
@@ -304,7 +305,6 @@ mod tests {
             validation_inputs(&dir, config, &digests).is_none(),
             "a missing database disables reuse"
         );
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -354,8 +354,8 @@ mod tests {
 
     #[test]
     fn first_save_prepares_verified_data_and_reuses_it_offline() {
-        let root = std::env::temp_dir().join(format!("u60-geodata-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let temp = super::super::test_dir::TestDir::new("geodata");
+        let root = temp.path().to_path_buf();
         let bytes = b"test database";
         let asset = Asset {
             remote: "geosite.dat",
@@ -414,7 +414,6 @@ mod tests {
             fs::read(root.join(asset.local)).unwrap(),
             b"previous database"
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -427,8 +426,8 @@ mod tests {
 
     #[test]
     fn fallback_uses_official_raw_and_verifies_before_accepting_existing_bytes() {
-        let root =
-            std::env::temp_dir().join(format!("u60-geodata-fallback-{}", std::process::id()));
+        let temp = super::super::test_dir::TestDir::new("geodata-fallback");
+        let root = temp.path().to_path_buf();
         let bytes = b"database from official repository";
         net::write_private(&root.join("GeoSite.dat"), bytes).unwrap();
         let mut calls = Vec::new();
@@ -451,6 +450,5 @@ mod tests {
         .unwrap();
         assert_eq!(calls.len(), 2);
         assert!(root.join("GeoSite.dat.source.txt").exists());
-        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -4,7 +4,6 @@
 Run only inside a disposable `--privileged --network none` container; see
 README.md. Prints one JSON line per check and exits non-zero on a failure.
 """
-import ctypes
 import json
 import os
 import shutil
@@ -14,21 +13,12 @@ import sys
 import threading
 import time
 
+from qa_netns import enter, in_ns
+
 DATA = "/qa-data"
 TABLE = "u60_mihomo"
 ROOT = "/data/zte-agent-mihomo"
 FAILED = []
-LIBC = ctypes.CDLL(None, use_errno=True)
-
-
-def enter(ns):
-    """This thread into network namespace `ns` (os.setns is Python 3.12+)."""
-    fd = os.open(f"/run/netns/{ns}", os.O_RDONLY)
-    try:
-        if LIBC.setns(fd, 0x40000000) != 0:  # CLONE_NEWNET
-            raise OSError(ctypes.get_errno(), "setns")
-    finally:
-        os.close(fd)
 
 
 def sh(*args, ns=None, check=True):
@@ -43,23 +33,6 @@ def report(name, ok, detail=""):
     print(json.dumps({"check": name, "ok": bool(ok), "detail": detail}), flush=True)
     if not ok:
         FAILED.append(name)
-
-
-def in_ns(ns, target, *args):
-    """Runs `target(*args)` in network namespace `ns` (a thread of its own)."""
-    result = {}
-
-    def run():
-        enter(ns)
-        try:
-            result["value"] = target(*args)
-        except Exception as e:  # noqa: BLE001 - reported as the result
-            result["value"] = f"error: {e}"
-
-    thread = threading.Thread(target=run)
-    thread.start()
-    thread.join()
-    return result.get("value")
 
 
 def serve(ns, family, address, port, label, transparent=False):

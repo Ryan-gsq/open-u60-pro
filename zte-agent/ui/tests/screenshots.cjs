@@ -1,7 +1,7 @@
 // Documentation screenshots of the real Web UI with fictional router readings.
-const {chromium}=require('playwright');
+const {launchChrome}=require('./browser.cjs');
 const fs=require('node:fs'),path=require('node:path'),http=require('node:http'),assert=require('node:assert/strict');
-const source=path.resolve(__dirname,'..'),output=path.join(source,'screenshots');
+const source=path.resolve(__dirname,'..'),output=process.env.U60_SCREENSHOTS_DIR || path.join(source,'screenshots');
 const ok=data=>({ok:true,data});
 const inventory={profiles:[{iccid:'8900000000000000001',state:'enabled',nickname:'Everyday',provider:'Example Mobile',name:'Home plan',class:'operational'},{iccid:'8900000000000000002',state:'disabled',nickname:'Travel',provider:'Example Travel',name:'Travel plan',class:'operational'},{iccid:'8900000000000000003',state:'disabled',nickname:'Backup',provider:'Example Mobile',name:'Backup plan',class:'operational'}],generation:1,observed_seq:1,observed_at:1793088000,agent_instance:1,updating:false,stale:false,pending_receipts:0};
 const core={
@@ -100,7 +100,7 @@ const server=http.createServer((req,res)=>{
  const file=req.url==='/'?'index.html':/^\/(?:ui|console\/a)\/[\w.-]+$/.test(req.url)?req.url.split('/').pop():'',full=path.join(source,file);if(!file||!fs.existsSync(full)){res.writeHead(404);res.end();return;}res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':'text/html');res.end(fs.readFileSync(full));
 });
 (async()=>{
- fs.mkdirSync(output,{recursive:true});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const heartbeat=setInterval(()=>{for(const stream of streams)stream.write(': heartbeat\n\n');},1000);const browser=await chromium.launch({headless:true,channel:'chrome'}),context=await browser.newContext({viewport:{width:1440,height:1100},reducedMotion:'reduce',locale:'en-US',timezoneId:'Asia/Manila'}),page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
+ fs.mkdirSync(output,{recursive:true});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const heartbeat=setInterval(()=>{for(const stream of streams)stream.write(': heartbeat\n\n');},1000);const browser=await launchChrome(),context=await browser.newContext({viewport:{width:1440,height:1100},reducedMotion:'reduce',locale:'en-US',timezoneId:'Asia/Manila'}),page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
  try{
   await page.goto(`http://127.0.0.1:${server.address().port}/`);await page.locator('#password').fill('preview-only');await page.locator('#login-form button[type=submit]').click();await page.waitForFunction(()=>OpenU60Console.connected&&document.querySelector('#wan-ipv6').textContent.includes('2001:db8'));
   const filter=new Set(process.argv.slice(2));

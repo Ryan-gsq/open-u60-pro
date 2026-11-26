@@ -359,9 +359,7 @@
     if (document.hidden || dirty() || loading || busy || API.locked || !API.connected || !onRoute() || Date.now() - lastLoad < 1000) return;
     load(true);
   }
-  window.addEventListener('focus', refreshVisible);
-  window.addEventListener('pageshow', refreshVisible);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisible(); });
+  UI.listenForVisibility(refreshVisible);
 
   UI.track({
     route,

@@ -2,7 +2,7 @@
 //! driver turns it on for every new station interface: the U60 dozes between
 //! beacons and the upstream AP holds its frames meanwhile. With it off, short
 //! single-connection tests through the relay went from 166-218 to 244-250
-//! Mbit/s (2026-11-08, `zte-agent/docs/relay-hw-offload.md`). Each relay
+//! Mbit/s (2026-11-08, `zte-agent/docs/archive/2026-11-relay-offload-benchmarks.md`). Each relay
 //! connection turns it off unless the owner keeps the driver's default. A
 //! step of the session's network plan, so `net_guard` turns it off again if
 //! the driver or a script turns it back on. Unrelated to ZTE's power saver
@@ -124,18 +124,17 @@ mod tests {
 
     #[test]
     fn turning_off_is_the_default_and_keeping_it_is_saved_privately() {
-        let root = std::env::temp_dir().join(format!("u60-power-save-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(auto_off(&root), "no file: turn it off");
-        save(&root, true).unwrap();
-        save(&root, false).unwrap();
-        assert!(!auto_off(&root));
-        save(&root, false).unwrap();
-        assert!(!auto_off(&root));
-        save(&root, true).unwrap();
-        assert!(auto_off(&root));
-        save(&root, true).unwrap();
-        let _ = std::fs::remove_dir_all(root);
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-power-save");
+        let root = temp.path();
+        assert!(auto_off(root), "no file: turn it off");
+        save(root, true).unwrap();
+        save(root, false).unwrap();
+        assert!(!auto_off(root));
+        save(root, false).unwrap();
+        assert!(!auto_off(root));
+        save(root, true).unwrap();
+        assert!(auto_off(root));
+        save(root, true).unwrap();
     }
 
     #[test]
@@ -150,10 +149,10 @@ mod tests {
 
     #[test]
     fn releasing_a_step_that_never_applied_changes_nothing() {
-        let dir = std::env::temp_dir().join(format!("u60-power-save-tx-{}", std::process::id()));
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-power-save-tx");
+        let dir = temp.path();
         let mut network = EffectSet::new("relay", dir.join("network.json"));
         network.withdraw(&[step().key()]).unwrap();
         assert!(!dir.join("network.json").exists());
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

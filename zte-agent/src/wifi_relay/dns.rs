@@ -189,8 +189,8 @@ mod tests {
 
     #[test]
     fn runtime_file_tracks_fresh_vendor_writes_and_removes_only_owned_lines() {
-        let root = std::env::temp_dir().join(format!("u60-relay-dns-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-relay-dns");
+        let root = temp.path();
         let path = root.join("resolv.conf");
         fs::write(&path, b"").unwrap();
         let wifi = ["192.168.2.1".parse().unwrap()];
@@ -204,14 +204,13 @@ mod tests {
             "# new vendor data\nnameserver 2001:db8:9::54\n"
         );
         update(&path, &[]).unwrap();
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn b31_netifd_symlink_is_preserved_and_unknown_targets_are_refused() {
         use std::os::unix::fs::symlink;
-        let root = std::env::temp_dir().join(format!("u60-relay-dns-link-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-relay-dns-link");
+        let root = temp.path();
         let auto = root.join("resolv.conf.auto");
         let link = root.join("resolv.conf");
         fs::write(&auto, "").unwrap();
@@ -224,6 +223,5 @@ mod tests {
         update_current(&link, &auto, &[]).unwrap();
         assert_eq!(fs::read_to_string(&auto).unwrap(), "");
         assert!(update_current(&link, &root.join("other"), &[]).is_err());
-        fs::remove_dir_all(root).unwrap();
     }
 }

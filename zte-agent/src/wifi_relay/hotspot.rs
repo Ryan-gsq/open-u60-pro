@@ -37,11 +37,17 @@ pub(super) fn prepare(
 /// the owner's 160 MHz channel would first need a radar check of about
 /// 60 s. Leaving a DFS channel needs none; nothing is journaled here.
 pub(super) fn restage(channels: &Channels) -> Result<(), String> {
-    dfs_switch::allow();
-    let before = Cmd::new("iw", &["dev", "wlan2", "info"]).run()?;
+    restage_with(channels, dfs_switch::allow, |cmd| cmd.run())
+}
+
+pub(super) fn restage_with(
+    channels: &Channels, allow: impl FnOnce(), mut run: impl FnMut(Cmd) -> Result<String, String>,
+) -> Result<(), String> {
+    allow();
+    let before = run(Cmd::new("iw", &["dev", "wlan2", "info"]))?;
     let (frequency, bandwidth, _) = parse_channel(&before).ok_or("Cannot read the hotspot channel")?;
     let staging = staging(channels, frequency, bandwidth).ok_or("No enabled non-DFS hotspot staging channel")?;
-    command(staging, 20, staging).run().map(|_| ())
+    run(command(staging, 20, staging)).map(|_| ())
 }
 
 /// The non-DFS 20 MHz channel to stage at from `frequency`/`bandwidth`: a

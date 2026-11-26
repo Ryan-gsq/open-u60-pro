@@ -1,6 +1,6 @@
 # Mihomo 与 Wi-Fi 中继：产品需求（PRD）
 
-更新：2026-11-12（批次 4）。本文是现行行为的总览，按本仓库 v1–v6 重构后的源码写（[实现与验收记录](relay-mihomo-implementation.md)），
+更新：2026-11-12（批次 4）。本文是现行行为的总览，按本仓库 v1–v6 重构后的源码写（[实现与验收记录](archive/2026-11-12-relay-mihomo-implementation.md)），
 其中标“待设备验收”的部分还没有在 B31 上验证。细节、实现依据和实测记录以下列文档为准：
 [network-extensions.md](network-extensions.md)（功能、安全、API、恢复）、
 [relay-hw-offload.md](relay-hw-offload.md)（IPA 硬件转发、Mihomo 的 DIRECT 绕过）、
@@ -35,7 +35,7 @@
 - 选中的订阅刷新时，相同源只更新刷新元数据；内容改变由控制器校验候选一次后热重载，不停核心。
   热重载不支持的启动设置改变、核心拒绝或变更订阅的结果未知时，用已校验候选做保留拦截的重启，
   启动失败回退最后应用的配置。切换配置、修改生效配置内容和修改扩展仍按配置变更重启。
-  成功刷新已在路由器验证，失败回退尚未验证，证据与边界见[批次 4](relay-mihomo-implementation.md#batch-4)。
+  成功刷新已在路由器验证，失败回退尚未验证，证据与边界见[批次 4](archive/2026-11-12-relay-mihomo-implementation.md#batch-4)。
 - 全局 Merge 和 JS Script 扩展在服务器端执行，有内存、时间上限；失败时保留旧配置。
 - 代理页可以切模式（rule/global/direct）、选节点、测延迟；Zashboard 经同源桥接打开，浏览器拿不到核心密钥。
 - 开关打开成功后记下选择，agent 或路由器重启后自动恢复；关掉即清除。
@@ -99,14 +99,14 @@
 - 2.4 GHz 上游：热点重新配置到上游的信道（20 MHz）。
 - 5 GHz 上游：热点先切到一个非 DFS 的 20 MHz 信道过渡，关联上游后让热点跟到上游信道；关联前打开驱动的
   DFS 切信道开关（owner decision 62：持久设置厂商键 `wireless.zte_mbb.dfs_channel_switch_disable=1`，
-  再 `iwpriv wlan2 disableDfsCS 0`）。过渡信道这一步没有配置能代替（报告 B）。
+  再 `iwpriv wlan2 disableDfsCS 0`）。过渡信道用于避开驱动在关联 DFS 上游前错误切换热点的问题，详见[当时的 B31 验收](archive/2026-11-03-dfs-acceptance.md)。
 - 连上后：DHCP、IPv4 策略路由（表 60631）、NAT、DNS 转发，临时关掉 ZTE 的离线门户；5 GHz 网络之间切换时
   这个抑制原样交给新连接，不会中断。
 - 可选的 IPv6（默认开）：NAT66，加上 LAN 上本地 ULA 地址的 RA。
-- 防火墙（待设备验收）：拒绝规则都在 agent 自己的 nft 表 `ip`/`ip6 u60_relay`，排在 ZTE 规则之前：
-  站点接口 `ath20` 拉起前就挡住上游进来的连接（只放已建立连接和 DHCP），断开后才撤；没装路由时不转发任何
-  经上游的流量；IPv6 到蜂窝一律拒绝；NAT66 的地址转换也在 nft。legacy iptables 只留必须穿过 ZTE 拒绝
-  规则的放行、门户 RETURN（保证排在厂商 DNAT 之前）和 IPv4 MASQUERADE。
+- 防火墙：拒绝规则都在 agent 自己的 nft 表 `ip`/`ip6 u60_relay`，排在 ZTE 规则之前。
+  站点接口 `ath20` 拉起前就挡住上游进来的连接（只放已建立连接和 DHCP），断开后才撤。没装路由时不转发
+  经上游的流量，IPv6 到蜂窝一律拒绝。IPv4 伪装在 `ip u60_relay/nat4`，NAT66 在 `ip6 u60_relay`。
+  legacy iptables 保留必须穿过 ZTE 拒绝规则的放行和门户 RETURN（保证排在厂商 DNAT 之前）。
 - 状态只显示"已配置 / 外网未验证"，不代表酒店已认证或外网可用。
 
 ### 4.3 运行和断开
@@ -193,10 +193,10 @@
 | Mihomo（TPROXY），单流 | 190–238 Mbit/s | Mihomo 31–44% |
 | 测速：经中继 / 直连上游 | 244–253 / 291–295 Mbit/s | — |
 
-还没验证（v1–v6 各版本的维护窗口清单见[实现与验收记录](relay-mihomo-implementation.md)）：
+还没验证（v1–v6 各版本的维护窗口清单见[实现与验收记录](archive/2026-11-12-relay-mihomo-implementation.md)）：
 
 - 蜂窝在线时和中继共存的行为，以及 IPACM 在两个 WAN 同时存在时的选择；
-- 2.4G 上游加硬件转发；
+- 2.4 GHz 上游经 USB 的 IPA 转发已在早期 B31 构建验证。Wi-Fi 热点客户端和批次 5 最终构建的真实 LAN IPA 路径仍待复验，见[设备验收索引](README.md#device-acceptance)；
 - 长时间运行的稳定性；
 - 酒店门户认证；
 - RPS 和硬件转发同时开的效果；

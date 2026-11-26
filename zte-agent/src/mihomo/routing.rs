@@ -25,7 +25,7 @@
 //! it whenever the file changes) and a set being refreshed (`unsettled`) are
 //! treated as unknown.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
@@ -82,34 +82,50 @@ pub(super) type Selected = BTreeMap<String, String>;
 /// `DOMAIN`/`DOMAIN-SUFFIX` entry whose first match is plain in both filters.
 pub(super) fn reload_probe(old: &[String], new: &[String]) -> Option<(String, bool)> {
     const PROBE: &str = "u60-reload-probe.invalid";
-    let fake = |filter: &[String], name: &str| -> Option<bool> {
-        for entry in filter {
-            let (rule, action) = entry.rsplit_once(',')?;
-            let (kind, payload) = rule.split_once(',').unwrap_or((rule, ""));
-            let hit = match kind {
-                "MATCH" => true,
-                "DOMAIN" => name.eq_ignore_ascii_case(payload),
-                "DOMAIN-SUFFIX" => name.eq_ignore_ascii_case(payload) || name.to_ascii_lowercase().ends_with(&format!(".{}", payload.to_ascii_lowercase())),
-                "DOMAIN-KEYWORD" => name.to_ascii_lowercase().contains(&payload.to_ascii_lowercase()),
-                // A keyword, a pattern or a set might match: no plain answer.
-                _ => return None,
-            };
-            if hit {
-                return Some(action == "fake-ip");
-            }
-        }
-        None
-    };
-    let mut names = vec![PROBE.to_owned()];
-    names.extend(new.iter().filter_map(|e| {
-        let (rule, _) = e.rsplit_once(',')?;
-        let (kind, payload) = rule.split_once(',')?;
-        matches!(kind, "DOMAIN" | "DOMAIN-SUFFIX").then(|| payload.to_owned())
+    if old == new { return None; }
+    let old = probe_entries(old);
+    let new = probe_entries(new);
+    let names = std::iter::once(PROBE).chain(new.iter().flatten().filter_map(|(kind, payload, _)| {
+        match *kind { "DOMAIN" | "DOMAIN-SUFFIX" => *payload, _ => None }
     }));
-    names.into_iter().find_map(|name| match (fake(old, &name), fake(new, &name)) {
-        (Some(before), Some(after)) if before != after => Some((name, after)),
+    let mut seen = HashSet::new();
+    names.filter(|name| seen.insert(*name)).find_map(|name| match (fake_address(&old, name), fake_address(&new, name)) {
+        (Some(before), Some(after)) if before != after => Some((name.to_owned(), after)),
         _ => None,
     })
+}
+
+type ProbeEntry<'a> = (&'a str, Option<&'a str>, bool);
+
+fn probe_entries(filter: &[String]) -> Vec<Option<ProbeEntry<'_>>> {
+    filter.iter().map(|entry| {
+        let (rule, action) = entry.rsplit_once(',')?;
+        let (kind, payload) = rule.split_once(',').map_or((rule, None), |(kind, payload)| (kind, Some(payload)));
+        Some((kind, payload, action == "fake-ip"))
+    }).collect()
+}
+
+fn fake_address(filter: &[Option<ProbeEntry<'_>>], name: &str) -> Option<bool> {
+    for entry in filter {
+        let (kind, payload, fake) = (*entry)?;
+        let payload = payload.unwrap_or("");
+        let hit = match kind {
+            "MATCH" => true,
+            "DOMAIN" => name.eq_ignore_ascii_case(payload),
+            "DOMAIN-SUFFIX" => domain_suffix(name, payload),
+            "DOMAIN-KEYWORD" => name.to_ascii_lowercase().contains(&payload.to_ascii_lowercase()),
+            // The bridge cannot predict patterns and rule-set matches.
+            _ => return None,
+        };
+        if hit { return Some(fake); }
+    }
+    None
+}
+
+fn domain_suffix(name: &str, suffix: &str) -> bool {
+    let name = name.as_bytes();
+    let Some(start) = name.len().checked_sub(suffix.len()) else { return false };
+    (start == 0 || name[start - 1] == b'.') && name[start..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
 /// The selector choices in a controller `GET /proxies` listing.
@@ -627,28 +643,37 @@ impl Routes {
     }
 
     fn direct(&self, target: &str, selected: &Selected) -> bool {
-        let mut name = target.to_owned();
+        let mut name = target;
         for _ in 0..16 {
             if name == "DIRECT" {
                 return true;
             }
-            let Some(group) = self.groups.get(&name).filter(|g| g.select) else { return false };
-            let Some(now) = selected.get(&name).or(group.members.first()) else { return false };
-            name = now.clone();
+            let Some(group) = self.groups.get(name).filter(|g| g.select) else { return false };
+            let Some(now) = selected.get(name).or(group.members.first()) else { return false };
+            name = now;
         }
         false
     }
 
-    /// Whether the owner could make `target` DIRECT: DIRECT itself, or a
-    /// `select` group with a configured member that could. Automatic groups
-    /// (`url-test` and the like) never count.
-    fn could_direct(&self, target: &str) -> bool {
-        fn walk(routes: &Routes, name: &str, depth: usize) -> bool {
-            name == "DIRECT"
-                || (depth < MAX_DEPTH * 2
-                    && routes.groups.get(name).filter(|g| g.select).is_some_and(|g| g.members.iter().any(|m| walk(routes, m, depth + 1))))
+    /// Targets that can reach DIRECT through at most sixteen select groups.
+    /// Expand backwards from DIRECT once per hop, so cycles and shared paths
+    /// are visited only at their shortest distance.
+    fn direct_targets(&self) -> HashSet<&str> {
+        let mut parents: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (name, group) in self.groups.iter().filter(|(_, group)| group.select) {
+            for member in &group.members {
+                parents.entry(member).or_default().push(name);
+            }
         }
-        walk(self, target, 0)
+        let mut found = HashSet::from(["DIRECT"]);
+        let mut frontier = vec!["DIRECT"];
+        for _ in 0..MAX_DEPTH * 2 {
+            let next: Vec<_> = frontier.into_iter().flat_map(|name| parents.get(name).into_iter().flatten().copied())
+                .filter(|name| found.insert(name)).collect();
+            if next.is_empty() { break; }
+            frontier = next;
+        }
+        found
     }
 
     /// The rule-mode `fake-ip-filter` (`dns.fake-ip-filter-mode: rule`,
@@ -732,15 +757,17 @@ impl Routes {
 
     /// Index of the last rule that may ever let traffic skip the core in the
     /// kernel, whatever the owner chooses: a rule that can match by address
-    /// with a target the owner could make DIRECT (`could_direct`), or a
+    /// with a target the owner could make DIRECT (`direct_targets`), or a
     /// `MATCH` with one; `None` if no rule can. No `MATCH` is the core's
     /// default, DIRECT. Judged from the configuration alone (not the current
     /// choices, which would move it when a group is switched), so a missing
     /// rule-set file or GeoIP code does not change DNS.
     fn last_return(&self) -> Option<usize> {
+        if self.rules.is_empty() { return None; }
+        let directs = self.direct_targets();
         let mut last = None;
         for (index, (rule, _)) in self.rules.iter().enumerate() {
-            let direct = self.could_direct(&rule.target);
+            let direct = directs.contains(rule.target.as_str());
             if rule.kind == "MATCH" {
                 return if direct { Some(index) } else { last };
             }
@@ -828,7 +855,7 @@ impl Routes {
                 out.tail = verdict;
                 break;
             }
-            let label = format!("Rule {} ({summary})", index + 1);
+            let label = || format!("Rule {} ({summary})", index + 1);
             let mut alts = Vec::new();
             for alt in self.effect(rule, root, 0, &mut out.sources, unsettled) {
                 match alt {
@@ -836,14 +863,14 @@ impl Routes {
                     // Skipping a DIRECT condition only sends more to the core.
                     Err(_) if verdict == Verdict::Direct => {}
                     Err(why) => {
-                        out.cut = Some(format!("{label}: {why}"));
+                        out.cut = Some(format!("{}: {why}", label()));
                         out.tail = Verdict::Core;
                         return out.with_codes();
                     }
                 }
             }
             if !alts.is_empty() {
-                out.steps.push(Step { verdict, alts, label });
+                out.steps.push(Step { verdict, alts, label: label() });
             }
         }
         out.with_codes()
@@ -1187,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "on-demand benchmark for range subtraction"]
     fn benchmark_subtract_4500_ranges() {
         let list: Vec<(u32, u32)> = (0..4500).map(|index| (index * 65536, index * 65536 + 255)).collect();
         let start = std::time::Instant::now();
@@ -1296,12 +1323,13 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         Routes::from(&serde_yaml_ng::from_str(&format!("geodata-mode: true\nproxy-groups: [{{name: 直连, type: select, proxies: [DIRECT, P]}}]\nrules: [{}]", rules.join(", "))).unwrap())
     }
 
-    fn home(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("u60-routing-{test}-{}", std::process::id()));
+    fn home(test: &str) -> super::super::test_dir::TestDir {
+        let temp = super::super::test_dir::TestDir::new(&format!("routing-{test}"));
+        let dir = temp.path();
         fs::create_dir_all(dir.join("ruleset")).unwrap();
         fs::write(dir.join("ruleset/Hentai.list"), "# comment\nDOMAIN-SUFFIX,e-hentai.org\nIP-CIDR,178.175.129.0/21,no-resolve\nPROCESS-NAME,ehviewer\n").unwrap();
         fs::write(dir.join("ruleset/Fcm.list"), "IP-CIDR,64.233.177.188/32,no-resolve\nDOMAIN,mtalk.google.com\nIP-ASN,15169\n").unwrap();
-        dir
+        temp
     }
 
     /// CN, NETFLIX and JP have ranges, EMPTY has none, anything else is missing.
@@ -1348,6 +1376,38 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         assert!(!r.direct("哔哩哔哩", &chosen));
         let looped: Selected = [("直连".to_owned(), "哔哩哔哩".to_owned()), ("哔哩哔哩".to_owned(), "直连".to_owned())].into();
         assert!(!r.direct("直连", &looped), "a loop is not DIRECT");
+    }
+
+    #[test]
+    fn could_direct_handles_cycles_diamonds_and_the_exact_sixteen_hop_limit() {
+        let mut routes = with_rules(&["MATCH,unknown"]);
+        let mut group = |name: &str, select, members: &[&str]| {
+            routes.groups.insert(name.to_owned(), Group { select, members: members.iter().map(|name| (*name).to_owned()).collect() });
+        };
+        group("CycleA", true, &["CycleB"]);
+        group("CycleB", true, &["CycleA"]);
+        group("BoundA", true, &["BoundB"]);
+        group("BoundB", true, &["BoundA", "DIRECT"]);
+        group("Left", true, &["Shared"]);
+        group("Right", true, &["Shared"]);
+        group("Shared", true, &["CycleA", "DIRECT"]);
+        group("Diamond", true, &["Left", "Right"]);
+        group("Auto", false, &["DIRECT"]);
+        for n in 0..=16 {
+            let member = if n == 0 { "DIRECT".to_owned() } else { format!("Depth{}", n - 1) };
+            group(&format!("Depth{n}"), true, &[&member]);
+        }
+        for (name, can) in [
+            ("CycleA", false), ("CycleB", false), ("BoundA", true),
+            ("Diamond", true), ("Auto", false), ("DIRECT", true), ("unknown", false),
+            ("Depth14", true), ("Depth15", true), ("Depth16", false),
+        ] {
+            routes.rules[0].0.target = name.into();
+            assert_eq!(routes.last_return(), can.then_some(0), "{name}");
+        }
+        // The selected route has its own cutoff, one hop shorter.
+        assert!(routes.direct("Depth14", &Selected::new()));
+        assert!(!routes.direct("Depth15", &Selected::new()));
     }
 
     /// The owner's subscription (2026-11-09): `claude.ai` is sent to a
@@ -1401,12 +1461,12 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         let dns = r.dns(true);
         assert!(dns.contains(&"DOMAIN-SUFFIX,blog.example,fake-ip".to_owned()), "even while 直连 is on DIRECT");
         assert!(dns.contains(&"DOMAIN-SUFFIX,fixed.example,real-ip".to_owned()), "DIRECT itself cannot be switched");
-        let root = home("q3");
+        let temp = home("q3");
+        let root = temp.path().to_path_buf();
         let direct = chain(&r, &Selected::new(), &root);
         let away = chain(&r, &[("直连".to_owned(), "P".to_owned())].into(), &root);
         assert_eq!(direct, away, "the address rule is DIRECT itself: still returns after the switch, which is why the domain must be fake");
         assert!(away.rules.contains(&"ip daddr @ip_0 return".to_owned()));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1423,7 +1483,8 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         let r = with_rules(&["DOMAIN,a.com,P", "GEOSITE,CN,DIRECT", "IP-CIDR6,2001:db8::/32,DIRECT", "GEOIP,PRIVATE,DIRECT", "IP-CIDR,192.168.0.44/32,DIRECT", "MATCH,P"]);
         assert!(fakes(&r).is_empty(), "no DIRECT rule matches IPv4 the chain sees, so nothing can skip the core");
         // Never narrower than the chain: every compiled return is inside it, for any choice.
-        let root = home("scope");
+        let temp = home("scope");
+        let root = temp.path().to_path_buf();
         for r in [routes(), with_rules(&["IP-ASN,1,DIRECT", "DOMAIN,a.com,P", "GEOIP,XX,直连", "MATCH,P"])] {
             let last = r.last_return().unwrap_or(0);
             for selected in [Selected::new(), [("直连".to_owned(), "P".to_owned())].into()] {
@@ -1432,7 +1493,6 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
                 assert!(returns.max().is_none_or(|at| at <= last));
             }
         }
-        let _ = fs::remove_dir_all(root);
     }
 
     /// Q2: what a refreshed or reloaded set holds can change behind DNS.
@@ -1454,7 +1514,8 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
 
     #[test]
     fn the_owners_rules_compile_in_order_with_fcm_now_returning() {
-        let root = home("owner");
+        let temp = home("owner");
+        let root = temp.path().to_path_buf();
         let c = chain(&routes(), &Selected::new(), &root);
         // 192.168.0.44 returns with the private ranges before the chain, and
         // DST-PORT,22 goes to the core like everything after GEOIP,CN.
@@ -1484,12 +1545,12 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         fs::write(&path, &edited).unwrap();
         fs::File::options().write(true).open(&path).unwrap().set_modified(touched + std::time::Duration::from_secs(60)).unwrap();
         assert!(sources[0].changed(), "new content");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn any_direct_address_rule_returns_and_a_select_group_follows_its_choice() {
-        let root = home("direct");
+        let temp = home("direct");
+        let root = temp.path().to_path_buf();
         let r = with_rules(&["IP-CIDR,1.1.1.0/24,P", "IP-CIDR,1.0.0.0/8,DIRECT", "GEOIP,JP,直连", "IP-CIDR,2.2.2.0/24,P", "IP-CIDR,3.3.3.0/24,P", "IP-CIDR,4.4.4.0/24,DIRECT", "IP-CIDR,5.5.5.0/24,P", "IP-CIDR,10.1.0.0/16,DIRECT", "MATCH,P"]);
         let c = chain(&r, &Selected::new(), &root);
         assert_eq!(c.rules, ["ip daddr @ip_0 goto to_core", "ip daddr @ip_1 return", "ip daddr @geo_jp return", "ip daddr @ip_2 goto to_core", "ip daddr @ip_3 return"], "the private range and the proxy rule before MATCH add nothing");
@@ -1501,12 +1562,12 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         assert!(c.rules.contains(&"ip daddr @geo_jp goto to_core".to_owned()));
         assert_eq!(c.returns, 2);
         assert!(private_v4("192.168.0.44/32") && private_v4("10.0.0.0/8") && !private_v4("10.0.0.0/7") && !private_v4("1.0.0.0/8"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_proxy_rule_the_kernel_cannot_check_cuts_the_chain_a_direct_one_is_skipped() {
-        let root = home("cut");
+        let temp = home("cut");
+        let root = temp.path().to_path_buf();
         let r = with_rules(&["IP-ASN,1,DIRECT", "NOT,((DOMAIN,a.com)),DIRECT", "GEOIP,CN,DIRECT", "IP-ASN,13335,P", "IP-CIDR,8.8.8.0/24,DIRECT", "MATCH,DIRECT"]);
         let c = chain(&r, &Selected::new(), &root);
         assert_eq!(c.rules, ["ip daddr @geo_cn return"], "earlier returns stay, nothing after the cut");
@@ -1519,12 +1580,12 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         assert!(reason(&["GEOIP,XX,P"]).contains("GEOIP,XX: not in GeoIP.dat"), "a missing code is found when rendering");
         let c = chain(&with_rules(&["GEOIP,XX,DIRECT", "GEOIP,EMPTY,P", "GEOIP,CN,DIRECT", "MATCH,P"]), &Selected::new(), &root);
         assert_eq!((c.rules.as_slice(), c.cut), (&["ip daddr @geo_cn return".to_owned()][..], None), "a missing DIRECT code is skipped, an empty one never matches");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn rule_set_files_and_geodata_mode_decide_what_the_kernel_can_check() {
-        let root = home("files");
+        let temp = home("files");
+        let root = temp.path().to_path_buf();
         let config = |extra: &str, rules: &str| Routes::from(&serde_yaml_ng::from_str(&format!("{extra}rule-providers:\n  Bin: {{type: http, behavior: ipcidr, format: mrs, path: ./ruleset/x.mrs}}\n  Gone: {{type: http, behavior: classical, format: text, path: ./ruleset/gone.list}}\n  Out: {{type: http, behavior: classical, format: text, path: ../outside.list}}\nrules: {rules}")).unwrap());
         let cut = |rules: &str| chain(&config("geodata-mode: true\n", rules), &Selected::new(), &root).cut.unwrap_or_default();
         assert!(cut("['RULE-SET,Bin,P']").contains("binary (mrs)"));
@@ -1534,12 +1595,12 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         let c = chain(&config("", "['GEOIP,CN,DIRECT', 'GEOIP,US,P']"), &Selected::new(), &root);
         assert_eq!(c.returns, 0);
         assert!(c.cut.unwrap().contains("geodata-mode"), "without it the core uses geoip.metadb");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn ports_networks_sources_and_logical_rules_compile_to_nft_matches() {
-        let root = home("logic");
+        let temp = home("logic");
+        let root = temp.path().to_path_buf();
         let r = with_rules(&[
             "DST-PORT,22/8000-9000,P",
             "NETWORK,UDP,P",
@@ -1568,7 +1629,6 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         );
         assert_eq!(c.sets[0].1, ["1.1.1.0/24"]);
         assert_eq!(c.cut, None, "an AND that never matches IPv4 is skipped even with IP-ASN");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1593,7 +1653,8 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
     #[test]
     fn a_switch_resets_what_lost_the_bypass_by_first_match() {
         use crate::netfx::conntrack::Scope;
-        let root = home("lost");
+        let temp = home("lost");
+        let root = temp.path().to_path_buf();
         let plan = |rules: &[&str]| chain(&with_rules(rules), &Selected::new(), &root);
         let dests = |scope: Scope| match scope {
             Scope::Destinations(d) => d.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -1626,7 +1687,6 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         assert_eq!(dests(lost_from(&[fewer.clone(), other.clone()], &fewer)), ["8.8.8.0/24"]);
         assert!(dests(lost_from(&[Chain::default(), other.clone()], &other)).is_empty());
         assert!(dests(lost_from(&[], &other)).is_empty());
-        let _ = fs::remove_dir_all(root);
     }
 
     /// Finding 6: a `domain` set's refresh cannot change the kernel plan.
@@ -1640,6 +1700,34 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
     }
 
     /// v3: a reload is proven by an answer that must differ.
+    #[test]
+    fn reload_probe_uses_new_filter_order_and_ascii_case_folding_at_dot_boundaries() {
+        let filter = |lines: &[&str]| lines.iter().map(|line| line.to_string()).collect::<Vec<_>>();
+        let old = filter(&["DOMAIN-SUFFIX,eXamPLE.Org,real-ip", "DOMAIN-SUFFIX,é.test,real-ip", "MATCH,fake-ip"]);
+        let new = filter(&[
+            "DOMAIN,notexample.org,fake-ip", "DOMAIN,É.test,fake-ip",
+            "DOMAIN,Deep.Example.org,fake-ip", "DOMAIN,Deep.Example.org,fake-ip",
+            "DOMAIN,SECOND.eXample.org,fake-ip", "MATCH,fake-ip",
+        ]);
+        assert_eq!(reload_probe(&old, &new), Some(("Deep.Example.org".into(), true)));
+        let mut swapped = new.clone();
+        swapped.swap(2, 4);
+        assert_eq!(reload_probe(&old, &swapped), Some(("SECOND.eXample.org".into(), true)));
+        assert_eq!(reload_probe(&old, &filter(&["DOMAIN,é.test,fake-ip", "MATCH,fake-ip"])), Some(("é.test".into(), true)));
+        assert_eq!(reload_probe(&old, &filter(&["DOMAIN,Example.Org,fake-ip", "MATCH,fake-ip"])), Some(("Example.Org".into(), true)));
+        assert_eq!(reload_probe(&old, &filter(&["unsupported entry", "DOMAIN,Example.Org,fake-ip", "MATCH,fake-ip"])), None);
+    }
+
+    #[test]
+    fn reload_probe_finds_a_tail_change_in_a_large_filter() {
+        let mut old: Vec<_> = (0..1000).map(|id| format!("DOMAIN-SUFFIX,d{id}.test,real-ip")).collect();
+        old.push("MATCH,fake-ip".into());
+        assert_eq!(reload_probe(&old, &old), None);
+        let mut new = old.clone();
+        new[999] = "DOMAIN-SUFFIX,D999.test,fake-ip".into();
+        assert_eq!(reload_probe(&old, &new), Some(("D999.test".into(), true)));
+    }
+
     #[test]
     fn a_reload_probe_is_a_name_whose_answer_must_change() {
         let r = with_rules(&["DOMAIN-SUFFIX,fixed.example,DIRECT", "DOMAIN-KEYWORD,ads,P", "GEOIP,CN,DIRECT", "MATCH,P"]);

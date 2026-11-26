@@ -19,7 +19,7 @@ Windows 自动枚举实验，出现复合设备、RNDIS 和 ADB。实验电脑�
 本版先交付这个三功能组合。诊断、串口、存储、DPL、QDSS 的函数对象保留在 gadget 中，
 主机当前只看到 RNDIS、ECM、ADB。保留全部调试接口的布局需要另做端点和双平台稳定性验证。
 
-## 配置和迁移
+## 现行单配置和迁移
 
 - `c.1/f1 → functions/gsi.rndis`，`f2 → functions/gsi.ecm`，`f3 → functions/ffs.adb`。
   RNDIS 最先链接，接口编号随此顺序分配。网络继续使用原厂 GSI/IPA 函数。
@@ -54,6 +54,8 @@ Windows 自动枚举实验，出现复合设备、RNDIS 和 ADB。实验电脑�
 旧版 `c.2` 的 configfs 属性不能用 BusyBox `rm -rf` 清理，空配置会让原厂 UDC 绑定失败。
 迁移过程逐个移除语言目录和配置目录。迁移成功后，原厂重建可自行清掉 `c.1/f*`。
 
+厂商 ubus 接口 `zwrt_bsp.usb` 只提供 `list`，组合更新通过 configfs 完成。
+
 ## 开发 Mac 的联网路径
 
 Mac 曾将 USB 服务 “ZTE Mobile Broadband” 排在 Wi-Fi 之前，默认路由因此经过路由器。
@@ -67,7 +69,7 @@ Mac 曾将 USB 服务 “ZTE Mobile Broadband” 排在 Wi-Fi 之前，默认路
 
 macOS 26 的 ECM、ADB、原厂重建、软件断开再连接及 agent 重启通过。直连镜像下载
 148.9 Mbit/s 时，内核仅转发 460 个包，路由器 CPU 15%，支持 ECM 使用 IPA 硬件转发。
-该记录对应旧布局。
+该记录对应旧布局。旧发布说明另记初测约 190–230 Mbit/s，也属于双配置时期。
 
 ### 2026-11-13 的单配置
 

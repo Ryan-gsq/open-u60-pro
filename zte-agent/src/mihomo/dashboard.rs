@@ -16,12 +16,11 @@ use axum::http::{header::*, HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
-use futures_util::StreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{API, CONTROLLER, DASHBOARD};
+use super::{API, DASHBOARD};
 use crate::auth::{SessionCheck, SessionId};
 use crate::boottime::BootInstant;
 use crate::handlers::AppState;
@@ -299,7 +298,7 @@ pub async fn serve(ctx: Ctx, mut req: Request, owner: SessionId) -> Response {
     // with every switch: what may skip the core is narrowed before the core
     // changes and follows it after (section 5.4). Refused during a restart.
     if routing_write(&method, endpoint) {
-        if !ctx.app.mihomo.accepts_writes() {
+        if !accepts_writes(&ctx).await {
             return busy();
         }
         let Ok(body) = serde_json::from_slice::<serde_json::Value>(if bytes.is_empty() { b"{}" } else { &bytes }) else {
@@ -329,20 +328,26 @@ pub async fn serve(ctx: Ctx, mut req: Request, owner: SessionId) -> Response {
             .build()
             .unwrap()
     });
-    let mut request = client.request(method.clone(), format!("http://{CONTROLLER}{endpoint}{query}")).bearer_auth(secret).body(bytes);
+    let addr = ctx.app.mihomo.bridge_addr();
+    let mut request = client.request(method.clone(), format!("http://{addr}{endpoint}{query}")).bearer_auth(secret).body(bytes);
     if let Some(ct) = parts.headers.get(CONTENT_TYPE) {
         request = request.header(CONTENT_TYPE, ct);
     }
-    let Ok(response) = request.send().await else {
+    proxy_response(request, endpoint).await
+}
+
+async fn proxy_response(request: reqwest::RequestBuilder, endpoint: &str) -> Response {
+    let Ok(mut response) = request.send().await else {
         return plain(502, "Mihomo did not answer");
     };
     let status = response.status();
     let ct = response.headers().get(CONTENT_TYPE).cloned();
-    let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else {
-            return plain(502, "Mihomo response was interrupted");
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => return plain(502, "Mihomo response was interrupted"),
         };
         if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
             return plain(502, "Mihomo response too large");
@@ -396,7 +401,12 @@ fn dashboard_file(root: &std::path::Path, file: &str, head: bool, conditional: &
         if data.len() as u64 > LIMIT { return plain(413, "Dashboard file too large"); }
         if file_handle.metadata().ok().map(|m| Stamp::of(&m)) != Some(stamp) { return plain(503, "Dashboard changed while loading"); }
         let bytes = match adapter::asset(file, data) { Ok(bytes) => Bytes::from(bytes), Err(e) => return plain(503, e) };
-        let asset = Asset { stamp, etag: format!("\"{:x}\"", Sha256::digest(&bytes)), bytes };
+        let etag = if file == "index.html" {
+            format!("\"{}\"", adapter::INDEX_SHA)
+        } else {
+            format!("\"{:x}\"", Sha256::digest(&bytes))
+        };
+        let asset = Asset { stamp, etag, bytes };
         if let (Some(slot), Some(cache)) = (pinned, &mut cache) { cache[slot] = Some(asset.clone()); }
         asset
     };
@@ -521,10 +531,11 @@ async fn websocket(ctx: &Ctx, req: &mut Request, path: &str, secret: &str, owner
         Some(k) => k,
         None => return plain(400, "Missing WebSocket key"),
     };
-    let Ok(Ok(mut upstream)) = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(CONTROLLER)).await else {
+    let addr = ctx.app.mihomo.bridge_addr();
+    let Ok(Ok(mut upstream)) = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr)).await else {
         return plain(502, "Mihomo did not answer");
     };
-    let handshake = format!("GET {path} HTTP/1.1\r\nHost: {CONTROLLER}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nAuthorization: Bearer {secret}\r\n\r\n");
+    let handshake = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nAuthorization: Bearer {secret}\r\n\r\n");
     let result = tokio::time::timeout(Duration::from_secs(3), async {
         upstream.write_all(handshake.as_bytes()).await?;
         let mut head = Vec::new();
@@ -582,6 +593,14 @@ async fn core_secret(ctx: &Ctx) -> Option<String> {
     tokio::task::spawn_blocking(move || core.secret()).await.ok().flatten()
 }
 
+async fn accepts_writes(ctx: &Ctx) -> bool {
+    if let Ok(state) = ctx.app.mihomo.shared.try_lock() {
+        return state.phase == super::Phase::Running;
+    }
+    let core = Arc::clone(&ctx.app.mihomo);
+    tokio::task::spawn_blocking(move || core.accepts_writes()).await.unwrap_or(false)
+}
+
 /// Zashboard is a trusted, separately version-pinned SPA. Give only its
 /// entry page its own CSP; do not relax the agent's nonced page policy.
 pub fn secure_dashboard(resp: &mut Response) {
@@ -596,8 +615,8 @@ mod tests {
 
     #[test]
     fn dashboard_revalidates_the_served_bytes_and_head_has_the_get_length() {
-        let root = std::env::temp_dir().join(format!("u60-etag-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = super::super::test_dir::TestDir::new("etag");
+        let root = temp.path().to_path_buf();
         let path = root.join("style.css");
         std::fs::write(&path, b"one").unwrap();
         let mut headers = HeaderMap::new();
@@ -607,7 +626,88 @@ mod tests {
         assert_eq!(dashboard_file(&root, "style.css", false, &headers).status(), StatusCode::NOT_MODIFIED);
         std::fs::write(&path, b"two").unwrap();
         assert_eq!(dashboard_file(&root, "style.css", false, &headers).status(), StatusCode::OK);
-        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dashboard_asset_body_and_etag_match_the_file_bytes() {
+        let root = super::super::test_dir::TestDir::new("served-bytes");
+        let css = b"body { color: #ac1033; }\n";
+        std::fs::write(root.path().join("style.css"), css).unwrap();
+        let reply = dashboard_file(root.path(), "style.css", false, &HeaderMap::new());
+        assert_eq!(reply.status(), StatusCode::OK);
+        assert_eq!(reply.headers()[ETAG], format!("\"{:x}\"", Sha256::digest(css)));
+        assert_eq!(reply.headers()[CONTENT_LENGTH], css.len().to_string());
+        assert_eq!(axum::body::to_bytes(reply.into_body(), usize::MAX).await.unwrap().as_ref(), css);
+    }
+
+    async fn proxy_body_fixture(chunks: Vec<Vec<u8>>, stall: bool) -> Reply {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" { break; }
+            }
+            for chunk in chunks {
+                if stream.write_all(&chunk).await.is_err() { return; }
+            }
+            if stall { let _ = released.await; }
+        });
+        let wait = if stall { Duration::from_secs(1) } else { Duration::from_secs(5) };
+        let client = reqwest::Client::builder().no_proxy().timeout(wait).build().unwrap();
+        let reply = proxy_response(client.get(format!("http://{addr}/version")), "/version").await;
+        let (parts, body) = reply.into_parts();
+        let _ = release.send(());
+        server.await.unwrap();
+        Reply {
+            status: parts.status.as_u16(),
+            headers: parts.headers,
+            body: String::from_utf8(axum::body::to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_body_collects_all_data_frames_and_skips_trailers() {
+        let reply = proxy_body_fixture(vec![
+            b"HTTP/1.1 202 Accepted\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\nTrailer: X-Fixture\r\n\r\n".to_vec(),
+            b"2\r\nab\r\n".to_vec(),
+            b"3\r\ncde\r\n".to_vec(),
+            b"0\r\nX-Fixture: ignored\r\n\r\n".to_vec(),
+        ], false).await;
+        assert_eq!(reply.status, 202);
+        assert_eq!(reply.header("content-type"), Some("text/plain"));
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+        assert_eq!(reply.header("x-fixture"), None);
+        assert_eq!(reply.body, "abcde");
+    }
+
+    #[tokio::test]
+    async fn proxy_body_distinguishes_size_overrun_from_eof_and_timeout_after_headers() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        for len in [LIMIT, LIMIT + 1] {
+            let reply = proxy_body_fixture(vec![
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n").into_bytes(),
+                vec![b'a'; LIMIT],
+                vec![b'b'; len - LIMIT],
+            ], false).await;
+            if len == LIMIT {
+                assert_eq!(reply.status, 200);
+                assert_eq!(reply.body.len(), LIMIT);
+                assert!(reply.body.bytes().all(|byte| byte == b'a'));
+            } else {
+                assert_eq!((reply.status, reply.body.as_str()), (502, "Mihomo response too large"));
+            }
+        }
+        for stall in [false, true] {
+            let reply = proxy_body_fixture(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na".to_vec()], stall).await;
+            assert_eq!((reply.status, reply.body.as_str()), (502, "Mihomo response was interrupted"));
+        }
     }
 
     #[test]
@@ -714,6 +814,23 @@ mod tests {
         assert_eq!(passes.remaining((digest(&token('a')), owner), at(7)), None);
     }
 
+    fn patch_request(cookie: &str, body: Body) -> Request {
+        request("PATCH", "/ui/mihomo/api/configs", 9, 20)
+            .header("cookie", cookie)
+            .header("origin", format!("http://{HOST}"))
+            .body(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dashboard_patch_returns_busy_until_the_core_is_running() {
+        let rig = rig("patch-reload", true, 9);
+        let (_, cookie) = grant_pass(&rig, 9).await;
+        let core = &rig.ctx.app.mihomo;
+        core.shared.lock().unwrap().phase = super::super::Phase::Reloading;
+        let req = patch_request(&cookie, Body::from(r#"{"mode":"global"}"#));
+        assert_eq!(send(&rig.ctx, req).await.status, StatusCode::SERVICE_UNAVAILABLE.as_u16());
+    }
+
     #[tokio::test]
     async fn dashboard_state_lock_wait_never_blocks_the_runtime() {
         let rig = rig("runtime-lock", true, 9);
@@ -740,6 +857,45 @@ mod tests {
             assert_eq!(reply.status, 200);
             worker.join().unwrap();
         }
+
+        use super::super::controller::{Answer, Message};
+        let (_, cookie) = grant_pass(&rig, 9).await;
+        let core = Arc::clone(&rig.ctx.app.mihomo);
+        let (commands, pending) = std::sync::mpsc::channel();
+        *core.commands.lock().unwrap() = Some(commands);
+        let (lock, requested) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (acquired, mut timer_acquired) = tokio::sync::watch::channel(None);
+        let mut body_acquired = timer_acquired.clone();
+        let worker = std::thread::spawn(move || {
+            requested.recv_timeout(Duration::from_secs(2)).unwrap();
+            {
+                let _guard = core.shared.lock().unwrap();
+                acquired.send(Some(std::time::Instant::now())).unwrap();
+                let _ = released.recv_timeout(Duration::from_secs(2));
+            }
+            let Message::Write { write, answer: Answer::Async(reply) } = pending.recv_timeout(Duration::from_secs(2)).unwrap() else {
+                panic!("expected an ordered write");
+            };
+            assert_eq!(write.body, json!({"mode":"global"}));
+            reply.send(Ok((204, Vec::new()))).unwrap();
+        });
+        // The bridge has already obtained the secret when it reads the body.
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            lock.send(()).unwrap();
+            body_acquired.wait_for(Option::is_some).await.unwrap();
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(br#"{"mode":"global"}"#))
+        }));
+        let timer = async {
+            let start = timer_acquired.wait_for(Option::is_some).await.unwrap().unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = release.send(());
+            start.elapsed()
+        };
+        let (elapsed, reply) = tokio::join!(timer, send(&rig.ctx, patch_request(&cookie, body)));
+        worker.join().unwrap();
+        assert_eq!(reply.status, 204);
+        assert!(elapsed < Duration::from_secs(1), "PATCH precheck blocked the runtime: {elapsed:?}");
     }
 
     #[test]
@@ -754,6 +910,7 @@ mod tests {
     struct Rig {
         ctx: Ctx,
         bearer: String,
+        _root: Option<super::super::test_dir::TestDir>,
     }
 
     fn peer(test: u8, n: u8) -> Peer {
@@ -763,8 +920,9 @@ mod tests {
     fn rig(name: &str, running: bool, test: u8) -> Rig {
         let mut state = AppState::new();
         state.auth.set_password(PW);
-        if running {
-            let root = std::env::temp_dir().join(format!("u60-dashboard-{name}-{}", std::process::id()));
+        let temp = running.then(|| super::super::test_dir::TestDir::new(&format!("dashboard-{name}")));
+        if let Some(temp) = &temp {
+            let root = temp.path().to_path_buf();
             std::fs::create_dir_all(root.join("ui/assets")).unwrap();
             std::fs::write(root.join("ui/assets/app.css"), "body{}").unwrap();
             std::fs::write(root.join("ui/index.html"), "<html>not the pinned page</html>").unwrap();
@@ -772,7 +930,7 @@ mod tests {
         }
         let ctx = Ctx::new(Arc::new(state), 2);
         let bearer = ctx.app.auth.login(PW, Kind::Bearer, PeerKey::from(peer(test, 250).0), &[]).unwrap().token.expose().to_owned();
-        Rig { ctx, bearer }
+        Rig { ctx, bearer, _root: temp }
     }
 
     struct Reply {

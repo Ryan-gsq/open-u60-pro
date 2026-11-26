@@ -1,4 +1,4 @@
-const assert=require('node:assert/strict'),{chromium}=require('playwright'),{start}=require('./fixture.cjs');
+const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs'),{start,assertQuiet,visibilityEvent,refreshOn}=require('./fixture.cjs');
 (async()=>{
   const off={connected:false,network_id:null,saved_network_id:null,width_mode:null,ssid:null,frequency:null,width:null,width_state:null,address:null,gateway:null,networks:[],internet:'not_verified',ipv6_relay:false,ipv6:{requested:false,state:'off',upstream:false,nat66:false,internet:'not_verified'},cellular_fallback:true,restoring:null,experimental:true,error:null,clock_error:null,recovery_required:false,autostart:false,saved_networks:[]};
   let status={...off};
@@ -27,8 +27,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     if(url==='/api/wifi-relay/forget'){const i=saved.findIndex(s=>s.id===body.id);if(i>=0)saved.splice(i,1);status={...status,saved_networks:saved};reply(status);return true;}
     return false;
   });
-  const browser=await chromium.launch({headless:true,channel:'chrome'}),page=await browser.newPage({viewport:{width:1440,height:1400}}),errors=[];
+  const browser=await launchChrome(),page=await browser.newPage({viewport:{width:1440,height:1400}}),errors=[];
   page.on('pageerror',error=>errors.push(error.message));
+  await page.clock.install();
   const text=sel=>page.locator(sel).textContent(),posts=()=>fixture.requests.filter(r=>r.method==='POST'),last=()=>posts().at(-1);
   const said=(sel,words)=>page.waitForFunction(([sel,words])=>document.querySelector(sel)?.textContent.includes(words),[sel,words]);
   const confirm=label=>page.locator('.confirm-dialog').getByRole('button',{name:label,exact:true}).click();
@@ -39,7 +40,8 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     assert.match(await text('#relay-status h3'),/Share a Wi-Fi connection/);assert.equal(posts().length,0,'opening the page must not start work');
     assert.equal(await page.locator('#relay-status .relay-facts').isHidden(),true);assert.equal(await page.getByRole('button',{name:'Disconnect relay'}).isHidden(),true);
     assert.match(await text('#relay-saved'),/No saved Wi-Fi networks/);
-    const before=fixture.requests.length;await page.waitForTimeout(1200);assert.equal(fixture.requests.length,before,'an idle relay page does not poll');
+    await assertQuiet(page,fixture.requests,1200,'an idle relay page does not poll');
+    await refreshOn(page,fixture,'focus','/api/wifi-relay/status');
 
     // Scan lists networks; text is inert and unsupported networks cannot be chosen.
     await page.getByRole('button',{name:'Scan',exact:true}).click();await said('#relay-networks .action-status','Found 4 networks');
@@ -55,6 +57,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     await said('#relay-networks .action-status','Enter the Wi-Fi password');
     await page.locator('#relay-password').fill('short');await page.getByRole('button',{name:'Connect to Wi-Fi'}).click();await said('#relay-networks .action-status','8–63 printable ASCII');
     assert.equal(posts().filter(r=>r.url.endsWith('/connect')).length,0);
+    await page.clock.runFor(1200);
+    await assertQuiet(page,fixture.requests,100,'focus leaves the relay password draft alone',()=>visibilityEvent(page,'focus'));
+    assert.equal(await page.locator('#relay-password').inputValue(),'short');
 
     // A definite refusal shows the router’s reason and re-reads the state.
     refuse='Wi-Fi association failed; check password and signal';
@@ -103,9 +108,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     status={...off,restoring:'Hotel Guest',autostart:true,networks:scan,saved_networks:saved};restoringPolls=0;
     await page.getByRole('button',{name:'Read current status'}).click();await said('#relay-status .relay-state','RECONNECTING');
     assert.match(await text('#relay-status h3'),/Hotel Guest/);assert.equal(await page.getByRole('button',{name:'Stop reconnecting'}).isVisible(),true);
-    await page.waitForTimeout(5200);assert.equal(restoringPolls,1,'only the explicit read requested status');
+    await assertQuiet(page,fixture.requests,5200,'relay restore waits for SSE without polling');assert.equal(restoringPolls,1,'only the explicit read requested status');
     status={...off,networks:scan,saved_networks:saved};fixture.patch({relay_status:{ok:true,data:status}});await said('#relay-status .relay-state','RELAY OFF');
-    const quiet=fixture.requests.length;await page.waitForTimeout(1200);assert.equal(fixture.requests.length,quiet,'polling stops once the restore ends');
+    await assertQuiet(page,fixture.requests,1200,'relay stays quiet once the restore ends');
 
     // A request that never answers is reported as uncertain, then the state is re-read.
     status={...off,networks:scan,saved_networks:saved};await page.getByRole('button',{name:'Read current status'}).click();await said('#relay-status .relay-state','RELAY OFF');

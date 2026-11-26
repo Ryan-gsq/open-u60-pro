@@ -2,6 +2,9 @@
 
 The agent manages the profiles on an eSIM card in the router's SIM slot (for example a 9eSIM B1): list them, switch which one is enabled, download new ones from an activation code (the operator's QR code), rename and delete them. It is its own GSMA SGP.22 LPA, in-process: card commands go over the modem's QMI UIM service (QMI over QRTR), downloads and receipts use HTTPS from the router's own connection. Nothing needs installing besides the agent. The SIM Toolkit menu is not used.
 
+The router has no built-in eUICC. The old `lpac` installation and phone Bluetooth B1 path were retired. On the development router the old `/data/lpac` bundle was archived as `/data/lpac.removed` on 2026-10-19.
+
+
 | Part | Where | License |
 |---|---|---|
 | Card commands, notifications, card info, profile download (ES10b/c, ES8+ metadata, ES9+) | [`euicc/`](../../euicc/), a Rust translation of [lpac](https://github.com/estkme-group/lpac)'s libeuicc | LGPL-2.1-only |

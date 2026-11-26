@@ -40,7 +40,14 @@ pub fn route_table_listed(family: &str, table: &str) -> Result<bool, String> {
 }
 
 fn lists_table(routes: &str, table: &str) -> bool {
-    routes.lines().any(|line| line.split_whitespace().collect::<Vec<_>>().windows(2).any(|pair| pair == ["table", table]))
+    listed_route_tables(routes).any(|listed| listed == table)
+}
+
+pub(crate) fn listed_route_tables(routes: &str) -> impl Iterator<Item = &str> {
+    routes.lines().flat_map(|line| {
+        let words = line.split_whitespace();
+        words.clone().zip(words.skip(1)).filter_map(|(key, value)| (key == "table").then_some(value))
+    })
 }
 
 pub fn route_target(args: &[String]) -> (&str, &str) {
@@ -199,6 +206,17 @@ mod tests {
     fn an_emptied_route_table_is_recognised_from_the_full_listing() {
         assert!(lists_table("default via 10.0.0.1 dev ath20 table 60631", "60631"));
         assert!(!lists_table("default via 10.0.0.1 dev ath20 table 60631", "6063"));
+    }
+
+    #[test]
+    fn route_table_listings_use_literal_adjacent_tokens_within_one_line() {
+        let main = "default via 10.0.0.1 dev ath20 table main";
+        assert!(lists_table(main, "main"));
+        assert!(!lists_table(main, "254"));
+        assert!(!lists_table("default dev ath20 table 254", "main"));
+        assert!(lists_table("blackhole default table   60631", "60631"));
+        assert!(!lists_table("default table\n60631", "60631"));
+        assert!(lists_table("default table table 60631", "60631"));
     }
 
     #[test]

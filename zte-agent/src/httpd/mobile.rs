@@ -580,9 +580,24 @@ mod tests {
     /// the router's own relay address and the LAN are served.
     #[test]
     fn the_relay_upstream_is_refused_like_the_carrier() {
-        let t = vec![ifa("lo", "127.0.0.1", 8, 0), ifa("br-lan", "192.168.0.1", 24, 0), ifa(RELAY, "192.168.2.124", 24, 0)];
+        let t = vec![
+            ifa("lo", "127.0.0.1", 8, 0),
+            ifa("br-lan", "192.168.0.1", 24, 0),
+            ifa("br-lan", "fe80::1", 64, 3),
+            ifa(RELAY, "192.168.2.124", 24, 0),
+            ifa(RELAY, "2001:db8:2::124", 64, 0),
+            ifa(RELAY, "fe80::124", 64, 7),
+        ];
         assert!(!admits(&t, v4("192.168.2.1")));
         assert!(admits(&t, v4("192.168.2.124")) && admits(&t, v4("192.168.0.23")));
+        assert!(!admits(&t, v6("2001:db8:2::23", 0)));
+        assert!(admits(&t, v6("2001:db8:2::124", 0)));
+        assert!(!admits(&t, v6("fe80::23", 7)));
+        assert!(admits(&t, v6("fe80::23", 3)));
+
+        let tie = [ifa("br-lan", "192.168.2.1", 24, 0), ifa(RELAY, "192.168.2.124", 24, 0)];
+        assert!(!admits(&tie, v4("192.168.2.23")));
+        assert!(admits(&tie, v4("192.168.2.124")));
     }
 
     #[test]

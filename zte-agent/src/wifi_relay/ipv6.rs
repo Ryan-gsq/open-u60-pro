@@ -4,15 +4,15 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::Ipv6Addr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{offload, stop_helper, Helper, IFACE, JOURNAL, PREF, ROOT, TABLE};
-use crate::boottime::{BootClock, Clock};
 use crate::net_tools::{self as net, Cmd, Step};
 use super::{EffectSet, Resource, Family, Route, RouteType, Rule, Addr, Internal, LegacyChain, LegacyHook, LegacyTool, Position, words};
 
@@ -36,7 +36,13 @@ const CHECK_EVERY: Duration = Duration::from_secs(15);
 /// Consecutive ticks whose inspection reads fail before the path is withdrawn.
 /// A failed check is retried on the next tick, not `CHECK_EVERY` later.
 const UNREADABLE_TICKS: u8 = 3;
+mod lease;
 mod ra;
+
+pub use lease::callback;
+use lease::{lease_file, lease_file_in, now, Lease, OnLink};
+#[cfg(test)]
+use lease::parse_lease;
 
 /// Why checking an unchanged path failed.
 #[derive(Debug)]
@@ -54,42 +60,6 @@ impl Fault {
             Self::Unreadable(e) | Self::Conflict(e) => e,
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Address {
-    address: Ipv6Addr,
-    prefix: u8,
-    preferred: u32,
-    valid: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Router {
-    address: Ipv6Addr,
-    valid: u32,
-    metric: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct OnLink {
-    address: Ipv6Addr,
-    prefix: u8,
-    valid: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Lease {
-    received: u64,
-    addresses: Vec<Address>,
-    routers: Vec<Router>,
-    onlink: Vec<OnLink>,
-    dns: Vec<Ipv6Addr>,
-    mtu: u32,
-}
-
-fn now() -> u64 {
-    BootClock.now().as_secs()
 }
 
 /// Whether an unchanged lease is due for its periodic lifetime/RA refresh.
@@ -146,180 +116,6 @@ fn cidr(text: &str) -> Option<(Ipv6Addr, u8)> {
 fn prefix(address: Ipv6Addr, bits: u8) -> String {
     let mask = u128::MAX.checked_shl(u32::from(128 - bits)).unwrap_or(0);
     format!("{}/{bits}", Ipv6Addr::from(u128::from(address) & mask))
-}
-
-fn parse_lease(get: impl Fn(&str) -> String, received: u64) -> Lease {
-    let mut addresses = Vec::new();
-    for name in ["ADDRESSES", "RA_ADDRESSES"] {
-        for entry in get(name).split_whitespace().take(16) {
-            let f: Vec<_> = entry.split(',').collect();
-            if f.len() != 3 {
-                continue;
-            }
-            let (Some((address, prefix)), Ok(preferred), Ok(valid)) =
-                (cidr(f[0]), f[1].parse::<u32>(), f[2].parse::<u32>())
-            else {
-                continue;
-            };
-            if usable(address)
-                && prefix > 0
-                && valid > 0
-                && preferred <= valid
-                && !addresses.iter().any(|a: &Address| a.address == address)
-            {
-                addresses.push(Address {
-                    address,
-                    prefix,
-                    preferred,
-                    valid,
-                });
-            }
-        }
-    }
-    let mut routers = Vec::new();
-    let mut onlink = Vec::new();
-    for entry in get("RA_ROUTES").split_whitespace().take(32) {
-        let f: Vec<_> = entry.split(',').collect();
-        if f.len() != 4 {
-            continue;
-        }
-        let (Some((network, bits)), Ok(valid), Ok(metric)) =
-            (cidr(f[0]), f[2].parse::<u32>(), f[3].parse::<u32>())
-        else {
-            continue;
-        };
-        if valid == 0 {
-            continue;
-        }
-        if network.is_unspecified() && bits == 0 {
-            if let Ok(address) = f[1].parse::<Ipv6Addr>() {
-                if address.is_unicast_link_local() {
-                    routers.push(Router {
-                        address,
-                        valid,
-                        metric,
-                    });
-                }
-            }
-        } else if f[1].is_empty() && usable(network) && bits > 0 {
-            let address = cidr(&prefix(network, bits)).unwrap().0;
-            if !onlink
-                .iter()
-                .any(|r: &OnLink| r.address == address && r.prefix == bits)
-            {
-                onlink.push(OnLink {
-                    address,
-                    prefix: bits,
-                    valid,
-                });
-            }
-        }
-    }
-    routers.sort_by_key(|r| r.metric);
-    let mut dns = Vec::new();
-    for name in ["RDNSS", "RA_DNS"] {
-        for text in get(name).split_whitespace().take(8) {
-            if let Ok(a) = text.parse::<Ipv6Addr>() {
-                if (usable(a) || a.is_unicast_link_local()) && !dns.contains(&a) {
-                    dns.push(a);
-                }
-            }
-        }
-    }
-    let mtu = get("RA_MTU")
-        .parse::<u32>()
-        .ok()
-        .filter(|m| (1280..=1500).contains(m))
-        .unwrap_or(1280);
-    Lease {
-        received,
-        addresses,
-        routers,
-        onlink,
-        dns,
-        mtu,
-    }
-}
-
-impl Lease {
-    /// Seconds until the first finite lifetime of this (already remaining) lease ends.
-    fn shortest_lifetime(&self) -> u32 {
-        self.addresses
-            .iter()
-            .flat_map(|a| [a.valid, a.preferred])
-            .chain(self.routers.iter().map(|r| r.valid))
-            .chain(self.onlink.iter().map(|r| r.valid))
-            .filter(|&n| n != u32::MAX)
-            .min()
-            .unwrap_or(u32::MAX)
-    }
-
-    fn remaining(&self, current: u64) -> Self {
-        let elapsed = current
-            .saturating_sub(self.received)
-            .min(u64::from(u32::MAX)) as u32;
-        let left = |n: u32| {
-            if n == u32::MAX {
-                n
-            } else {
-                n.saturating_sub(elapsed)
-            }
-        };
-        let mut l = self.clone();
-        for a in &mut l.addresses {
-            a.valid = left(a.valid);
-            a.preferred = left(a.preferred);
-        }
-        l.addresses.retain(|a| a.valid > 0 && a.preferred > 0);
-        for r in &mut l.routers {
-            r.valid = left(r.valid);
-        }
-        l.routers.retain(|r| r.valid > 0);
-        for r in &mut l.onlink {
-            r.valid = left(r.valid);
-        }
-        l.onlink.retain(|r| r.valid > 0);
-        l
-    }
-
-    fn ready(&self) -> bool {
-        !self.addresses.is_empty() && !self.routers.is_empty()
-    }
-}
-
-/// No shell and no vendor netifd callback: untrusted RA/DHCP data is parsed
-/// into bounded typed state. Only the parent watchdog may change networking.
-pub fn callback(interface: &str, event: &str) -> i32 {
-    if interface != IFACE {
-        return 1;
-    }
-    let Some(path) = std::env::var("U60_RELAY_DHCP6_SESSION")
-        .ok()
-        .and_then(|s| lease_file(&s))
-    else {
-        return 1;
-    };
-    if matches!(event, "started" | "stopped") {
-        let _ = fs::remove_file(path);
-        return 0;
-    }
-    if !matches!(
-        event,
-        "bound" | "informed" | "updated" | "rebound" | "ra-updated" | "unbound"
-    ) {
-        return 0;
-    }
-    let lease = parse_lease(|k| std::env::var(k).unwrap_or_default(), now());
-    if net::write_private(&path, &serde_json::to_vec(&lease).unwrap()).is_ok() {
-        0
-    } else {
-        1
-    }
-}
-
-fn lease_file(session: &str) -> Option<PathBuf> {
-    (session.len() == 32 && session.bytes().all(|c| c.is_ascii_hexdigit()))
-        .then(|| Path::new(ROOT).join(format!("ipv6-lease-{session}.json")))
 }
 
 pub struct Upstream {
@@ -386,6 +182,26 @@ impl Upstream {
             "upstream_mtu":self.installed.as_ref().map(|l| l.mtu),"lan_mtu":self.ra_mtu})
     }
 
+    #[cfg(test)]
+    pub(super) fn seed_handover(&mut self, journal: &Path) -> u32 {
+        let child = Command::new("/bin/cat").stdin(std::process::Stdio::piped()).spawn().unwrap();
+        let pid = child.id();
+        self.client = Some(Helper::Owned(child));
+        self.session = Some("0000000000000000000000000000000a".into());
+        self.network = EffectSet::new("relay", journal.join(super::journals::V6_NETWORK));
+        self.network.assume(vec![ra_step("fd00::/64", "fe80::1".parse().unwrap(), 1500)]);
+        self.phase = "configured";
+        self.installed = Some(parse_lease(|_| String::new(), now()));
+        pid
+    }
+
+    #[cfg(test)]
+    pub(super) fn assert_handover_retained(&self, pid: u32) {
+        assert!(matches!(&self.client, Some(Helper::Owned(c)) if c.id() == pid));
+        assert_eq!(self.session.as_deref(), Some("0000000000000000000000000000000a"));
+        assert!(self.network.journaled("@u60-relay-ra", "restore").is_some());
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -409,7 +225,7 @@ impl Upstream {
             self.uplink.update(|l| l.discovery = true)?;
             let mut nonce = [0u8; 16];
             getrandom::getrandom(&mut nonce).map_err(|_| "Cannot create IPv6 relay session")?;
-            let session = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let session = crate::common::hex_lower(&nonce);
             self.session = Some(session.clone());
             let callback = std::env::current_exe().map_err(|_| "Cannot locate relay callback")?;
             // libtest replaces main(), so isolated Linux QA uses the real
@@ -524,12 +340,10 @@ impl Upstream {
         let live = live.unwrap();
         let ra_mtu = ra::advertised_mtu(live.mtu, ra::lan_mtu()?)?;
         let lan = Cmd::new("ip", &["-j", "-6", "addr", "show", "dev", "br-lan"]).run()?;
-        observe_lan(
-            &mut self.lan_observed,
-            &lan,
-            self.lan_prefix.as_deref(),
-            now(),
-        )?;
+        let observed_at = now();
+        let addresses = parse_lan_addresses(&lan)?;
+        let (prefixes, _) = lan_state(&addresses)?;
+        observe_lan(&mut self.lan_observed, &addresses, prefixes, self.lan_prefix.as_deref(), observed_at)?;
         let sources: Vec<_> = self.lan_observed.keys().cloned().collect();
         if self.path.as_ref().is_some_and(|p| same_path(p, &live))
             && sources == self.lan_sources
@@ -745,8 +559,9 @@ impl Upstream {
 
     fn configure(&mut self, lease: &Lease, mtu: u32) -> Result<String, String> {
         let lan = Cmd::new("ip", &["-j", "-6", "addr", "show", "dev", "br-lan"]).run()?;
-        let (lan_prefixes, linklocal) = lan_state(&lan)?;
-        let ula = stable_ula()?;
+        let addresses = parse_lan_addresses(&lan)?;
+        let (lan_prefixes, linklocal) = lan_state(&addresses)?;
+        let ula = stable_ula(Path::new(JOURNAL))?;
         let ula_address = cidr(&ula).unwrap().0;
         if lan_prefixes
             .iter()
@@ -776,7 +591,7 @@ impl Upstream {
         }) {
             return Err("Upstream IPv6 on-link prefix overlaps LAN or Tailnet".into());
         }
-        observe_lan(&mut self.lan_observed, &lan, None, now())?;
+        observe_lan(&mut self.lan_observed, &addresses, lan_prefixes, None, now())?;
         let mut sources: Vec<_> = self.lan_observed.keys().cloned().collect();
         if sources.iter().any(|p| {
             lease.onlink.iter().any(|r| {
@@ -844,28 +659,37 @@ impl Upstream {
     /// journals are loaded changes nothing; after, the caller stops the
     /// client and rolls IPv6 back from its journals (`recover`).
     pub fn adopt(&mut self, client: offload::Record, session: &str) -> Result<(), String> {
-        let path = lease_file(session).ok_or("Invalid IPv6 session")?;
+        self.adopt_with(client, session, Path::new(ROOT), Path::new(JOURNAL), |cmd| cmd.run(), ra::lan_mtu, EffectSet::declare)
+    }
+
+    fn adopt_with(
+        &mut self, client: offload::Record, session: &str, runtime: &Path, journal: &Path,
+        mut read: impl FnMut(Cmd) -> Result<String, String>, lan_mtu: impl FnOnce() -> Result<u32, String>,
+        mut declare: impl FnMut(&mut EffectSet, Vec<Resource>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let path = lease_file_in(runtime, session).ok_or("Invalid IPv6 session")?;
         let bytes = fs::read(path).map_err(|_| "No IPv6 lease")?;
         let lease: Lease = serde_json::from_slice(&bytes).map_err(|_| "Invalid IPv6 lease")?;
         let live = lease.remaining(now());
         if !live.ready() {
             return Err("the IPv6 lease is not usable".into());
         }
-        let ula = stable_ula()?;
-        let lan = Cmd::new("ip", &["-j", "-6", "addr", "show", "dev", "br-lan"]).run()?;
-        let (_, linklocal) = lan_state(&lan)?;
+        let ula = stable_ula(journal)?;
+        let lan = read(Cmd::new("ip", &["-j", "-6", "addr", "show", "dev", "br-lan"]))?;
+        let addresses = parse_lan_addresses(&lan)?;
+        let (prefixes, linklocal) = lan_state(&addresses)?;
         let mut observed = BTreeMap::new();
-        observe_lan(&mut observed, &lan, Some(&ula), now())?;
+        observe_lan(&mut observed, &addresses, prefixes, Some(&ula), now())?;
         let lan_sources: Vec<String> = observed.keys().cloned().collect();
         let mut sources = lan_sources.clone();
         if !sources.contains(&ula) {
             sources.push(ula.clone());
         }
-        let local = Cmd::new("ip", &["-j", "-6", "addr", "show"]).run()?;
+        let local = read(Cmd::new("ip", &["-j", "-6", "addr", "show"]))?;
         let dns_lease = safe_dns_lease(&live, &sources, &local)?;
-        let mtu = ra::advertised_mtu(live.mtu, ra::lan_mtu()?)?;
-        let setup = EffectSet::load("relay", &Path::new(JOURNAL).join(super::journals::V6_SETUP))?;
-        let network = EffectSet::load("relay", &Path::new(JOURNAL).join(super::journals::V6_NETWORK))?;
+        let mtu = ra::advertised_mtu(live.mtu, lan_mtu()?)?;
+        let setup = EffectSet::load("relay", &journal.join(super::journals::V6_SETUP))?;
+        let network = EffectSet::load("relay", &journal.join(super::journals::V6_NETWORK))?;
         // The tables first: the relay's adoption declared them without NAT66.
         self.uplink.update(|l| {
             l.discovery = true;
@@ -874,9 +698,9 @@ impl Upstream {
         (self.setup, self.network) = (setup, network);
         self.client = Some(Helper::Adopted(client));
         self.session = Some(session.to_owned());
-        self.setup.declare(setup_plan())?;
-        self.network.declare(network_plan(&dns_lease, &ula, &sources))?;
-        self.network.declare(vec![ra_step(&ula, linklocal, mtu)])?;
+        declare(&mut self.setup, setup_plan())?;
+        declare(&mut self.network, network_plan(&dns_lease, &ula, &sources))?;
+        declare(&mut self.network, vec![ra_step(&ula, linklocal, mtu)])?;
         self.requested = true;
         self.installed = Some(lease);
         self.path = Some(live);
@@ -1037,8 +861,8 @@ pub(crate) fn setup_plan() -> Vec<Resource> {
         Resource::LegacyHook(LegacyHook { tool: LegacyTool::V6, table: "filter".into(), chain: "INPUT".into(), rule: words(&["-i", IFACE, "-j", "U60_R6_IN"]), position: Position::InsertFirst })]
 }
 
-fn stable_ula() -> Result<String, String> {
-    let path = Path::new(JOURNAL).join("ula-prefix");
+fn stable_ula(journal: &Path) -> Result<String, String> {
+    let path = journal.join("ula-prefix");
     if let Ok(text) = fs::read_to_string(&path) {
         let text = text.trim();
         if cidr(text).is_some_and(|(a, p)| p == 64 && a.octets()[0] == 0xfd && prefix(a, p) == text)
@@ -1055,11 +879,15 @@ fn stable_ula() -> Result<String, String> {
     Ok(value)
 }
 
-fn lan_state(text: &str) -> Result<(Vec<String>, Ipv6Addr), String> {
-    let value: Value = serde_json::from_str(text).map_err(|_| "Cannot read IPv6 LAN addresses")?;
-    let addrs = value[0]["addr_info"]
-        .as_array()
-        .ok_or("No IPv6 LAN addresses")?;
+fn parse_lan_addresses(text: &str) -> Result<Vec<Value>, String> {
+    let mut value: Value = serde_json::from_str(text).map_err(|_| "Cannot read IPv6 LAN addresses")?;
+    match value.get_mut(0).and_then(|link| link.get_mut("addr_info")).map(Value::take) {
+        Some(Value::Array(addresses)) => Ok(addresses),
+        _ => Err("No IPv6 LAN addresses".into()),
+    }
+}
+
+fn lan_state(addrs: &[Value]) -> Result<(Vec<String>, Ipv6Addr), String> {
     let mut prefixes = Vec::new();
     let mut linklocal = None;
     for entry in addrs.iter().take(32) {
@@ -1095,20 +923,16 @@ fn lan_state(text: &str) -> Result<(Vec<String>, Ipv6Addr), String> {
 
 fn observe_lan(
     known: &mut BTreeMap<String, u64>,
-    text: &str,
+    addresses: &[Value],
+    prefixes: Vec<String>,
     owned: Option<&str>,
     now: u64,
 ) -> Result<(), String> {
-    let (prefixes, _) = lan_state(text)?;
-    let value: Value = serde_json::from_str(text).map_err(|_| "Cannot read LAN lifetimes")?;
     for p in prefixes {
         if Some(p.as_str()) == owned {
             continue;
         }
-        let lifetime = value[0]["addr_info"]
-            .as_array()
-            .unwrap()
-            .iter()
+        let lifetime = addresses.iter()
             .filter(|a| {
                 a["local"]
                     .as_str()
@@ -1473,6 +1297,17 @@ fn maintain_ra() -> Result<(), Fault> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::lease::{callback_with, Address};
+
+    fn lan_state_from_text(text: &str) -> Result<(Vec<String>, Ipv6Addr), String> {
+        lan_state(&parse_lan_addresses(text)?)
+    }
+
+    fn observe_lan_from_text(known: &mut BTreeMap<String, u64>, text: &str, owned: Option<&str>, now: u64) -> Result<(), String> {
+        let addresses = parse_lan_addresses(text)?;
+        let (prefixes, _) = lan_state(&addresses)?;
+        observe_lan(known, &addresses, prefixes, owned, now)
+    }
 
     fn network_plan(lease: &Lease, ula: &str, sources: &[String]) -> Vec<Step> {
         crate::netfx::effect::test_plan(super::network_plan(lease, ula, sources))
@@ -1512,6 +1347,51 @@ mod tests {
             },
             100,
         )
+    }
+
+    #[test]
+    fn same_boot_ipv6_adoption_keeps_the_client_nonce_and_restores_nat66() {
+        let dir = super::super::test_dir::TestDir::new("ipv6-adoption");
+        let kernel = super::super::uplink::tests::Kernel::default();
+        let effects = std::sync::Arc::new(std::sync::Mutex::new(EffectSet::new("relay", dir.path().join("wireless.json"))));
+        let uplink = super::super::uplink::Shared::with(dir.path().join("uplink.nft"), effects, Box::new(kernel.clone()));
+        uplink.guard().unwrap();
+        let mut upstream = Upstream::new(uplink);
+        let nonce = "b".repeat(32);
+        let mut current = lease();
+        current.received = now();
+        let lease_path = lease_file_in(dir.path(), &nonce).unwrap();
+        let lease_bytes = serde_json::to_vec(&current).unwrap();
+        fs::write(&lease_path, &lease_bytes).unwrap();
+        fs::write(dir.path().join("ula-prefix"), "fd00::/64").unwrap();
+        for name in [super::super::journals::V6_SETUP, super::super::journals::V6_NETWORK] {
+            fs::write(dir.path().join(name), serde_json::to_vec(&json!({"boot": net::boot_id(), "undo": []})).unwrap()).unwrap();
+        }
+        let client = offload::Record { pid: 123, start: 456 };
+        upstream.adopt_with(client, &nonce, dir.path(), dir.path(), |cmd| {
+            if cmd.args.ends_with(&["dev".to_string(), "br-lan".to_string()]) {
+                Ok(r#"[{"addr_info":[{"local":"fe80::1"},{"local":"2001:db8:5::1","prefixlen":64}]}]"#.into())
+            } else {
+                assert_eq!(cmd, Cmd::new("ip", &["-j", "-6", "addr", "show"]));
+                Ok("[]".into())
+            }
+        }, || Ok(1500), |effects, resources| { effects.assume(resources); Ok(()) }).unwrap();
+        assert!(matches!(upstream.client, Some(Helper::Adopted(record)) if record == client));
+        assert_eq!(upstream.session.as_deref(), Some(nonce.as_str()));
+        let layout = upstream.uplink.layout().unwrap();
+        let nat66 = layout.nat66.unwrap();
+        assert_eq!(nat66.sources, ["2001:db8:5::/64", "fd00::/64"]);
+        assert_eq!(nat66.dns, Some("2001:db8:1::53".parse().unwrap()));
+        assert!(kernel.table("ip6").unwrap().contains("masquerade"));
+        assert!(upstream.checked.is_none());
+        let ra = upstream.network.journaled("@u60-relay-ra", "restore").cloned().unwrap();
+        let old = "a".repeat(32);
+        for event in ["updated", "stopped"] {
+            assert_eq!(callback_with(IFACE, event, dir.path(), |key| (key == "U60_RELAY_DHCP6_SESSION").then(|| old.clone())), 0);
+            assert_eq!(fs::read(&lease_path).unwrap(), lease_bytes);
+            assert_eq!(upstream.network.journaled("@u60-relay-ra", "restore"), Some(&ra));
+        }
+        assert!(!lease_file_in(dir.path(), &old).unwrap().exists());
     }
 
     #[test]
@@ -1561,7 +1441,8 @@ mod tests {
 
     #[test]
     fn unreadable_checks_keep_the_path_for_a_few_ticks_but_conflicts_withdraw_it() {
-        let mut upstream = Upstream::new(super::super::uplink::tests::shared("unreadable").0);
+        let (uplink, _, _temp) = super::super::uplink::tests::shared("unreadable");
+        let mut upstream = Upstream::new(uplink);
         for _ in 1..UNREADABLE_TICKS {
             assert!(upstream
                 .tolerate(Err(Fault::Unreadable("busy".into())))
@@ -1717,10 +1598,54 @@ mod tests {
     }
 
     #[test]
+    fn lan_prefix_selection_is_bounded_but_uses_lifetimes_from_every_entry() {
+        let mut entries = vec![
+            json!({"local":"fe80::1","prefixlen":64}),
+            json!({"local":"2001:db8:5::1","prefixlen":64,"valid_life_time":20}),
+            json!({"local":"2001:db8:4::1","prefixlen":64,"valid_life_time":30}),
+            json!({"local":"2001:db8:5::2","prefixlen":64,"valid_life_time":60}),
+            json!({"local":"fe80::2","prefixlen":64}),
+        ];
+        entries.resize(32, json!({}));
+        entries.extend([
+            json!({"local":"2001:db8:5::3","prefixlen":64,"valid_life_time":10000}),
+            json!({"local":"2001:db8:6::1","prefixlen":64,"valid_life_time":90}),
+            json!({"local":"fe80::3","prefixlen":64}),
+        ]);
+        let text = json!([{"addr_info":entries}]).to_string();
+        let (prefixes, linklocal) = lan_state_from_text(&text).unwrap();
+        assert_eq!(prefixes, ["2001:db8:5::/64", "2001:db8:4::/64"]);
+        assert_eq!(linklocal, "fe80::2".parse::<Ipv6Addr>().unwrap());
+        let mut known = BTreeMap::new();
+        observe_lan_from_text(&mut known, &text, None, 100).unwrap();
+        assert_eq!(known, BTreeMap::from([
+            ("2001:db8:4::/64".into(), 130),
+            ("2001:db8:5::/64".into(), 100 + LAN_GRACE),
+        ]));
+    }
+
+    #[test]
+    fn lan_prefix_validation_and_retention_keep_their_separate_limits() {
+        let text = |count| {
+            let mut entries = vec![json!({"local":"fe80::1","prefixlen":64})];
+            entries.extend((1..=count).map(|n| json!({"local":format!("2001:db8:{n}::1"),"prefixlen":64})));
+            json!([{"addr_info":entries}]).to_string()
+        };
+        assert_eq!(lan_state_from_text(&text(8)).unwrap().0.len(), 8);
+        assert_eq!(lan_state_from_text(&text(9)).unwrap_err(), "Too many IPv6 LAN prefixes");
+        let mut known = (1..=15).map(|n| (format!("fd00:{n}::/64"), 150)).collect();
+        observe_lan_from_text(&mut known, &text(1), None, 100).unwrap();
+        assert_eq!(known.len(), 16);
+        assert_eq!(observe_lan_from_text(&mut known, &text(2), None, 149).unwrap_err(), "Too many retained LAN IPv6 prefixes");
+        observe_lan_from_text(&mut known, &text(2), None, 150).unwrap();
+        assert_eq!(known.len(), 2);
+    }
+
+    #[test]
     fn retained_lan_prefixes_expire_without_restoring_vendor_addresses() {
         let text = |addrs: Value| json!([{"addr_info":addrs}]).to_string();
         let mut known = BTreeMap::new();
-        observe_lan(
+        observe_lan_from_text(
             &mut known,
             &text(json!([
                 {"local":"fe80::1","prefixlen":64},
@@ -1736,11 +1661,11 @@ mod tests {
             {"local":"fe80::1","prefixlen":64},
             {"local":"2001:db8:3::1","prefixlen":64,"valid_life_time":u32::MAX}
         ]));
-        observe_lan(&mut known, &current, None, 110).unwrap();
+        observe_lan_from_text(&mut known, &current, None, 110).unwrap();
         assert_eq!(known.len(), 2);
         assert_eq!(known["2001:db8:2::/64"], 130);
         assert_eq!(known["2001:db8:3::/64"], 110 + LAN_GRACE);
-        observe_lan(&mut known, &current, None, 130).unwrap();
+        observe_lan_from_text(&mut known, &current, None, 130).unwrap();
         assert!(!known.contains_key("2001:db8:2::/64"));
         let plan = network_plan(
             &lease(),
@@ -1920,10 +1845,10 @@ mod tests {
     #[test]
     fn ipv6_lan_parsing_preserves_existing_prefix_and_requires_linklocal_dns() {
         let s = r#"[{"addr_info":[{"local":"2001:db8:2::1","prefixlen":64},{"local":"fe80::1","prefixlen":64}]}]"#;
-        let (p, ll) = lan_state(s).unwrap();
+        let (p, ll) = lan_state_from_text(s).unwrap();
         assert_eq!(p, ["2001:db8:2::/64"]);
         assert_eq!(ll, "fe80::1".parse::<Ipv6Addr>().unwrap());
-        assert!(lan_state("[]").is_err());
+        assert!(lan_state_from_text("[]").is_err());
     }
 
     #[test]
@@ -2030,7 +1955,8 @@ mod tests {
     #[test]
     fn relay_resource_plans_have_literal_restore_and_journal_contracts() {
         use crate::netfx::effect::{fake::FakeNft, testing::Kernel};
-        let directory = std::env::temp_dir().join(format!("u60-resource-plans-{}", std::process::id()));
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-resource-plans");
+        let directory = temp.path();
         let v4 = super::super::Lease { ip: "10.20.0.7".parse().unwrap(), subnet: "255.255.255.0".parse().unwrap(), gateway: "10.20.0.1".parse().unwrap(), dns: vec![] };
         let ula = "fd12:3456:789a::/64";
         let plans = [
@@ -2063,7 +1989,6 @@ mod tests {
             assert_eq!(lines, expected, "{name}");
             assert_eq!(kernel.writes.iter().map(|(_, input)| input.as_str()).collect::<String>(), restore, "{name}");
         }
-        fs::remove_dir_all(directory).unwrap();
     }
 
     /// v5 isolated acceptance (`zte-agent/tests/relay-firewall-qa`): the

@@ -21,8 +21,8 @@
 始终保持上游协商带宽。自动调优（探测、挑战、窄档定时重设）及其采样器、
 `/api/wifi-relay/tuning` 和网页选项在 v6 删除；以前按网络保存的“自动调优”读作保持协商带宽，
 下次写入时去掉该字段。每次新关联后的那次宽度复位（`wifi_relay/width.rs`）在 2026-11-12 删除：
-驱动残留的窄档只来自 `iwpriv … chwidth` 写入（重载驱动才清除），调优器删除后唯一的写入者就是复位本身
-（报告 B）。现在 agent 不运行 `chwidth`；手工试验过窄档后要自己设回。
+驱动残留的窄档只来自 `iwpriv … chwidth` 写入（重载驱动才清除），调优器删除后唯一的写入者就是复位本身。
+现在 agent 不运行 `chwidth`。手工试验过窄档后要自己设回。见[2026-10-29 带宽验收](archive/2026-10-29-width-v2-acceptance.md)。
 
 ## 数据路径
 
@@ -53,6 +53,14 @@ flowchart LR
   未开启、无服务或无有效路由，退出中继后就没有外网。
 
 ## 操作与恢复
+
+`wpa.conf` 的 `freq_list` 和 `scan_freq` 均设为选中上游的频率。前者限制选网，后者限制
+supplicant 发起的关联扫描范围。B31 在热点运行于 160 MHz 时可能在多频扫描中漏掉 5 GHz。
+
+B31 的历史测试中，通过 `hostapd_cli` 临时修改 `wlan2` 的信道或带宽参数曾使热点停在
+`DISABLED`。当原配置文件仍在时，厂商的单接口恢复命令是
+`/etc/init.d/hostapd-daemon.init restart wlan2`。设备证据见
+[2026-10-29 验收](archive/2026-10-29-width-v2-acceptance.md)。
 
 ### 连接或更换上游
 
@@ -88,10 +96,8 @@ Disconnect 先更新取消代次和待断开标志，立即发布 `disconnecting
 以 80 秒实际时间为截止，每条查询也有超时。失败保留剩余恢复日志供重试。
 
 2026-11-12 批次 4 真机补记：拆除期间状态请求在 0.00–0.01 s 返回，额外四次 Disconnect 各在 0.01 s
-回 HTTP 200；扫描和省电请求各等 3.02 s 后回 HTTP 409，带 `disconnecting`，没有误报需要恢复
-（`measurements/b4-final/phase-test.log`）。无其他操作时 Disconnect 用 65.085133 s 拆完并返回
-（`measurements/b4-final/phase-test-2.log`）。这些文件位于仓库旁的
-`../probe-reports/2026-11-11-relay-mihomo/measurements/`；更多验证边界见[批次 4](relay-mihomo-implementation.md#batch-4)。
+回 HTTP 200；扫描和省电请求各等 3.02 s 后回 HTTP 409，带 `disconnecting`，没有误报需要恢复。
+无其他操作时 Disconnect 用 65.085133 s 拆完并返回。构建和范围见[批次 4](archive/2026-11-12-relay-mihomo-implementation.md#batch-4)。
 
 5 GHz 之间的切换不走这条清理路径：热点留在中继带去的 DFS 信道时，新的关联在同一信道上
 也完成不了（B31 实测一直 SCANNING），所以交接时热点先回过渡信道，再随新关联走；
@@ -124,9 +130,8 @@ Disconnect 先更新取消代次和待断开标志，立即发布 `disconnecting
   进程，撤销旧运行状态（撤掉路由后通知 Mihomo），再恢复 Mihomo 和最近的上游选择。最多
   按退避策略尝试约 17 分钟，手动连接、断开或明确关闭热点会取消重试。
 - **整机重启**：日志携带 boot ID；旧开机的运行快照不会覆盖新启动的原厂热点。
-  等原厂启动栅栏后，根据保存选择重新扫描和连接。2026-11-12 批次 3 构建第一次尝试在开机 72.9 s 恢复
-  （`measurements/b2-reboot3/agent-boot.log`）；同日批次 4 构建第一次尝试在开机 76.053 s 恢复
-  （`measurements/b4-final/agent-boot.log`）。两次是各自构建的记录，不是恢复时限。
+  等原厂启动栅栏后，根据保存选择重新扫描和连接。实测的构建、设备与恢复时点见
+  [批次 3](archive/2026-11-12-relay-mihomo-implementation.md#batch-3)和[批次 4](archive/2026-11-12-relay-mihomo-implementation.md#batch-4)。
 - **和 2026-11-12 之前的版本（站点叫 `u60sta0`）互相更换**：两边都不认对方留下的中继（旧接口名的助手、日志和
   规则不再识别，车主决定不留兼容，2026-11-12）。更换之前先断开中继，或者更换之后重启。
 - **固件电源管理关 Wi-Fi（UI 重启、低电量关机、快启待机、关机充电模式）**：进入 `mode_power_off` 时，
@@ -140,7 +145,9 @@ Disconnect 先更新取消代次和待断开标志，立即发布 `disconnecting
 - **清理中途失败**：已完成的步骤不重做，未完成 undo 留在日志；操作结束后阶段为
   `recovery_pending`，才显示 `recovery_required`，可以再次断开/清理，必要时 USB 执行 `network-recover`。
 
-### 状态阶段与请求边界（2026-11-12）
+#低电量关机后恢复供电可能进入厂商的关机充电模式，此时保留车主的重启恢复意图。见[启动诊断](network-extensions.md#power-off-charging-boot)。
+
+## 状态阶段与请求边界（2026-11-12）
 
 状态只读内存，`phase` 为 `idle`、`scanning`、`connecting`、`active`、`recovering`、`disconnecting` 或
 `recovery_pending`；`recovering` 包括等待关联恢复和 agent 启动恢复，实际扫描/连接步骤显示对应阶段。
@@ -165,5 +172,5 @@ Disconnect 先更新取消代次和待断开标志，立即发布 `disconnecting
   崩溃恢复依据，删除会重新引入已复现故障。
 - Strict Clippy 被仓库其他模块既有告警阻塞；此次中继改动没有新增 Clippy 诊断。
 
-真机结果及范围见 [2026-11-03 验收记录](2026-11-03-dfs-acceptance.md)。本次证明
+真机结果及范围见 [2026-11-03 验收记录](archive/2026-11-03-dfs-acceptance.md)。本次证明
 设备自身联网，不宣称已完成全部信道、冷启动、雷达事件或下游满载吞吐测试。

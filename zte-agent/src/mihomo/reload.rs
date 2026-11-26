@@ -1,3 +1,7 @@
+//! Configuration facts used to choose between a live reload and a restart.
+//! Preparation keeps these fields for checking the running core after reload
+//! and for identifying the databases that validation needs.
+
 use serde_yaml_ng::Value;
 
 /// Only fields needed after the YAML tree is dropped. In particular this

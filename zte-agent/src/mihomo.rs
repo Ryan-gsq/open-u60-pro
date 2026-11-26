@@ -39,6 +39,8 @@ pub mod profiles;
 mod reload;
 mod routing;
 pub mod transform;
+#[cfg(test)]
+mod test_dir;
 
 use controller::{Answered, Engage, Message, Phase, Prepared, Snapshot, Source};
 
@@ -99,6 +101,8 @@ pub struct Mihomo {
     /// What the controller last published (pages never wait for it).
     shared: Arc<Mutex<Snapshot>>,
     commands: Mutex<Option<Sender<Message>>>,
+    #[cfg(test)]
+    bridge_addr: Option<String>,
 }
 
 impl Mihomo {
@@ -124,18 +128,39 @@ impl Mihomo {
             geoip: geoip::Cache::default(),
             shared: Arc::new(Mutex::new(Snapshot::default())),
             commands: Mutex::new(None),
+            #[cfg(test)]
+            bridge_addr: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(root: PathBuf) -> Self {
+        Self::at(root)
     }
 
     /// A running core with this secret, for the bridge's tests.
     #[cfg(test)]
     pub(crate) fn for_bridge(root: PathBuf, secret: String) -> Self {
-        let this = Self::at(root);
+        Self::for_bridge_at(root, secret, CONTROLLER.parse().unwrap())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_bridge_at(root: PathBuf, secret: String, addr: std::net::SocketAddr) -> Self {
+        let mut this = Self::at(root);
+        this.bridge_addr = Some(addr.to_string());
         let mut snapshot = this.snapshot();
         snapshot.phase = Phase::Running;
         snapshot.secret = Some(secret);
         *this.shared.lock().unwrap() = snapshot;
         this
+    }
+
+    fn bridge_addr(&self) -> &str {
+        #[cfg(test)]
+        if let Some(addr) = &self.bridge_addr {
+            return addr;
+        }
+        CONTROLLER
     }
 
     fn journal(&self) -> PathBuf {
@@ -262,6 +287,10 @@ impl Mihomo {
     }
 
     pub fn install(&self) -> Result<(), String> {
+        self.install_from(|url, sha, max| self.download(url, sha, max))
+    }
+
+    fn install_from(&self, mut download: impl FnMut(&str, &str, u64) -> Result<Vec<u8>, String>) -> Result<(), String> {
         let _profiles = self
             .profile_operation
             .try_lock()
@@ -280,7 +309,7 @@ impl Mihomo {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Vec::new();
         remember_validation(&self.root, &[]);
         net::private_dir(&self.root)?;
-        let core = self.download(CORE_URL, CORE_SHA, 32 * 1024 * 1024)?;
+        let core = download(CORE_URL, CORE_SHA, 32 * 1024 * 1024)?;
         let mut binary = Vec::new();
         flate2::read::GzDecoder::new(core.as_slice())
             .take(100 * 1024 * 1024 + 1)
@@ -289,13 +318,13 @@ impl Mihomo {
         if binary.len() > 100 * 1024 * 1024 || !binary.starts_with(b"\x7fELF") {
             return Err("Invalid Mihomo binary".into());
         }
-        let ui = self.download(UI_URL, UI_SHA, 8 * 1024 * 1024)?;
-        let core_license = self.download(
+        let ui = download(UI_URL, UI_SHA, 8 * 1024 * 1024)?;
+        let core_license = download(
             "https://raw.githubusercontent.com/MetaCubeX/mihomo/v1.19.33/LICENSE",
             "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
             64 * 1024,
         )?;
-        let ui_license = self.download(
+        let ui_license = download(
             "https://raw.githubusercontent.com/Zephyruso/zashboard/v3.29.1/LICENSE",
             "ffc390eec51f16b58506b1a42c99fe0cd9ffea1e3081aab443100fd8c20182d9",
             8 * 1024,
@@ -510,9 +539,10 @@ impl Mihomo {
     async fn routing_write_async(&self, write: controller::Write) -> Answered {
         #[cfg(test)]
         if self.commands.lock().unwrap().is_none() {
-            // `for_bridge`: no controller; the write reaches the core as is.
+            // `for_bridge_at`: no controller; the write reaches the core as is.
             let secret = self.secret().ok_or("Mihomo is off")?;
-            return tokio::task::spawn_blocking(move || control::raw_call(CONTROLLER, &secret, write.method, &write.segments, &write.body, Duration::from_secs(5)))
+            let addr = self.bridge_addr().to_owned();
+            return tokio::task::spawn_blocking(move || control::raw_call(&addr, &secret, write.method, &write.segments, &write.body, Duration::from_secs(5)))
                 .await
                 .map_err(|_| "The bridge test write failed".to_owned())?;
         }
@@ -524,7 +554,7 @@ impl Mihomo {
     /// Whether a routing write would be taken now (Running): the bridge
     /// answers 503 during a restart instead of queueing behind it.
     fn accepts_writes(&self) -> bool {
-        self.snapshot().phase == Phase::Running
+        self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).phase == Phase::Running
     }
 
     /// The relay changed its routes. Never blocks the relay (I2).
@@ -608,7 +638,7 @@ impl controller::Port for DevicePort {
                 let source = m.selected_source()?;
                 let mut random = [0u8; 32];
                 getrandom::getrandom(&mut random).map_err(|_| "Random secret unavailable")?;
-                let secret: String = random.iter().map(|b| format!("{b:02x}")).collect();
+                let secret = crate::common::hex_lower(&random);
                 let lan = lan_address()?;
                 self.lan = Some(lan);
                 let bypass = m.direct_bypass_enabled();
@@ -800,9 +830,10 @@ impl controller::Port for DevicePort {
 
     fn reload(&mut self, secret: &str, config: &str) -> Result<u16, String> {
         net::write_private(&self.m.root.join("config.yaml"), config.as_bytes())?;
-        let agent = ureq::Agent::config_builder().proxy(None).http_status_as_error(false).timeout_global(Some(Duration::from_secs(15))).build().new_agent();
+        let agent = control::new_agent(Some(Duration::from_secs(15)), false);
+        let addr = self.m.bridge_addr();
         agent
-            .put(&format!("http://{CONTROLLER}/configs?force=false"))
+            .put(&format!("http://{addr}/configs?force=false"))
             .header("Authorization", &format!("Bearer {secret}"))
             .send_json(json!({"payload": config}))
             .map(|r| r.status().as_u16())
@@ -864,10 +895,6 @@ impl controller::Port for DevicePort {
 impl controller::CoreHandle for core::Core {
     fn generation(&self) -> u64 {
         self.generation
-    }
-
-    fn pid(&self) -> u32 {
-        core::Core::pid(self)
     }
 
     fn stop(&self) -> bool {
@@ -997,12 +1024,12 @@ fn valid_runtime(runtime: &Value) -> bool {
 }
 
 fn core_ready(secret: &str) -> bool {
-    ureq::Agent::config_builder()
-        .proxy(None)
-        .timeout_global(Some(Duration::from_millis(300)))
-        .build()
-        .new_agent()
-        .get(&format!("http://{CONTROLLER}/version"))
+    core_ready_at(CONTROLLER, secret)
+}
+
+fn core_ready_at(addr: &str, secret: &str) -> bool {
+    control::new_agent(Some(Duration::from_millis(300)), true)
+        .get(&format!("http://{addr}/version"))
         .header("Authorization", &format!("Bearer {secret}"))
         .call()
         .is_ok()
@@ -1371,12 +1398,12 @@ fn proxy_resources() -> Vec<Resource> {
 
 /// One controller read (the core's secret never leaves the router).
 fn controller_get(secret: &str, path: &str) -> Option<Value> {
-    ureq::Agent::config_builder()
-        .proxy(None)
-        .timeout_global(Some(Duration::from_secs(2)))
-        .build()
-        .new_agent()
-        .get(&format!("http://{CONTROLLER}{path}"))
+    controller_get_at(CONTROLLER, secret, path)
+}
+
+fn controller_get_at(addr: &str, secret: &str, path: &str) -> Option<Value> {
+    control::new_agent(Some(Duration::from_secs(2)), true)
+        .get(&format!("http://{addr}{path}"))
         .header("Authorization", &format!("Bearer {secret}"))
         .call()
         .ok()?
@@ -1485,17 +1512,18 @@ mod tests {
             Cmd::new("ip", &["-6", "rule", "del", "pref", "18620", "fwmark", "0x700/0xff00", "lookup", "60625"]),
             Cmd::new("@u60-mihomo-nft", &["remove"]),
         ];
-        let directory = std::env::temp_dir().join(format!("u60-start-journal-{}", std::process::id()));
+        let temp = test_dir::TestDir::new("start-journal");
+        let directory = temp.path().to_path_buf();
         let path = directory.join("network.json");
         write_start_journal(&path, |_| Ok("1".into()));
         let written: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["undo"], serde_json::to_value(expected).unwrap());
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn a_validation_is_remembered_for_this_boot_only() {
-        let dir = std::env::temp_dir().join(format!("u60-validated-{}", std::process::id()));
+        let temp = test_dir::TestDir::new("validated");
+        let dir = temp.path().to_path_buf();
         fs::create_dir_all(&dir).unwrap();
         remember_validation(&dir, &["abc:1:2".to_owned(), "def:3:4".to_owned()]);
         let boot = net::boot_id();
@@ -1506,15 +1534,12 @@ mod tests {
         remember_validation(&dir, &[]);
         assert!(!dir.join(VALIDATED).exists());
         assert!(Mihomo::at(dir.clone()).validated_config.lock().unwrap().is_empty());
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn slow_profile_status_does_not_hold_dashboard_runtime_mutex() {
-        let m = Arc::new(Mihomo::for_bridge(
-            std::env::temp_dir(),
-            "fixture".into(),
-        ));
+        let temp = test_dir::TestDir::new("slow-profile-status");
+        let m = Arc::new(Mihomo::for_bridge(temp.path().to_path_buf(), "fixture".into()));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let worker = {
@@ -1637,25 +1662,26 @@ mod tests {
     /// news and failure handling still run: the controller never takes it.
     #[test]
     fn mihomo_never_waits_for_the_relays_network_lock() {
-        let dir = std::env::temp_dir().join(format!("u60-core-cac-{}", std::process::id()));
+        let temp = test_dir::TestDir::new("core-cac");
+        let dir = temp.path().to_path_buf();
         let lock = Arc::new(crate::netfx::admission::Gate::new());
         let m = Arc::new(Mihomo::at(dir.clone()));
-        m.start("u60.home.arpa".into());
+        let controller = controller::tests::Harness::for_mihomo(&m);
         let held = crate::netfx::admission::enter(&lock, Duration::ZERO).unwrap();
         let started = Instant::now();
-        assert!(m.enable("u60.home.arpa").is_err(), "fails fast here (no ip/nft), but answers");
+        assert_eq!(m.enable("u60.home.arpa").unwrap_err(), "fixture rejected the start");
         m.uplink_changed();
         m.set_direct_bypass(true).unwrap();
         m.disable().unwrap();
         assert!(started.elapsed() < Duration::from_secs(5), "{:?} with the relay's lock held", started.elapsed());
         drop(held);
-        let _ = std::fs::remove_dir_all(dir);
+        drop(controller);
     }
 
     #[test]
     fn direct_bypass_flag_status_and_legacy_fallback() {
-        let dir = std::env::temp_dir().join(format!("u60-direct-bypass-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = test_dir::TestDir::new("direct-bypass");
+        let dir = temp.path().to_path_buf();
         let m = Mihomo::at(dir.clone());
         assert_eq!(m.status()["direct_bypass"], Value::Bool(false));
         assert_eq!(m.status()["direct_bypass_active"], Value::Bool(false));
@@ -1669,7 +1695,6 @@ mod tests {
         assert!(!dir.join(BYPASS).exists());
         assert!(!dir.join(LEGACY_BYPASS).exists());
         assert_eq!(m.status()["direct_bypass"], Value::Bool(false));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1701,11 +1726,12 @@ mod tests {
     /// keeps, for the isolated Linux acceptance (`tests/mihomo-qa`). Run with
     /// `U60_MIHOMO_QA=<dir> cargo test -p zte-agent export_for_isolated_linux_acceptance -- --ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "fixture exporter requires U60_MIHOMO_QA to name its output directory"]
     fn export_for_isolated_linux_acceptance() {
         let dir = PathBuf::from(std::env::var_os("U60_MIHOMO_QA").expect("U60_MIHOMO_QA"));
         fs::create_dir_all(&dir).unwrap();
-        let root = std::env::temp_dir().join(format!("u60-mihomo-qa-{}", std::process::id()));
+        let temp = test_dir::TestDir::new("mihomo-qa");
+        let root = temp.path().join("mihomo");
         let plan = |rules: &str| {
             let routes = routing::Routes::from(&serde_yaml_ng::from_str(&format!("proxy-groups: [{{name: P, type: select, proxies: [JP]}}]\nrules: {rules}")).unwrap());
             routes.compile(&routing::Selected::new(), &root, &[]).render(&|_| Err("no GeoIP here".to_owned()))
@@ -1737,7 +1763,6 @@ mod tests {
         let mut journal: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         journal["boot"] = json!("{boot}");
         fs::write(path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
-        let _ = fs::remove_dir_all(root);
     }
 
     /// Release blocker 2 with the real tools (`tests/mihomo-qa`, run inside
@@ -1746,7 +1771,7 @@ mod tests {
     /// written but nothing applied, after each step, half rolled back) is
     /// recovered completely and only for our own objects.
     #[test]
-    #[ignore]
+    #[ignore = "requires the disposable Mihomo QA container and its router namespace"]
     fn isolated_ownership_and_interrupted_journals() {
         assert_eq!(std::env::var("U60_MIHOMO_QA_ISOLATED").as_deref(), Ok("1"));
         assert!(Path::new("/u60-qa-disposable").exists());
@@ -1859,7 +1884,8 @@ mod tests {
     fn a_validated_reload_candidate_is_reused_without_overwriting_the_serving_config() {
         use controller::Port;
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("u60-reload-validation-{}", std::process::id()));
+        let temp = test_dir::TestDir::new("reload-validation");
+        let dir = temp.path().to_path_buf();
         let mihomo = Arc::new(Mihomo::at(dir.clone()));
         net::write_private(&dir.join("mihomo"), b"#!/bin/sh\nprintf x >> \"$3/check-count\"\n").unwrap();
         fs::set_permissions(dir.join("mihomo"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1883,7 +1909,142 @@ mod tests {
         } else {
             assert_eq!(remembered, *mihomo.validated_config.lock().unwrap());
         }
-        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn validation_does_not_cache_a_replaced_core_or_a_failed_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir::TestDir::new("validation-dependencies");
+        let root = dir.path();
+        let m = Mihomo::for_test(root.to_owned());
+        let fake = br#"#!/bin/sh
+printf x >> "$3/check-count"
+if [ -f "$3/mihomo.next" ]; then mv "$3/mihomo.next" "$3/mihomo" || exit; fi
+[ ! -e "$3/fail" ]
+"#;
+        for name in ["mihomo", "mihomo.next"] {
+            let path = root.join(name);
+            fs::write(&path, fake).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(root.join("config.yaml"), "serving bytes").unwrap();
+        let check = |file, config| m.validate_candidate(file, config, "test-secret", &[], file == "candidate.yaml");
+        let candidate = "rules: ['MATCH,DIRECT']";
+        check("candidate.yaml", candidate).unwrap();
+        assert!(m.validated_config.lock().unwrap().is_empty());
+        assert!(!root.join("candidate.yaml").exists());
+        check("candidate.yaml", candidate).unwrap();
+        check("candidate.yaml", candidate).unwrap();
+        assert_eq!(fs::read(root.join("check-count")).unwrap(), b"xx");
+        let different = "rules: ['MATCH,REJECT']";
+        fs::write(root.join("fail"), "").unwrap();
+        for file in ["candidate.yaml", "check.yaml"] {
+            assert_eq!(check(file, different).unwrap_err(), "Mihomo could not validate the configuration; check YAML, nodes, providers and rule databases");
+            assert!(!root.join(file).exists());
+            assert_eq!(fs::read(root.join("config.yaml")).unwrap(), b"serving bytes");
+            assert_eq!(m.validated_config.lock().unwrap().len(), 1);
+        }
+        fs::remove_file(root.join("fail")).unwrap();
+        check("check.yaml", different).unwrap();
+        assert_eq!(fs::read(root.join("check-count")).unwrap(), b"xxxxx");
+    }
+
+    fn dashboard_zip(path: &str, method: zip::CompressionMethod, write: impl FnOnce(&mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>)) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(path, zip::write::SimpleFileOptions::default().compression_method(method)).unwrap();
+        write(&mut zip);
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn extract_ui_rejects_invalid_paths_symlinks_and_oversized_archives() {
+        use std::io::Write;
+        use zip::{write::SimpleFileOptions, CompressionMethod::Stored};
+        let dir = test_dir::TestDir::new("extract-boundaries");
+        let stage = dir.path().join("stage");
+        assert_eq!(extract_ui(b"not a ZIP", &stage).unwrap_err(), "Invalid dashboard ZIP");
+        let traversal = dashboard_zip("dist/../../escaped", Stored, |zip| zip.write_all(b"escape").unwrap());
+        assert_eq!(extract_ui(&traversal, &stage).unwrap_err(), "Unsafe dashboard archive path");
+        assert!(!dir.path().join("escaped").exists());
+        let missing = dashboard_zip("dist/main.js", Stored, |zip| zip.write_all(b"missing index").unwrap());
+        assert_eq!(extract_ui(&missing, &stage).unwrap_err(), "Dashboard index.html missing");
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.add_symlink("dist/index.html", "../escaped", SimpleFileOptions::default()).unwrap();
+        assert_eq!(extract_ui(&zip.finish().unwrap().into_inner(), &stage).unwrap_err(), "Dashboard symlinks are not allowed");
+        const LIMIT: u64 = 32 * 1024 * 1024;
+        let large = |size| dashboard_zip("dist/index.html", zip::CompressionMethod::Deflated, |zip| {
+            std::io::copy(&mut std::io::repeat(0).take(size), zip).unwrap();
+        });
+        extract_ui(&large(LIMIT), &stage).unwrap();
+        assert_eq!(fs::metadata(stage.join("index.html")).unwrap().len(), LIMIT);
+        assert_eq!(extract_ui(&large(LIMIT + 1), &stage).unwrap_err(), "Dashboard archive too large");
+    }
+
+    #[test]
+    fn extract_ui_reads_stored_and_deflated_bytes_and_rejects_a_bad_crc() {
+        use std::io::Write;
+        use zip::CompressionMethod::{Deflated, Stored};
+        let dir = test_dir::TestDir::new("extract-crc");
+        let stage = dir.path().join("stage");
+        let contents = b"dashboard contents for checksum test";
+        for method in [Stored, Deflated] {
+            let archive = dashboard_zip("dist/index.html", method, |zip| zip.write_all(contents).unwrap());
+            extract_ui(&archive, &stage).unwrap();
+            assert_eq!(fs::read(stage.join("index.html")).unwrap(), contents);
+        }
+        let mut archive = dashboard_zip("dist/index.html", Stored, |zip| zip.write_all(contents).unwrap());
+        let at = archive.windows(contents.len()).position(|window| window == contents).unwrap();
+        archive[at] ^= 1;
+        assert_eq!(extract_ui(&archive, &stage).unwrap_err(), "Invalid checksum");
+    }
+
+    #[test]
+    fn install_checks_gzip_elf_and_size_before_replacing_installed_files() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        const LIMIT: u64 = 100 * 1024 * 1024;
+        let dir = test_dir::TestDir::new("install-boundaries");
+        let root = dir.path();
+        let m = Mihomo::for_test(root.to_owned());
+        fs::create_dir(root.join("ui")).unwrap();
+        fs::write(root.join("ui/index.html"), b"old ui").unwrap();
+        fs::write(root.join("mihomo"), b"old core").unwrap();
+        let gzip = |prefix: &[u8], size| {
+            let mut out = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            out.write_all(prefix).unwrap();
+            std::io::copy(&mut std::io::repeat(0).take(size - prefix.len() as u64), &mut out).unwrap();
+            out.finish().unwrap()
+        };
+        for (body, error) in [
+            (Err("Download SHA256 verification failed".into()), "Download SHA256 verification failed"),
+            (Ok(b"not gzip".to_vec()), "Cannot decompress Mihomo"),
+            (Ok(gzip(b"not ELF", 7)), "Invalid Mihomo binary"),
+            (Ok(gzip(b"\x7fELF", LIMIT + 1)), "Invalid Mihomo binary"),
+        ] {
+            assert_eq!(m.install_from(|url, sha, max| {
+                assert_eq!((url, sha, max), (CORE_URL, CORE_SHA, 32 * 1024 * 1024));
+                body.clone()
+            }).unwrap_err(), error);
+            assert_eq!(fs::read(root.join("mihomo")).unwrap(), b"old core");
+            assert_eq!(fs::read(root.join("ui/index.html")).unwrap(), b"old ui");
+        }
+        let mut requested = Vec::new();
+        m.install_from(|url, _, max| {
+            requested.push(max);
+            if url == CORE_URL { return Ok(gzip(b"\x7fELF", LIMIT)); }
+            if url == UI_URL {
+                return Ok(dashboard_zip("dist/index.html", zip::CompressionMethod::Stored, |zip| zip.write_all(b"new ui").unwrap()));
+            }
+            Ok(b"license".to_vec())
+        }).unwrap();
+        assert_eq!(requested, [32 * 1024 * 1024, 8 * 1024 * 1024, 64 * 1024, 8 * 1024]);
+        let binary = fs::metadata(root.join("mihomo")).unwrap();
+        assert_eq!((binary.len(), binary.permissions().mode() & 0o777), (LIMIT, 0o700));
+        assert_eq!(fs::read(root.join("ui/index.html")).unwrap(), b"new ui");
+        assert_eq!(fs::read(root.join("ui.previous/index.html")).unwrap(), b"old ui");
+        for file in ["LICENSE-Mihomo-GPL-3.0.txt", "LICENSE-Zashboard-MIT.txt"] {
+            assert_eq!(fs::read(root.join(file)).unwrap(), b"license");
+        }
     }
 
     #[test]
@@ -1934,7 +2095,8 @@ mod tests {
 
     #[test]
     fn off_status_has_no_dashboard_and_creates_nothing() {
-        let dir = std::env::temp_dir().join("u60-mihomo-no-side-effects");
+        let temp = test_dir::TestDir::new("mihomo-no-side-effects");
+        let dir = temp.path().join("mihomo");
         let m = Mihomo::at(dir.clone());
         assert_eq!(m.status()["running"], false);
         assert!(m.status()["dashboard"].is_null());
@@ -1988,7 +2150,8 @@ mod tests {
 
     #[test]
     fn core_operations_refuse_while_installing_without_occupying_the_network_lock() {
-        let dir = std::env::temp_dir().join(format!("u60-core-busy-{}", std::process::id()));
+        let temp = test_dir::TestDir::new("core-busy");
+        let dir = temp.path().join("mihomo");
         let lock = Arc::new(crate::netfx::admission::Gate::new());
         let m = Mihomo::at(dir.clone());
         let _operation = m.operation.lock().unwrap();
@@ -2005,18 +2168,19 @@ mod tests {
     }
 
     /// The owner's choice outlives restarts until it is turned off or a
-    /// start the owner asked for fails (the controller, real device side;
-    /// without `ip` and `nft` here, a start fails before taking anything).
+    /// start the owner asked for fails. The port fixture fails preparation
+    /// and delegates restart marker operations to Mihomo.
     #[test]
     fn owner_choice_outlives_restarts_until_turned_off_or_failing() {
-        let dir = std::env::temp_dir().join(format!("u60-core-wanted-{}", std::process::id()));
+        let temp = test_dir::TestDir::new("core-wanted");
+        let dir = temp.path().to_path_buf();
         let m = Arc::new(Mihomo::at(dir.clone()));
         net::write_private(&dir.join(WANTED), b"1").unwrap();
         assert!(m.wants_restore());
         assert_eq!(m.status_with(|| Err("none".into()))["autostart"], true);
-        m.start("u60.home.arpa".into());
+        let controller = controller::tests::Harness::for_mihomo(&m);
         // The owner saw it fail: a restart must not retry it.
-        assert!(m.enable("u60.home.arpa").is_err());
+        assert_eq!(m.enable("u60.home.arpa").unwrap_err(), "fixture rejected the start");
         assert!(!m.wants_restore());
         assert_eq!(m.snapshot().phase, Phase::Off);
         net::write_private(&dir.join(WANTED), b"1").unwrap();
@@ -2025,20 +2189,21 @@ mod tests {
         // Nothing wanted: returns at once and changes nothing.
         m.restore("u60.home.arpa");
         assert!(!m.running() && m.snapshot().phase == Phase::Off);
-        std::fs::remove_dir_all(dir).unwrap();
+        drop(controller);
     }
 
     #[test]
     fn restore_marker_write_and_delete_failures_are_reported() {
-        let dir = std::env::temp_dir().join(format!("u60-core-marker-{}", std::process::id()));
+        let temp = test_dir::TestDir::new("core-marker");
+        let dir = temp.path().to_path_buf();
         let m = Arc::new(Mihomo::at(dir.clone()));
         std::fs::create_dir_all(dir.join(WANTED)).unwrap();
         assert!(net::write_private(&dir.join(WANTED), b"1").is_err());
         assert_eq!(m.set_wanted(false).unwrap_err(), "Cannot clear Mihomo's restart setting");
-        m.start("u60.home.arpa".into());
+        let controller = controller::tests::Harness::for_mihomo(&m);
         let error = m.enable("u60.home.arpa").unwrap_err();
         assert!(error.contains("Cannot clear Mihomo's restart setting"), "{error}");
-        std::fs::remove_dir_all(dir).unwrap();
+        drop(controller);
     }
 
     #[test]

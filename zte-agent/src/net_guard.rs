@@ -228,20 +228,29 @@ pub fn start(bus: &crate::event_bus::EventBus) {
 
 #[cfg(target_os = "linux")]
 fn watch() {
+    watch_paths(WATCHED);
+}
+
+#[cfg(target_os = "linux")]
+fn watch_paths(paths: &[&str]) {
     use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: plain inotify syscalls on a descriptor this thread owns.
     let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
     if fd < 0 {
         return crate::netlog!("[guard] inotify unavailable; relying on events and the fallback check");
     }
+    let inotify = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = inotify.as_raw_fd();
     let mut watched = 0;
-    for path in WATCHED {
+    for path in paths {
         let Ok(c) = CString::new(*path) else { continue };
         if unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_OPEN) } >= 0 {
             watched += 1;
         }
     }
     crate::netlog!("[guard] watching {watched} ZTE scripts");
+    if watched == 0 { return; }
     let mut buffer = [0u8; 4096];
     loop {
         let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -261,6 +270,18 @@ fn watch() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_watcher_without_paths_returns() {
+        let (done, finished) = std::sync::mpsc::channel();
+        let watcher = std::thread::spawn(move || {
+            watch_paths(&[]);
+            done.send(()).unwrap();
+        });
+        finished.recv_timeout(Duration::from_secs(5)).expect("no watches can produce an event");
+        watcher.join().unwrap();
+    }
 
     #[test]
     fn a_cursor_checks_first_then_only_after_a_settled_trigger_or_the_fallback() {

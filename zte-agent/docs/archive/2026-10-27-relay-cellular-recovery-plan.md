@@ -1,5 +1,9 @@
 # Relay and cellular recovery plan
 
+> **Historical proposal · 2026-10-27.** See the [current lifecycle](../relay-lifecycle.md)
+> and [IPv6 ownership and release rules](../network-extensions.md#wi-fi-relay).
+> The broader recovery coordinator below is a proposal.
+
 Date: 2026-10-27 (America/Los_Angeles).
 Scope: Rust agent, Wi-Fi Relay, cellular fallback, IPv6 RA/NAT66, Mihomo and
 the device web UI. No companion-app UI changes. This is a target design and

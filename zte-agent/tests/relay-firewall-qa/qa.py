@@ -4,7 +4,7 @@
 Run only inside a disposable `--privileged --network none` container; see
 README.md. Prints one JSON line per check and exits non-zero on a failure.
 """
-import ctypes
+import itertools
 import json
 import os
 import shutil
@@ -14,21 +14,13 @@ import sys
 import threading
 import time
 
+from qa_netns import enter, in_ns
+
 DATA = "/qa-data"
 TABLE = "u60_relay"
 JOURNAL = "/data/zte-agent-relay"
 FAILED = []
-LIBC = ctypes.CDLL(None, use_errno=True)
 LEGACY = ["iptables", "ip6tables", "iptables-restore", "ip6tables-restore", "iptables-save", "ip6tables-save"]
-
-
-def enter(ns):
-    fd = os.open(f"/run/netns/{ns}", os.O_RDONLY)
-    try:
-        if LIBC.setns(fd, 0x40000000) != 0:  # CLONE_NEWNET
-            raise OSError(ctypes.get_errno(), "setns")
-    finally:
-        os.close(fd)
 
 
 def sh(*args, ns=None, check=True, stdin=None):
@@ -43,22 +35,6 @@ def report(name, ok, detail=""):
     print(json.dumps({"check": name, "ok": bool(ok), "detail": str(detail)[:300]}), flush=True)
     if not ok:
         FAILED.append(name)
-
-
-def in_ns(ns, target, *args):
-    result = {}
-
-    def run():
-        enter(ns)
-        try:
-            result["value"] = target(*args)
-        except Exception as e:  # noqa: BLE001 - reported as the result
-            result["value"] = f"error: {e}"
-
-    thread = threading.Thread(target=run)
-    thread.start()
-    thread.join()
-    return result.get("value")
 
 
 def serve(ns, family, address, port, label):
@@ -132,6 +108,46 @@ def send_udp(ns, family, source_port, address, port):
         sock.close()
 
     in_ns(ns, run)
+
+
+def serve_dns_udp(ns, family, address, port, label):
+    ready = threading.Event()
+    stop = threading.Event()
+
+    def run():
+        enter(ns)
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind((address, port))
+            sock.settimeout(0.2)
+            ready.set()
+            while not stop.is_set():
+                try:
+                    data, peer = sock.recvfrom(256)
+                except socket.timeout:
+                    continue
+                sock.sendto(f"{label}:{peer[0]}:".encode() + data, peer)
+
+    threading.Thread(target=run, daemon=True).start()
+    if not ready.wait(5):
+        raise RuntimeError(f"{label} UDP DNS fixture did not bind {address}:{port}")
+    return stop
+
+
+def ask_dns(ns, address, transport, source_port, mark=None):
+    def run():
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        with socket.socket(family, transport) as conn:
+            conn.settimeout(1.5)
+            if mark is not None:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)
+            conn.bind(("::" if family == socket.AF_INET6 else "0.0.0.0", source_port))
+            conn.connect((address, 53))
+            conn.sendall(b"hi\n")
+            return conn.recv(256).decode().strip()
+
+    return in_ns(ns, run)
 
 
 def ask(ns, address, port, source=None, timeout=1.5, mark=None):
@@ -290,7 +306,7 @@ def resource_repairs():
     sh("iptables", "-X", "U60_FOREIGN_QA", ns="router")
 
 
-def data_plane():
+def data_plane(mihomo_data):
     servers = [
         serve("upstream", socket.AF_INET, "0.0.0.0", 80, "up"),
         serve("upstream", socket.AF_INET6, "::", 80, "up6"),
@@ -369,8 +385,63 @@ def data_plane():
     got = twice("router", "2001:db8:5::53", 53)
     report("NAT66 without a resolver: the router's IPv6 DNS is rejected", all(all(rejected(g)) for g in got), got)
 
+    if mihomo_data:
+        coexistence(mihomo_data)
     for stop in servers + [stop_dhcp, stop_dhcp6]:
         stop.set()
+
+
+def remove_mihomo_tables():
+    sh("nft", "-f", "-", ns="router", stdin="delete table ip u60_mihomo\ndelete table ip6 u60_mihomo\n")
+
+
+def coexistence(mihomo_data):
+    sh("nft", "-f", f"{DATA}/full.nft", ns="router")
+    cell_host = "fd42:60::1"
+    sh("ip", "-6", "addr", "add", f"{cell_host}/128", "dev", "lo", "nodad", ns="cell")
+    sh("ip", "-6", "route", "add", f"{cell_host}/128", "via", "2001:db8:c::1", "dev", "rmnet_data0", ns="router")
+    stop = [
+        serve("router", socket.AF_INET, "0.0.0.0", 1053, "core"),
+        serve("router", socket.AF_INET6, "::", 1053, "core6"),
+    ]
+    for ns, family, address, port, label in (
+        ("router", socket.AF_INET, "0.0.0.0", 1053, "core"),
+        ("router", socket.AF_INET6, "::", 1053, "core6"),
+        ("router", socket.AF_INET6, "::", 53, "routerdns6"),
+        ("upstream", socket.AF_INET, "10.20.0.1", 53, "hoteldns"),
+        ("upstream", socket.AF_INET6, "2001:db8:20::1", 53, "hoteldns6"),
+        ("upstream", socket.AF_INET, "203.0.113.53", 53, "hoteldns-original"),
+        ("upstream", socket.AF_INET6, "2001:db8:53::8", 53, "hoteldns6-original"),
+    ):
+        stop.append(serve_dns_udp(ns, family, address, port, label))
+
+    # A new original tuple for each packet-path check, even across nft batch swaps.
+    ports = itertools.count(41000)
+    for tool in ("iptables", "ip6tables"):
+        sh(tool, "-P", "FORWARD", "DROP", ns="router")
+    try:
+        for shape in ("full", "hold", "reject", "withdrawn"):
+            if shape == "withdrawn":
+                remove_mihomo_tables()
+            else:
+                sh("nft", "-f", f"{mihomo_data}/{shape}.nft", ns="router")
+            v4, v6 = ("core", "core6") if shape in ("full", "hold") else ("hoteldns", "routerdns6")
+            for protocol, transport in (("UDP", socket.SOCK_DGRAM), ("TCP", socket.SOCK_STREAM)):
+                for family, address, label in (("IPv4", "198.51.100.53", v4), ("IPv6", "2001:db8:5::53", v6)):
+                    got = ask_dns("client", address, transport, next(ports))
+                    report(f"combined {shape}: LAN {family} {protocol} DNS reaches {label}", got.startswith(f"{label}:"), got)
+                for address, label in (("203.0.113.53", "hoteldns-original"), ("2001:db8:53::8", "hoteldns6-original")):
+                    got = ask_dns("router", address, transport, next(ports), mark=0x01000000)
+                    report(f"combined {shape}: marked {protocol} OUTPUT DNS retains {address}", got.startswith(f"{label}:"), got)
+            # ULA is a Mihomo bypass, so the LAN probe actually reaches the relay's rmnet* reject.
+            for ns in ("client", "router"):
+                got = twice(ns, cell_host, 80)
+                report(f"combined {shape}: {ns} IPv6 to rmnet is rejected", all(all(rejected(g)) for g in got), got)
+    finally:
+        for tool in ("iptables", "ip6tables"):
+            sh(tool, "-P", "FORWARD", "ACCEPT", ns="router")
+        for event in stop:
+            event.set()
 
 
 def chain_lines(tool, chain):
@@ -446,13 +517,18 @@ def rollback(agent, label):
 
 
 def main():
+    mihomo_data = os.environ.get("U60_MIHOMO_QA_DATA")
     legacy_tools()
     topology()
     tables_load()
     restore_inputs()
     resource_repairs()
-    data_plane()
+    data_plane(mihomo_data)
+    if mihomo_data:
+        sh("nft", "-f", f"{mihomo_data}/full.nft", ns="router")
     portal()
+    if mihomo_data:
+        remove_mihomo_tables()
     for agent, label in (("/old-agent", "the previous agent"), ("/new-agent", "this agent")):
         if os.path.exists(agent):
             rollback(agent, label)

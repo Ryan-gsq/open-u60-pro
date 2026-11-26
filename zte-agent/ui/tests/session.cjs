@@ -1,5 +1,5 @@
 // Authentication regressions use only an isolated local fixture.
-const {chromium}=require('playwright'),assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path');
+const {launchChrome}=require('./browser.cjs'),assert=require('node:assert/strict'),http=require('node:http'),fs=require('node:fs'),path=require('node:path');
 (async()=>{
   let loginCount=0,currentToken='',lateResponse;const streams=new Set(),errors=[],requests=[];
   const send=(res,data,status=200)=>{res.writeHead(status,{'Content-Type':'application/json'});res.end(JSON.stringify(status===200 ? {ok:true,data} : {ok:false,error:'unauthorized'}));};
@@ -14,7 +14,7 @@ const {chromium}=require('playwright'),assert=require('node:assert/strict'),http
     send(res,{});
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const heartbeat=setInterval(()=>{for(const res of streams)res.write(': heartbeat\n\n');},1000);
-  const browser=await chromium.launch({headless:true,channel:'chrome'}),context=await browser.newContext(),page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));
+  const browser=await launchChrome(),context=await browser.newContext(),page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));
   const live=()=>page.waitForFunction(()=>OpenU60Console.connected),login=async()=>{await page.waitForFunction(()=>document.querySelector('#login-dialog').open);await page.locator('#password').fill('test-password');await page.locator('#login-form button[type=submit]').click();await live();};
   const base=`http://127.0.0.1:${server.address().port}`;await page.goto(base);await login();assert.equal(loginCount,1);
   assert.equal(await page.evaluate(()=>sessionStorage.getItem('openu60.session')),currentToken);assert.equal(await page.locator('#password').inputValue(),'');

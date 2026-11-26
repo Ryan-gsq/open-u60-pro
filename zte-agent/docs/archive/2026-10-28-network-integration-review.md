@@ -1,5 +1,9 @@
 # Network integration review
 
+> **Historical record · 2026-10-26 to 2026-10-28.** See the
+> [current operations and API reference](../network-extensions.md) and the
+> [device acceptance index](../README.md#device-acceptance).
+
 > 2026-11-12 note: the relay station named `u60sta0` in this review is `ath20` since 2026-11-12.
 
 ## Review follow-up (2026-10-28, local changes)
@@ -232,7 +236,7 @@ formal profile/configuration were left unchanged.
 - Generic cleanup still stops on dependency failures but now reports a sanitized
   reason and suggests panel retry. The larger coordinator, dependency-group and
   cross-boot design remains a proposal in
-  [relay-cellular-recovery-plan.md](relay-cellular-recovery-plan.md), not a claim
+  [relay-cellular-recovery-plan.md](2026-10-27-relay-cellular-recovery-plan.md), not a claim
   that these broader reliability changes have already been implemented.
 
 Validation for this increment:
@@ -485,7 +489,7 @@ claim of production readiness or exhaustive correctness.
 - Browser: 28 page/viewport cases without overflow; dashboard JS: 4 passed.
 - Clippy: succeeds with 23 baseline warnings. ARM64 static stripped section Total
   7,389,824 bytes; gzip -9 3,767,868 bytes. CSS stays 49,026 bytes.
-- Details and reproducible harness: [relay-ipv6-validation.md](relay-ipv6-validation.md).
+- Details and reproducible harness: [relay-ipv6-validation.md](2026-10-27-relay-ipv6-validation.md).
 
 Totals for the IPv6 follow-up: Standards axis 2 correctness findings fixed
 (worst P1), no remaining documented violations; Spec axis 7 findings fixed

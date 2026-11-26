@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Side-effect-free admission probe (relay-mihomo-refactor-plan.md, v1
-# acceptance). For DURATION seconds it sends owner writes with an invalid JSON
+# Admission probe (zte-agent/docs/archive/2026-11-10-relay-mihomo-refactor-plan.md,
+# v1 acceptance). For DURATION seconds it sends owner writes with an invalid JSON
 # body to two admission-gated endpoints. A write that is admitted stops at the
 # JSON check (400) and changes nothing; the rest are refused before any write.
-# Counts "in progress" refusals (the network lock was busy past the 3 s wait)
+# Counts "in progress" refusals (conflicting network work did not release admission within 3 s)
 # apart from real conflicts (the relay or Mihomo owns the network).
 #
 #   ANDROID_SERIAL=<serial> scripts/probe-admission.sh [seconds] [pause]
@@ -12,10 +12,13 @@
 set -euo pipefail
 DURATION=${1:-120}
 PAUSE=${2:-0.25}
-PORT=18091
-adb forward "tcp:$PORT" tcp:9090 >/dev/null
-trap 'adb forward --remove "tcp:$PORT" >/dev/null 2>&1 || true' EXIT
-TOKEN=$(adb shell cat /tmp/zte-agent-run/admin-token | tr -d '\r\n')
+SERIAL=$(adb get-serialno)
+PORT=$(adb -s "$SERIAL" forward tcp:0 tcp:9090)
+case "$PORT" in
+    ''|0|*[!0-9]*) echo "ADB did not return an allocated TCP port" >&2; exit 1 ;;
+esac
+trap 'adb -s "$SERIAL" forward --remove "tcp:$PORT" >/dev/null 2>&1 || true' EXIT
+TOKEN=$(adb -s "$SERIAL" shell cat /tmp/zte-agent-run/admin-token | tr -d '\r\n')
 [ -n "$TOKEN" ] || { echo "no local token" >&2; exit 1; }
 busy=0 conflict=0 admitted=0 gate=0 other=0 total=0
 end=$((SECONDS + DURATION))

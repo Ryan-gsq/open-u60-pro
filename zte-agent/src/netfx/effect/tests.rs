@@ -2,12 +2,23 @@ use super::*;
 use std::collections::BTreeMap;
 use super::super::fake::FakeNft;
 
+#[derive(Debug, PartialEq, Eq)]
+enum EffectCall {
+    Restore(String),
+    Apply(Cmd),
+    Undo(Cmd),
+}
+
 #[derive(Default)]
 pub(crate) struct Kernel {
     pub tables: BTreeMap<(String, String), Vec<String>>,
     pub writes: Vec<(String, String)>,
     pub reads: Vec<Cmd>,
     commands: Vec<Cmd>,
+    effects: Vec<EffectCall>,
+    apply_error: Option<Cmd>,
+    checks: Vec<Cmd>,
+    routes: Vec<Cmd>,
     undos: Vec<Cmd>,
     error: Option<String>,
     check_error: Option<(i32, String)>,
@@ -15,6 +26,7 @@ pub(crate) struct Kernel {
     pub settings: BTreeMap<String, String>,
     ip: BTreeMap<String, String>,
     undo_error: bool,
+    blocked_undo: Option<Cmd>,
     normalize: bool,
     fail_after_commit: bool,
 }
@@ -68,6 +80,7 @@ impl Probe for Kernel {
     }
 
     fn status(&mut self, command: &Cmd) -> Result<(i32, String), String> {
+        self.checks.push(command.clone());
         if let Some(error) = &self.check_error { return Ok(error.clone()); }
         let lines = self.tables.entry((command.program.clone(), command.args[3].clone())).or_default();
         let name = &command.args[5];
@@ -88,14 +101,19 @@ impl Probe for Kernel {
     }
 
     fn apply(&mut self, command: &Cmd) -> Result<(), String> {
+        self.effects.push(EffectCall::Apply(command.clone()));
         self.commands.push(command.clone());
+        if self.apply_error.as_ref() == Some(command) { return Err("cannot apply route".into()); }
         if command.program == "@u60-sysctl" {
             self.settings.insert(command.args[0].clone(), command.args[1].clone());
+        } else if command.program == "ip" && command.args.get(1..3).is_some_and(|words| words == ["route", "add"]) {
+            self.routes.push(command.clone());
         }
         Ok(())
     }
 
     fn restore(&mut self, program: &str, input: String) -> Result<(), String> {
+        self.effects.push(EffectCall::Restore(program.into()));
         if let Some(path) = self.stop_before_effect.take() {
             let journal = EffectSet::read(&path).unwrap();
             assert_eq!(journal.undo.len(), 2, "the last undo is durable before restore starts");
@@ -154,8 +172,12 @@ impl Probe for Kernel {
     }
 
     fn undo(&mut self, command: &Cmd) -> Result<(), String> {
+        self.effects.push(EffectCall::Undo(command.clone()));
         self.undos.push(command.clone());
-        if self.undo_error { return Err("busy".into()); }
+        if self.undo_error || self.blocked_undo.as_ref() == Some(command) { return Err("busy".into()); }
+        if command.program == "ip" && command.args.get(1..3).is_some_and(|words| words == ["route", "del"]) {
+            self.routes.retain(|route| route.args[..2] != command.args[..2] || route.args[3..] != command.args[3..]);
+        }
         if matches!(command.program.as_str(), "iptables" | "ip6tables") { firewall::undo(command, self) } else { Ok(()) }
     }
 
@@ -437,6 +459,18 @@ fn routes_use_metric_gateway_and_device_and_rules_refuse_a_foreign_priority() {
 }
 
 #[test]
+fn reserved_route_tables_match_aliases_but_still_require_an_explicit_adjacent_value() {
+    let main = "default via 10.0.0.1 dev ath20 table main";
+    assert!(table_used(main, "main"));
+    assert!(table_used(main, "254"));
+    assert!(table_used("default dev ath20 table 254", "main"));
+    assert!(!table_used("default dev ath20", "main"));
+    assert!(table_used("blackhole default table 60631", "60631"));
+    assert!(!table_used("blackhole default table 60631", "6063"));
+    assert!(!table_used("default table\n60631", "60631"));
+}
+
+#[test]
 fn insert_first_hook_keeps_a_vendor_rule_added_above_it() {
     for position in [Position::InsertFirst] {
         let mut set = set("first");
@@ -469,16 +503,219 @@ fn an_owned_route_or_rule_can_be_replaced_under_its_typed_key() {
     let mut set = set("replace-route");
     let mut kernel = Kernel::default();
     let mut nft = FakeNft::default();
-    let mut first = Route::new(Family::V4, RouteType::Unicast, "default", "60631");
-    first.device = Some("ath20".into());
-    first.gateway = Some("192.0.2.1".into());
-    let mut next = first.clone();
-    next.gateway = Some("192.0.2.3".into());
+    let (first, next) = replacement_routes();
     set.declare_with(vec![Resource::Route(first.clone())], &mut kernel, &mut nft).unwrap();
     set.declare_with(vec![Resource::Route(next.clone())], &mut kernel, &mut nft).unwrap();
     assert_eq!(kernel.undos, [first.command("del")]);
     assert_eq!(kernel.commands.last(), Some(&next.command("add")));
     set.release_with(&mut kernel).unwrap();
+}
+
+fn replacement_routes() -> (Route, Route) {
+    let mut first = Route::new(Family::V4, RouteType::Unicast, "default", "60631");
+    first.device = Some("ath20".into());
+    first.gateway = Some("192.0.2.1".into());
+    let mut next = first.clone();
+    next.gateway = Some("192.0.2.3".into());
+    (first, next)
+}
+
+#[test]
+fn a_blocked_replacement_keeps_both_undos_for_reconcile_or_restart_recovery() {
+    for recover in [false, true] {
+        let mut set = set(if recover { "blocked-restart" } else { "blocked-reconcile" });
+        let mut kernel = Kernel::default();
+        let mut nft = FakeNft::default();
+        let (first, next) = replacement_routes();
+        let first_undo = first.command("del");
+        let next_undo = next.command("del");
+        set.declare_with(vec![Resource::Route(first.clone())], &mut kernel, &mut nft).unwrap();
+        kernel.blocked_undo = Some(first_undo.clone());
+        assert_eq!(set.declare_with(vec![Resource::Route(next.clone())], &mut kernel, &mut nft), Err("busy".into()));
+        let journal = fs::read(&set.path).unwrap();
+        assert_eq!(EffectSet::read(&set.path).unwrap().undo, [first_undo.clone(), next_undo.clone()]);
+        assert_eq!(kernel.undos, [first_undo.clone()]);
+        assert_eq!(kernel.routes, [first.command("add")]);
+
+        let blocked = set.reconcile_with(&mut kernel, &mut nft);
+        assert!(blocked.restored.is_empty());
+        assert_eq!(blocked.failed, ["resource replacement: not checked: busy"]);
+        assert_eq!(fs::read(&set.path).unwrap(), journal);
+        assert_eq!(kernel.undos, [first_undo.clone(), first_undo.clone()]);
+        assert_eq!(kernel.commands, [first.command("add")]);
+        kernel.blocked_undo = None;
+        kernel.undos.clear();
+
+        if recover {
+            EffectSet::recover_with(&set.path, &mut kernel).unwrap();
+            assert_eq!(kernel.undos, [next_undo, first_undo]);
+            assert!(kernel.routes.is_empty());
+            assert!(!set.path.exists());
+            EffectSet::recover_with(&set.path, &mut kernel).unwrap();
+            assert_eq!(kernel.undos.len(), 2);
+        } else {
+            let repaired = set.reconcile_with(&mut kernel, &mut nft);
+            assert_eq!(repaired.restored.len(), 1);
+            assert!(repaired.failed.is_empty());
+            assert_eq!(kernel.undos, [first_undo]);
+            assert_eq!(kernel.routes, [next.command("add")]);
+            assert_eq!(EffectSet::read(&set.path).unwrap().undo, [next_undo]);
+            kernel.ip.insert("-4 route show table all".into(), "default via 192.0.2.3 dev ath20 table 60631".into());
+            assert!(set.reconcile_with(&mut kernel, &mut nft).restored.is_empty());
+            assert_eq!(kernel.commands, [first.command("add"), next.command("add")]);
+            set.release_with(&mut kernel).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_withdrawal_failure_blocks_redeclaring_or_reapplying_the_resource() {
+    let mut set = set("blocked-withdrawal");
+    let mut kernel = Kernel::default();
+    let mut nft = FakeNft::default();
+    let (first, next) = replacement_routes();
+    let resource = Resource::Route(first.clone());
+    set.declare_with(vec![resource.clone()], &mut kernel, &mut nft).unwrap();
+    kernel.blocked_undo = Some(first.command("del"));
+    assert!(set.withdraw_with(&[resource.key()], &mut kernel).unwrap_err().contains("Network cleanup paused: busy"));
+    assert_eq!(set.declare_with(vec![Resource::Route(next)], &mut kernel, &mut nft), Err("Network cleanup is pending".into()));
+    let result = set.reconcile_with(&mut kernel, &mut nft);
+    assert!(result.restored.is_empty() && result.failed.is_empty());
+    assert_eq!(kernel.commands, [first.command("add")]);
+    assert_eq!(EffectSet::read(&set.path).unwrap().undo, [first.command("del")]);
+    kernel.blocked_undo = None;
+    set.withdraw_with(&[resource.key()], &mut kernel).unwrap();
+    assert!(kernel.routes.is_empty());
+    assert!(!set.path.exists());
+}
+
+#[test]
+fn saved_journal_bytes_match_the_owned_serializer() {
+    let mut set = set("journal-bytes");
+    let commands = vec![
+        Cmd::new("true", &[]),
+        Cmd::new("@u60-sysctl", &["httpredirect_cmd", "1"]),
+        Cmd::new("test", &["a \"quoted\" value\n", "relay 中继"]),
+    ];
+    for undo in [vec![], commands] {
+        let old = Journal { boot: net::boot_id(), undo: undo.clone() };
+        set.undo = undo;
+        set.save().unwrap();
+        assert_eq!(fs::read(&set.path).unwrap(), serde_json::to_vec(&old).unwrap());
+    }
+}
+
+#[test]
+fn a_bad_journal_returns_an_error_without_mutating_its_bytes_or_attempting_undo() {
+    let set = set("bad-journal");
+    let mut kernel = Kernel::default();
+    for bytes in [br#"{"boot":"","undo":[{"program":"true","args":[]},"#.as_slice(), br#"{"boot":"","undo":null}"#] {
+        net::write_private(&set.path, bytes).unwrap();
+        assert_eq!(EffectSet::load("mihomo", &set.path).err().as_deref(), Some("Network recovery journal is invalid"));
+        assert_eq!(EffectSet::recover_with(&set.path, &mut kernel), Err("Network recovery journal is invalid".into()));
+        assert_eq!(fs::read(&set.path).unwrap(), bytes);
+        assert!(kernel.undos.is_empty());
+    }
+}
+
+#[test]
+fn b31_hooks_use_the_real_listings_and_check_only_unconfirmed_rules() {
+    let mut set = set("b31-hooks");
+    let mut kernel = Kernel::default();
+    for (program, table, listing) in firewall::b31_listing_sections() {
+        kernel.tables.insert((program.into(), table.into()), listing.lines().map(String::from).collect());
+    }
+    let masquerade = LegacyHook {
+        tool: LegacyTool::V4, table: "nat".into(), chain: "POSTROUTING".into(),
+        rule: ["-o", "ath20", "-m", "comment", "--comment", "zte-agent-wifi-relay", "-j", "MASQUERADE"].map(String::from).to_vec(),
+        position: Position::BeforeVendor,
+    };
+    let input = LegacyHook {
+        tool: LegacyTool::V6, table: "filter".into(), chain: "INPUT".into(),
+        rule: ["-i", "ath20", "-j", "U60_RELAY_IN"].map(String::from).to_vec(),
+        position: Position::BeforeVendor,
+    };
+    let resources = vec![Resource::LegacyHook(masquerade.clone()), Resource::LegacyHook(input.clone())];
+    set.undo = resources.iter().map(|resource| resource.undo(|_| unreachable!()).unwrap()).collect();
+    set.save().unwrap();
+    let mut adopted = EffectSet::load("relay", &set.path).unwrap();
+    let mut nft = FakeNft::default();
+    let before = kernel.tables.clone();
+    adopted.declare_with(resources, &mut kernel, &mut nft).unwrap();
+    assert_eq!(kernel.reads, [
+        legacy_listing(LegacyTool::V6, "filter"),
+        legacy_listing(LegacyTool::V4, "nat"),
+        legacy_listing(LegacyTool::V6, "filter"),
+    ]);
+    assert!(kernel.writes.is_empty() && kernel.checks.is_empty());
+    assert_eq!(kernel.tables, before);
+
+    let key = ("iptables".into(), "nat".into());
+    let listed = hook_line(&masquerade).unwrap();
+    kernel.tables.get_mut(&key).unwrap().retain(|line| line != &listed);
+    kernel.check_error = Some((4, "Another app is currently holding the xtables lock.".into()));
+    let result = adopted.reconcile_with(&mut kernel, &mut nft);
+    assert!(result.restored.is_empty());
+    assert_eq!(result.failed, ["iptables -t nat hook POSTROUTING -o ath20 -m comment --comment zte-agent-wifi-relay -j MASQUERADE: not checked: cannot establish hook position (check exited 4)"]);
+    assert_eq!(kernel.checks, [masquerade.command("-C", None)]);
+    assert!(kernel.writes.is_empty());
+
+    kernel.check_error = None;
+    kernel.tables.get_mut(&key).unwrap().insert(before[&key].iter().position(|line| line == &listed).unwrap(), listed.clone());
+    EffectSet::recover_with(&set.path, &mut kernel).unwrap();
+    let input_line = hook_line(&input).unwrap();
+    let mut expected = before;
+    expected.get_mut(&key).unwrap().retain(|line| line != &listed);
+    expected.get_mut(&("ip6tables".into(), "filter".into())).unwrap().retain(|line| line != &input_line);
+    assert_eq!(kernel.tables, expected, "recovery removes the two exact owned hooks");
+}
+
+#[test]
+fn pending_legacy_restore_flushes_before_an_obsolete_route_is_removed() {
+    let mut set = set("obsolete-flush");
+    let mut kernel = Kernel::seeded();
+    let mut nft = FakeNft::default();
+    let (first, next) = replacement_routes();
+    set.declare_with(vec![Resource::Route(first.clone())], &mut kernel, &mut nft).unwrap();
+    kernel.effects.clear();
+    kernel.blocked_undo = Some(first.command("del"));
+    assert_eq!(set.declare_with(vec![chain(), Resource::Route(next.clone())], &mut kernel, &mut nft), Err("busy".into()));
+    assert_eq!(kernel.effects, [EffectCall::Restore("iptables-restore".into()), EffectCall::Undo(first.command("del"))]);
+    assert!(kernel.lines().iter().any(|line| line == "-N U60_TEST"));
+    assert_eq!(kernel.routes, [first.command("add")]);
+    assert_eq!(EffectSet::read(&set.path).unwrap().undo, [first.command("del"), chain().undo(|_| unreachable!()).unwrap(), next.command("del")]);
+}
+
+#[test]
+fn mixed_batches_flush_legacy_before_a_route_and_apply_the_second_family_only_on_success() {
+    for blocked in [false, true] {
+        let mut set = set(if blocked { "mixed-blocked" } else { "mixed-success" });
+        let mut kernel = Kernel::seeded();
+        let mut nft = FakeNft::default();
+        let (route, _) = replacement_routes();
+        let Resource::LegacyChain(mut v6) = chain() else { unreachable!() };
+        v6.tool = LegacyTool::V6;
+        let plan = vec![chain(), hook(), Resource::Route(route.clone()), Resource::LegacyChain(v6)];
+        let undos: Vec<_> = plan.iter().map(|resource| resource.undo(|_| unreachable!()).unwrap()).collect();
+        set.undo = undos[..2].to_vec();
+        set.save().unwrap();
+        let mut adopted = EffectSet::load("mihomo", &set.path).unwrap();
+        if blocked { kernel.apply_error = Some(route.command("add")); }
+        let result = adopted.declare_with(plan, &mut kernel, &mut nft);
+        assert_eq!(EffectSet::read(&set.path).unwrap().undo, undos);
+        assert_eq!(adopted.held.len(), 4);
+        assert_eq!(kernel.writes[0], ("iptables-restore".into(), "*filter\n-N U60_TEST\n-A U60_TEST -j ACCEPT\n-A U60_TEST -j RETURN\n-I INPUT 1 -j U60_TEST\nCOMMIT\n".into()));
+        let mut effects = vec![EffectCall::Restore("iptables-restore".into()), EffectCall::Apply(route.command("add"))];
+        if blocked {
+            assert_eq!(result, Err("cannot apply route".into()));
+            assert!(!kernel.tables.contains_key(&("ip6tables".into(), "filter".into())));
+        } else {
+            result.unwrap();
+            effects.push(EffectCall::Restore("ip6tables-restore".into()));
+            assert_eq!(kernel.writes[1], ("ip6tables-restore".into(), "*filter\n-N U60_TEST\n-A U60_TEST -j ACCEPT\n-A U60_TEST -j RETURN\nCOMMIT\n".into()));
+        }
+        assert_eq!(kernel.effects, effects);
+    }
 }
 
 #[test]

@@ -46,8 +46,9 @@
       return;
     }
     if (!groups.length) { groupList.replaceChildren(el('p', 'empty', data.groups.length ? 'No group or node matches the filter.' : 'The running configuration has no proxy groups.')); return; }
+    const resolveNode = M.makeNodeResolver(data.groups);
     groupList.replaceChildren(...groups.map(group => {
-      const card = el('article', 'proxy-group'), head = el('div', 'proxy-group-head'), copy = el('div'), now = M.resolveNode(data.groups, group.name), node = nodes()[now];
+      const card = el('article', 'proxy-group'), head = el('div', 'proxy-group-head'), copy = el('div'), now = resolveNode(group.name), node = nodes()[now];
       card.dataset.group = group.name;
       copy.append(el('h3', '', group.name), el('p', 'field-help', group.now ? `Now: ${group.now}${group.now !== now && now ? ` → ${now}` : ''}` : 'No node selected'));
       head.append(copy, el('span', 'tag', group.type));
@@ -148,9 +149,7 @@
     if (document.hidden || loading || busy || API.locked || !API.connected || !onRoute() || Date.now() - lastLoad < 1000) return;
     load(true);
   }
-  window.addEventListener('focus', refreshVisible);
-  window.addEventListener('pageshow', refreshVisible);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisible(); });
+  UI.listenForVisibility(refreshVisible);
 
   UI.track({
     route,

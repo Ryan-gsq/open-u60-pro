@@ -1,5 +1,10 @@
 # DFS upstream acceptance — 2026-11-03
 
+> **Historical acceptance · 2026-11-03.** v6 retired automatic bandwidth
+> tuning, including per-network controls. The association width reset was removed
+> on 2026-11-12, and `setup.sh` no longer keeps an installation backup. See the
+> [current relay lifecycle](../relay-lifecycle.md) and [installation instructions](../../../README.md#first-time-setup).
+
 > 2026-11-12 note: the station named `u60sta0` here is `ath20` since 2026-11-12.
 
 Device: U60 Pro B31, CN self-managed PHY. Upstream: `W_Game`, WPA2,
@@ -56,7 +61,7 @@ and waits for the original hotspot's CAC to complete.
 - TERM/restart of the verified main agent recovered the journal, completed CAC,
   and automatically rejoined `W_Game`. Final API: connected, 5260 MHz, 160 MHz,
   autostart true, error null, recovery_required false. Mihomo running/error null.
-- On-device [Internet check](../../scripts/check-relay-internet.sh), binding
+- On-device [Internet check](../../../scripts/check-relay-internet.sh), binding
   probes to `u60sta0`, passed both after reconnection and after agent restart:
   gateway **5/5**, public IPv4 `223.5.5.5` **5/5**, DNS resolution successful,
   HTTPS to `www.baidu.com` **200 over IPv4 and IPv6**. The IPv4 route explicitly
@@ -131,7 +136,7 @@ Additional observed results:
   service launcher and remains. setup.sh retains its normal installation rollback
   artifacts; they are not test scripts.
 
-The current lifecycle and rationale are in [relay-lifecycle.md](relay-lifecycle.md).
+The current lifecycle and rationale are in [relay-lifecycle.md](../relay-lifecycle.md).
 
 
 Final delivered mobile revision: setup backup `/data/zte-agent-install-20261103-151638-31665`;

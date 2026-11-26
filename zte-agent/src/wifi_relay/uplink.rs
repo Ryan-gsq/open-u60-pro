@@ -1,9 +1,9 @@
 //! The relay's own nftables tables, `ip`/`ip6 u60_relay`, built in one place
-//! (`relay-mihomo-architecture.md` section 4.3). Denials live here; legacy
-//! iptables keeps only the accepts that must pass the vendor's DROP/REJECT
-//! (`U60_RELAY_IN`, `U60_RELAY_FWD`, `U60_R6_IN`, `U60_R6_FWD`), the portal
-//! RETURN. The active IPv4 and IPv6 layouts own their masquerade. A return here leaves
-//! only these chains: the vendor's rules still apply after them.
+//! (`relay-mihomo-architecture.md` section 4.3). The nftables layouts own
+//! denials and IPv4/IPv6 masquerade. Legacy iptables keeps the ACCEPT rules
+//! that pass the vendor's DROP/REJECT (`U60_RELAY_IN`, `U60_RELAY_FWD`,
+//! `U60_R6_IN`, `U60_R6_FWD`) and the offline-portal RETURN. The RETURN
+//! skips the vendor portal redirect while the vendor's filtering still applies.
 //!
 //! What the tables hold follows the session (`Layout`):
 //! - always, from before the station is raised (a scan too) until the station
@@ -262,10 +262,9 @@ impl Shared {
         Self::declare(&mut s)
     }
 
-    /// A previous agent's tables, taken over with installed routes: only
-    /// ours (by marker) are, and the guard with `relay`'s part replaces them
-    /// in one load, so forwarding and DNS never lapse. IPv6 adds its parts
-    /// again when it starts.
+    /// Verify the previous agent's ownership marker and stage the IPv4 layout.
+    /// IPv6 takeover can confirm the combined layout through `update` before
+    /// the caller invokes `finish_adopt`.
     pub fn adopt(&self, relay: Relay) -> Result<(), String> {
         let mut s = self.state();
         let tables = NftTables::new("relay", TABLE, s.file.clone());
@@ -276,6 +275,9 @@ impl Shared {
         Ok(())
     }
 
+    /// Declare the dual-family layout after IPv6 takeover. One batch loads
+    /// the layout if needed, and a layout already confirmed during takeover
+    /// is reused.
     pub fn finish_adopt(&self) -> Result<(), String> {
         Self::declare(&mut self.state())
     }
@@ -361,11 +363,12 @@ pub mod tests {
         }
     }
 
-    pub fn shared(test: &str) -> (Shared, Kernel) {
-        let dir = std::env::temp_dir().join(format!("u60-uplink-{test}-{}", std::process::id()));
+    pub(in crate::wifi_relay) fn shared(test: &str) -> (Shared, Kernel, crate::wifi_relay::test_dir::TestDir) {
+        let temp = crate::wifi_relay::test_dir::TestDir::new(test);
+        let dir = temp.path();
         let kernel = Kernel::default();
         let effects = Arc::new(Mutex::new(EffectSet::new("relay", dir.join("wireless.json"))));
-        (Shared::with(dir.join("uplink.nft"), effects, Box::new(kernel.clone())), kernel)
+        (Shared::with(dir.join("uplink.nft"), effects, Box::new(kernel.clone())), kernel, temp)
     }
 
     fn relay() -> Relay {
@@ -502,7 +505,7 @@ pub mod tests {
 
     #[test]
     fn the_journal_entries_undo_with_what_the_previous_agent_runs() {
-        let (shared, _) = shared("undos");
+        let (shared, _, _temp) = shared("undos");
         let resource = shared.resource(None);
         let mut commands = vec![resource.undo(|_| Ok("1".into())).unwrap()];
         commands.extend(resource.extra_undos());
@@ -514,7 +517,7 @@ pub mod tests {
     /// declared before the guard; a failed load stays the target.
     #[test]
     fn parts_come_and_go_in_one_batch_and_a_failed_one_is_retried() {
-        let (uplink, kernel) = shared("parts");
+        let (uplink, kernel, _temp) = shared("parts");
         uplink.update(|l| l.relay = Some(relay())).unwrap();
         assert!(kernel.table("ip").is_none() && uplink.layout().is_none(), "nothing before the guard");
         uplink.claim().unwrap();
@@ -541,7 +544,7 @@ pub mod tests {
 
     #[test]
     fn another_programs_table_is_never_taken_over() {
-        let (uplink, kernel) = shared("foreign");
+        let (uplink, kernel, _temp) = shared("foreign");
         kernel.0.lock().unwrap().tables.insert(("ip".into(), TABLE.into()), "table ip u60_relay {\n}\n".into());
         assert!(uplink.claim().is_err());
         assert!(kernel.table("ip").unwrap() == "table ip u60_relay {\n}\n");
@@ -549,7 +552,7 @@ pub mod tests {
 
     #[test]
     fn a_same_boot_takeover_reuses_the_complete_relay_table_without_writes() {
-        let (previous, kernel) = shared("takeover");
+        let (previous, kernel, _temp) = shared("takeover");
         previous.guard().unwrap();
         previous.update(|layout| {
             layout.relay = Some(relay());
@@ -570,6 +573,5 @@ pub mod tests {
         next.finish_adopt().unwrap();
         assert_eq!(kernel.0.lock().unwrap().loads, before);
         assert_eq!(next.status()["target"], next.status()["confirmed"]);
-        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 }

@@ -15,9 +15,6 @@ impl CoreHandle for FakeCore {
     fn generation(&self) -> u64 {
         self.generation
     }
-    fn pid(&self) -> u32 {
-        4000 + self.generation as u32
-    }
     fn stop(&self) -> bool {
         self.alive.store(false, Ordering::SeqCst);
         self.world.lock().unwrap().events.push(format!("stop {}", self.generation));
@@ -30,6 +27,7 @@ struct World {
     events: Vec<String>,
     validation: Option<Validation>,
     wanted: bool,
+    mihomo: Option<Arc<super::super::Mihomo>>,
     adoptable: bool,
     /// Effects are held (`Port::owns`).
     owned: bool,
@@ -58,6 +56,8 @@ struct World {
     resets: Vec<Scope>,
     selected_direct: bool,
     writes: Vec<String>,
+    write_results: VecDeque<Answered>,
+    read_results: VecDeque<Option<bool>>,
     uplink: Uplink,
     busy: Option<String>,
     guard_due: bool,
@@ -240,8 +240,9 @@ impl Port for FakePort {
         Ok(())
     }
     fn read_back(&mut self, _: &str) -> Option<(Mode, Selected, Value)> {
-        let direct = self.world().selected_direct;
-        let runtime = self.world().runtime.clone().unwrap_or_else(|| json!({"mode": "rule", "log-level": "info"}));
+        let mut world = self.world();
+        let direct = world.read_results.pop_front().unwrap_or(Some(world.selected_direct))?;
+        let runtime = world.runtime.clone().unwrap_or_else(|| json!({"mode": "rule", "log-level": "info"}));
         Some((Mode::Rule, [("G".to_owned(), if direct { "DIRECT" } else { "P" }.to_owned())].into(), runtime))
     }
     fn plan(&mut self, _: &routing::Routes, bypass: bool, _: Mode, selected: &Selected, unsettled: &[String]) -> (Bypass, Chain) {
@@ -258,6 +259,9 @@ impl Port for FakePort {
         self.log(format!("write {} with tables {}", write.segments.join("/"), tables.unwrap_or_default()));
         let mut w = self.world();
         w.writes.push(write.segments.join("/"));
+        if let Some(result) = w.write_results.pop_front() {
+            return result;
+        }
         if write.segments.first().is_some_and(|s| s == "proxies") {
             w.selected_direct = write.body["name"] == "DIRECT";
         }
@@ -284,10 +288,15 @@ impl Port for FakePort {
         Guarded { result: Ok(()), confirmed: w.owned && w.target == w.tables }
     }
     fn wanted(&mut self) -> bool {
-        self.world().wanted
+        let world = self.world();
+        world.mihomo.as_ref().map_or(world.wanted, |mihomo| mihomo.wants_restore())
     }
     fn set_wanted(&mut self, on: bool) -> Result<(), String> {
-        self.world().wanted = on;
+        let mut world = self.world();
+        if let Some(mihomo) = &world.mihomo {
+            return mihomo.set_wanted(on);
+        }
+        world.wanted = on;
         Ok(())
     }
     fn sources_changed(&mut self) -> bool {
@@ -311,7 +320,7 @@ fn timings() -> Timings {
     }
 }
 
-struct Harness {
+pub(in crate::mihomo) struct Harness {
     port: FakePort,
     tx: Sender<Message>,
     shared: Arc<Mutex<Snapshot>>,
@@ -323,10 +332,25 @@ impl Harness {
         Self::with(world, timings())
     }
 
+    pub(in crate::mihomo) fn for_mihomo(mihomo: &Arc<super::super::Mihomo>) -> Self {
+        let world = World {
+            mihomo: Some(Arc::clone(mihomo)),
+            prepare: [Some("fixture rejected the start".into())].into(),
+            ..World::default()
+        };
+        let harness = Self::with_snapshot(world, Timings::default(), Arc::clone(&mihomo.shared));
+        harness.tx.send(Message::Boot).unwrap();
+        *mihomo.commands.lock().unwrap() = Some(harness.tx.clone());
+        harness
+    }
+
     fn with(world: World, timings: Timings) -> Self {
+        Self::with_snapshot(world, timings, Arc::new(Mutex::new(Snapshot::default())))
+    }
+
+    fn with_snapshot(world: World, timings: Timings, shared: Arc<Mutex<Snapshot>>) -> Self {
         let port = FakePort(Arc::new(Mutex::new(world)));
         let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(Mutex::new(Snapshot::default()));
         let controller = Controller::new(port.clone(), rx, tx.clone(), Arc::clone(&shared), timings);
         let thread = std::thread::spawn(move || controller.run());
         Self { port, tx, shared, thread: Some(thread) }
@@ -346,6 +370,12 @@ impl Harness {
         let (tx, rx) = mpsc::sync_channel(1);
         self.tx.send(Message::Write { write: Write { method: "PUT", segments: vec!["proxies".into(), group.into()], body: json!({"name": name}) }, answer: Answer::Sync(tx) }).unwrap();
         rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    fn barrier(&self) {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.tx.send(Message::Barrier(reply)).unwrap();
+        answer.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -411,7 +441,7 @@ fn an_old_cores_late_exit_cannot_touch_the_new_one() {
     let events = h.events();
     assert!(after(&events, "tables hold", "spawn 2"), "interception held before the old core stopped: {events:?}");
     h.tx.send(Message::Exited { generation: 1, how: "signal 15".into() }).unwrap();
-    std::thread::sleep(Duration::from_millis(80));
+    h.barrier();
     let later = h.snapshot();
     assert_eq!((later.phase, later.generation), (Phase::Running, s.generation));
     assert!(!h.events().contains(&"direct".to_owned()), "no D3 for a stale exit");
@@ -425,17 +455,16 @@ fn an_old_cores_late_exit_cannot_touch_the_new_one() {
 fn a_relay_switch_restarts_the_core_once() {
     let h = Harness::new(World { uplink: Uplink::sample("ath20", 9, "192.168.2.124", Some("2409:8a00::5")), ..World::default() });
     h.enable(true).unwrap();
-    let settle = || std::thread::sleep(Duration::from_millis(80));
     h.port.world().uplink = Uplink::default();
     h.tx.send(Message::Egress).unwrap();
-    settle();
+    h.barrier();
     assert_eq!(h.snapshot().generation, 1, "no egress: nothing to restart onto");
     h.port.world().uplink = Uplink::sample("ath20", 10, "192.168.2.124", None);
     h.tx.send(Message::Egress).unwrap();
     h.until("generation 2", |s| s.generation == 2 && s.phase == Phase::Running);
     h.port.world().uplink = Uplink::sample("ath20", 10, "192.168.2.124", Some("2409:8a00::5"));
     h.tx.send(Message::Egress).unwrap();
-    settle();
+    h.barrier();
     let s = h.snapshot();
     assert_eq!((s.phase, s.generation), (Phase::Running, 2), "IPv6 added to the same interface restarts nothing");
     assert_eq!(h.events().iter().filter(|e| e.starts_with("spawn")).count(), 2);
@@ -487,7 +516,7 @@ fn a_retry_queued_before_the_owner_turned_it_off_starts_nothing() {
     assert!(!h.port.world().wanted && !h.port.world().owned);
     // A late exit of that core changes nothing either.
     h.tx.send(Message::Exited { generation: 1, how: "signal 9".into() }).unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    h.barrier();
     assert_eq!(h.snapshot().phase, Phase::Off);
 }
 
@@ -599,7 +628,7 @@ fn an_agent_restart_adopts_the_interception_without_going_direct() {
     assert!(!events.iter().any(|e| e == "recover" || e == "direct" || e == "tables guard"), "{events:?}");
     let other = Harness::new(World { wanted: false, adoptable: true, ..World::default() });
     other.tx.send(Message::Boot).unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    other.barrier();
     assert_eq!(other.events(), ["recover"], "not wanted: roll back");
 }
 
@@ -899,7 +928,7 @@ fn a_new_ipv4_egress_in_backoff_retries_now() {
     assert!(h.enable(false).is_err());
     assert_eq!(h.snapshot().phase, Phase::Backoff);
     h.tx.send(Message::Egress).unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    h.barrier();
     assert_eq!(h.snapshot().phase, Phase::Backoff, "no new egress: the timer decides");
     h.port.world().uplink = Uplink::sample("ath20", 9, "192.0.2.2", None);
     h.tx.send(Message::Egress).unwrap();
@@ -989,4 +1018,62 @@ fn exit_while_validating_withdraws_now_and_discards_the_candidate() {
     finish.send(()).unwrap();
     assert!(result.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
     assert_eq!(h.port.world().spawned, [generation]);
+}
+
+#[test]
+fn routing_write_waits_in_hold_for_readback_then_resets_only_lost_direct() {
+    for result in [Ok((204, Vec::new())), Err("Mihomo did not answer".into())] {
+        let port = FakePort(Arc::new(Mutex::new(World { selected_direct: true, ..World::default() })));
+        let mut controller = direct_controller(&port);
+        {
+            let mut world = port.world();
+            world.resets.clear();
+            world.events.clear();
+            world.write_results.push_back(result.clone());
+            world.read_results.extend([None, Some(false)]);
+        }
+        assert_eq!(controller.write(&select_proxy()), result);
+        {
+            let world = port.world();
+            assert_eq!(world.tables.as_deref(), Some("hold"));
+            assert!(world.resets.is_empty());
+        }
+        controller.tick();
+        controller.tick();
+        let world = port.world();
+        assert_eq!(world.events, ["tables hold", "write proxies/G with tables hold", "tables full/0"]);
+        assert_eq!(world.writes, ["proxies/G"]);
+        assert_eq!(world.resets, [Scope::Destinations(vec!["1.2.3.0/24".parse().unwrap()])]);
+        assert_eq!(world.tables.as_deref(), Some("full/0"));
+    }
+}
+
+#[test]
+fn refused_routing_write_returns_the_core_reply_and_restores_the_old_plan() {
+    let port = FakePort(Arc::new(Mutex::new(World { selected_direct: true, ..World::default() })));
+    let mut controller = direct_controller(&port);
+    let denied = Ok((400, br#"{"message":"Unknown proxy"}"#.to_vec()));
+    {
+        let mut world = port.world();
+        world.resets.clear();
+        world.events.clear();
+        world.write_results.push_back(denied.clone());
+        world.read_results.push_back(Some(true));
+    }
+    assert_eq!(controller.write(&select_proxy()), denied);
+    let world = port.world();
+    assert_eq!(world.events, ["tables hold", "write proxies/G with tables hold", "tables full/1"]);
+    assert_eq!(world.tables.as_deref(), Some("full/1"));
+    assert_eq!(world.resets, [Scope::Destinations(Vec::new())]);
+}
+
+fn direct_controller(port: &FakePort) -> Controller<FakePort> {
+    let (tx, rx) = mpsc::channel();
+    let mut controller = Controller::new(port.clone(), rx, tx, Arc::new(Mutex::new(Snapshot::default())), timings());
+    controller.enable("u60.home.arpa".into(), true).unwrap();
+    controller
+}
+
+fn select_proxy() -> Write {
+    Write { method: "PUT", segments: vec!["proxies".into(), "G".into()], body: json!({"name": "P"}) }
 }

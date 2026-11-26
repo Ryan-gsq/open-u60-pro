@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
-use super::{Mihomo, CONTROLLER};
+use super::Mihomo;
 
 const MAX_BODY: u64 = 4 * 1024 * 1024;
 const MAX_GROUPS: usize = 64;
@@ -43,6 +43,29 @@ fn call(
     body: Option<&Value>,
     wait: Duration,
 ) -> Result<Option<Value>, String> {
+    let mut response = send(base, secret, method, segments.iter().copied(), query, body, wait)?;
+    let status = response.status().as_u16();
+    let value = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_BODY)
+        .read_json::<Value>()
+        .ok();
+    if (200..300).contains(&status) {
+        return Ok(value);
+    }
+    Err(refusal_detail(status, value.as_ref()))
+}
+
+fn send<'a>(
+    base: &str,
+    secret: &str,
+    method: &str,
+    segments: impl IntoIterator<Item = &'a str>,
+    query: &[(&str, &str)],
+    body: Option<&Value>,
+    wait: Duration,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
     let mut url = reqwest::Url::parse(&format!("http://{base}/")).map_err(|_| "Invalid controller address")?;
     url.path_segments_mut()
         .map_err(|_| "Invalid controller address")?
@@ -59,43 +82,27 @@ fn call(
         ("PATCH", Some(body)) => agent.patch(url.as_str()).config().timeout_global(Some(wait)).build().header("Authorization", &auth).send_json(body),
         _ => return Err("Unsupported controller request".into()),
     };
-    let mut response = sent.map_err(|_| "Mihomo did not answer".to_owned())?;
-    let status = response.status().as_u16();
-    let value = response
-        .body_mut()
-        .with_config()
-        .limit(MAX_BODY)
-        .read_json::<Value>()
-        .ok();
-    if (200..300).contains(&status) {
-        return Ok(value);
-    }
-    let detail = value
-        .as_ref()
-        .and_then(|v| v["message"].as_str())
-        .map(|m| m.chars().filter(|c| !c.is_control()).take(160).collect::<String>())
-        .filter(|m| !m.is_empty());
-    Err(detail.unwrap_or_else(|| format!("Mihomo refused the request (HTTP {status})")))
+    sent.map_err(|_| "Mihomo did not answer".to_owned())
+}
+
+pub(super) fn new_agent(wait: Option<Duration>, status_is_error: bool) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .http_status_as_error(status_is_error)
+        .timeout_global(wait)
+        .build()
+        .new_agent()
 }
 
 fn agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    AGENT.get_or_init(|| ureq::Agent::config_builder().proxy(None).http_status_as_error(false).build().new_agent())
+    AGENT.get_or_init(|| new_agent(None, false))
 }
 
 /// A routing write for the controller (`controller::Write`): the core's
 /// status and body as they are, for the console and the dashboard bridge.
 pub(crate) fn raw_call(base: &str, secret: &str, method: &str, segments: &[String], body: &Value, wait: Duration) -> Result<(u16, Vec<u8>), String> {
-    let mut url = reqwest::Url::parse(&format!("http://{base}/")).map_err(|_| "Invalid controller address")?;
-    url.path_segments_mut().map_err(|_| "Invalid controller address")?.clear().extend(segments);
-    let agent = agent();
-    let auth = format!("Bearer {secret}");
-    let sent = match method {
-        "PUT" => agent.put(url.as_str()).config().timeout_global(Some(wait)).build().header("Authorization", &auth).send_json(body),
-        "PATCH" => agent.patch(url.as_str()).config().timeout_global(Some(wait)).build().header("Authorization", &auth).send_json(body),
-        _ => return Err("Unsupported controller request".into()),
-    };
-    let mut response = sent.map_err(|_| "Mihomo did not answer".to_owned())?;
+    let mut response = send(base, secret, method, segments.iter().map(String::as_str), &[], Some(body), wait)?;
     let status = response.status().as_u16();
     let bytes = response.body_mut().with_config().limit(MAX_BODY).read_to_vec().unwrap_or_default();
     Ok((status, bytes))
@@ -103,9 +110,13 @@ pub(crate) fn raw_call(base: &str, secret: &str, method: &str, segments: &[Strin
 
 /// The core's error message from a refused write, bounded and printable.
 fn refused(status: u16, body: &[u8]) -> String {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| v["message"].as_str().map(|m| m.chars().filter(|c| !c.is_control()).take(160).collect::<String>()))
+    refusal_detail(status, serde_json::from_slice::<Value>(body).ok().as_ref())
+}
+
+fn refusal_detail(status: u16, value: Option<&Value>) -> String {
+    value
+        .and_then(|v| v["message"].as_str())
+        .map(|m| m.chars().filter(|c| !c.is_control()).take(160).collect::<String>())
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| format!("Mihomo refused the request (HTTP {status})"))
 }
@@ -196,7 +207,7 @@ impl Mihomo {
         wait: Duration,
     ) -> Result<Option<Value>, Failure> {
         let secret = self.secret().ok_or_else(off)?;
-        call(CONTROLLER, &secret, method, segments, query, body, wait).map_err(|error| (503, error))
+        call(self.bridge_addr(), &secret, method, segments, query, body, wait).map_err(|error| (503, error))
     }
 
     fn proxy_listing(&self) -> Result<Value, Failure> {
@@ -391,7 +402,77 @@ mod tests {
     }
 
     #[test]
-    fn every_operation_refuses_while_clash_is_off() {
+    fn raw_controller_calls_preserve_reply_bytes_and_refuse_get() {
+        let (addr, seen) = controller(vec![("/proxies/name%2Fpart", 422, "raw refusal\n")]);
+        let segments = ["proxies".into(), "name/part".into()];
+        let body = json!({"name":"DIRECT"});
+        let wait = Duration::from_secs(2);
+        assert_eq!(raw_call(&addr, "k", "GET", &segments, &body, wait).unwrap_err(), "Unsupported controller request");
+        assert_eq!(raw_call(&addr, "k", "PUT", &segments, &body, wait).unwrap(), (422, b"raw refusal\n".to_vec()));
+        let request = &seen.lock().unwrap()[0];
+        assert!(request.starts_with("PUT /proxies/name%2Fpart HTTP/1.1"));
+    }
+
+    #[test]
+    fn core_io_keeps_readiness_json_read_and_reload_status_handling() {
+        use super::super::{controller::Port, controller_get_at, core_ready_at, DevicePort};
+        let (base, seen) = controller(vec![
+            ("/version", 304, ""),
+            ("/json", 200, r#"{"key":true}"#),
+            ("/refused", 403, r#"{"message":"denied"}"#),
+            ("/broken", 200, "invalid JSON"),
+            ("/configs?force=false", 422, "invalid JSON"),
+        ]);
+        assert!(core_ready_at(&base, "k"), "a terminal 3xx still answers the readiness probe");
+        assert_eq!(controller_get_at(&base, "k", "/json"), Some(json!({"key":true})));
+        assert_eq!(controller_get_at(&base, "k", "/refused"), None);
+        assert_eq!(controller_get_at(&base, "k", "/broken"), None);
+
+        let dir = super::super::test_dir::TestDir::new("reload-status");
+        let mihomo = Arc::new(Mihomo::for_bridge_at(dir.path().to_owned(), "k".into(), base.parse().unwrap()));
+        let mut port = DevicePort::new(mihomo, "u60.home.arpa".into());
+        let config = "mode: rule";
+        assert_eq!(port.reload("k", config).unwrap(), 422);
+        assert_eq!(std::fs::read(dir.path().join("config.yaml")).unwrap(), config.as_bytes());
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests.iter().all(|request| request.to_ascii_lowercase().contains("authorization: bearer k")));
+        let (header, body) = requests[4].split_once("\r\n\r\n").unwrap();
+        assert!(header.starts_with("PUT /configs?force=false HTTP/1.1"));
+        assert_eq!(serde_json::from_str::<Value>(body).unwrap(), json!({"payload":config}));
+    }
+
+    #[test]
+    fn core_errors_preserve_the_control_handler_status_and_body_contract() {
+        let (addr, seen) = controller(vec![
+            ("/configs", 500, "not JSON"),
+            ("/proxies/DIRECT/delay", 503, r#"{"message":"timed\u0007 out"}"#),
+        ]);
+        let fixture = super::super::test_dir::TestDir::new("control-errors");
+        let mut state = crate::handlers::AppState::new();
+        state.mihomo = Arc::new(Mihomo::for_bridge_at(fixture.path().to_owned(), "fixture".into(), addr.parse().unwrap()));
+        assert_eq!(proxies(&state), (503, json!({"ok":false,"error":"Mihomo refused the request (HTTP 500)"})));
+        assert_eq!(delay(&state, br#"{"name":"DIRECT"}"#), (200, json!({"ok":true,"data":{"name":"DIRECT","delay":0,"error":"timed out"}})));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(mode(&state, br#"{"mode":"global"}"#), (503, json!({"ok":false,"error":"Mihomo's controller is not running"})));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        *state.mihomo.commands.lock().unwrap() = Some(tx);
+        let worker = std::thread::spawn(move || {
+            use super::super::controller::{Answer, Message};
+            let Message::Write { write, answer: Answer::Sync(reply) } = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+                panic!("expected an ordered routing write");
+            };
+            assert_eq!((write.method, write.segments.as_slice()), ("PATCH", &["configs".to_owned()][..]));
+            reply.send(Ok((400, br#"{"message":"bad\u0007 mode"}"#.to_vec()))).unwrap();
+        });
+        let reply = mode(&state, br#"{"mode":"global"}"#);
+        worker.join().unwrap();
+        assert_eq!(reply, (503, json!({"ok":false,"error":"bad mode"})));
+    }
+
+    #[test]
+    fn every_operation_refuses_while_mihomo_is_off() {
         let state = crate::handlers::AppState::new();
         for (status, body) in [
             proxies(&state),

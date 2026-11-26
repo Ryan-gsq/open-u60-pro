@@ -30,10 +30,30 @@ struct Held {
     observed: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize)]
+struct PreparedResource {
+    resource: Resource,
+    undo: Cmd,
+    owned: bool,
+    adopted: bool,
+}
+
+struct RegisteredResource {
+    index: usize,
+    owned: bool,
+    adopted: bool,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 struct Journal {
     boot: String,
     undo: Vec<Cmd>,
+}
+
+#[derive(Serialize)]
+struct JournalRef<'a> {
+    boot: String,
+    undo: &'a [Cmd],
 }
 
 impl EffectSet {
@@ -134,7 +154,7 @@ impl EffectSet {
     fn save(&self) -> Result<(), String> {
         #[cfg(test)]
         self.journal_writes.set(self.journal_writes.get() + 1);
-        net::write_private(&self.path, &serde_json::to_vec(&Journal { boot: net::boot_id(), undo: self.undo.clone() }).map_err(|error| error.to_string())?)
+        net::write_private(&self.path, &serde_json::to_vec(&JournalRef { boot: net::boot_id(), undo: &self.undo }).map_err(|error| error.to_string())?)
     }
 
     pub fn declare(&mut self, resources: Vec<Resource>) -> Result<(), String> {
@@ -146,11 +166,24 @@ impl EffectSet {
             return Ok(());
         }
         let mut listings = Listings::default();
-        let mut prepared = Vec::new();
+        let prepared = self.prepare(resources, &mut listings, probe, nft)?;
+        self.write_ahead(&prepared)?;
+        net::changed();
+        self.apply_prepared(prepared, listings, probe, nft)
+    }
+
+    fn prepare(
+        &self,
+        resources: Vec<Resource>,
+        listings: &mut Listings,
+        probe: &mut impl Probe,
+        nft: &mut (impl Nft + ?Sized),
+    ) -> Result<Vec<PreparedResource>, String> {
+        let mut prepared: Vec<PreparedResource> = Vec::new();
         for resource in resources {
             validate(&resource, self.owner)?;
             let key = resource.key();
-            if prepared.iter().any(|(previous, _, _, _): &(Resource, Cmd, bool, bool)| previous.key() == key) {
+            if prepared.iter().any(|previous| previous.resource.key() == key) {
                 return Err("A network batch declares the same resource twice".into());
             }
             let held = self.held.iter().find(|held| held.resource.key() == key);
@@ -167,11 +200,11 @@ impl EffectSet {
                     Resource::Route(route) => self.held.iter().any(|held| matches!(&held.resource, Resource::Route(previous) if previous.family == route.family && shared::route_table(&previous.table) == shared::route_table(&route.table))),
                     _ => false,
                 };
-                vacant(&resource, table_held, &mut listings, probe, nft)?;
+                vacant(&resource, table_held, listings, probe, nft)?;
             }
             if let Resource::LegacyHook(hook) = &resource {
                 if let Some(target) = hook.target() {
-                    let pending = prepared.iter().any(|(resource, _, _, _)| matches!(resource, Resource::LegacyChain(chain) if chain.tool == hook.tool && chain.table == hook.table && chain.name == target));
+                    let pending = prepared.iter().any(|previous| matches!(&previous.resource, Resource::LegacyChain(chain) if chain.tool == hook.tool && chain.table == hook.table && chain.name == target));
                     if !pending && !firewall::has_chain(listings.get(legacy_listing(hook.tool, &hook.table), probe)?, target) {
                         return Err("The legacy hook's target chain is missing".into());
                     }
@@ -180,9 +213,13 @@ impl EffectSet {
             if held.is_some_and(|held| held.withdrawing) {
                 return Err("Network cleanup is pending".into());
             }
-            prepared.push((resource, undo, owned, adopted));
+            prepared.push(PreparedResource { resource, undo, owned, adopted });
         }
-        for (resource, undo, _, _) in &prepared {
+        Ok(prepared)
+    }
+
+    fn write_ahead(&mut self, prepared: &[PreparedResource]) -> Result<(), String> {
+        for PreparedResource { resource, undo, .. } in prepared {
             if !self.undo.contains(undo) {
                 self.undo.push(undo.clone());
             }
@@ -190,10 +227,18 @@ impl EffectSet {
                 if !self.undo.contains(&extra) { self.undo.push(extra); }
             }
         }
-        self.save()?;
-        net::changed();
-        let mut indices = Vec::new();
-        for (resource, undo, owned, adopted) in prepared {
+        self.save()
+    }
+
+    fn apply_prepared(
+        &mut self,
+        prepared: Vec<PreparedResource>,
+        mut listings: Listings,
+        probe: &mut impl Probe,
+        nft: &mut (impl Nft + ?Sized),
+    ) -> Result<(), String> {
+        let mut registered = Vec::new();
+        for PreparedResource { resource, undo, owned, adopted } in prepared {
             let previous = self.held.iter().find(|held| held.resource.key() == resource.key())
                 .filter(|held| held.undo != undo)
                 .map(|held| held.undo.clone());
@@ -218,10 +263,10 @@ impl EffectSet {
                     self.held.len() - 1
                 }
             };
-            indices.push((index, owned, adopted));
+            registered.push(RegisteredResource { index, owned, adopted });
         }
         let mut pending = Restore::default();
-        for (index, owned, adopted) in indices {
+        for RegisteredResource { index, owned, adopted } in registered {
             if !self.held[index].obsolete.is_empty() {
                 pending.run(probe)?;
                 self.clear_obsolete(index, probe)?;
@@ -623,7 +668,8 @@ fn repair(resource: &Resource, listings: &mut Listings, probe: &mut impl Probe) 
 }
 
 fn table_used(text: &str, table: &str) -> bool {
-    text.lines().any(|line| line.split_whitespace().collect::<Vec<_>>().windows(2).any(|pair| pair[0] == "table" && shared::route_table(pair[1]) == shared::route_table(table)))
+    let table = shared::route_table(table);
+    net::listed_route_tables(text).any(|listed| shared::route_table(listed) == table)
 }
 
 fn route_present(route: &Route, text: &str) -> bool {

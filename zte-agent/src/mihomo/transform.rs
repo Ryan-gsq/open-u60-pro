@@ -306,6 +306,48 @@ mod tests {
     }
 
     #[test]
+    fn config_and_merge_input_boundaries_are_enforced_before_application() {
+        let padded = |size| format!("mode: rule\n#{}", "x".repeat(size - "mode: rule\n#".len()));
+        assert!(mapping(&padded(MAX_CONFIG)).is_ok());
+        assert_eq!(mapping(&padded(MAX_CONFIG + 1)).unwrap_err(), "Configuration exceeds 512 KiB");
+        for (input, error) in [
+            ("rules: [", "Invalid configuration YAML"),
+            ("<<: wrong", "Invalid YAML merge keys"),
+            ("- node", "Configuration must be a YAML mapping, not a node list or Base64 subscription"),
+        ] {
+            assert_eq!(mapping(input).unwrap_err(), error);
+        }
+        for enabled in [true, false] {
+            let mut ext = Extensions { merge_enabled: enabled, merge: padded(MAX_EXTENSION), ..Extensions::default() };
+            ext.validate().unwrap();
+            compile("rules: [old]", "test", &ext).unwrap();
+            ext.merge.push('x');
+            assert_eq!(ext.validate().unwrap_err(), "Each extension is limited to 128 KiB");
+            assert_eq!(compile("rules: [old]", "test", &ext).unwrap_err(), "Each extension is limited to 128 KiB");
+        }
+        let mut ext = Extensions { script: " ".repeat(MAX_EXTENSION), ..Extensions::default() };
+        ext.validate().unwrap();
+        ext.script.push(' ');
+        assert_eq!(ext.validate().unwrap_err(), "Each extension is limited to 128 KiB");
+    }
+
+    #[test]
+    fn overlay_rejects_invalid_keys_and_values_and_preserves_ascii_case_rules() {
+        for (source, patch, error) in [
+            ("rules: [old]", "5: nope", "Merge keys must be strings"),
+            ("rules: [old]", "append-rules: scalar", "prepend-/append- values must be lists"),
+            ("rules: scalar", "append-rules: [new]", "Cannot extend a non-list field"),
+            ("rules: [old]", "append-other: [new]", "Only rules, proxies and proxy-groups support prepend-/append-"),
+        ] {
+            let ext = Extensions { merge_enabled: true, merge: patch.into(), ..Extensions::default() };
+            assert_eq!(compile(source, "test", &ext).unwrap_err(), error);
+        }
+        let ext = Extensions { merge_enabled: true, merge: "RuLeS: [replaced]\nAPPEND-RULES: [ignored]\nappend-rules: [appended]".into(), ..Extensions::default() };
+        let result = mapping(&compile("rules: [old]", "test", &ext).unwrap()).unwrap();
+        assert_eq!(result["rules"], serde_yaml_ng::to_value(["replaced", "appended"]).unwrap());
+    }
+
+    #[test]
     fn merge_has_explicit_array_and_dns_host_semantics() {
         let mut config = mapping("rules: [old]\ndns: {nameserver: [a], nameserver-policy: {old: a}}\nhosts: {old: 127.0.0.1}\n").unwrap();
         overlay(&mut config, mapping("rules: [new]\nprepend-rules: [first]\nappend-rules: [last]\ndns: {nameserver-policy: {new: b}}\nhosts: {}\n").unwrap()).unwrap();

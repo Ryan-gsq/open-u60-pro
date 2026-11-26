@@ -68,6 +68,10 @@ assert.deepEqual([42,0,null,undefined].map(M.delayLabel),['42 ms','Timeout','Unt
 assert.equal(M.modeLabel('global'),'Global');assert.equal(M.modeLabel('weird'),'Rule');assert.deepEqual(M.modes.map(m=>m[0]),['rule','global','direct']);
 const groups=[{name:'Auto',now:'HK 01',all:['HK 01','US 02']},{name:'Proxy',now:'Auto',all:['Auto','DIRECT']},{name:'Loop',now:'Loop',all:['Loop']},{name:'Empty',now:null,all:[]}];
 assert.equal(M.resolveNode(groups,'Proxy'),'HK 01','nested groups resolve to the node in use');assert.equal(M.resolveNode(groups,'DIRECT'),'DIRECT');assert.equal(M.resolveNode(groups,'Loop'),'','a cycle gives up');assert.equal(M.resolveNode(groups,'Empty'),'');
+assert.equal(M.resolveNode([...groups,{name:'Auto',now:'JP 03'}],'Proxy'),'JP 03','the last group with a duplicate name wins');
+const chain=Array.from({length:8},(_,index)=>({name:`Group ${index}`,now:`Group ${index+1}`}));
+assert.equal(M.resolveNode(chain,'Group 0'),'','the eighth group exhausts the default lookup depth');
+assert.equal(M.resolveNode(chain,'Group 0',9),'Group 8','a larger depth reaches the node');
 assert.deepEqual(M.memberOptions(groups[0],{'HK 01':{delay:88},'US 02':{delay:0}}),[{name:'HK 01',label:'HK 01 · 88 ms'},{name:'US 02',label:'US 02 · Timeout'}]);
 assert.deepEqual(M.memberOptions({all:['A']},{A:{delay:null}}),[{name:'A',label:'A · Untested'}]);
 assert.deepEqual(M.memberOptions(groups[1],{}),[{name:'Auto',label:'Auto'},{name:'DIRECT',label:'DIRECT'}]);

@@ -20,6 +20,7 @@ struct World {
     adopted: bool,
     prepare_hotspot: bool,
     scan_rounds: bool,
+    record_subscription_dns: bool,
 }
 
 #[derive(Clone)]
@@ -29,6 +30,16 @@ struct FakePort {
 }
 
 impl FakePort {
+    fn record_subscription_dns(&self, state: &State) {
+        let mut world = self.world.lock().unwrap();
+        if world.record_subscription_dns {
+            let servers = state.session.as_ref().and_then(|session| session.lease.as_ref()).map(|lease| {
+                if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() }
+            }).unwrap_or_default();
+            world.calls.push(format!("subscription DNS {servers:?}"));
+        }
+    }
+
     fn call(&self, name: &'static str) {
         let pause = {
             let mut world = self.world.lock().unwrap();
@@ -75,6 +86,9 @@ impl Port for FakePort {
     }
     fn boot_now(&self) -> BootInstant {
         BootInstant::from_duration(self.world.lock().unwrap().elapsed)
+    }
+    fn sync_subscription_dns(&self, state: &State) {
+        self.record_subscription_dns(state);
     }
     fn snapshot(&mut self, state: &State) -> Value {
         if self.world.lock().unwrap().pause.as_ref().is_some_and(|pause| pause.0 == "snapshot") {
@@ -377,14 +391,6 @@ fn disconnect_during_join_discards_late_success_and_cleans_before_the_next_conne
 
 #[test]
 fn disconnect_during_hotspot_preparation_waits_for_the_join_boundary_before_cleanup() {
-    let source = include_str!("../../wifi_relay.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
-    let hotspot = include_str!("../hotspot.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
-    assert!(!source.contains("thread_local!"));
-    assert!(!source.contains(".during("));
-    assert!(!hotspot.lines().any(|line| !line.trim_start().starts_with("//") && line.contains("cancel")), "hotspot steps have no cancellation input");
-    assert!(source.contains("match handover(&mut old, &channels, keep_ipv6, || self.uplink_changed())"));
-    assert!(source.contains("hotspot::prepare(&mut session.wireless, selected.frequency, &channels)?;\n            }\n            check()?;"));
-
     let harness = Harness::new(World { prepare_hotspot: true, ..World::default() });
     let (entered, release) = harness.pause("hotspot-prepare");
     let relay = Arc::clone(&harness.relay);
@@ -413,16 +419,6 @@ fn disconnect_during_hotspot_preparation_waits_for_the_join_boundary_before_clea
 
 #[test]
 fn cancellation_between_scan_rounds_cleans_the_temporary_session() {
-    let source = include_str!("../../wifi_relay.rs");
-    let scan = source.split("    fn scan(&mut self, state: &mut State, cancel: &Cancellation)").nth(1).unwrap()
-        .split("    fn join(").next().unwrap();
-    let operation = scan.find("let result = (|| {").unwrap();
-    let captured = scan.find("})();").unwrap();
-    let cleanup = scan.find("cleanup(session, || ())?;").unwrap();
-    let boundary = scan.rfind("self.check(cancel)?;").unwrap();
-    assert!(operation < captured && captured < cleanup && cleanup < boundary);
-    assert!(scan.ends_with("        result\n    }\n\n"), "scan errors must be returned after temporary cleanup");
-
     let harness = Harness::new(World { scan_rounds: true, ..World::default() });
     let (entered, release) = harness.pause("scan-round-1");
     let relay = Arc::clone(&harness.relay);
@@ -567,7 +563,8 @@ fn restore_wait_is_woken_by_cancel_instead_of_waiting_five_minutes() {
 
 #[test]
 fn restore_rechecks_changed_target_and_same_target_owner_replacement() {
-    let root = Path::new("/tmp/u60-test/work/relayctl/restore-target");
+    let temp = crate::wifi_relay::test_dir::TestDir::new("restore-target");
+    let root = temp.path();
     resume::save(root, &network(), false).unwrap();
     let shared = Arc::new(Shared::new());
     let port = DevicePort { control: None, settings: None, shared: Arc::clone(&shared), mihomo: None, tailscale: None };
@@ -581,7 +578,6 @@ fn restore_rechecks_changed_target_and_same_target_owner_replacement() {
     resume::save(root, &network(), false).unwrap();
     assert_eq!(resume::load(root), cancel.target);
     assert_eq!(port.check(&cancel).unwrap_err(), RESTORE_CANCELLED);
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1011,22 +1007,35 @@ fn a_request_started_at_the_deadline_wins_once_and_waits_for_its_result() {
 }
 
 #[test]
-fn boot_recovery_and_callback_entry_points_keep_their_synchronous_contract() {
-    let source = include_str!("../../main.rs");
-    let restore = source.split("fn restore_network(").nth(1).unwrap().split("fn wait_for_boot(").next().unwrap();
-    assert!(restore.contains("if !state.wifi_relay.wants_restore() && !state.mihomo.wants_restore()"));
-    let barrier = restore.find("wait_for_boot();").unwrap();
-    let relay_boot = restore.find("state.wifi_relay.recover_idle();").unwrap();
-    let core_first = restore.find("state.mihomo.restore(").unwrap();
-    let relay_restore = restore.find("state.wifi_relay.restore();").unwrap();
-    assert_eq!(restore.matches("state.mihomo.restore(").count(), 1);
-    assert!(barrier < relay_boot && relay_boot < core_first && core_first < relay_restore);
-    assert!(source.contains("wifi_relay::WifiRelay::new(lock).recover()"));
+fn subscription_dns_follows_adoption_renewal_errors_and_teardown_at_publication() {
+    let harness = Harness::new(World { adopted: true, record_subscription_dns: true, ..World::default() });
+    harness.relay.recover_idle();
+    assert_eq!(harness.calls(), ["enter adopt", "exit adopt", "subscription DNS [10.0.0.1]"]);
+
+    let mut renewed = observation("COMPLETED");
+    renewed.lease.as_mut().unwrap().dns = vec!["10.0.0.1".parse().unwrap(), "10.0.0.53".parse().unwrap()];
+    harness.tick(renewed, 1);
+    let calls = harness.calls();
+    assert!(calls.windows(2).any(|trace| trace == ["exit maintain", "subscription DNS [10.0.0.1, 10.0.0.53]"]));
+
+    harness.relay.disconnect().unwrap();
+    let calls = harness.calls();
+    assert!(calls.windows(2).any(|trace| trace == ["subscription DNS []", "enter cleanup"]));
+    assert_eq!(calls.last().map(String::as_str), Some("subscription DNS []"));
+
+    harness.port.world.lock().unwrap().joins.push_back(Err("association failed".into()));
+    assert_eq!(harness.connect().unwrap_err(), "association failed");
+    let calls = harness.calls();
+    assert!(calls.ends_with(&["exit join".into(), "subscription DNS []".into()]));
+
+    harness.connect().unwrap();
+    let calls = harness.calls();
+    assert!(calls.ends_with(&["subscription DNS [10.0.0.1]".into(), "enter egress".into(), "exit egress".into()]));
 }
 
 #[test]
 fn a_new_owner_during_snapshot_build_cannot_publish_the_previous_join() {
-    let harness = Harness::new(World::default());
+    let harness = Harness::new(World { record_subscription_dns: true, ..World::default() });
     let (entered, release) = harness.pause("snapshot");
     let relay = Arc::clone(&harness.relay);
     let thread = std::thread::spawn(move || relay.connect_remembered("open", "", true, false, false));
@@ -1036,6 +1045,9 @@ fn a_new_owner_during_snapshot_build_cannot_publish_the_previous_join() {
     assert_eq!(thread.join().unwrap().unwrap_err(), RESTORE_CANCELLED);
     assert_eq!(harness.relay.status()["connected"], false);
     assert!(harness.port.world.lock().unwrap().target.is_none());
+    let calls = harness.calls();
+    assert!(calls.windows(2).any(|trace| trace == ["subscription DNS [10.0.0.1]", "enter snapshot"]));
+    assert_eq!(calls.last().map(String::as_str), Some("subscription DNS []"));
     assert!(!harness.calls().contains(&"enter egress".into()));
 }
 

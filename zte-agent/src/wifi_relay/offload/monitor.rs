@@ -162,7 +162,8 @@ mod tests {
     fn lines_follow_a_start_and_dropping_stops_delayed_work() {
         let (tx, rx) = mpsc::channel();
         // Records are private files: never in the shared temporary directory itself.
-        let dir = std::env::temp_dir().join(format!("u60-monitor-{}", std::process::id()));
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-monitor");
+        let dir = temp.path();
         let pid_file = dir.join("monitor.pid");
         let monitor = Monitor::start("monitor-test", "test monitor", "sh", &["-c", "echo one; echo two; exec sleep 30"], Some(pid_file.clone()), move |line, alive| {
             tx.send((line.map(str::to_owned), alive.clone())).unwrap();
@@ -187,7 +188,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!pid_file.exists(), "the record of process {pid} goes with it");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1,11 +1,13 @@
 // Exercises real digit animation on the streamed UI; no router is contacted.
-const {chromium} = require('playwright');
+const {launchChrome}=require('./browser.cjs');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const {overviewProfiles,serveOverviewProfiles,navigateToOverview,assertQuiet}=require('./fixture.cjs');
 (async()=>{
   const streams = new Set(), requests = [], errors = [];
+  let overviewVisits=0;
   const data = {
     device:{hostname:'OpenU60',uptime_secs:1234,kernel:'test',load_avg:[0,0,0]},
     speed:{rx_speed:12500000,tx_speed:1250000,rx_bytes:999000000,tx_bytes:1200000000},
@@ -17,24 +19,32 @@ const path = require('node:path');
   const frame=(res,event,values)=>res.write(`event: ${event}\ndata: ${JSON.stringify({readings:values})}\n\n`);
   function push(names) { for(const res of streams){const values=Object.fromEntries(names.map(name=>[name,{ok:true,data:name==='resources'?resources:data[name]}]));frame(res,'patch',values);} }
   const server=http.createServer((req,res)=>{
-    if(req.url.startsWith('/api/')) requests.push(req.url);
-    if(req.url.startsWith('/api/dashboard/events')){res.writeHead(200,{'Content-Type':'text/event-stream'});streams.add(res);res.on('close',()=>streams.delete(res));const initial=Object.fromEntries(Object.entries(data).map(([name,data])=>[name,{ok:true,data}]));if(req.url.includes('topics=health'))initial.resources={ok:true,data:resources};frame(res,'snapshot',initial);return;}
+    if(req.url.startsWith('/api/') || req.method!=='GET')requests.push(`${req.method} ${req.url}`);
+    if(req.method==='GET' && new URL(req.url,'http://localhost').pathname==='/api/dashboard/events'){res.writeHead(200,{'Content-Type':'text/event-stream'});streams.add(res);res.on('close',()=>streams.delete(res));const initial=Object.fromEntries(Object.entries(data).map(([name,data])=>[name,{ok:true,data}]));if(req.url.includes('topics=health'))initial.resources={ok:true,data:resources};frame(res,'snapshot',initial);return;}
+    if(serveOverviewProfiles(req,res))return;
+    if(req.method!=='GET'){res.writeHead(405);res.end();return;}
     const file=req.url==='/'?'index.html':/^\/(?:ui|console\/a)\/[\w.-]+$/.test(req.url)?req.url.split('/').pop():'',full=path.join(__dirname,'..',file);
     if(!file||!fs.existsSync(full)){res.writeHead(404);res.end();return;}
     res.setHeader('Content-Type',file.endsWith('.css')?'text/css':file.endsWith('.js')?'text/javascript':'text/html');res.setHeader('Content-Security-Policy',"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'");res.end(fs.readFileSync(full));
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const heartbeat=setInterval(()=>{for(const stream of streams)stream.write(': heartbeat\n\n');},1000);
-  const browser=await chromium.launch({headless:true,channel:'chrome'}),page=await browser.newPage({viewport:{width:1440,height:1100},reducedMotion:'no-preference'});
+  const browser=await launchChrome(),page=await browser.newPage({viewport:{width:1440,height:1100},reducedMotion:'no-preference'});
   page.on('pageerror',error=>errors.push(error.message));
+  await page.clock.install();
   await page.addInitScript(()=>{
     window.__numberAnimations=0;
     const original=Element.prototype.animate;
     Element.prototype.animate=function(...args){if(this.classList.contains('number-current'))window.__numberAnimations++;return original.apply(this,args);};
   });
-  const go=async key=>{await page.evaluate(key=>OpenU60Navigation.go(key),key);await page.waitForFunction(key=>document.documentElement.dataset.route===key,key);await page.waitForFunction(()=>document.querySelector('#stream-state').textContent==='Live');};
+  const go=async key=>{
+    const navigate=async()=>{await page.evaluate(key=>OpenU60Navigation.go(key),key);await page.waitForFunction(key=>document.documentElement.dataset.route===key,key);await page.waitForFunction(()=>document.querySelector('#stream-state').textContent==='Live');};
+    if(key==='dashboard/overview'){overviewVisits++;await navigateToOverview(page,navigate);}else await navigate();
+  };
   const settled=()=>page.waitForFunction(()=>!document.querySelector('[data-number-animating]'));
-  await page.goto(`http://127.0.0.1:${server.address().port}/`);await page.waitForFunction(()=>document.querySelector('#download').textContent==='100.00');
+  overviewVisits++;
+  await navigateToOverview(page,()=>page.goto(`http://127.0.0.1:${server.address().port}/`));await page.waitForFunction(()=>document.querySelector('#download').textContent==='100.00');
+  const animationRequests=requests.length;
   assert.equal(await page.evaluate(()=>window.__numberAnimations),0,'initial readings never count from invented zeroes');
   const height=await page.locator('#download').evaluate(node=>node.getBoundingClientRect().height);
   data.speed.rx_speed=15000000;push(['speed']);
@@ -45,9 +55,11 @@ const path = require('node:path');
   assert.equal(await page.locator('#download .number-ghost').first().getAttribute('aria-hidden'),'true');
   assert.equal(await page.locator('#download .number-ghost').first().textContent(),'','old visual digits never duplicate the current text');
   assert.equal(await page.locator('#download').evaluate(node=>node.getBoundingClientRect().height),height,'digit rolls must not change the line height');
-  await page.locator('#download').evaluate(node=>node.getAnimations({subtree:true}).forEach(animation=>{animation.pause();animation.currentTime=140;}));
-  await page.screenshot({path:'/tmp/zte-number-transition.png'});
-  await page.locator('#download').evaluate(node=>node.getAnimations({subtree:true}).forEach(animation=>animation.play()));
+  if(process.env.U60_NUMBER_SCREENSHOT){
+    await page.locator('#download').evaluate(node=>node.getAnimations({subtree:true}).forEach(animation=>{animation.pause();animation.currentTime=140;}));
+    await page.screenshot({path:process.env.U60_NUMBER_SCREENSHOT});
+    await page.locator('#download').evaluate(node=>node.getAnimations({subtree:true}).forEach(animation=>animation.play()));
+  }
   const starts=await page.evaluate(()=>window.__numberAnimations);push(['speed']);await page.waitForTimeout(50);assert.equal(await page.evaluate(()=>window.__numberAnimations),starts,'identical SSE values do not restart motion');
   data.speed.rx_speed=16000000;push(['speed']);await page.waitForFunction(()=>document.querySelector('#download').textContent==='128.00');
   data.speed.rx_speed=17000000;push(['speed']);await page.waitForFunction(()=>document.querySelector('#download').textContent==='136.00');await settled();assert.equal(await page.locator('#download').textContent(),'136.00','rapid patches keep the newest reading');
@@ -61,6 +73,8 @@ const path = require('node:path');
   // Formatting changes animate as one update and preserve the exact new unit.
   data.speed.rx_bytes=1000000000;push(['speed']);await page.waitForFunction(()=>document.querySelector('#received').textContent==='1.00 GB');await settled();assert.equal(await page.locator('#received').getAttribute('aria-label'),'1.00 GB');
   data.speed.rx_bytes=1010000000;push(['speed']);await page.waitForFunction(()=>document.querySelector('#received').textContent==='1.01 GB');await settled();
+  assert.equal(requests.length,animationRequests,'digit animations add no requests');
+  await assertQuiet(page,requests,1200,'an idle overview makes no requests');
   await go('network/signal');await page.locator('#lte-carriers .carrier-metrics').scrollIntoViewIfNeeded();await page.evaluate(()=>{window.__carrier=document.querySelector('#lte-carriers .carrier-card');});
   data.signal.lte_rsrp='-94';push(['signal']);await page.waitForFunction(()=>document.querySelector('#lte-carriers .carrier-metrics dd').textContent==='-94 dBm');
   assert.equal(await page.evaluate(()=>window.__carrier===document.querySelector('#lte-carriers .carrier-card')),true,'carrier measurements keep stable DOM nodes');
@@ -81,9 +95,12 @@ const path = require('node:path');
   // Hiding the tab settles active visuals and never starts background animations.
   data.speed.rx_speed+=125000;push(['speed']);await page.waitForFunction(()=>document.querySelector('#download').hasAttribute('data-number-animating'));
   await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,get:()=>true});document.dispatchEvent(new Event('visibilitychange'));});await settled();
-  await page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,get:()=>false});document.dispatchEvent(new Event('visibilitychange'));});await page.waitForFunction(()=>document.querySelector('#stream-state').textContent==='Live');
+  // Resuming the stream delivers a fresh snapshot, which also reloads the active overview.
+  overviewVisits++;
+  await navigateToOverview(page,()=>page.evaluate(()=>{Object.defineProperty(document,'hidden',{configurable:true,get:()=>false});document.dispatchEvent(new Event('visibilitychange'));}));
+  await page.waitForFunction(()=>document.querySelector('#stream-state').textContent==='Live');
   data.speed.rx_speed+=125000;push(['speed']);await page.waitForFunction(()=>document.querySelector('#download').hasAttribute('data-number-animating'));for(const stream of streams)stream.write('event: auth\ndata: {}\n\n');await page.waitForFunction(()=>document.querySelector('#login-dialog').open);await settled();await page.waitForTimeout(450);assert.equal(await page.locator('#download').textContent(),'—','no animation can restore values after locking');assert.equal(await page.locator('#diagnostic-health dd').first().textContent(),'—');
-  assert.ok(requests.every(url=>url.startsWith('/api/dashboard/events')),'animations add no requests or polling');assert.deepEqual(errors,[]);
+  assert.deepEqual(requests.filter(request=>!/^GET \/api\/dashboard\/events(?:\?|$)/.test(request)),Array(overviewVisits).fill(`GET ${overviewProfiles}`),'only overview activations read profiles');assert.deepEqual(errors,[]);
   await browser.close();clearInterval(heartbeat);for(const stream of streams)stream.destroy();server.close();
   console.log('Passed: real-value digit rolls, immediate current text and accessible labels, stable line height, unchanged and interrupted SSE updates, unit changes, stable carrier/sensor/process nodes, IDs and inputs excluded, reduced-motion changes, hidden tabs, lock cancellation, no added requests, and both themes across phone/tablet/desktop.');
 })().catch(error=>{console.error(error);process.exit(1);});

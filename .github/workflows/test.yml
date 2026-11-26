@@ -1,0 +1,35 @@
+name: Agent tests
+
+on:
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: cargo test --locked -p zte-agent --no-fail-fast
+      - run: node scripts/test-agent.cjs pure
+      - run: node --test zte-agent/tests/mihomo-dashboard.cjs
+      - run: python3 -m unittest scripts/test_install_agent.py
+
+  browsers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install --prefix "$RUNNER_TEMP/u60-playwright" --no-package-lock playwright@1.65.1
+      - run: node "$RUNNER_TEMP/u60-playwright/node_modules/playwright/cli.js" install --with-deps chrome webkit
+      - run: NODE_PATH="$RUNNER_TEMP/u60-playwright/node_modules" node scripts/test-agent.cjs browser

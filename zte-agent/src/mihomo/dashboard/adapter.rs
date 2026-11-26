@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 const MAIN: &str = "assets/index-Cmoa7oGY.js";
 const MAIN_SHA: &str = "882c26eb9783c137cf9875402aa94974e19abe2638f7f23249cda5ccf4da4682";
-const INDEX_SHA: &str = "70bb3dc4057cbc0feaff524672f2b0fbafa52279b757dbdc8cb8fdc3e6a73510";
+pub(super) const INDEX_SHA: &str = "70bb3dc4057cbc0feaff524672f2b0fbafa52279b757dbdc8cb8fdc3e6a73510";
 const BOOTSTRAP: &str = include_str!("bootstrap.js");
 const MISMATCH: &str = "Dashboard version mismatch; turn off Mihomo and reinstall the pinned core & dashboard";
 
@@ -43,22 +43,34 @@ pub(super) fn asset(file: &str, data: Vec<u8>) -> Result<Vec<u8>, &'static str> 
         return Err(MISMATCH);
     }
     if file == MAIN {
-        adapt(String::from_utf8(data).map_err(|_| MISMATCH)?).map(String::into_bytes)
+        adapt(std::str::from_utf8(&data).map_err(|_| MISMATCH)?).map(String::into_bytes)
     } else {
         Ok(data)
     }
 }
 
-fn adapt(mut js: String) -> Result<String, &'static str> {
+fn adapt(js: &str) -> Result<String, &'static str> {
+    let mut edits = Vec::with_capacity(REPLACEMENTS.len());
+    let mut growth = BOOTSTRAP.len();
     for (from, to) in REPLACEMENTS {
         let at = js.find(from).ok_or(MISMATCH)?;
         if js[at + from.len()..].contains(from) {
             return Err(MISMATCH);
         }
-        js.replace_range(at..at + from.len(), to);
+        edits.push((at, at + from.len(), *to));
+        growth += to.len().saturating_sub(from.len());
     }
-    js.insert_str(0, BOOTSTRAP);
-    Ok(js)
+    edits.sort_unstable_by_key(|&(at, _, _)| at);
+    let mut adapted = String::with_capacity(js.len() + growth);
+    adapted.push_str(BOOTSTRAP);
+    let mut cursor = 0;
+    for (at, end, replacement) in edits {
+        adapted.push_str(js.get(cursor..at).ok_or(MISMATCH)?);
+        adapted.push_str(replacement);
+        cursor = end;
+    }
+    adapted.push_str(&js[cursor..]);
+    Ok(adapted)
 }
 
 #[cfg(test)]
@@ -71,7 +83,7 @@ mod tests {
 
     #[test]
     fn adapter_initializes_backend_before_upstream_connection_and_prefills_setup() {
-        let js = adapt(anchors()).unwrap();
+        let js = adapt(&anchors()).unwrap();
         assert!(js.starts_with(BOOTSTRAP));
         for (_, to) in REPLACEMENTS {
             assert!(js.contains(to));
@@ -84,9 +96,17 @@ mod tests {
     }
 
     #[test]
+    fn adapted_bundle_keeps_all_other_bytes_in_source_order() {
+        let source = REPLACEMENTS.iter().rev().map(|(from, _)| *from).collect::<Vec<_>>().join("\r\n/* 放置 */\r\n");
+        let expected = REPLACEMENTS.iter().rev().map(|(_, to)| *to).collect::<Vec<_>>().join("\r\n/* 放置 */\r\n");
+        let expected = format!("{BOOTSTRAP}{expected}");
+        assert_eq!(adapt(&source).unwrap().as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
     fn unexpected_dashboard_versions_and_non_unique_anchors_fail_closed() {
         for source in [String::new(), anchors().replacen(REPLACEMENTS[0].0, "drift", 1), format!("{};{}", anchors(), REPLACEMENTS[0].0)] {
-            assert!(adapt(source).is_err());
+            assert!(adapt(&source).is_err());
         }
         assert!(asset(MAIN, anchors().into_bytes()).is_err());
         assert!(asset("index.html", b"<html></html>".to_vec()).is_err());
@@ -95,11 +115,21 @@ mod tests {
 
     // Optional local QA: verify the real downloaded release and export the
     // exact adapted bytes for browser tests, without starting device services.
-    #[test]
-    fn pinned_distribution_browser_fixture() {
+    #[tokio::test]
+    async fn pinned_distribution_browser_fixture() {
         let Ok(source) = std::env::var("U60_ZASHBOARD_DIST") else { return };
+        let root = std::path::Path::new(&source);
         for file in ["index.html", MAIN] {
-            let data = asset(file, std::fs::read(std::path::Path::new(&source).join(file)).unwrap()).unwrap();
+            let original = std::fs::read(root.join(file)).unwrap();
+            let data = asset(file, original.clone()).unwrap();
+            if file == "index.html" { assert_eq!(data, original); }
+            let expected_etag = format!("\"{:x}\"", Sha256::digest(&data));
+            for _ in 0..2 {
+                let response = super::super::dashboard_file(root, file, false, &axum::http::HeaderMap::new());
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                assert_eq!(response.headers()[axum::http::header::ETAG], expected_etag);
+                assert_eq!(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().as_ref(), data);
+            }
             if let Ok(out) = std::env::var("U60_WEB_QA_DIR") {
                 let path = std::path::Path::new(&out).join("dashboard").join(file);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -1,9 +1,12 @@
-//! B31 AP+STA relay, implemented with the firmware's public nl80211 and
-//! hostapd/wpa control tools. No vendor daemon or persistent Wi-Fi UCI is
-//! replaced. Optional upstream IPv6 and downstream NAT66 use owned runtime state.
+//! B31 AP+STA relay via the firmware's nl80211 and hostapd/wpa control tools.
+//! The relay works with the installed vendor daemons and journals its runtime
+//! changes, including optional upstream IPv6 and downstream NAT66. Its persistent
+//! Wi-Fi UCI change is the vendor's DFS channel-switch setting (`dfs_switch`).
 
 pub(crate) mod ipv6;
 pub(crate) mod adopt;
+mod bss;
+mod dhcp;
 mod controller;
 pub(crate) mod dns;
 pub(crate) mod portal;
@@ -15,10 +18,19 @@ mod resume;
 mod scan;
 pub(crate) mod steering;
 pub(crate) mod uplink;
+#[cfg(test)]
+mod test_dir;
+
+use bss::{channel, decode_ssid, network_id, parse_bss_on_channels, wpa_network};
+#[cfg(test)]
+pub use bss::parse_bss;
+pub use dhcp::{dhcp_callback, Lease};
+use dhcp::{lease_change, lease_file, read_lease, resolvers_acceptable, start_dhcp, validate_lease, LeaseChange, NftLease};
+#[cfg(test)]
+use dhcp::dhcp_callback_at;
 
 use std::fs;
 use std::net::Ipv4Addr;
-use std::num::NonZeroU32;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,9 +38,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use controller::{Command as RelayCommand, Message, Observation, Selection, State};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::boottime::{BootClock, BootInstant, Clock};
 use crate::net_tools::{self as net, Cmd, NetworkLock, Step};
@@ -52,14 +63,6 @@ pub struct Network {
     pub supported: bool,
     #[serde(skip)]
     bssid: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Lease {
-    ip: Ipv4Addr,
-    subnet: Ipv4Addr,
-    gateway: Ipv4Addr,
-    dns: Vec<Ipv4Addr>,
 }
 
 struct Session {
@@ -614,9 +617,126 @@ impl DevicePort {
         Ok(())
     }
 
+    fn begin_join(
+        &mut self, state: &mut State, selected: &Network, ipv6: bool, cancel: &Cancellation,
+        root: &Path, channels: &scan::Channels,
+    ) -> Result<(Session, bool, bool), String> {
+        self.begin_join_with(
+            state, selected, ipv6, cancel, root, channels,
+            Self::publish,
+            |port, old, keep_ipv6| handover(old, channels, keep_ipv6, || port.uplink_changed()),
+            |port, old| cleanup(old, || port.uplink_changed()),
+            |port| port.prepare(cancel),
+        )
+    }
+
+    fn associate_and_lease(
+        &self, session: &mut Session, selected: &Network, network_config: &str,
+        channels: &scan::Channels, kept: bool, cancel: &Cancellation,
+    ) -> Result<Lease, String> {
+        let check = || self.check(cancel);
+        prepare_join_hotspot_with(kept, check, || hotspot::prepare(&mut session.wireless, selected.frequency, channels))?;
+        net::write_private(&Path::new(ROOT).join("wpa.conf"), format!("ctrl_interface={ROOT}/ctrl\nupdate_config=0\n{network_config}").as_bytes())?;
+        // Undo must detach STA before restoring the same-radio AP channel,
+        // including a crash between reconfigure and association completion
+        // (a handed-over station has that undo already).
+        session.wireless.lock().unwrap().step(association_step())?;
+        if kept {
+            // `handover` disconnected it; a reconfigure alone keeps it so.
+            wpa("reconnect", &[]).and_then(expect_ok)?;
+        }
+        let mut linked = false;
+        for _ in 0..30 {
+            check()?;
+            if wpa("status", &[]).is_ok_and(|s| net::key(&s, "wpa_state") == Some("COMPLETED") && net::key(&s, "bssid") == Some(&selected.bssid)) {
+                linked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        if !linked {
+            return Err("Wi-Fi association failed; check password and signal".into());
+        }
+        let (nonce, dhcp) = start_dhcp(None)?;
+        session.dhcp_session = Some(nonce.clone());
+        session.dhcp = Some(dhcp);
+        let mut lease = None;
+        for _ in 0..25 {
+            check()?;
+            if let Ok(current) = read_lease(&nonce) {
+                lease = Some(current);
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        lease.ok_or_else(|| "No usable DHCP lease received".into())
+    }
+
+    fn install_ipv4(session: &mut Session, lease: &Lease) -> Result<u32, String> {
+        let lan_ip: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.ipaddr"]).run()?.parse().map_err(|_| "Invalid LAN address")?;
+        let lan_mask: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.netmask"]).run()?.parse().map_err(|_| "Invalid LAN mask")?;
+        let prefix = validate_lease(lease, lan_ip, lan_mask)?;
+        if fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default().trim() != "1" {
+            return Err("Router IPv4 forwarding is disabled".into());
+        }
+        // The tables grow (forwarding, DNS, the IPv6 baseline) after the
+        // legacy accepts and routes, before the policy rule moves traffic.
+        let mut plan = relay_plan(lease, prefix, lan_ip, lan_mask);
+        let rule = plan.pop().expect("the policy rule is the plan's last step");
+        session.network.declare(plan)?;
+        // LAN web traffic skips the vendor's offline redirect before the
+        // policy rule moves it (the RETURN and the kernel redirect); a
+        // handed-over session holds both.
+        for step in portal::web_bypasses() {
+            session.dns.declare(vec![step])?;
+        }
+        session.dns.declare(portal::web_redirect(&session.dns))?;
+        session.uplink.update(|l| l.relay = Some(relay_layout(lease, lan_ip, lan_mask)))?;
+        session.network.declare(vec![rule])?;
+        session.routed = true;
+        if !crate::mihomo::egress::relay_route(false) {
+            return Err("Firmware policy routing did not select the Wi-Fi upstream".into());
+        }
+        Ok(prefix)
+    }
+
+    fn begin_join_with(
+        &mut self, state: &mut State, selected: &Network, ipv6: bool, cancel: &Cancellation,
+        root: &Path, channels: &scan::Channels,
+        publish: impl FnOnce(&mut Self, &State),
+        transfer: impl FnOnce(&Self, &mut Session, bool) -> Result<(), String>,
+        teardown: impl FnOnce(&Self, &mut Session) -> Result<(), String>,
+        prepare: impl FnOnce(&mut Self) -> Result<Session, String>,
+    ) -> Result<(Session, bool, bool), String> {
+        if !channels.contains(selected.frequency) {
+            return Err("The upstream channel is disabled by the radio; scan again".into());
+        }
+        // A validated replacement owns the next restart choice only once it
+        // succeeds. Until then, do not silently restart the previous network.
+        if cancel.target.is_none() { self.settings = None; resume::clear(root)?; }
+        self.control = None;
+        let old = state.session.take();
+        publish(self, state);
+        // Between 5 GHz upstreams the station and hotspot are handed over
+        // (`handover`); otherwise the old session is torn down first.
+        if let Some(mut old) = old {
+            let five = |n: Option<&Network>| n.is_some_and(|n| n.frequency > 5000);
+            let keep_ipv6 = ipv6 && old.selected.as_ref().is_some_and(|n| n.bssid == selected.bssid) && old.ipv6.configured();
+            if five(old.selected.as_ref()) && five(Some(selected)) {
+                match transfer(self, &mut old, keep_ipv6) {
+                    Ok(()) => return Ok((successor(old, keep_ipv6), true, keep_ipv6)),
+                    Err(e) => crate::netlog!("[relay] station not handed over ({e}); tearing the old connection down"),
+                }
+            }
+            teardown(self, &mut old)?;
+        }
+        prepare(self).map(|session| (session, false, false))
+    }
+
     fn set_phase(&self, phase: Phase) { self.shared.phase(phase); }
 
     fn publish(&mut self, state: &State) {
+        <Self as controller::Port>::sync_subscription_dns(self, state);
         let value = <Self as controller::Port>::snapshot(self, state);
         let pending = recovery_pending(Path::new(JOURNAL));
         let cancel = self.shared.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -637,13 +757,43 @@ fn finish_join_hotspot_failure(
     clear_error
 }
 
+fn scan_session_with(
+    connected: bool, mut check: impl FnMut() -> Result<(), String>,
+    prepare: impl FnOnce() -> Result<Session, String>, scan: impl FnOnce() -> Result<Vec<Network>, String>,
+    cleanup: impl FnOnce(&mut Session) -> Result<(), String>,
+) -> Result<Vec<Network>, String> {
+    check()?;
+    let mut temporary = if !connected { Some(prepare()?) } else { None };
+    let result = check().and_then(|()| scan());
+    if let Some(session) = &mut temporary {
+        cleanup(session)?;
+    }
+    check()?;
+    result
+}
+
+fn prepare_join_hotspot_with(
+    kept: bool, check: impl Fn() -> Result<(), String>, prepare: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    check()?;
+    if !kept { prepare()?; }
+    check()
+}
+
 impl controller::Port for DevicePort {
     fn now(&self) -> Instant { Instant::now() }
     fn boot_now(&self) -> BootInstant { BootClock.now() }
-    fn snapshot(&mut self, state: &State) -> Value {
+    fn sync_subscription_dns(&self, state: &State) {
         if let Some(core) = &self.mihomo {
-            core.set_subscription_dns(state.session.as_ref().and_then(|session| session.lease.as_ref()).map(|lease| if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() }).unwrap_or_default());
+            let lease = state.session.as_ref().and_then(|session| session.lease.as_ref());
+            let servers = lease.map(|lease| {
+                if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() }
+            }).unwrap_or_default();
+            core.set_subscription_dns(servers);
         }
+    }
+
+    fn snapshot(&mut self, state: &State) -> Value {
         let mut value = snapshot(state, BootClock.now());
         let settings = self.settings.get_or_insert_with(|| {
             let mut settings = json!({"autostart":resume::load(Path::new(JOURNAL)).is_some(), "enabled":offload::enabled(), "auto_off":power_save::auto_off(Path::new(JOURNAL))});
@@ -681,22 +831,16 @@ impl controller::Port for DevicePort {
     fn adopt(&mut self) -> Option<Session> { self.adopt_previous() }
 
     fn scan(&mut self, state: &mut State, cancel: &Cancellation) -> Result<Vec<Network>, String> {
-        self.check(cancel)?;
-        let mut temporary = if state.session.is_none() { Some(self.prepare(cancel)?) } else { None };
-        let result = (|| {
-            self.check(cancel)?;
+        scan_session_with(state.session.is_some(), || self.check(cancel), || self.prepare(cancel), || {
             let channels = scan::Channels::parse(&Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?);
             let plan = channels.plan();
             let mut ctrl = scan::Ctrl::attach(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT))?;
             let (table, took) = scan::run(&mut ctrl, &plan, || self.check(cancel))?;
             Ok(parse_bss_on_channels(&table, took.as_secs() + 1, &channels))
-        })();
-        if let Some(session) = &mut temporary {
+        }, |session| {
             self.set_phase(Phase::Disconnecting);
-            cleanup(session, || ())?;
-        }
-        self.check(cancel)?;
-        result
+            cleanup(session, || ())
+        })
     }
 
     fn join(&mut self, state: &mut State, selection: Selection, ipv6: bool, cancel: &Cancellation) -> Result<Session, String> {
@@ -706,101 +850,11 @@ impl controller::Port for DevicePort {
         let network_config = selection.config;
         // Country/driver restrictions may have changed since the last scan.
         let channels = scan::Channels::parse(&Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?);
-        if !channels.contains(selected.frequency) {
-            return Err("The upstream channel is disabled by the radio; scan again".into());
-        }
-        // A validated replacement owns the next restart choice only once it
-        // succeeds. Until then, do not silently restart the previous network.
-        if cancel.target.is_none() { self.settings = None; resume::clear(root)?; }
-        self.control = None;
-        let old = state.session.take();
-        self.publish(state);
-        // Between 5 GHz upstreams the station and hotspot are handed over
-        // (`handover`); otherwise the old session is torn down first.
-        let mut handed = None;
-        if let Some(mut old) = old {
-            let five = |n: Option<&Network>| n.is_some_and(|n| n.frequency > 5000);
-            let keep_ipv6 = ipv6 && old.selected.as_ref().is_some_and(|n| n.bssid == selected.bssid) && old.ipv6.configured();
-            let transferred = if five(old.selected.as_ref()) && five(Some(&selected)) {
-                match handover(&mut old, &channels, keep_ipv6, || self.uplink_changed()) {
-                    Ok(()) => true,
-                    Err(e) => { crate::netlog!("[relay] station not handed over ({e}); tearing the old connection down"); false }
-                }
-            } else { false };
-            if transferred { handed = Some((successor(old, keep_ipv6), keep_ipv6)); }
-            else { cleanup(&mut old, || self.uplink_changed())?; }
-        }
-        let kept = handed.is_some();
-        let ipv6_kept = handed.as_ref().is_some_and(|(_, ipv6)| *ipv6);
-        let mut session = match handed.map_or_else(|| self.prepare(cancel), |(next, _)| Ok(next)) {
-            Ok(session) => session,
-            Err(e) => return Err(e),
-        };
+        let (mut session, kept, ipv6_kept) = self.begin_join(state, &selected, ipv6, cancel, root, &channels)?;
         let check = || self.check(cancel);
         let result = (|| {
-            check()?;
-            if !kept {
-                hotspot::prepare(&mut session.wireless, selected.frequency, &channels)?;
-            }
-            check()?;
-            net::write_private(&Path::new(ROOT).join("wpa.conf"), format!("ctrl_interface={ROOT}/ctrl\nupdate_config=0\n{network_config}").as_bytes())?;
-            // Undo must detach STA before restoring the same-radio AP channel,
-            // including a crash between reconfigure and association completion
-            // (a handed-over station has that undo already).
-            session.wireless.lock().unwrap().step(association_step())?;
-            if kept {
-                // `handover` disconnected it; a reconfigure alone keeps it so.
-                wpa("reconnect", &[]).and_then(expect_ok)?;
-            }
-            let mut linked = false;
-            for _ in 0..30 {
-                check()?;
-                if wpa("status", &[]).is_ok_and(|s| net::key(&s, "wpa_state") == Some("COMPLETED") && net::key(&s, "bssid") == Some(&selected.bssid)) {
-                    linked = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            if !linked {
-                return Err("Wi-Fi association failed; check password and signal".into());
-            }
-            let (nonce, dhcp) = start_dhcp(None)?;
-            session.dhcp_session = Some(nonce.clone());
-            session.dhcp = Some(dhcp);
-            let mut lease = None;
-            for _ in 0..25 {
-                check()?;
-                if let Ok(current) = read_lease(&nonce) {
-                    lease = Some(current);
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            let lease = lease.ok_or("No usable DHCP lease received")?;
-            let lan_ip: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.ipaddr"]).run()?.parse().map_err(|_| "Invalid LAN address")?;
-            let lan_mask: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.netmask"]).run()?.parse().map_err(|_| "Invalid LAN mask")?;
-            let prefix = validate_lease(&lease, lan_ip, lan_mask)?;
-            if fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default().trim() != "1" {
-                return Err("Router IPv4 forwarding is disabled".into());
-            }
-            // The tables grow (forwarding, DNS, the IPv6 baseline) after the
-            // legacy accepts and routes, before the policy rule moves traffic.
-            let mut plan = relay_plan(&lease, prefix, lan_ip, lan_mask);
-            let rule = plan.pop().expect("the policy rule is the plan's last step");
-            session.network.declare(plan)?;
-            // LAN web traffic skips the vendor's offline redirect before the
-            // policy rule moves it (the RETURN and the kernel redirect); a
-            // handed-over session holds both.
-            for step in portal::web_bypasses() {
-                session.dns.declare(vec![step])?;
-            }
-            session.dns.declare(portal::web_redirect(&session.dns))?;
-            session.uplink.update(|l| l.relay = Some(relay_layout(&lease, lan_ip, lan_mask)))?;
-            session.network.declare(vec![rule])?;
-            session.routed = true;
-            if !crate::mihomo::egress::relay_route(false) {
-                return Err("Firmware policy routing did not select the Wi-Fi upstream".into());
-            }
+            let lease = self.associate_and_lease(&mut session, &selected, &network_config, &channels, kept, cancel)?;
+            let prefix = Self::install_ipv4(&mut session, &lease)?;
             // CPU-path help and hardware forwarding are optional: the relay
             // works without them.
             if let Err(e) = session.network.declare(steering::plan()) {
@@ -1011,53 +1065,6 @@ fn decide(link: AssociationResult, helpers_alive: bool, change: LeaseChange, hot
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum LeaseChange {
-    Same,
-    /// Only the resolver list beyond the one the DNS rules point at differs.
-    Resolvers(Lease),
-    Replaced,
-}
-
-/// The installed rules bake in the address, mask, gateway and the first
-/// resolver. Anything else in a renewal (extra or reordered resolvers) can be
-/// adopted in place; a missing lease or a different baked-in value cannot.
-fn lease_change(installed: &Lease, current: Option<&Lease>) -> LeaseChange {
-    let Some(current) = current else {
-        return LeaseChange::Replaced;
-    };
-    if current == installed {
-        return LeaseChange::Same;
-    }
-    let resolver = |lease: &Lease| lease.dns.first().copied().unwrap_or(lease.gateway);
-    if (current.ip, current.subnet, current.gateway)
-        == (installed.ip, installed.subnet, installed.gateway)
-        && resolver(current) == resolver(installed)
-    {
-        LeaseChange::Resolvers(current.clone())
-    } else {
-        LeaseChange::Replaced
-    }
-}
-
-/// A renewed lease passes the same checks as a new one before it is adopted.
-fn resolvers_acceptable(lease: &Lease) -> bool {
-    let address = |key: &str| {
-        Cmd::new("uci", &["-q", "get", key])
-            .run()
-            .ok()?
-            .parse::<Ipv4Addr>()
-            .ok()
-    };
-    let (Some(lan), Some(mask)) = (
-        address("network.lan.ipaddr"),
-        address("network.lan.netmask"),
-    ) else {
-        return false;
-    };
-    validate_lease(lease, lan, mask).is_ok()
-}
-
 #[derive(Clone, Copy)]
 enum Origin<'a> {
     /// A connect request; `remember` saves its password.
@@ -1150,7 +1157,7 @@ fn stop_strays(spare: &[offload::Record]) -> Result<(), String> {
     let me = std::process::id().to_string();
     let boot = net::boot_id();
     let recorded: Vec<offload::Record> = MONITORS.iter().filter_map(|name| offload::Record::parse(&fs::read_to_string(pid_file(name)).ok()?, &boot)).collect();
-    let strays: Vec<(libc::pid_t, u64)> = fs::read_dir("/proc")
+    let strays: Vec<offload::Record> = fs::read_dir("/proc")
         .map_err(|_| "Cannot list processes")?
         .flatten()
         .filter_map(|entry| {
@@ -1161,7 +1168,7 @@ fn stop_strays(spare: &[offload::Record]) -> Result<(), String> {
             let status = fs::read_to_string(entry.path().join("status")).ok()?;
             let parent = status.lines().find_map(|l| l.strip_prefix("PPid:")).map(str::trim);
             let process = offload::Record { pid: pid as u32, start: crate::netfx::exec::process_start(pid as u32)? };
-            (stray(&args, process, &recorded) && parent != Some(me.as_str()) && !spare.contains(&process)).then_some((pid, process.start))
+            (stray(&args, process, &recorded) && parent != Some(me.as_str()) && !spare.contains(&process)).then_some(process)
         })
         .collect();
     // Only a previous agent's records are left here: a live session has none.
@@ -1172,19 +1179,26 @@ fn stop_strays(spare: &[offload::Record]) -> Result<(), String> {
         return Ok(());
     }
     crate::netlog!("[relay] stopping {} helper(s) left by a previous agent", strays.len());
-    // A zombie has an empty command line; its parent (init) reaps it.
-    // Also the same process: a reused id is never signalled.
-    let alive = |(pid, start): &(libc::pid_t, u64)| fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| !c.is_empty()) && crate::netfx::exec::process_start(*pid as u32) == Some(*start);
+    stop_stray_helpers(&strays, |process| same_process(*process), |process, signal| {
+        // SAFETY: plain kill(2) on a process matched and re-identified just above.
+        unsafe { libc::kill(process.pid as libc::pid_t, signal) };
+    }, std::thread::sleep)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn stop_stray_helpers<T>(
+    strays: &[T], mut alive: impl FnMut(&T) -> bool,
+    mut send: impl FnMut(&T, libc::c_int), mut sleep: impl FnMut(Duration),
+) -> Result<(), String> {
     for (signal, wait) in [(libc::SIGTERM, 10), (libc::SIGKILL, 10)] {
-        for (pid, _) in strays.iter().filter(|p| alive(p)) {
-            // SAFETY: plain kill(2) on a process matched and re-identified just above.
-            unsafe { libc::kill(*pid, signal) };
+        for process in strays.iter().filter(|p| alive(p)) {
+            send(process, signal);
         }
         for _ in 0..wait {
-            if !strays.iter().any(alive) {
+            if !strays.iter().any(&mut alive) {
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(100));
+            sleep(Duration::from_millis(100));
         }
     }
     Err("A previous relay helper is still running; retry".into())
@@ -1312,18 +1326,47 @@ fn handover(old: &mut Session, channels: &scan::Channels, keep_ipv6: bool, uplin
     if !old.supplicant.as_mut().is_some_and(Helper::alive) {
         return Err("the supplicant exited".into());
     }
+    handover_with(old, keep_ipv6, uplink_changed, UpstreamHandover {
+        stop_ipv6: |old: &mut Session| old.ipv6.stop(),
+        release_routes: |old: &mut Session| {
+            if let Err(e) = old.uplink.update(|l| l.relay = None) {
+                crate::netlog!("[relay] relay tables not narrowed before releasing routes (the journal removes them): {e}");
+            }
+            old.network.release()
+        },
+        release_resolver: |old: &mut Session| old.dns.withdraw(&[resolver_key()]),
+        restage: || {
+            wpa("disconnect", &[]).and_then(expect_ok)?;
+            hotspot::restage(channels)
+        },
+    })
+}
+
+struct UpstreamHandover<V6, Routes, Resolver, Restage> {
+    stop_ipv6: V6,
+    release_routes: Routes,
+    release_resolver: Resolver,
+    restage: Restage,
+}
+
+fn handover_with(
+    old: &mut Session, keep_ipv6: bool, uplink_changed: impl FnOnce(),
+    steps: UpstreamHandover<
+        impl FnOnce(&mut Session) -> Result<(), String>,
+        impl FnOnce(&mut Session) -> Result<(), String>,
+        impl FnOnce(&mut Session) -> Result<(), String>,
+        impl FnOnce() -> Result<(), String>,
+    >,
+) -> Result<(), String> {
     old.offload.stop();
     if !keep_ipv6 {
-        old.ipv6.stop()?;
+        (steps.stop_ipv6)(old)?;
     }
-    if let Err(e) = old.uplink.update(|l| l.relay = None) {
-        crate::netlog!("[relay] relay tables not narrowed before releasing routes (the journal removes them): {e}");
-    }
-    let routes = old.network.release();
+    let routes = (steps.release_routes)(old);
     // Only the resolver follows the lease. Released here, the switch read 1
     // until the next lease and a fw3 reload in that gap let the vendor's
     // DNAT in for good (`portal`); the next session holds both as they are.
-    let dns = old.dns.withdraw(&[resolver_key()]);
+    let dns = (steps.release_resolver)(old);
     if std::mem::take(&mut old.routed) {
         uplink_changed();
     }
@@ -1332,8 +1375,7 @@ fn handover(old: &mut Session, channels: &scan::Channels, keep_ipv6: bool, uplin
     if let Some(path) = old.dhcp_session.take().and_then(|session| lease_file(Path::new(ROOT), &session)) {
         let _ = fs::remove_file(path);
     }
-    wpa("disconnect", &[]).and_then(expect_ok)?;
-    hotspot::restage(channels)?;
+    (steps.restage)()?;
     crate::netlog!("[relay] station handed over to the next upstream{}; the hotspot waits on its staging channel", if keep_ipv6 { " with its IPv6" } else { "" });
     Ok(())
 }
@@ -1461,233 +1503,6 @@ pub(crate) fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) 
     p
 }
 
-fn channel(f: u32) -> Option<u32> {
-    if (2412..=2472).contains(&f) && (f - 2407).is_multiple_of(5) {
-        return Some((f - 2407) / 5);
-    }
-    if f == 2484 {
-        return Some(14);
-    }
-    let ch = f.checked_sub(5000)? / 5;
-    ((5005..=5895).contains(&f) && (f - 5000).is_multiple_of(5)).then_some(ch)
-}
-
-fn decode_ssid(s: &str) -> String {
-    let b = s.as_bytes();
-    let hex = |byte: u8| (byte as char).to_digit(16).map(|n| n as u8);
-    let mut bytes = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if i + 3 < b.len() && &b[i..i + 2] == b"\\x" {
-            // Scan output is untrusted UTF-8: byte offsets need not be
-            // character boundaries when a malformed escape follows \\x.
-            if let (Some(hi), Some(lo)) = (hex(b[i + 2]), hex(b[i + 3])) {
-                bytes.push(hi * 16 + lo);
-                i += 4;
-                continue;
-            }
-        }
-        if b[i] == b'\\' && matches!(b.get(i + 1), Some(b'\\' | b'"')) {
-            i += 1;
-        }
-        bytes.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-/// Fresh entries of the supplicant's `BSS` pages (`====`/`####` after each
-/// entry) as (bssid, MHz, dBm, flags, ssid). Entries older than `max_age`
-/// seconds came from the kernel's cache, not this scan, and are left out.
-fn fresh_bss(text: &str, max_age: u64, mut each: impl FnMut(&str, u32, i32, &str, &str)) {
-    let mut fields = std::collections::HashMap::new();
-    for line in text.lines().chain(["===="]) {
-        if line != "====" && line != "####" {
-            if let Some((key, value)) = line.split_once('=') {
-                fields.insert(key, value);
-            }
-            continue;
-        }
-        let field = |key| fields.get(key).copied().unwrap_or("");
-        let fresh = field("age").parse::<u64>().is_ok_and(|age| age <= max_age);
-        if let (true, Ok(frequency), Ok(signal)) = (fresh, field("freq").parse(), field("level").parse()) {
-            each(field("bssid"), frequency, signal, field("flags"), field("ssid"));
-        }
-        fields.clear();
-    }
-}
-
-/// Networks offered for relay, strongest first.
-pub fn parse_bss(text: &str, max_age: u64) -> Vec<Network> {
-    let mut out: Vec<Network> = Vec::new();
-    fresh_bss(text, max_age, |bssid, frequency, signal, flags, ssid| out.extend(network(bssid, frequency, signal, flags, ssid)));
-    out.sort_by_key(|n| std::cmp::Reverse(n.signal));
-    out.truncate(80);
-    out
-}
-
-/// A cached BSS can be returned even when its channel was not scanned.
-/// Only the PHY's currently enabled channels may be offered for connection.
-fn parse_bss_on_channels(text: &str, max_age: u64, channels: &scan::Channels) -> Vec<Network> {
-    let mut networks = parse_bss(text, max_age);
-    for network in &mut networks {
-        network.supported &= channels.contains(network.frequency);
-    }
-    networks
-}
-
-fn network(bssid: &str, frequency: u32, signal: i32, flags: &str, ssid: &str) -> Option<Network> {
-    if bssid.len() != 17 || !bssid.split(':').all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit())) {
-        return None;
-    }
-    let ssid = decode_ssid(ssid);
-    if ssid.is_empty() || ssid.len() > 32 || ssid.chars().any(char::is_control) {
-        return None;
-    }
-    let security = if flags.contains("WPA2-PSK") {
-        "wpa2"
-    } else if flags == "[ESS]" || flags == "[WPS][ESS]" {
-        "open"
-    } else {
-        "unsupported"
-    };
-    let id = network_id(bssid, frequency, &ssid);
-    Some(Network { id, ssid, frequency, signal, security, supported: security != "unsupported" && channel(frequency).is_some(), bssid: bssid.into() })
-}
-
-/// A scanned network's id: stable for one BSS, channel and name.
-fn network_id(bssid: &str, frequency: u32, ssid: &str) -> String {
-    format!("{:x}", Sha256::digest(format!("{bssid}:{frequency}:{ssid}").as_bytes()))[..16].to_owned()
-}
-
-fn wpa_network(n: &Network, password: &str) -> Result<String, String> {
-    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    // scan_freq keeps the supplicant's own scans to one channel: the driver
-    // drops 5 GHz from multi-channel scans while the hotspot runs 160 MHz.
-    let mut config = format!("network={{\nssid={}\nbssid={}\nfreq_list={f}\nscan_freq={f}\n", hex(n.ssid.as_bytes()), n.bssid, f = n.frequency);
-    match n.security {
-        "open" if password.is_empty() => config.push_str("key_mgmt=NONE\n"),
-        "wpa2" => {
-            let psk = if password.len() == 64 && password.bytes().all(|b| b.is_ascii_hexdigit()) {
-                password.to_ascii_lowercase()
-            } else {
-                if !(8..=63).contains(&password.len()) || !password.bytes().all(|b| (32..=126).contains(&b)) {
-                    return Err("WPA2 password must be 8-63 printable ASCII characters or a 64-digit hex PSK".into());
-                }
-                let mut key = [0u8; 32];
-                ring::pbkdf2::derive(ring::pbkdf2::PBKDF2_HMAC_SHA1, NonZeroU32::new(4096).unwrap(), n.ssid.as_bytes(), password.as_bytes(), &mut key);
-                hex(&key)
-            };
-            config.push_str(&format!("key_mgmt=WPA-PSK\nproto=RSN\npsk={psk}\n"));
-        }
-        _ => return Err("Unsupported Wi-Fi security or password supplied for an open network".into()),
-    }
-    config.push_str("}\n");
-    Ok(config)
-}
-
-fn prefix(mask: Ipv4Addr) -> Option<u32> {
-    let m = u32::from(mask);
-    (m.count_ones() == m.leading_ones() && (8..=30).contains(&m.count_ones())).then(|| m.count_ones())
-}
-
-fn validate_lease(l: &Lease, lan: Ipv4Addr, mask: Ipv4Addr) -> Result<u32, String> {
-    let p = prefix(l.subnet).ok_or("Invalid upstream subnet mask")?;
-    prefix(mask).ok_or("Invalid LAN subnet mask")?;
-    let ip = u32::from(l.ip);
-    let gw = u32::from(l.gateway);
-    let m = u32::from(l.subnet);
-    let low = ip & m;
-    let high = low | !m;
-    if !(0x01000000..0xe0000000).contains(&ip) || l.ip.is_loopback() || ip <= low || ip >= high || gw <= low || gw >= high || ip == gw {
-        return Err("Invalid upstream IPv4 lease or gateway".into());
-    }
-    let overlap = |a: u32, b: u32| low <= b && high >= a;
-    let lan_low = u32::from(lan) & u32::from(mask);
-    if overlap(lan_low, lan_low | !u32::from(mask)) || overlap(0x64400000, 0x647fffff) || overlap(0xa9fe0000, 0xa9feffff) {
-        return Err("Upstream subnet conflicts with LAN, Tailnet or link-local addresses".into());
-    }
-    let lan_high = lan_low | !u32::from(mask);
-    for dns in &l.dns {
-        let address = u32::from(*dns);
-        if !(0x01000000..0xe0000000).contains(&address)
-            || dns.is_loopback()
-            || (lan_low..=lan_high).contains(&address)
-            || (0x64400000..=0x647fffff).contains(&address)
-            || dns.is_link_local()
-            || (low..=high).contains(&address) && (address == low || address == high || address == ip)
-        {
-            return Err("Upstream DHCP supplied an invalid or conflicting DNS resolver".into());
-        }
-    }
-    Ok(p)
-}
-
-fn lease_file(root: &Path, session: &str) -> Option<std::path::PathBuf> {
-    (session.len() == 32 && session.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| root.join(format!("ipv4-lease-{session}.json")))
-}
-
-/// The envelope identifies the NAT implementation on adoption. A rollback
-/// to an older agent rejects this lease before it installs legacy NAT and
-/// runs its ordinary journal recovery (including removal of the nft table).
-#[derive(Serialize, Deserialize)]
-struct NftLease { nft_v4: Lease }
-
-fn read_lease(session: &str) -> Result<Lease, String> {
-    let path = lease_file(Path::new(ROOT), session).ok_or("Invalid DHCP session")?;
-    serde_json::from_slice::<NftLease>(&fs::read(path).map_err(|_| "No DHCP lease")?).map(|record| record.nft_v4).map_err(|_| "Invalid DHCP lease".into())
-}
-
-/// A DHCP client on a new session path (its lease file), asking for
-/// `request` when given: the session id and the client.
-fn start_dhcp(request: Option<Ipv4Addr>) -> Result<(String, Child), String> {
-    let callback = std::env::current_exe().map_err(|e| e.to_string())?;
-    #[cfg(test)]
-    let callback = std::env::var_os("U60_IPV6_QA_CALLBACK").map(std::path::PathBuf::from).unwrap_or(callback);
-    let mut nonce = [0; 16];
-    getrandom::getrandom(&mut nonce).map_err(|_| "Cannot create DHCP session")?;
-    let nonce = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let mut cmd = Command::new("udhcpc");
-    cmd.args(["-f", "-i", IFACE, "-s"])
-        .arg(callback)
-        .args(["-t", "5", "-T", "3", "-A", "10"]);
-    if let Some(address) = request {
-        cmd.args(["-r", &address.to_string()]);
-    }
-    cmd.env("U60_RELAY_DHCP", "1").env("U60_RELAY_DHCP_SESSION", &nonce);
-    Ok((nonce, net::owned_child(cmd)?))
-}
-
-/// BusyBox udhcpc invokes the agent executable with bound/renew/deconfig.
-/// A per-connection path prevents late callback children corrupting a reconnect.
-pub fn dhcp_callback(event: &str) -> i32 {
-    dhcp_callback_at(Path::new(ROOT), event, |key| std::env::var(key).ok())
-}
-
-fn dhcp_callback_at(root: &Path, event: &str, env: impl Fn(&str) -> Option<String>) -> i32 {
-    let Some(path) = env("U60_RELAY_DHCP_SESSION").and_then(|session| lease_file(root, &session)) else { return 1 };
-    if env("interface").as_deref() != Some(IFACE) {
-        return 1;
-    }
-    if event == "deconfig" {
-        let _ = fs::remove_file(path);
-        return 0;
-    }
-    if !["bound", "renew"].contains(&event) {
-        return 0;
-    }
-    let read = |name| env(name)?.split_whitespace().next()?.parse::<Ipv4Addr>().ok();
-    let (Some(ip), Some(subnet), Some(gateway)) = (read("ip"), read("subnet"), read("router")) else { return 1 };
-    let dns = env("dns").unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).take(3).collect();
-    let lease = Lease { ip, subnet, gateway, dns };
-    if net::write_private(&path, &serde_json::to_vec(&NftLease { nft_v4: lease }).unwrap()).is_ok() {
-        0
-    } else {
-        1
-    }
-}
-
 pub fn status(state: &crate::handlers::AppState) -> (u16, Value) {
     let mut response = json!({"ok":true});
     response["data"] = state.wifi_relay.status();
@@ -1744,6 +1559,174 @@ fn change_error(relay: &WifiRelay, error: String) -> (u16, Value) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_temporary_scan_cleans_up_before_returning_the_scan_error_or_cancellation() {
+        use std::cell::RefCell;
+        for (cleanup_fails, cancelled, expected) in [
+            (false, false, "scan failed"),
+            (false, true, RESTORE_CANCELLED),
+            (true, false, "cleanup failed"),
+            (true, true, "cleanup failed"),
+        ] {
+            let dir = test_dir::TestDir::new("temporary-scan");
+            let (port, _, _, cancel) = join_fixture(dir.path());
+            let calls = RefCell::new(Vec::new());
+            let result = scan_session_with(false, || { calls.borrow_mut().push("check"); port.check(&cancel) },
+                || { calls.borrow_mut().push("prepare"); Ok(Session::new(dir.path())) },
+                || { calls.borrow_mut().push("scan"); if cancelled { port.shared.cancel_restore(); } Err("scan failed".into()) },
+                |_| { calls.borrow_mut().push("cleanup"); if cleanup_fails { Err("cleanup failed".into()) } else { Ok(()) } },
+            );
+            assert_eq!(result.err().as_deref(), Some(expected));
+            let mut trace = vec!["check", "prepare", "check", "scan", "cleanup"];
+            if !cleanup_fails { trace.push("check"); }
+            assert_eq!(calls.into_inner(), trace);
+        }
+    }
+
+    #[test]
+    fn the_join_checks_for_cancellation_after_hotspot_preparation() {
+        let dir = test_dir::TestDir::new("join-cancellation-boundary");
+        let (port, _, _, cancel) = join_fixture(dir.path());
+        let result = prepare_join_hotspot_with(false, || port.check(&cancel), || {
+            port.shared.cancel_restore();
+            Ok(())
+        });
+        assert_eq!(result, Err(RESTORE_CANCELLED.into()));
+        let result = prepare_join_hotspot_with(false, || port.check(&cancel), || panic!("cancelled before staging"));
+        assert_eq!(result, Err(RESTORE_CANCELLED.into()));
+    }
+
+    #[test]
+    fn change_errors_keep_the_http_status_error_and_current_phase() {
+        let shared = Arc::new(Shared::new());
+        let relay = WifiRelay { lock: Arc::new(crate::netfx::admission::Gate::new()), shared: shared.clone(), commands: OnceLock::new(), mihomo: None, tailscale: None };
+        shared.phase(Phase::Connecting);
+        for (error, status) in [
+            ("A network operation is in progress", 409),
+            ("Wi-Fi is still applying its new settings", 409),
+            ("Invalid relay request", 503),
+            ("Unknown relay action", 503),
+        ] {
+            assert_eq!(change_error(&relay, error.into()), (status, json!({"ok":false,"error":error,"phase":"connecting"})));
+        }
+    }
+
+    #[test]
+    fn stray_helpers_are_signalled_in_batches_and_the_final_wait_is_not_checked_again() {
+        use std::cell::{Cell, RefCell};
+        let waits = Cell::new(0);
+        let trace = RefCell::new(Vec::new());
+        let result = stop_stray_helpers(&[11, 22], |pid| {
+            trace.borrow_mut().push(("check", *pid));
+            waits.get() < if *pid == 11 { 10 } else { 20 }
+        }, |pid, signal| {
+            trace.borrow_mut().push((if signal == libc::SIGTERM { "TERM" } else { "KILL" }, *pid));
+        }, |duration| {
+            assert_eq!(duration, Duration::from_millis(100));
+            trace.borrow_mut().push(("sleep", 0));
+            waits.set(waits.get() + 1);
+        });
+        let mut expected = vec![("check", 11), ("TERM", 11), ("check", 22), ("TERM", 22)];
+        for _ in 0..10 { expected.extend([("check", 11), ("sleep", 0)]); }
+        expected.extend([("check", 11), ("check", 22), ("KILL", 22)]);
+        for _ in 0..10 { expected.extend([("check", 11), ("check", 22), ("sleep", 0)]); }
+        assert_eq!(trace.into_inner(), expected);
+        assert_eq!(result, Err("A previous relay helper is still running; retry".into()));
+    }
+
+    fn join_fixture(dir: &Path) -> (DevicePort, State, Network, Cancellation) {
+        let shared = Arc::new(Shared::new());
+        let port = DevicePort { shared: shared.clone(), control: None, settings: Some(json!({})), mihomo: None, tailscale: None };
+        let cancel = Cancellation { shared, generation: 0, target: None };
+        let selected = Network { id: "test".into(), ssid: "upstream".into(), frequency: 5500, signal: -50, security: "open", supported: true, bssid: "00:11:22:33:44:55".into() };
+        let mut session = Session::new(dir);
+        session.selected = Some(selected.clone());
+        session.routed = true;
+        let state = State { session: Some(session), ..Default::default() };
+        (port, state, selected, cancel)
+    }
+
+    #[test]
+    fn dfs_handover_preserves_ipv6_only_for_the_same_bssid_with_ipv6_enabled() {
+        use std::cell::RefCell;
+        for (same_bssid, ipv6, keep) in [(true, true, true), (false, true, false), (true, false, false)] {
+            let dir = test_dir::TestDir::new("dfs-handover");
+            let (mut port, mut state, mut selected, cancel) = join_fixture(dir.path());
+            let old = state.session.as_mut().unwrap();
+            let pid = old.ipv6.seed_handover(dir.path());
+            let wireless = old.wireless.clone();
+            if !same_bssid { selected.bssid = "00:11:22:33:44:66".into(); }
+            let channels = scan::Channels::parse("* 5180 MHz [36]\n* 5500 MHz [100]\nRadar detection");
+            let calls = RefCell::new(Vec::new());
+            let (mut next, handed, kept) = port.begin_join_with(
+                &mut state, &selected, ipv6, &cancel, dir.path(), &channels,
+                |_, state| assert!(state.session.is_none()),
+                |_, old, keep_ipv6| handover_with(old, keep_ipv6, || calls.borrow_mut().push("notify"), UpstreamHandover {
+                    stop_ipv6: |old: &mut Session| { calls.borrow_mut().push("stop IPv6"); old.ipv6.stop_client(); Ok(()) },
+                    release_routes: |_: &mut Session| { calls.borrow_mut().push("release IPv4 routes"); Ok(()) },
+                    release_resolver: |_: &mut Session| { calls.borrow_mut().push("release resolver"); Ok(()) },
+                    restage: || { calls.borrow_mut().push("restage"); Ok(()) },
+                }),
+                |_, _| panic!("handover should succeed"),
+                |_| panic!("reuse the previous session"),
+            ).unwrap();
+            assert!(handed && kept == keep);
+            assert!(Arc::ptr_eq(&wireless, &next.wireless));
+            assert!(!next.routed);
+            let mut expected = vec!["release IPv4 routes", "release resolver", "notify", "restage"];
+            if keep {
+                next.ipv6.assert_handover_retained(pid);
+                next.ipv6.stop_client();
+            } else {
+                expected.insert(0, "stop IPv6");
+                assert!(!next.ipv6.configured());
+            }
+            assert_eq!(calls.into_inner(), expected);
+        }
+    }
+
+    #[test]
+    fn dfs_handover_without_a_staging_channel_tears_down_before_preparing() {
+        use std::cell::RefCell;
+        let dir = test_dir::TestDir::new("dfs-no-staging");
+        let (mut port, mut state, selected, cancel) = join_fixture(dir.path());
+        let previous = state.session.as_ref().unwrap().wireless.clone();
+        let channels = scan::Channels::parse("* 5180 MHz [36]\n* 5500 MHz [100]\nRadar detection");
+        let calls = RefCell::new(Vec::new());
+        let (new, handed, _) = port.begin_join_with(
+            &mut state, &selected, false, &cancel, dir.path(), &channels,
+            |_, _| calls.borrow_mut().push("publish"),
+            |_, _, _| hotspot::restage_with(&channels, || calls.borrow_mut().push("allow DFS"), |cmd| {
+                assert_eq!(cmd, Cmd::new("iw", &["dev", "wlan2", "info"]));
+                calls.borrow_mut().push("read channel");
+                Ok("channel 36 (5180 MHz), width: 160 MHz, center1: 5250 MHz".into())
+            }),
+            |_, old| { assert!(Arc::ptr_eq(&previous, &old.wireless)); calls.borrow_mut().push("full teardown"); Ok(()) },
+            |_| { calls.borrow_mut().push("prepare"); Ok(Session::new(dir.path())) },
+        ).unwrap();
+        assert!(!handed && !Arc::ptr_eq(&previous, &new.wireless));
+        assert_eq!(calls.into_inner(), ["publish", "allow DFS", "read channel", "full teardown", "prepare"]);
+    }
+
+    #[test]
+    fn a_disabled_join_frequency_leaves_resume_and_the_old_session_alone() {
+        let dir = test_dir::TestDir::new("dfs-disabled");
+        let (mut port, mut state, selected, cancel) = join_fixture(dir.path());
+        let old = state.session.as_ref().unwrap().wireless.clone();
+        resume::save(dir.path(), &selected, true).unwrap();
+        let before = resume::load(dir.path()).unwrap();
+        let channels = scan::Channels::parse("* 5500 MHz [100] (disabled)");
+        let error = port.begin_join_with(
+            &mut state, &selected, true, &cancel, dir.path(), &channels,
+            |_, _| panic!("published"), |_, _, _| panic!("handed over"),
+            |_, _| panic!("torn down"), |_| panic!("prepared"),
+        ).err().unwrap();
+        assert_eq!(error, "The upstream channel is disabled by the radio; scan again");
+        assert_eq!(resume::load(dir.path()), Some(before));
+        assert!(Arc::ptr_eq(&old, &state.session.unwrap().wireless));
+        assert_eq!(port.settings, Some(json!({})));
+    }
+
     fn relay_plan(lease: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) -> Vec<Step> {
         crate::netfx::effect::test_plan(super::relay_plan(lease, prefix, lan, mask))
     }
@@ -1779,15 +1762,15 @@ mod tests {
 
     #[test]
     fn restore_intent_io_failures_are_explicit_and_do_not_masquerade_as_cancellation() {
-        let root = std::env::temp_dir().join(format!("u60-restore-io-{}", std::process::id()));
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-restore-io");
+        let root = temp.path();
         fs::create_dir_all(root.join("resume.json")).unwrap();
-        assert_eq!(resume::clear(&root).unwrap_err(), "Cannot clear the relay to restore");
+        assert_eq!(resume::clear(root).unwrap_err(), "Cannot clear the relay to restore");
         let network = Network { id: "write-fails".into(), ssid: "Restore test".into(), frequency: 2412, signal: -40, security: "open", supported: true, bssid: "02:00:00:00:00:01".into() };
-        assert_eq!(resume::save(&root, &network, true).unwrap_err(), "Cannot save the relay to restore after a restart");
+        assert_eq!(resume::save(root, &network, true).unwrap_err(), "Cannot save the relay to restore after a restart");
         let relay = WifiRelay::new(Arc::new(crate::netfx::admission::Gate::new()));
         let generation = relay.shared.cancel_restore();
         assert!(!relay.shared.generation_matches(generation - 1));
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1869,11 +1852,11 @@ mod tests {
 
     #[test]
     fn late_ipv4_callbacks_cannot_overwrite_or_delete_a_new_sessions_lease() {
-        let root = std::env::temp_dir().join(format!("u60-dhcp4-session-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-dhcp4-session");
+        let root = temp.path();
         let old = "a".repeat(32);
         let new = "b".repeat(32);
-        let call = |event: &str, session: &str, ip: &str| dhcp_callback_at(&root, event, |key| Some(match key {
+        let call = |event: &str, session: &str, ip: &str| dhcp_callback_at(root, event, |key| Some(match key {
             "interface" => IFACE, "U60_RELAY_DHCP_SESSION" => session,
             "ip" => ip, "subnet" => "255.255.255.0", "router" | "dns" => "10.0.0.1", _ => return None,
         }.into()));
@@ -1887,7 +1870,6 @@ mod tests {
         assert_eq!(call("renew", "../escape", "10.0.0.2"), 1);
         assert_eq!(call("deconfig", &new, "10.0.0.3"), 0);
         assert!(!active.exists());
-        fs::remove_dir_all(root).unwrap();
     }
 
     fn bss(entries: &[(&str, u32, i32, u64, &str, &str)]) -> String {
@@ -2088,8 +2070,9 @@ mod tests {
         assert_eq!(resolver(&l).command().unwrap(), Cmd::new("@u60-relay-dns", &["10.0.0.53"]));
         assert!(!held.iter().any(|resource| resource.key() == resolver_key()), "the handover's release takes none of it");
         // The old session as `handover` leaves it before `successor`.
-        let dir = std::env::temp_dir().join(format!("u60-relay-successor-{}", std::process::id()));
-        let mut old = Session::new(&dir);
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-relay-successor");
+        let dir = temp.path();
+        let mut old = Session::new(dir);
         old.dns.assume(held);
         let mut next = successor(old, false);
         for (program, first) in [("iptables", "-w"), ("ip6tables", "-w"), ("@u60-relay-portal", "release"), ("@u60-sysctl", "httpredirect_cmd")] {
@@ -2101,7 +2084,6 @@ mod tests {
         let result = next.dns.reconcile_with(&mut device, &mut crate::netfx::effect::fake::FakeNft::default());
         assert_eq!(device.writes.len(), 1);
         assert!(result.restored.len() == 1 && result.failed.is_empty(), "{result:?}");
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// v5: the denials are in the relay's tables; legacy holds accepts only
@@ -2162,24 +2144,24 @@ mod tests {
     /// disconnect leave Mihomo's uplink alone; a session that routed tells it once.
     #[test]
     fn only_a_session_that_installed_routes_tells_mihomo_its_uplink_changed() {
-        let dir = std::env::temp_dir().join(format!("u60-relay-routed-{}", std::process::id()));
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-relay-routed");
+        let dir = temp.path();
         let mut told = 0;
-        let mut scan = Session::new(&dir);
+        let mut scan = Session::new(dir);
         cleanup(&mut scan, || told += 1).unwrap();
         assert_eq!(told, 0, "a scan or a join that failed before routing");
-        let mut routed = Session::new(&dir);
+        let mut routed = Session::new(dir);
         routed.routed = true;
         cleanup(&mut routed, || told += 1).unwrap();
         cleanup(&mut routed, || told += 1).unwrap();
         assert_eq!(told, 1, "once, not again for a repeated teardown");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn failed_recovery_journals_keep_network_ownership() {
-        let dir = std::env::temp_dir().join(format!("u60-relay-ownership-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        assert!(!recovery_pending(&dir));
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-relay-ownership");
+        let dir = temp.path();
+        assert!(!recovery_pending(dir));
         for name in [
             "network.json",
             "wireless.json",
@@ -2189,10 +2171,9 @@ mod tests {
             "ra-runtime.json",
         ] {
             fs::write(dir.join(name), b"retained recovery evidence").unwrap();
-            assert!(recovery_pending(&dir), "{name}");
+            assert!(recovery_pending(dir), "{name}");
             fs::remove_file(dir.join(name)).unwrap();
         }
-        fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -2294,9 +2275,8 @@ mod tests {
 
     #[test]
     fn temporary_hotspot_off_during_join_keeps_resume_and_restore_generation() {
-        let root = std::env::temp_dir().join(format!("u60-relay-join-hotspot-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = crate::wifi_relay::test_dir::TestDir::new("u60-relay-join-hotspot");
+        let root = temp.path();
         let candidate = Network {
             id: "home".into(),
             ssid: "Home".into(),
@@ -2306,16 +2286,15 @@ mod tests {
             supported: true,
             bssid: "02:00:00:00:00:11".into(),
         };
-        resume::save(&root, &candidate, false).unwrap();
+        resume::save(root, &candidate, false).unwrap();
         let shared = Shared::new();
 
-        assert_eq!(finish_join_hotspot_failure(&shared, false, || resume::clear(&root)), None);
+        assert_eq!(finish_join_hotspot_failure(&shared, false, || resume::clear(root)), None);
         assert!(shared.generation_matches(0));
-        assert!(resume::load(&root).is_some());
+        assert!(resume::load(root).is_some());
 
-        assert_eq!(finish_join_hotspot_failure(&shared, true, || resume::clear(&root)), None);
+        assert_eq!(finish_join_hotspot_failure(&shared, true, || resume::clear(root)), None);
         assert!(!shared.generation_matches(0));
-        assert!(resume::load(&root).is_none());
-        let _ = std::fs::remove_dir_all(&root);
+        assert!(resume::load(root).is_none());
     }
 }

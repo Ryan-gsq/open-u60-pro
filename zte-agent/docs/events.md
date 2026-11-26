@@ -2,7 +2,7 @@
 
 A Server-Sent Events (SSE) stream of JSON for the apps and other integrations, so they can stop polling. On connect it sends the current value of every topic asked for, then only changes. One sampler inside the agent reads values that have no firmware event (signal, traffic, battery, …) once for all open streams, and only while at least one stream wants them. With no stream open nothing is sampled: no timers, no commands.
 
-The web UI's live pages use the same hub through their own cookie-authenticated streams under `/ui/` (see [web-ui.md](web-ui.md)); a page may ask for its own signal cadence as `signal_ms` does (eSIM Profiles: 10 s; otherwise the browser's refresh interval from Settings › Polling, 1–10 s, default 2 s; the fastest stream still wins). This page is about `/api/events`.
+The production console uses a separate authenticated stream at `GET /api/dashboard/events`. In that stream, `topics=tailscale` selects the `tailscale_status` reading. See [console live data](responsive-console.md#live-data) for its envelope, topics and cadence.
 
 ## Request
 
@@ -128,7 +128,7 @@ There are no `id:` lines and `Last-Event-ID` is ignored: the stream carries stat
 ## Client guidance
 
 - **Use a dedicated HTTP client for the stream**, not the one used for requests: no overall (resource) timeout, and a read/idle timeout of at least 45 s (3 × the keep-alive). The apps' request clients would cut the stream (iOS 10 s request / 15 s resource timeouts, Android `readTimeout` 15 s).
-- **Browsers:** `EventSource` cannot send an `Authorization` header, so it cannot open `/api/events`. Use `fetch()` with a stream reader, or a native SSE client. The agent sends no CORS headers, so a page from another origin cannot read the stream; the built-in web UI uses its own `/ui/live/*` streams.
+- **Browsers:** `EventSource` cannot send an `Authorization` header, so it cannot open `/api/events`. Use `fetch()` with a stream reader, or a native SSE client. The agent sends no CORS headers, so a page from another origin cannot read the stream; the built-in console reads its same-origin dashboard stream with `fetch()`.
 - **After `bye`, do not reconnect automatically,** except after `lifetime`: then reconnect at once if the screen is still visible. On `token_expired` or `logged_out` log in first; on `standby` reconnect when the user next opens the screen; on `evicted` stay disconnected. Treat a reason you do not know like `logged_out`.
 - **On a network error** (the connection ended without `bye`), reconnect with the same topics, with a backoff starting at 3 s (`retry: 3000`), doubling up to about a minute: the new stream replaces the old one, which the agent may not have noticed is gone. On 503, wait `Retry-After`. On 401 (after an agent restart, say), log in, then reconnect. On 403 `agent password required`, do not retry.
 - **One stream per set of topics per token.** A second stream with the same topics ends the first (`bye evicted`); combine what one screen needs into one stream.

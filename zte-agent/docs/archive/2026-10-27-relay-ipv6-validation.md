@@ -1,11 +1,15 @@
 # IPv6 relay / NAT66 validation
 
+> **Historical validation · 2026-10-26 and 2026-10-27.** Results apply
+> to the builds and scenarios recorded below. See the [device acceptance index](../README.md#device-acceptance)
+> and the [IPv6 QA instructions](../../tests/relay-ipv6/README.md).
+
 ## 2026-10-27 runtime RA update
 
 The historical results below predate the runtime RA/DNS cutover. The new release
 is installed via setup.sh with factory-password auth and one rc.local hook.
 Full current evidence, limitations and the physical reboot outcome are in
-[network-integration-review.md](network-integration-review.md#runtime-ra-cutover-and-physical-reboot-2026-10-27).
+[network-integration-review.md](2026-10-28-network-integration-review.md#runtime-ra-cutover-and-physical-reboot-2026-10-27).
 Normal Relay no longer changes DHCP/UCI RA options or restores old cellular DNS.
 Actual OpenWrt+B31 RA packets, W AP+STA, downstream NAT66, real Mihomo dual-stack
 HTTPS/non-53 UDP, manual-cellular-off link loss and reboot-then-reconnect pass.
@@ -71,7 +75,7 @@ use `--network none`, disposable namespaces and read-only artifact bindings;
 no host networking or physical router settings are used.
 
 The full lifecycle and RA runners are in
-[tests/relay-ipv6](../tests/relay-ipv6/README.md). Official OpenWrt artifacts are
+[tests/relay-ipv6](../../tests/relay-ipv6/README.md). Official OpenWrt artifacts are
 SHA-256-pinned in that directory. The rule-plan/traffic, real-core and B31
 isolated-bridge runners behind the rows above were removed on 2026-11-12: they
 no longer matched the nftables rules or the Mihomo controller; current rule and

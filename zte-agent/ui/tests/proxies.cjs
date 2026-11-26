@@ -1,4 +1,4 @@
-const assert=require('node:assert/strict'),{chromium}=require('playwright'),{start}=require('./fixture.cjs');
+const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs'),{start,assertQuiet,refreshOn}=require('./fixture.cjs');
 (async()=>{
   let running=false,selectFails=null,modeFails=null,inflight=0,peak=0;
   const nodes={'HK 01':{type:'Trojan',delay:88},'US 02 <i>x</i>':{type:'Vmess',delay:0},'JP 03':{type:'Vless',delay:640},DIRECT:{type:'Direct',delay:null}};
@@ -20,8 +20,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     if(url==='/api/mihomo/proxies/delay'){inflight++;peak=Math.max(peak,inflight);setTimeout(()=>{inflight--;reply({name:body.name,delay:delays[body.name]});},60);return true;}
     return false;
   });
-  const browser=await chromium.launch({headless:true,channel:'chrome'}),page=await browser.newPage({viewport:{width:1440,height:1500}}),errors=[];
+  const browser=await launchChrome(),page=await browser.newPage({viewport:{width:1440,height:1500}}),errors=[];
   page.on('pageerror',error=>errors.push(error.message));
+  await page.clock.install();
   const text=sel=>page.locator(sel).textContent(),posts=()=>fixture.requests.filter(r=>r.method==='POST'),last=()=>posts().at(-1);
   const said=(sel,words)=>page.waitForFunction(([sel,words])=>document.querySelector(sel)?.textContent.includes(words),[sel,words]);
   const confirm=async label=>{await page.locator('.confirm-dialog').getByRole('button',{name:label,exact:true}).click();await page.locator('.confirm-dialog').waitFor({state:'hidden'});};
@@ -46,7 +47,8 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     assert.deepEqual(await group('Proxy').locator('option').allTextContents(),['Auto','HK 01 · 88 ms','US 02 <i>x</i> · Timeout','JP 03 · 640 ms','DIRECT · Untested']);
     assert.equal(await page.locator('.proxy-group i').count(),0,'node names are never parsed as HTML');
     assert.equal(await page.locator('#proxies-mode-select').inputValue(),'rule');
-    const idle=fixture.requests.length;await page.waitForTimeout(1200);assert.equal(fixture.requests.length,idle,'the proxies page does not poll');
+    await assertQuiet(page,fixture.requests,1200,'the proxies page does not poll');
+    await refreshOn(page,fixture,'visibilitychange','/api/mihomo/proxies');
 
     const unchanged=posts().length;
     await page.locator('#proxies-mode-select').selectOption('direct');await confirm('Cancel');
@@ -74,6 +76,9 @@ const assert=require('node:assert/strict'),{chromium}=require('playwright'),{sta
     assert.equal(await page.locator('#proxies-mode-select').inputValue(),'global');modeFails=null;
 
     // Filtering is local and finds groups by their members.
+    await page.locator('#proxies-search').fill('global');assert.deepEqual(await page.locator('.proxy-group h3').allTextContents(),['GLOBAL']);
+    assert.match(await group('GLOBAL').textContent(),/Now: Proxy → JP 03/,'the selected node resolves through a group filtered out of the page');
+    assert.match(await group('GLOBAL').locator('.proxy-delay').textContent(),/390 ms/);
     await page.locator('#proxies-search').fill('jp 03');assert.deepEqual(await page.locator('.proxy-group h3').allTextContents(),['Auto','Proxy'],'only the groups that list JP 03 remain; GLOBAL does not');
     await page.locator('#proxies-search').fill('direct');assert.equal(await page.locator('.proxy-group').count(),2);
     await page.locator('#proxies-search').fill('nothing like this');assert.match(await text('#proxies-groups'),/No group or node matches/);await page.locator('#proxies-search').fill('');

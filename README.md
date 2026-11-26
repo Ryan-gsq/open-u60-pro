@@ -69,7 +69,7 @@ A lightweight Rust HTTP server that runs directly on the router (port 9090, on t
 cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 ```
 
-**189 endpoints across 23 categories:**
+The table summarizes the agent’s API by category. See [network extension routes](zte-agent/docs/network-extensions.md#routes) for request details and the [agent documentation index](zte-agent/docs/README.md) for operating and architecture guides.
 
 | Category | # | Capabilities |
 |---|---|---|
@@ -81,6 +81,7 @@ cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 | SIM | 7 | SIM info, IMEI, PIN management, PUK unlock |
 | Cell/Band | 19 | NR/LTE band locking, cell locking, neighbor scan, STC, signal quality detection |
 | Router | 29 | DNS, LAN/DHCP, firewall, NAT, DMZ, UPnP, port forwarding, QoS, domain filter, APN profiles, VPN/ALG |
+| DHCP reservations | 2 | `GET` and `POST /api/router/reservations` for downstream DHCPv4 bindings |
 | WiFi | 4 | Status, SSID/password/channel/TX power, guest WiFi |
 | USB | 3 | USB mode switching, powerbank control |
 | Telephony | 15 | Voice calls (dial/hangup/answer/DTMF/mute), USSD codes, SIM Toolkit menus |
@@ -92,9 +93,13 @@ cargo build --release --target aarch64-unknown-linux-musl -p zte-agent
 | System | 2 | Process list, kill bloatware |
 | Scheduler | 5 | Scheduled/recurring jobs for any API action |
 | Live updates | 1 | `GET /api/events`: Server-Sent Events of signal, traffic, battery, SIM, eSIM progress and more |
+| Dashboard SSE | 1 | `GET /api/dashboard/events` streams console readings and optional topics |
 | Live Activity | 3 | Register/unregister the iOS Live Activity, status |
 | Agent Update | 6 | Signed Stable/Beta checks, inactive-slot download, guarded install and rollback |
-| Tailscale | 8 | Remote management: setup, login URL, enable/disable, config, logout, update |
+| Wi-Fi Relay | 8 | `GET /api/wifi-relay/status` and `POST` actions for scan, connect, disconnect, clock, forget, offload and power save |
+| Mihomo | 14 | `/api/mihomo/*` covers installation, configuration, start/stop, DIRECT bypass, profiles, extensions, proxy selection and delay, routing mode and the Zashboard pass. `/ui/mihomo/*` serves Zashboard and its bridge |
+| LAN HTTPS | 4 | `GET /api/https` for status and `POST /api/https/{on,renew,reset}` for certificate and listener controls |
+| Tailscale | 10 | Setup, login URL, enable/disable, config, logout and update. `GET /api/tailscale/versions` and `POST /api/tailscale/versions/refresh` discover releases |
 | AT Terminal | 2 | Send AT commands, port info |
 
 ### Web UI (built into the agent)
@@ -105,7 +110,7 @@ Open `http://192.168.0.1:9090/` on the router's Wi-Fi for a dashboard, connectio
 
 Open **`http://192.168.0.1:9090/console/`** on the router’s network. The console is embedded in the agent binary, with no separate frontend server or cloud service. When LAN HTTPS is enabled, use `/console/` on that same HTTPS address. It uses the current agent’s rate-limited bearer sign-in, Host/Origin checks and elapsed-time session expiry; `/` opens this console, and old `/ui/` bookmarks redirect to it. HTTPS and certificate-install controls are in Settings → HTTPS & Install.
 
-The five sections cover Dashboard, Network, SMS, Tools and Settings. They include LTE/NR carrier aggregation and SA/NSA, WAN IPv4/IPv6, offline statistics, Wi-Fi/mobile/APN settings, connected-device traffic and observed peaks, eSIM management, SMS actions/forwarding, operator scanning, diagnostics, LAN/DHCP, firewall, port forwarding, UPnP, DMZ and QoS. Only fields reported by the firmware are presented as measurements or limits. See the [screenshots](#new-responsive-web-ui) and [developer guide](zte-agent/docs/responsive-console.md).
+The five sections cover Dashboard, Network, SMS, Tools and Settings. They include LTE/NR carrier aggregation and SA/NSA, WAN IPv4/IPv6, offline statistics, Wi-Fi/mobile/APN settings, connected-device traffic and observed peaks, eSIM management, SMS actions/forwarding, operator scanning, diagnostics, LAN/DHCP, firewall, port forwarding, UPnP, DMZ and QoS. Network also includes Wi-Fi Relay, Mihomo, Mihomo proxies and Tailscale. Only fields reported by the firmware are presented as measurements or limits. See the [screenshots](#new-responsive-web-ui) and [developer guide](zte-agent/docs/responsive-console.md).
 
 ### Mobile Companion Apps
 
@@ -135,11 +140,15 @@ The Rust agent serves one responsive browser console at **`http://192.168.0.1:90
 | <img src="zte-agent/ui/screenshots/dashboard-mobile-light.png" alt="Phone Web UI with WAN IPv4 and IPv6, live rates and fixed five-tab bottom navigation" width="250"> | <img src="zte-agent/ui/screenshots/signal-tablet-dark.png" alt="Tablet Web UI in dark mode with expandable navigation, 5G NSA status and carrier measurements" width="500"> |
 
 <details>
-<summary>More Web UI previews: dark dashboard, connected devices and eSIM management</summary>
+<summary>More Web UI previews</summary>
 
 <p><img src="zte-agent/ui/screenshots/dashboard-desktop-dark.png" alt="Desktop Web UI dashboard in dark mode" width="1100"></p>
 <p><img src="zte-agent/ui/screenshots/devices-desktop-light.png" alt="Connected Devices with sample MAC/IP addresses, current traffic, observed peaks and separately reported limits" width="1100"></p>
 <p><img src="zte-agent/ui/screenshots/esim-desktop-dark.png" alt="eSIM management in dark mode with active and inactive sample profiles and masked identifiers" width="1100"></p>
+<p><img src="zte-agent/ui/screenshots/relay-desktop-dark.png" alt="Wi-Fi Relay with a sample upstream and saved networks" width="1100"></p>
+<p><img src="zte-agent/ui/screenshots/mihomo-desktop-dark.png" alt="Mihomo running with a demonstration profile library" width="1100"></p>
+<p><img src="zte-agent/ui/screenshots/mihomo-proxies-desktop-dark.png" alt="Mihomo proxies showing routing mode and sample proxy groups" width="1100"></p>
+<p><img src="zte-agent/ui/screenshots/tailscale-desktop-dark.png" alt="Tailscale showing a demonstration tailnet device and version controls" width="1100"></p>
 
 </details>
 
@@ -313,22 +322,22 @@ and the private launcher `/data/local/tmp/start_zte_agent.sh`. It verifies that 
 console loads, that the API rejects unauthenticated requests and that the
 responding process is the supervisor-started slot A, and adds one boot entry
 before `exit 0` in `/etc/rc.local`. Other boot
-commands are preserved, repeated launcher calls do not create duplicate agents,
-and the script keeps an installation-specific rollback directory under `/data`.
+commands are preserved and repeated launcher calls do not create duplicate agents.
+On success `setup.sh` deletes its staging directory. It writes the same new
+build to both slots, so this installation leaves no copy of the prior build.
+Later signed OTA updates can fall back to the previous verified slot during
+an unsuccessful trial. See [OTA recovery](docs/ota-updates.md#failure-behavior).
 It does not reboot the router, set up SSH with `--no-ssh` or enable mobile data.
-Updates may leave Mihomo/Relay on: the new agent first recovers owned network
-changes, then attempts to resume the saved owner choices. Mihomo needs its enabled
-marker; Relay needs the last successfully connected remembered/open network.
-Switching Clash off or disconnecting Relay clears the respective resume choice.
-An older installation without these markers cannot supply missing intent; saved
-profiles or Wi-Fi credentials alone do not enable either extension. See
-[restart policy](zte-agent/docs/network-extensions.md#after-a-restart).
-Wi-Fi Relay, Clash / Mihomo and Clash proxies are pages under **Network** in the
-responsive console (`#network/relay`, `#network/mihomo`, `#network/proxies`); the
-same operations remain available through `/api/wifi-relay/*` and `/api/mihomo/*`.
-**Open Zashboard** on the Clash pages opens the pinned dashboard in a new tab,
-already connected to Clash. Old `/ui/relay` and `/ui/router/mihomo` bookmarks open
-the console pages (see [network extensions](zte-agent/docs/network-extensions.md)).
+After an update, the agent attempts to resume persisted owner choices. Mihomo
+uses its enabled marker, and Wi-Fi Relay uses the last eligible remembered or
+open network. See [After a restart](zte-agent/docs/network-extensions.md#after-a-restart)
+for startup order and retries. When updating from a test build older than
+2026-11-12, disconnect the relay before updating or reboot afterwards. See the
+[recovery notes](zte-agent/docs/network-extensions.md#recovery).
+Under **Network**, use **Wi-Fi Relay**, **Mihomo**, **Mihomo proxies**, or
+**Tailscale**. **Open Zashboard** on the Mihomo pages opens the pinned dashboard
+in a new tab while the core runs. Old `/ui/relay` and `/ui/router/mihomo`
+bookmarks still open the matching console pages. See [network extensions](zte-agent/docs/network-extensions.md).
 In factory-password mode, successful login with the actual password is a manual
 check; setup verifies that the factory verifier loaded without reading plaintext.
 
@@ -369,12 +378,12 @@ Switching, adding, renaming and deleting require an agent password. In the apps:
 1. Connect your phone to the router's WiFi
 2. Open OpenU60 app
 3. Set agent URL: `http://192.168.0.1:9090`
-4. Enter the agent password you set above
+4. Enter the official router admin password if you used `--factory-password` on B31, or the explicit agent password you set during installation
 5. No app? Open http://192.168.0.1:9090/ in a browser instead (see [Web UI](#web-ui)).
 
 ## Web UI
 
-Connect to the router’s Wi-Fi or USB network and open **http://192.168.0.1:9090/**. Sign in with the agent password (`ZTE_AGENT_PASSWORD` in its startup script). The same responsive console works on phones, tablets and desktop computers. Old `/ui/` bookmarks redirect to the corresponding console screen; the old page, form and live-stream routes are retired.
+Connect to the router’s Wi-Fi or USB network and open **http://192.168.0.1:9090/**. With `--factory-password` on B31, sign in with the router’s official admin password. If you installed with an explicit agent password, use that password (`ZTE_AGENT_PASSWORD` in the launcher). The same responsive console works on phones, tablets and desktop computers. Old `/ui/` bookmarks redirect to the corresponding console screen; the old page, form and live-stream routes are retired.
 
 The five sections are Dashboard, Network, SMS, Tools and Settings. They cover live connectivity and carrier aggregation, IPv4/IPv6, connected devices, Wi-Fi/mobile/APN settings, eSIM management, SMS and forwarding, network operators, battery/power details, diagnostics, LAN/DHCP, firewall/DMZ/UPnP, port forwarding, QoS and device controls. Data changes arrive over SSE. JavaScript is required; the console serves its own scripts, styles and fonts without a cloud service.
 
