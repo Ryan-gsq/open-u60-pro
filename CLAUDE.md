@@ -73,3 +73,17 @@ ubus call zwrt_data get_wwaniface '{"source_module":"zte_topsw_data","cid":1}'
 - **Portal.** Use a browser User-Agent to reproduce ZTE's kernel HTTP redirect. Keep the portal RETURN ahead of the vendor redirect and preserve the session's kernel redirect setting. See [hotel authentication](zte-agent/docs/network-extensions.md#hotel-authentication).
 - **Mihomo firewall.** TPROXY needs `bridge-nf-call-ip(6)tables=0`. B31 lacks `NFT_FIB_INET` and the nft bridge family and rejects chain names `fwd`, `post` and `c`. An nft accept cannot override a legacy DROP. Preserve dual-family batches and the legacy accept-only exceptions. Allow kernel bypass only for traffic the active rules would send DIRECT. See [firewall and rule changes](zte-agent/docs/relay-mihomo-architecture.md#53-拦截表).
 - **Mihomo controller.** One thread owns the core and its effects. Routing writes tighten first, write and read back, then reset lost DIRECT software connections, with a LAN IPv4 fallback when the lost scope is unknown or too broad. Every `to_core` ends with a TCP/UDP drop. Enter D3 direct only after confirming core exit and withdrawing interception. See [Mihomo architecture](zte-agent/docs/relay-mihomo-architecture.md#5-mihomo) and [batch 4 keep-alive evidence](zte-agent/docs/archive/2026-11-12-relay-mihomo-implementation.md#batch-4).
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `Ryan-gsq/open-u60-pro` (fork). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical five-role triage labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context (`GLOSSARY.md` and `docs/adr/` at the repo root). See `docs/agents/domain.md`.
