@@ -1174,7 +1174,7 @@ bodies. A console login can obtain the dedicated Zashboard bridge pass cookie.
 | GET | `/ui/mihomo/dashboard/*` | Running-only local third-party panel, pass cookie required |
 | restricted | `/ui/mihomo/api/*` | Same-origin pass-cookie HTTP/WebSocket bridge |
 
-See [Tailscale routes](#tailscale-routes) for the ten remote-management endpoints.
+See [Tailscale routes](#tailscale-routes) for the remote-management and Tailscale Services endpoints.
 
 Relay `phase` is `idle`, `scanning`, `connecting`, `active`, `recovering`,
 `disconnecting` or `recovery_pending`. `recovering` covers association recovery
@@ -1211,6 +1211,11 @@ boot restoration.
 | PUT | `/api/tailscale/config` | Apply a partial update to managed settings and return refreshed status |
 | POST | `/api/tailscale/logout` | Log out of Tailscale |
 | POST | `/api/tailscale/update` | Update to the selected version with SHA-256 verification |
+| GET | `/api/tailscale/services` | Aggregate `ServeConfig`, `Prefs.AdvertiseServices`, `Self.CapMap`, and `Self.PrimaryRoutes` for `svc:*` services |
+| PUT | `/api/tailscale/services/:name` | Atomically create or update one `svc:<name>` service via `If-Match`-guarded `POST /localapi/v0/serve-config` |
+| POST | `/api/tailscale/services/:name/drain` | Stop accepting new connections for `svc:<name>` while retaining saved handlers |
+| POST | `/api/tailscale/services/:name/advertise` | Resume advertising `svc:<name>` to the tailnet |
+| DELETE | `/api/tailscale/services/:name` | Clear all handlers and advertisement for `svc:<name>` |
 
 Send the managed fields you want to change with `PUT /api/tailscale/config`.
 Omitted fields keep their saved values. The managed fields are `hostname`,
@@ -1228,6 +1233,19 @@ state. `routing.exit` shows `advertised`, `via_mihomo`, and approval states in
 preferences match, `pending_daemon` when saved changes are waiting to apply,
 `drift` when the running daemon differs, or `unknown` when the comparison is
 unavailable.
+
+Tailscale Services (`svc:*`) use `tailscaled`'s own `ServeConfig` in
+`/data/tailscale/tailscaled.state` as the sole source of truth. Reads are
+fork-free over `/localapi/v0/serve-config`, `/localapi/v0/prefs`, and
+`/localapi/v0/status?peers=false`. Single-service writes validate syntax, port
+conflicts, and HTTPS path uniqueness, preserve all other services and node-level
+Serve entries verbatim, pass the `ETag` via `If-Match` (returning HTTP 409 on
+concurrent edits), refuse to silently overwrite CLI-only advanced handlers
+(`Text`, plaintext `HTTP`, `TerminateTLS`, `ProxyProtocol`, `AcceptAppCaps`,
+`--tun`), and automatically advertise newly created services while preserving
+an existing service's drained state on edit. All Tailscale Services endpoints
+run on the Slow lane and require authentication, CSRF/Origin checks, and
+serialization through `prefs_lock`.
 
 ### Tailscale kernel-TUN and Clean DNS
 

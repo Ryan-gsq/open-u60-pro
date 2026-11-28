@@ -8,11 +8,13 @@ pub(crate) mod clean_dns;
 pub mod config;
 mod localapi;
 pub(crate) mod netplane;
+mod services;
 mod supervisor;
 mod update;
 
 pub use config::TsConfig;
 pub(crate) use netplane::{nft_command, recover as recover_network};
+pub use services::{service_advertise, service_delete, service_drain, service_put, services_list};
 pub use update::{update, versions, versions_refresh};
 
 use localapi::{

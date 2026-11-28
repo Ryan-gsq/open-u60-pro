@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{cli_with_timeout, SOCK};
 
@@ -19,6 +20,7 @@ use super::{cli_with_timeout, SOCK};
 const STATUS_PATH: &str = "/localapi/v0/status?peers=false";
 const FULL_STATUS_PATH: &str = "/localapi/v0/status";
 const PREFS_PATH: &str = "/localapi/v0/prefs";
+const SERVE_CONFIG_PATH: &str = "/localapi/v0/serve-config";
 /// A peerless status is a few KB; anything larger is not tailscaled.
 const LOCALAPI_MAX_BYTES: usize = 1024 * 1024;
 /// Streaming cap for full `/localapi/v0/status` including large tailnet peer maps.
@@ -28,6 +30,15 @@ const LOCALAPI_MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Logged once per process: LocalAPI failing while the CLI works means the
 /// fork-free path is broken, which would otherwise be invisible.
 static LOCALAPI_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(super) struct CurrentTailnet {
+    #[serde(rename = "MagicDNSSuffix", default)]
+    pub magic_dns_suffix: Option<String>,
+    #[serde(rename = "MagicDNSEnabled", default)]
+    pub _magic_dns_enabled: bool,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -45,6 +56,10 @@ pub(super) struct Status {
     #[serde(default, deserialize_with = "null_default")]
     pub health: Vec<String>,
     pub version: Option<String>,
+    #[serde(rename = "MagicDNSSuffix", default)]
+    pub magic_dns_suffix: Option<String>,
+    #[serde(rename = "CurrentTailnet", default)]
+    pub current_tailnet: Option<CurrentTailnet>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -69,6 +84,10 @@ pub(super) struct SelfStatus {
     pub exit_node_option: bool,
     #[serde(rename = "ExitNode", default)]
     pub _exit_node: bool,
+    #[serde(default, deserialize_with = "null_default")]
+    pub tags: Vec<String>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub cap_map: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -136,6 +155,8 @@ impl<'de> Deserialize<'de> for FullStatus {
                 let mut self_status = None;
                 let mut health = Vec::new();
                 let mut version = None;
+                let mut magic_dns_suffix = None;
+                let mut current_tailnet = None;
                 let mut peers = Vec::new();
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -150,6 +171,8 @@ impl<'de> Deserialize<'de> for FullStatus {
                             health = map.next_value::<Option<Vec<String>>>()?.unwrap_or_default();
                         }
                         "Version" => version = map.next_value()?,
+                        "MagicDNSSuffix" => magic_dns_suffix = map.next_value()?,
+                        "CurrentTailnet" => current_tailnet = map.next_value()?,
                         "Peer" => {
                             peers = map.next_value::<Option<PeersVec>>()?.map_or_else(Vec::new, |p| p.0);
                         }
@@ -167,6 +190,8 @@ impl<'de> Deserialize<'de> for FullStatus {
                         self_status,
                         health,
                         version,
+                        magic_dns_suffix,
+                        current_tailnet,
                     },
                     peers,
                 })
@@ -177,12 +202,14 @@ impl<'de> Deserialize<'de> for FullStatus {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(super) struct Prefs {
     pub netfilter_mode: Option<i32>,
     #[serde(default, deserialize_with = "null_default")]
     pub advertise_routes: Vec<String>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub advertise_services: Vec<String>,
     #[serde(rename = "WantRunning")]
     pub _want_running: Option<bool>,
     #[serde(rename = "CorpDNS")]
@@ -311,18 +338,12 @@ fn connect_until(path: &Path, deadline: Instant) -> Result<UnixStream, LocalApiE
     }
 }
 
-fn localapi_get<T: DeserializeOwned>(path: &str, deadline: Instant) -> Result<T, LocalApiError> {
-    localapi_get_at(Path::new(SOCK), path, deadline)
-}
-
-fn localapi_get_at<T: DeserializeOwned>(
+fn localapi_request_raw(
     sock: &Path,
-    path: &str,
+    mut request: &[u8],
     deadline: Instant,
-) -> Result<T, LocalApiError> {
+) -> Result<Vec<u8>, LocalApiError> {
     let mut stream = connect_until(sock, deadline)?;
-    let head = format!("GET {path} HTTP/1.0\r\nHost: local-tailscaled.sock\r\n\r\n");
-    let mut request = head.as_bytes();
     while !request.is_empty() {
         remaining(deadline)?;
         match stream.write(request) {
@@ -360,6 +381,20 @@ fn localapi_get_at<T: DeserializeOwned>(
             Err(e) => return Err(io_err(e)),
         }
     }
+    Ok(raw)
+}
+
+fn localapi_get<T: DeserializeOwned>(path: &str, deadline: Instant) -> Result<T, LocalApiError> {
+    localapi_get_at(Path::new(SOCK), path, deadline)
+}
+
+fn localapi_get_at<T: DeserializeOwned>(
+    sock: &Path,
+    path: &str,
+    deadline: Instant,
+) -> Result<T, LocalApiError> {
+    let head = format!("GET {path} HTTP/1.0\r\nHost: local-tailscaled.sock\r\n\r\n");
+    let raw = localapi_request_raw(sock, head.as_bytes(), deadline)?;
     parse_localapi_response(&raw).map_err(LocalApiError::Other)
 }
 
@@ -623,6 +658,132 @@ pub(super) fn daemon_status_at_until<T: DeserializeOwned>(
 
 pub(super) fn daemon_prefs_at_until(sock: &Path, deadline: Instant) -> Option<Prefs> {
     localapi_get_at(sock, PREFS_PATH, deadline).ok()
+}
+
+#[derive(Debug)]
+pub(super) struct LocalApiResponse<T> {
+    pub body: T,
+    pub etag: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) enum LocalApiWriteError {
+    Timeout,
+    PreconditionFailed,
+    HttpStatus(u16, String),
+    Other(String),
+}
+
+fn split_localapi_http(raw: &[u8]) -> Result<(u16, Option<String>, &[u8]), String> {
+    let (head_len, sep_len) = (0..raw.len())
+        .find_map(|i| {
+            if raw[i..].starts_with(b"\r\n\r\n") {
+                Some((i, 4))
+            } else if raw[i..].starts_with(b"\n\n") {
+                Some((i, 2))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| "incomplete HTTP response (no end of headers)".to_string())?;
+    let head = String::from_utf8_lossy(&raw[..head_len]);
+    let mut lines = head.lines();
+    let status_line = lines.next().unwrap_or("");
+    let mut parts = status_line.splitn(3, ' ');
+    let version = parts.next().unwrap_or("");
+    let code_str = parts.next().unwrap_or("");
+    if !version.starts_with("HTTP/1.") {
+        return Err("not an HTTP response".into());
+    }
+    let code = code_str
+        .parse::<u16>()
+        .map_err(|_| "invalid HTTP status code".to_string())?;
+    let mut etag = None;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value.eq_ignore_ascii_case("chunked")
+            {
+                return Err("chunked localapi response".into());
+            }
+            if name.eq_ignore_ascii_case("etag") && !value.is_empty() {
+                etag = Some(value.to_string());
+            }
+        }
+    }
+    Ok((code, etag, &raw[head_len + sep_len..]))
+}
+
+pub(super) fn daemon_serve_config_at_until(
+    sock: &Path,
+    deadline: Instant,
+) -> Result<LocalApiResponse<Value>, String> {
+    let head = format!("GET {SERVE_CONFIG_PATH} HTTP/1.0\r\nHost: local-tailscaled.sock\r\n\r\n");
+    let raw = match localapi_request_raw(sock, head.as_bytes(), deadline) {
+        Ok(v) => v,
+        Err(LocalApiError::Timeout) => return Err("tailscale serve-config timed out".into()),
+        Err(LocalApiError::Other(e)) => return Err(e),
+    };
+    let (code, etag, body_bytes) = split_localapi_http(&raw)?;
+    if code != 200 {
+        return Err(format!("LocalAPI returned HTTP {code}"));
+    }
+    let trimmed = String::from_utf8_lossy(body_bytes);
+    let body = if trimmed.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_slice::<Value>(body_bytes) {
+            Ok(Value::Null) => json!({}),
+            Ok(v) => v,
+            Err(e) => {
+                return Err(format!(
+                    "parse localapi JSON at line {}, column {}",
+                    e.line(),
+                    e.column()
+                ))
+            }
+        }
+    };
+    Ok(LocalApiResponse { body, etag })
+}
+
+pub(super) fn daemon_set_serve_config_at_until(
+    sock: &Path,
+    config: &Value,
+    if_match: Option<&str>,
+    deadline: Instant,
+) -> Result<(), LocalApiWriteError> {
+    let body = serde_json::to_vec(config)
+        .map_err(|e| LocalApiWriteError::Other(format!("encode serve config: {e}")))?;
+    let mut head = format!(
+        "POST {SERVE_CONFIG_PATH} HTTP/1.0\r\nHost: local-tailscaled.sock\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if let Some(etag) = if_match.map(str::trim).filter(|e| !e.is_empty()) {
+        if !etag.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            head.push_str(&format!("If-Match: {etag}\r\n"));
+        }
+    }
+    head.push_str("\r\n");
+    let mut req = head.into_bytes();
+    req.extend_from_slice(&body);
+    let raw = match localapi_request_raw(sock, &req, deadline) {
+        Ok(v) => v,
+        Err(LocalApiError::Timeout) => return Err(LocalApiWriteError::Timeout),
+        Err(LocalApiError::Other(e)) => return Err(LocalApiWriteError::Other(e)),
+    };
+    let (code, _, resp_body) = split_localapi_http(&raw).map_err(LocalApiWriteError::Other)?;
+    if (200..=299).contains(&code) {
+        Ok(())
+    } else if code == 412 {
+        Err(LocalApiWriteError::PreconditionFailed)
+    } else {
+        let msg = String::from_utf8_lossy(resp_body).trim().to_string();
+        let snippet: String = msg.chars().take(240).collect();
+        Err(LocalApiWriteError::HttpStatus(code, snippet))
+    }
 }
 
 pub(super) fn daemon_full_status_until(deadline: Instant) -> Result<FullStatus, String> {
@@ -936,5 +1097,109 @@ mod tests {
             localapi_get_at::<Prefs>(&path, PREFS_PATH, Instant::now()),
             Err(LocalApiError::Timeout)
         ));
+    }
+
+    #[test]
+    fn serve_config_get_and_post_round_trip_with_etag_and_412() {
+        let path = sock_path("serve-cfg-get");
+        let server = serve_once(
+            &path,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nEtag: abc123\r\n\r\n{\"Services\":{\"svc:demo\":{\"TCP\":{\"443\":{\"HTTPS\":true}}}}}\n",
+        );
+        let resp =
+            daemon_serve_config_at_until(&path, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert_eq!(resp.etag.as_deref(), Some("abc123"));
+        assert_eq!(resp.body["Services"]["svc:demo"]["TCP"]["443"]["HTTPS"], true);
+        assert_eq!(server.join().unwrap()[0], "GET /localapi/v0/serve-config HTTP/1.0");
+        let _ = std::fs::remove_file(&path);
+
+        let path_post = sock_path("serve-cfg-post");
+        let _ = std::fs::remove_file(&path_post);
+        let listener = UnixListener::bind(&path_post).unwrap();
+        let post_server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                    let cl = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim().eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= pos + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            String::from_utf8(buf).unwrap()
+        });
+        daemon_set_serve_config_at_until(
+            &path_post,
+            &json!({"Services":{}}),
+            Some("abc123"),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let raw_req = post_server.join().unwrap();
+        assert!(raw_req.starts_with("POST /localapi/v0/serve-config HTTP/1.0\r\n"));
+        assert!(raw_req.contains("If-Match: abc123\r\n"));
+        assert!(raw_req.ends_with("{\"Services\":{}}"));
+        let _ = std::fs::remove_file(&path_post);
+
+        let path_412 = sock_path("serve-cfg-412");
+        let _srv = serve_once(&path_412, "HTTP/1.0 412 Precondition Failed\r\n\r\netag mismatch\n");
+        let err = daemon_set_serve_config_at_until(
+            &path_412,
+            &json!({}),
+            Some("stale"),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(matches!(err, LocalApiWriteError::PreconditionFailed));
+        let _ = std::fs::remove_file(&path_412);
+    }
+
+    #[test]
+    fn parses_self_capmap_tags_magic_dns_and_advertise_services() {
+        let status: Status = serde_json::from_str(
+            r#"{
+              "BackendState": "Running",
+              "MagicDNSSuffix": "tail.ts.net",
+              "CurrentTailnet": {"MagicDNSSuffix": "tail.ts.net", "MagicDNSEnabled": true},
+              "Self": {
+                "Online": true,
+                "DNSName": "u60-pro.tail.ts.net.",
+                "Tags": ["tag:t3"],
+                "CapMap": {
+                  "https": null,
+                  "service-host": [{"svc:app": ["100.75.1.9"]}],
+                  "services/app": [{"Name": "svc:app", "Addrs": ["100.75.1.9"], "Ports": ["tcp:443"]}]
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(status.magic_dns_suffix.as_deref(), Some("tail.ts.net"));
+        let self_st = status.self_status.unwrap();
+        assert_eq!(self_st.tags, ["tag:t3"]);
+        assert!(self_st.cap_map.contains_key("https"));
+        assert!(self_st.cap_map.contains_key("services/app"));
+
+        let prefs: Prefs =
+            serde_json::from_str(r#"{"AdvertiseServices":["svc:app"]}"#).unwrap();
+        assert_eq!(prefs.advertise_services, ["svc:app"]);
     }
 }

@@ -544,6 +544,23 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Put, "/api/tailscale/config") => tailscale::config_set(state, body),
         (&Method::Post, "/api/tailscale/logout") => tailscale::logout(state),
         (&Method::Post, "/api/tailscale/update") => tailscale::update(state, body),
+        (&Method::Get, "/api/tailscale/services") => tailscale::services_list(state),
+        (&Method::Put, p) if p.starts_with("/api/tailscale/services/") => {
+            tailscale::service_put(state, &p["/api/tailscale/services/".len()..], body)
+        }
+        (&Method::Delete, p) if p.starts_with("/api/tailscale/services/") => {
+            tailscale::service_delete(state, &p["/api/tailscale/services/".len()..])
+        }
+        (&Method::Post, p) if p.starts_with("/api/tailscale/services/") => {
+            let rest = &p["/api/tailscale/services/".len()..];
+            if let Some(name) = rest.strip_suffix("/drain") {
+                tailscale::service_drain(state, name)
+            } else if let Some(name) = rest.strip_suffix("/advertise") {
+                tailscale::service_advertise(state, name)
+            } else {
+                (404, error_body("not found"))
+            }
+        }
         // LAN test (download/upload handled above before body read)
         (&Method::Get, "/api/lan/ping") => lan_test::ping(),
         // Speed test
@@ -914,5 +931,47 @@ mod tests {
         assert_eq!(route(&Method::Get, "/api/mihomo/profiles/0a1b2c3d4e5f6071", &state, b"").0, 404);
         assert_eq!(route(&Method::Delete, "/api/mihomo/profiles/0a1b2c3d4e5f6071", &state, b"").0, 404);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tailscale_services_routes_use_slow_lane_and_enforce_csrf_and_name_validation() {
+        for (method, path) in [
+            (Method::Get, "/api/tailscale/services"),
+            (Method::Put, "/api/tailscale/services/demo"),
+            (Method::Post, "/api/tailscale/services/demo/drain"),
+            (Method::Post, "/api/tailscale/services/demo/advertise"),
+            (Method::Delete, "/api/tailscale/services/demo"),
+        ] {
+            assert_eq!(lane(method, path), Lane::Slow, "{method:?} {path}");
+        }
+        assert_eq!(lane(Method::Get, "/api/tailscale/status"), Lane::General);
+
+        let auth = with_password();
+        let token = auth.login(PW, Kind::Bearer, peer(2), &[]).unwrap();
+        let t = Some(token.token.expose());
+        let h = host("192.168.0.1:9090");
+        let cross = ReqHeaders { origin: Some("http://evil.com"), ..h };
+        for (method, path) in [
+            (Method::Put, "/api/tailscale/services/demo"),
+            (Method::Post, "/api/tailscale/services/demo/drain"),
+            (Method::Post, "/api/tailscale/services/demo/advertise"),
+            (Method::Delete, "/api/tailscale/services/demo"),
+        ] {
+            assert_eq!(
+                run(&auth, &info(method, path, None, t, cross)),
+                reply(403, "cross-origin request refused"),
+                "{method:?} {path}"
+            );
+            assert_eq!(
+                run(&auth, &info(method, path, None, None, h)),
+                reply(401, "unauthorized"),
+                "{method:?} {path}"
+            );
+        }
+
+        let state = AppState::new();
+        state.auth.set_password(PW);
+        assert_eq!(route(&Method::Put, "/api/tailscale/services/BadName", &state, b"{}").0, 400);
+        assert_eq!(route(&Method::Post, "/api/tailscale/services/demo/unknown", &state, b"").0, 404);
     }
 }

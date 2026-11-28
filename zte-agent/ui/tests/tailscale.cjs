@@ -50,6 +50,127 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
   let configError = null;
   let mihomo = {running: true};
   const dns = {running: true, config: {enabled: true, transport: 'doh'}};
+  const lanClients = {
+    hosts: {
+      'aa:bb:cc:dd:ee:01': {name: 'DevBox', ipaddrs: ['192.168.0.124'], ip6addrs: ['fe80::1']},
+      'aa:bb:cc:dd:ee:02': {name: 'DynamicLaptop', ipaddrs: ['192.168.0.150'], ip6addrs: []}
+    },
+    dhcp_leases: [{macaddr: 'aa:bb:cc:dd:ee:02', hostname: 'DynamicLaptop', ipaddr: '192.168.0.150'}]
+  };
+  const dhcpReservations = {
+    entries: [{id: 'res-1', mac: 'aa:bb:cc:dd:ee:01', ip: '192.168.0.124', name: 'DevBox'}]
+  };
+  let servicesStore = [
+    {
+      name: 't3code',
+      service: 'svc:t3code',
+      fqdn: 't3code.tail1234.ts.net',
+      admin_url: 'https://console.tailscale.com/admin/services/svc:t3code',
+      state: 'active',
+      configured: true,
+      advertised: true,
+      drained: false,
+      approved: true,
+      editable: true,
+      unsupported_reasons: [],
+      vips: ['100.75.136.27'],
+      primary_vips: ['100.75.136.27'],
+      allowed_vips: ['100.75.136.27'],
+      tailnet_ports: ['tcp:443', 'tcp:3773'],
+      configured_ports: [443, 3773],
+      unallowed_ports: [],
+      access_urls: ['https://t3code.tail1234.ts.net', 'tcp://t3code.tail1234.ts.net:3773'],
+      rules: [
+        {protocol: 'https', port: 443, path: '/', target: 'http://192.168.0.124:3773', access_url: 'https://t3code.tail1234.ts.net', port_allowed: true, target_ip: '192.168.0.124', target_kind: 'lan_private', subnet_route_state: 'approved'},
+        {protocol: 'tcp', port: 3773, target: '192.168.0.124:3773', access_url: 'tcp://t3code.tail1234.ts.net:3773', port_allowed: true, target_ip: '192.168.0.124', target_kind: 'lan_private', subnet_route_state: 'approved'}
+      ]
+    },
+    {
+      name: 'mismatch',
+      service: 'svc:mismatch',
+      fqdn: 'mismatch.tail1234.ts.net',
+      admin_url: 'https://console.tailscale.com/admin/services/svc:mismatch',
+      state: 'port_mismatch',
+      configured: true,
+      advertised: true,
+      drained: false,
+      approved: true,
+      editable: true,
+      unsupported_reasons: [],
+      vips: ['100.75.136.28'],
+      primary_vips: ['100.75.136.28'],
+      allowed_vips: ['100.75.136.28'],
+      tailnet_ports: ['tcp:443'],
+      configured_ports: [443, 8443],
+      unallowed_ports: [8443],
+      access_urls: ['https://mismatch.tail1234.ts.net', 'tcp://mismatch.tail1234.ts.net:8443'],
+      rules: [
+        {protocol: 'https', port: 443, path: '/', target: 'http://192.168.0.124:8080', access_url: 'https://mismatch.tail1234.ts.net', port_allowed: true, target_ip: '192.168.0.124', target_kind: 'lan_private', subnet_route_state: 'approved'},
+        {protocol: 'tcp', port: 8443, target: '192.168.0.124:8443', access_url: 'tcp://mismatch.tail1234.ts.net:8443', port_allowed: false, target_ip: '192.168.0.124', target_kind: 'lan_private', subnet_route_state: 'approved'}
+      ]
+    },
+    {
+      name: 'cli-only',
+      service: 'svc:cli-only',
+      fqdn: 'cli-only.tail1234.ts.net',
+      admin_url: 'https://console.tailscale.com/admin/services/svc:cli-only',
+      state: 'active',
+      configured: true,
+      advertised: true,
+      drained: false,
+      approved: true,
+      editable: false,
+      unsupported_reasons: ['plain text handler on port 443 / is CLI-only'],
+      vips: ['100.75.136.29'],
+      primary_vips: ['100.75.136.29'],
+      allowed_vips: ['100.75.136.29'],
+      tailnet_ports: ['tcp:443'],
+      configured_ports: [443],
+      unallowed_ports: [],
+      access_urls: [],
+      rules: []
+    },
+    {
+      name: 'assigned-only',
+      service: 'svc:assigned-only',
+      fqdn: 'assigned-only.tail1234.ts.net',
+      admin_url: 'https://console.tailscale.com/admin/services/svc:assigned-only',
+      state: 'unconfigured',
+      configured: false,
+      advertised: false,
+      drained: false,
+      approved: false,
+      editable: true,
+      unsupported_reasons: [],
+      vips: ['100.75.136.30'],
+      primary_vips: [],
+      allowed_vips: [],
+      tailnet_ports: ['tcp:443'],
+      configured_ports: [],
+      unallowed_ports: [],
+      access_urls: [],
+      rules: []
+    }
+  ];
+  function servicesPayload() {
+    const running = status.backend_state === 'Running';
+    if (!running) {
+      return {available: false, reason: 'Enable and sign in to Tailscale.', backend_state: status.backend_state, magic_dns_suffix: null, https_enabled: false, tags: [], advertised_routes: [], approved_routes: [], lan_subnets: [], router_ips: [], services: []};
+    }
+    return {
+      available: true,
+      reason: null,
+      backend_state: 'Running',
+      magic_dns_suffix: 'tail1234.ts.net',
+      https_enabled: true,
+      tags: ['tag:t3'],
+      advertised_routes: status.advertise_routes,
+      approved_routes: (status.routing?.routes || []).filter(r => r.state === 'approved').map(r => r.prefix),
+      lan_subnets: ['192.168.0.0/24'],
+      router_ips: ['192.168.0.1'],
+      services: servicesStore
+    };
+  }
 
   function updateRouting() {
     const running = status.backend_state === 'Running';
@@ -207,6 +328,87 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
       };
       updateRouting();
       reply({status: 'logged_out', warning: 'daemon unavailable — remove this machine in the admin console'});
+      return true;
+    }
+    if (method === 'GET' && url === '/api/tailscale/services') {
+      reply(servicesPayload());
+      return true;
+    }
+    if (method === 'GET' && url === '/api/network/clients') {
+      reply(lanClients);
+      return true;
+    }
+    if (method === 'GET' && url === '/api/router/reservations') {
+      reply(dhcpReservations);
+      return true;
+    }
+    if (method === 'PUT' && url.startsWith('/api/tailscale/services/')) {
+      const name = decodeURIComponent(url.slice('/api/tailscale/services/'.length));
+      const existing = servicesStore.find(s => s.name === name);
+      if (existing && existing.editable === false) {
+        fail(`svc:${name} contains CLI-only handlers`, 409);
+        return true;
+      }
+      const rules = (body?.rules || []).map(r => ({
+        ...r,
+        access_url: r.protocol === 'https'
+          ? `https://${name}.tail1234.ts.net${r.port === 443 ? '' : `:${r.port}`}${r.path && r.path !== '/' ? r.path : ''}`
+          : `tcp://${name}.tail1234.ts.net:${r.port}`,
+        port_allowed: null,
+        target_ip: null,
+        target_kind: 'lan_private',
+        subnet_route_state: 'not_advertised'
+      }));
+      const next = {
+        name,
+        service: `svc:${name}`,
+        fqdn: `${name}.tail1234.ts.net`,
+        admin_url: `https://console.tailscale.com/admin/services/svc:${name}`,
+        state: existing?.approved ? 'active' : 'pending',
+        configured: true,
+        advertised: existing ? existing.advertised || !existing.configured : true,
+        drained: existing?.drained === true,
+        approved: existing?.approved === true,
+        editable: true,
+        unsupported_reasons: [],
+        vips: existing?.vips || [],
+        primary_vips: existing?.primary_vips || [],
+        allowed_vips: existing?.allowed_vips || [],
+        tailnet_ports: existing?.tailnet_ports || [],
+        configured_ports: [...new Set(rules.map(r => r.port))],
+        unallowed_ports: [],
+        access_urls: rules.map(r => r.access_url),
+        rules
+      };
+      if (existing) Object.assign(existing, next);
+      else servicesStore.push(next);
+      reply(servicesPayload());
+      return true;
+    }
+    if (method === 'POST' && url.startsWith('/api/tailscale/services/') && url.endsWith('/drain')) {
+      const name = decodeURIComponent(url.slice('/api/tailscale/services/'.length, -'/drain'.length));
+      const svc = servicesStore.find(s => s.name === name);
+      if (!svc) { fail('not found', 404); return true; }
+      svc.advertised = false;
+      svc.drained = true;
+      svc.state = 'drained';
+      reply(servicesPayload());
+      return true;
+    }
+    if (method === 'POST' && url.startsWith('/api/tailscale/services/') && url.endsWith('/advertise')) {
+      const name = decodeURIComponent(url.slice('/api/tailscale/services/'.length, -'/advertise'.length));
+      const svc = servicesStore.find(s => s.name === name);
+      if (!svc) { fail('not found', 404); return true; }
+      svc.advertised = true;
+      svc.drained = false;
+      svc.state = svc.approved ? 'active' : 'pending';
+      reply(servicesPayload());
+      return true;
+    }
+    if (method === 'DELETE' && url.startsWith('/api/tailscale/services/')) {
+      const name = decodeURIComponent(url.slice('/api/tailscale/services/'.length));
+      servicesStore = servicesStore.filter(s => s.name !== name);
+      reply(servicesPayload());
       return true;
     }
     return false;
@@ -678,6 +880,62 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     updateRouting();
     fixture.patch({tailscale_status: envelope(status)});
     await routeRow(longPrefix).waitFor();
+
+    // 5g. Tailscale Services (svc:*) panel: merged list, states, hints, picker, CRUD, drain/advertise/clear.
+    const services = page.locator('#tailscale-services');
+    await services.locator('[data-service="svc:t3code"]').waitFor({state: 'visible'});
+    assert.match(await services.locator('[data-service="svc:t3code"]').textContent(), /Active/);
+    assert.match(await services.locator('[data-service="svc:mismatch"]').textContent(), /Port mismatch/);
+    assert.match(await services.locator('[data-service="svc:mismatch"]').textContent(), /8443/);
+    assert.match(await services.locator('[data-service="svc:cli-only"]').textContent(), /Read-only CLI configuration/);
+    assert.equal(await services.locator('[data-service="svc:cli-only"]').getByRole('button', {name: 'Edit', exact: true}).count(), 0);
+    assert.match(await services.locator('[data-service="svc:assigned-only"]').textContent(), /Unconfigured/);
+    const svcAdmin = services.locator('[data-service="svc:t3code"] a', {hasText: 'Tailscale admin'});
+    assert.equal(await svcAdmin.getAttribute('href'), 'https://console.tailscale.com/admin/services/svc:t3code');
+    assert.equal(await svcAdmin.getAttribute('rel'), 'noopener noreferrer');
+
+    // Add a new service with multi-path HTTPS + TCP + dynamic DHCP & missing-subnet hints + device quick-pick.
+    await button('Add service').click();
+    await page.locator('#tailscale-service-editor').waitFor({state: 'visible'});
+    await page.waitForFunction(() => document.querySelector('#tailscale-svc-pick-0')?.options.length >= 3);
+    assert.doesNotMatch(await services.textContent(), /aa:bb:cc:dd/i, 'full MAC never leaks into Services picker');
+    await page.locator('#tailscale-service-name').fill('my-web');
+    await page.locator('#tailscale-svc-pick-0').selectOption('192.168.0.150');
+    await page.locator('#tailscale-svc-target-0').fill('http://192.168.0.150:8080');
+    // Both non-blocking hints appear for dynamic IP on unapproved/unadvertised subnet (10.99.0.5) & unreserved IP (192.168.0.150).
+    await services.locator('[data-kind="dhcp"]').waitFor({state: 'visible'});
+    assert.equal(await services.locator('[data-kind="dhcp"] a').getAttribute('href'), '#network/lan');
+    await button('+ Add rule').click();
+    await page.locator('#tailscale-svc-port-1').fill('443');
+    await page.locator('#tailscale-svc-path-1').fill('/api');
+    await page.locator('#tailscale-svc-target-1').fill('https+insecure://10.99.0.5:8443');
+    await services.locator('[data-kind="subnet"]').waitFor({state: 'visible'});
+    assert.match(await services.locator('[data-kind="subnet"]').textContent(), /10\.99\.0\.5/);
+    await button('+ Add rule').click();
+    await page.locator('#tailscale-svc-proto-2').selectOption('tcp');
+    await page.locator('#tailscale-svc-port-2').fill('9001');
+    await page.locator('#tailscale-svc-target-2').fill('unix:/tmp/my.sock');
+    await button('Save service').click();
+    await said('#tailscale-services .action-status', 'svc:my-web saved.');
+    await services.locator('[data-service="svc:my-web"]').waitFor({state: 'visible'});
+    const lastSvcPut = fixture.requests.filter(r => r.method === 'PUT' && r.url === '/api/tailscale/services/my-web').at(-1);
+    assert.equal(lastSvcPut.body.rules.length, 3);
+
+    // Drain, Advertise, and Clear with confirmation dialog.
+    const myWebCard = services.locator('[data-service="svc:my-web"]');
+    await myWebCard.getByRole('button', {name: 'Drain', exact: true}).click();
+    await confirm('Drain service');
+    await said('#tailscale-services .action-status', 'svc:my-web drained.');
+    assert.match(await myWebCard.textContent(), /Drained/);
+    await myWebCard.getByRole('button', {name: 'Advertise', exact: true}).click();
+    await confirm('Advertise service');
+    await said('#tailscale-services .action-status', 'svc:my-web advertised.');
+    await myWebCard.getByRole('button', {name: 'Clear', exact: true}).click();
+    assert.match(await text('.confirm-dialog'), /Remove all local serve handlers for svc:my-web/);
+    await confirm('Clear svc:my-web');
+    await said('#tailscale-services .action-status', 'svc:my-web cleared.');
+    assert.equal(await myWebCard.count(), 0);
+    assert.equal(await services.locator('[data-service="svc:t3code"]').count(), 1, 'clearing one service preserves others');
 
     // 6. Responsive & theme checks at 320, 390, 820 and 1440 in light & dark modes.
     for (const width of [320, 390, 820, 1440]) {

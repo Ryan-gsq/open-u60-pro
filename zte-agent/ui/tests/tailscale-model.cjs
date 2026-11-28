@@ -309,4 +309,110 @@ assert.deepEqual(M.lastUpdateSummary({version: '1.86.2', ok: false, error: 'sha2
   text: 'Update to v1.86.2 failed · just now: sha256 mismatch'
 });
 
-console.log('Passed: tailscale-model.js states, eligibility, URL safety, CIDR/version/SHA-256 validation, diffs and formatting.');
+// Tailscale Services (svc:*) validation, normalization, picker, and hints.
+assert.deepEqual(M.normalizeServiceName('t3code'), {name: 't3code', service: 'svc:t3code'});
+assert.deepEqual(M.normalizeServiceName('svc:my-app-1'), {name: 'my-app-1', service: 'svc:my-app-1'});
+assert.equal(M.serviceAdminUrl('t3code'), 'https://console.tailscale.com/admin/services/svc:t3code');
+assert.equal(M.serviceAdminUrl('Bad_Name'), '');
+for (const bad of ['', 'svc:', 'Upper', '-lead', 'trail-', 'a.b', 'a/b', 'a'.repeat(64)]) {
+  assert.ok(M.serviceNameProblem(bad), `expected error for ${bad}`);
+}
+
+assert.deepEqual(M.normalizeServicePath('', false), {path: '/', dedupKey: '/'});
+assert.deepEqual(M.normalizeServicePath('/api/', false), {path: '/api', dedupKey: '/api'});
+assert.deepEqual(M.normalizeServicePath('/files/', true), {path: '/files/', dedupKey: '/files'});
+assert.ok(M.normalizeServicePath('relative', false).error);
+assert.ok(M.normalizeServicePath('/a?b=1', false).error);
+assert.ok(M.normalizeServicePath('/a//b', false).error);
+
+const validRules = M.validateServiceRules([
+  {protocol: 'https', port: 443, path: '/', target: 'http://192.168.0.124:3773'},
+  {protocol: 'https', port: 443, path: '/api/', target: 'https+insecure://192.168.0.1:9443'},
+  {protocol: 'https', port: 443, path: '/lo', target: 'http://127.0.0.1:9090'},
+  {protocol: 'https', port: 443, path: '/ts', target: 'http://100.64.1.5:8080'},
+  {protocol: 'https', port: 443, path: '/pub', target: 'https://1.1.1.1:443'},
+  {protocol: 'https', port: 443, path: '/sock', target: 'unix:/tmp/app.sock'},
+  {protocol: 'https', port: 443, path: '/files/', target: 'file:///data/share'},
+  {protocol: 'tcp', port: 3773, target: 'tcp://192.168.0.124:3773'},
+  {protocol: 'tcp', port: 2222, target: '[::1]:2222'},
+  {protocol: 'tcp', port: 9001, target: 'unix:///tmp/raw.sock'}
+]);
+assert.equal(validRules.error, undefined);
+assert.equal(validRules.rules.length, 10);
+assert.equal(validRules.rules[1].path, '/api');
+assert.equal(validRules.rules[6].path, '/files/');
+assert.equal(validRules.rules[7].target, '192.168.0.124:3773');
+assert.equal(validRules.rules[9].target, 'unix:/tmp/raw.sock');
+
+// Conflicts and malformed targets.
+assert.ok(M.validateServiceRules([]).error);
+assert.match(M.validateServiceRules([
+  {protocol: 'https', port: 443, path: '/', target: 'http://192.168.0.2:80'},
+  {protocol: 'tcp', port: 443, target: '192.168.0.2:443'}
+]).error, /both HTTPS and TCP/);
+assert.match(M.validateServiceRules([
+  {protocol: 'https', port: 443, path: '/api', target: 'http://192.168.0.2:80'},
+  {protocol: 'https', port: 443, path: '/api/', target: 'http://192.168.0.3:80'}
+]).error, /Duplicate HTTPS path/);
+assert.match(M.validateServiceRules([
+  {protocol: 'tcp', port: 22, target: '192.168.0.2:22'},
+  {protocol: 'tcp', port: 22, target: '192.168.0.3:22'}
+]).error, /Duplicate TCP rule/);
+assert.match(M.validateServiceRules([
+  {protocol: 'tcp', port: 80, target: 'file:///etc/hosts'}
+]).error, /HTTPS rules/);
+assert.match(M.validateServiceRules([
+  {protocol: 'tcp', port: 80, target: '192.168.0.2'}
+]).error, /include a port/);
+
+// MAC masking and device picker (never leaks full MAC).
+assert.equal(M.maskMac('AA:BB:CC:DD:EE:01'), '••:••:••:••:ee:01');
+assert.equal(M.maskMac('invalid'), '');
+const picker = M.buildTargetPickerOptions(
+  {
+    hosts: {'aa:bb:cc:dd:ee:01': {name: 'Workstation', ipaddrs: ['192.168.0.124'], ip6addrs: ['fe80::1', 'fd00:12::10']}},
+    dhcp_leases: [{macaddr: 'aa:bb:cc:dd:ee:02', hostname: '', ipaddr: '192.168.0.150'}]
+  },
+  {entries: [{mac: 'aa:bb:cc:dd:ee:01', ip: '192.168.0.124', name: 'Workstation'}]}
+);
+assert.equal(picker[0].ip, '192.168.0.124');
+assert.equal(picker[0].isStatic, true);
+assert.doesNotMatch(picker.map(item => item.label).join('\n'), /aa:bb:cc:dd/i);
+assert.match(picker.find(item => item.ip === '192.168.0.150').label, /••:••:••:••:ee:02/);
+
+assert.equal(M.applyPickedIpToTarget('https', 'https+insecure://192.168.0.10:8443/app', '192.168.0.124'), 'https+insecure://192.168.0.124:8443/app');
+assert.equal(M.applyPickedIpToTarget('https', '', 'fd00:12::10'), 'http://[fd00:12::10]');
+assert.equal(M.applyPickedIpToTarget('tcp', '192.168.0.10:3773', '192.168.0.124'), '192.168.0.124:3773');
+
+// Dynamic DHCP IP hint & Subnet Route coverage hint (non-blocking).
+const hints = M.serviceTargetHints(
+  [
+    {protocol: 'https', port: 443, path: '/', target: 'http://192.168.0.124:3773'},
+    {protocol: 'https', port: 443, path: '/b', target: 'http://192.168.0.150:8080'},
+    {protocol: 'tcp', port: 9000, target: '10.20.0.5:9000'},
+    {protocol: 'tcp', port: 9001, target: '10.99.0.5:9001'},
+    {protocol: 'https', port: 443, path: '/self', target: 'http://192.168.0.1:9090'},
+    {protocol: 'https', port: 443, path: '/lo', target: 'http://127.0.0.1:9090'},
+    {protocol: 'https', port: 443, path: '/ts', target: 'http://100.64.1.2:80'},
+    {protocol: 'https', port: 443, path: '/pub', target: 'https://1.1.1.1:443'}
+  ],
+  {
+    reservations: [{ip: '192.168.0.124'}],
+    advertisedRoutes: ['192.168.0.0/24', '10.20.0.0/24'],
+    approvedRoutes: ['192.168.0.0/24'],
+    routerIps: ['192.168.0.1'],
+    httpsEnabled: false
+  }
+);
+assert.deepEqual(hints.unreservedIps, ['192.168.0.150', '10.20.0.5', '10.99.0.5']);
+assert.deepEqual(hints.pendingSubnetIps, ['10.20.0.5']);
+assert.deepEqual(hints.unadvertisedSubnetIps, ['10.99.0.5']);
+assert.equal(hints.httpsDisabledWarning, true);
+
+assert.deepEqual(M.serviceStateMeta('active'), {state: 'active', label: 'Active', chipState: 'approved'});
+assert.deepEqual(M.serviceStateMeta('port_mismatch'), {state: 'port_mismatch', label: 'Port mismatch', chipState: 'pending'});
+assert.deepEqual(M.serviceStateMeta('drained'), {state: 'drained', label: 'Drained', chipState: 'unknown'});
+assert.match(M.formatServicePortDiff({unallowed_ports: [8443], tailnet_ports: ['tcp:443']}), /8443.*tcp:443/);
+assert.equal(M.formatServicePortDiff({unallowed_ports: [], tailnet_ports: ['tcp:443']}), '');
+
+console.log('Passed: tailscale-model.js states, eligibility, URL safety, CIDR/version/SHA-256/Services validation, diffs, hints and formatting.');

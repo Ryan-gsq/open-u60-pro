@@ -3502,4 +3502,45 @@ dialog[data-motion="closing"]::backdrop { animation: dialog-scrim-out .12s ease-
 .tailscale-update-banner[hidden] { display:none; }
 .tailscale-update-banner[data-state="ok"] { border-left-color:var(--accent); background:var(--live-surface); }
 .tailscale-update-banner[data-state="busy"],.tailscale-update-banner[data-state="error"] { border-left-color:var(--warning-accent); background:var(--warning-surface); color:var(--warning-ink); }
+.tailscale-services-unavailable { margin:14px 0 0; }
+.tailscale-services-unavailable[hidden],.tailscale-services-bar[hidden],.tailscale-services-empty[hidden],.tailscale-service-editor[hidden] { display:none; }
+.tailscale-services-bar-actions { margin-inline-start:auto; margin-top:0; }
+.tailscale-services-env-notes { margin:14px 0 0; }
+.tailscale-service-list { display:grid; gap:14px; margin-top:18px; }
+.tailscale-service-list:empty { display:none; }
+.tailscale-service-card { display:grid; gap:12px; min-width:0; padding:16px; border:1px solid var(--line); background:var(--surface-soft); }
+.tailscale-service-head { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-start; gap:10px 16px; min-width:0; }
+.tailscale-service-title { display:grid; gap:4px; min-width:0; }
+.tailscale-service-title h3 { margin:0; font-size:14px; overflow-wrap:anywhere; }
+.tailscale-service-title p,.tailscale-service-title small { margin:0; overflow-wrap:anywhere; }
+.tailscale-service-alert { margin:0; }
+.tailscale-service-rules { display:grid; gap:8px; margin:0; padding:0; list-style:none; }
+.tailscale-service-rule-item { display:grid; gap:6px; min-width:0; padding:10px 12px; border:1px solid var(--line); background:var(--surface); }
+.tailscale-service-rule-meta { display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px; min-width:0; }
+.tailscale-service-rule-meta code,.tailscale-service-url { font:12px var(--mono); overflow-wrap:anywhere; min-width:0; }
+.tailscale-service-url-row { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; min-width:0; }
+.tailscale-service-editor { margin-top:20px; padding:18px; border:1px solid var(--line-strong); background:var(--surface-soft); }
+.tailscale-service-editor h3 { margin:0 0 14px; font-size:15px; }
+.tailscale-service-editor-fields { display:grid; gap:16px; min-width:0; margin:0; padding:0; border:0; }
+.tailscale-service-rules-editor { display:grid; gap:10px; min-width:0; }
+.tailscale-service-rules-head { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; }
+.tailscale-service-rule-rows { display:grid; gap:12px; min-width:0; }
+.tailscale-service-rule-row { display:grid; grid-template-columns:minmax(100px,130px) minmax(90px,120px) minmax(110px,1fr) minmax(0,1fr) auto; gap:10px 12px; align-items:end; padding:12px; border:1px solid var(--line); background:var(--surface); min-width:0; }
+.tailscale-service-rule-row .form-field { margin:0; min-width:0; }
+.tailscale-service-target-field { grid-column:1/-2; }
+.tailscale-service-hints { display:grid; gap:10px; margin:14px 0 0; }
+.tailscale-service-hints:empty { display:none; }
+.tailscale-service-hint { margin:0; }
+.tailscale-service-hint-note { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px 14px; padding:10px 12px; border-left:3px solid var(--accent); background:var(--live-surface); }
+.tailscale-service-hint-note p { margin:0; flex:1 1 220px; }
+#tailscale-services .button { white-space:normal; }
+@media (max-width:900px) {
+  .tailscale-service-rule-row { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .tailscale-service-target-field { grid-column:1/-1; }
+}
+@media (max-width:767px) {
+  .tailscale-services-bar-actions { margin-inline-start:0; }
+  .tailscale-service-card,.tailscale-service-editor { padding:12px; }
+  .tailscale-service-rule-row { grid-template-columns:minmax(0,1fr); }
+}
 @media (prefers-reduced-motion:reduce) { .mihomo-glyph[data-state="running"]::before,.relay-glyph[data-state="restoring"]::before,.tailscale-glyph[data-state="busy"]::before { animation:none; } }

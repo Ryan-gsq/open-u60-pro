@@ -1802,6 +1802,8 @@ mod tests {
             }),
             health: vec![],
             version: Some("1.104.7".into()),
+            magic_dns_suffix: None,
+            current_tailnet: None,
         }
     }
 

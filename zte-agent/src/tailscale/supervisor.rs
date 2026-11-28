@@ -63,8 +63,8 @@ pub(super) struct RelayWatchState {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct ChildIdentity {
-    pid: u32,
-    instance: u64,
+    pub(super) pid: u32,
+    pub(super) instance: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

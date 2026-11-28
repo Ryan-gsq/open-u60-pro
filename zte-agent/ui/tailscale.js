@@ -259,6 +259,102 @@
   const routingText = UI.status(routingPanel);
   routingPanel.append(routingBar, routingForm, routingText);
 
+  // ── Tailscale Services (svc:*) ──────────────────────────────────────────
+  const servicesPanel = UI.panel(
+    route,
+    'tailscale-services',
+    'Tailscale Services (svc:*)',
+    'Publish LAN devices, local router ports, Unix sockets or local files as Tailscale Services with dedicated MagicDNS names, virtual IPs and automatic HTTPS.'
+  );
+  routingPanel.after(servicesPanel);
+
+  const servicesUnavailable = el('p', 'field-help tailscale-services-unavailable', 'Enable and sign in to Tailscale above to manage Tailscale Services.');
+  const servicesBar = el('div', 'tailscale-routing-bar tailscale-services-bar');
+  servicesBar.hidden = true;
+  const servicesSuffixLabel = el('strong', 'mono', '—');
+  const servicesHttpsChip = el('span', 'tailscale-routing-chip', 'Unknown');
+  const servicesTagsLabel = el('strong', 'mono', 'None');
+  for (const [label, node] of [
+    ['MagicDNS suffix', servicesSuffixLabel],
+    ['Tailnet HTTPS', servicesHttpsChip],
+    ['Node tags', servicesTagsLabel]
+  ]) {
+    const fact = el('div', 'tailscale-routing-fact');
+    fact.append(el('small', 'field-help', label), node);
+    servicesBar.append(fact);
+  }
+  const servicesBarActions = el('div', 'form-actions tailscale-services-bar-actions');
+  const addServiceBtn = button('Add service', () => openServiceEditor(null), 'primary');
+  addServiceBtn.id = 'tailscale-service-add-btn';
+  const refreshServicesBtn = button('Refresh services', () => loadServices({quiet: false}));
+  servicesBarActions.append(addServiceBtn, refreshServicesBtn);
+  servicesBar.append(servicesBarActions);
+
+  const servicesEnvNotes = el('div', 'relay-problem tailscale-alerts tailscale-services-env-notes');
+  servicesEnvNotes.setAttribute('role', 'status');
+  servicesEnvNotes.hidden = true;
+
+  const servicesList = el('div', 'tailscale-service-list');
+  servicesList.setAttribute('aria-label', 'Tailscale Services');
+  const servicesEmpty = el('p', 'field-help tailscale-services-empty', 'No Tailscale Services configured or assigned to this router yet.');
+  servicesEmpty.hidden = true;
+
+  // Single-service editor (add / edit / configure)
+  const serviceEditor = el('form', 'settings-form tailscale-service-editor');
+  serviceEditor.id = 'tailscale-service-editor';
+  serviceEditor.autocomplete = 'off';
+  serviceEditor.hidden = true;
+  const serviceEditorTitle = el('h3', '', 'Add Tailscale Service');
+  const serviceEditorFields = el('fieldset', 'tailscale-service-editor-fields');
+  serviceEditorFields.append(el('legend', 'sr-only', 'Tailscale Service configuration'));
+
+  const serviceNameInput = el('input', 'mono');
+  serviceNameInput.id = 'tailscale-service-name';
+  serviceNameInput.name = 'service_name';
+  serviceNameInput.type = 'text';
+  serviceNameInput.maxLength = 67;
+  serviceNameInput.spellcheck = false;
+  serviceNameInput.autocapitalize = 'none';
+  serviceNameInput.placeholder = 'my-app';
+  const serviceNameField = field(
+    'Service name (svc:<name>)',
+    serviceNameInput,
+    '1–63 lowercase ASCII letters, digits or hyphens. Published as <name>.<tailnet>.ts.net.'
+  );
+
+  const rulesSection = el('div', 'tailscale-service-rules-editor');
+  const rulesHeader = el('div', 'tailscale-service-rules-head');
+  const addRuleBtn = button('+ Add rule', () => {
+    addEditorRuleRow({protocol: 'https', port: '', path: '/', target: ''});
+    drawServiceEditor();
+  });
+  rulesHeader.append(el('strong', '', 'Port & route rules'), addRuleBtn);
+  const editorRuleRowsEl = el('div', 'tailscale-service-rule-rows');
+  rulesSection.append(rulesHeader, editorRuleRowsEl);
+  serviceEditorFields.append(serviceNameField.wrapper, rulesSection);
+
+  const serviceEditorHints = el('div', 'tailscale-service-hints');
+  serviceEditorHints.setAttribute('aria-live', 'polite');
+
+  const serviceEditorActions = el('div', 'form-actions');
+  const saveServiceBtn = button('Save service', null, 'primary');
+  saveServiceBtn.id = 'tailscale-service-save-btn';
+  saveServiceBtn.type = 'submit';
+  const cancelServiceBtn = button('Cancel', () => closeServiceEditor('Service draft discarded.'));
+  serviceEditorActions.append(saveServiceBtn, cancelServiceBtn);
+  serviceEditor.append(serviceEditorTitle, serviceEditorFields, serviceEditorHints, serviceEditorActions);
+
+  const servicesText = UI.status(servicesPanel);
+  servicesPanel.append(
+    servicesUnavailable,
+    servicesBar,
+    servicesEnvNotes,
+    servicesList,
+    servicesEmpty,
+    serviceEditor,
+    servicesText
+  );
+
   // ── Install & Upgrade ───────────────────────────────────────────────────
   const updatePanel = UI.panel(
     route,
@@ -347,6 +443,9 @@
   let routingState = M.rebaseRouting(null), routingSession = 0;
   let mihomoStatus = null, routingContextTimer, routingContextLoad = 0, routingContextLoading = false;
   let routeRows = new Map(), lanSuggestionSignature = '';
+  let servicesData = null, servicesLoading = false, servicesAttempted = false, servicesError = '', servicesLoadId = 0;
+  let pickerOptions = [], reservationsList = null, pickerLoaded = false, pickerLoadId = 0;
+  let editorOpen = false, editorMode = 'new', editorLockedName = '', editorRules = [];
   const READING_STATUS_MESSAGE = 'Reading Tailscale status…';
   const onRoute = () => OpenU60Navigation.current.key === route;
 
@@ -362,7 +461,8 @@
   const routingEditable = () => routingState.baseline && !busy && API.connected && !API.locked && M.view(status).canConfig;
   const authDirty = () => authKeyInput.value.trim().length > 0;
   const updateDirty = () => versionInput.value.trim().length > 0 || sha256Input.value.trim().length > 0;
-  const dirty = () => configDirty() || routingDirty() || authDirty() || updateDirty();
+  const serviceEditorDirty = () => editorOpen;
+  const dirty = () => configDirty() || routingDirty() || authDirty() || updateDirty() || serviceEditorDirty();
   const effectiveUpdateVersion = () => versionInput.value.trim() || selectedVersion;
 
   function populateConfig(data) {
@@ -421,6 +521,16 @@
       const next = M.rebaseRouting(M.routingBaseline(data), routingState);
       if (routingState.dirty && !next.dirty) say(routingText, '');
       routingState = next;
+    }
+    if (view.running) {
+      if (!servicesAttempted && !servicesLoading) loadServices({quiet: true});
+    } else {
+      servicesLoadId++;
+      servicesLoading = false;
+      servicesAttempted = false;
+      servicesError = '';
+      servicesData = null;
+      if (editorOpen) closeServiceEditor('');
     }
     draw();
   }
@@ -708,12 +818,475 @@
     }
   }
 
+  async function copyText(text, targetStatus, label) {
+    const clean = String(text || '').trim();
+    if (!clean) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(clean);
+        say(targetStatus, `${label} copied to clipboard.`);
+        return;
+      }
+      const helper = el('textarea', 'sr-only');
+      helper.value = clean;
+      helper.setAttribute('readonly', '');
+      document.body.append(helper);
+      helper.select();
+      const copied = document.execCommand('copy');
+      helper.remove();
+      say(targetStatus, copied ? `${label} copied to clipboard.` : `Copy blocked by browser; copy ${clean} manually.`, !copied);
+    } catch {
+      say(targetStatus, `Clipboard access is unavailable; copy ${clean} manually.`, true);
+    }
+  }
+
+  function addEditorRuleRow(rule) {
+    editorRules.push({
+      protocol: rule?.protocol === 'tcp' ? 'tcp' : 'https',
+      port: rule?.port !== undefined && rule?.port !== null ? String(rule.port) : '',
+      path: rule?.path ?? '/',
+      target: String(rule?.target || '')
+    });
+  }
+
+  function openServiceEditor(svc) {
+    editorOpen = true;
+    editorRules = [];
+    if (!svc) {
+      editorMode = 'new';
+      editorLockedName = '';
+      serviceNameInput.value = '';
+      serviceNameInput.readOnly = false;
+      addEditorRuleRow({protocol: 'https', port: '443', path: '/', target: ''});
+    } else {
+      editorMode = svc.configured ? 'edit' : 'configure';
+      editorLockedName = svc.name;
+      serviceNameInput.value = svc.name;
+      serviceNameInput.readOnly = true;
+      if (Array.isArray(svc.rules) && svc.rules.length) {
+        for (const r of svc.rules) addEditorRuleRow(r);
+      } else {
+        const firstPort = Array.isArray(svc.tailnet_ports)
+          ? (svc.tailnet_ports[0]?.match(/(\d+)/)?.[1] || '443')
+          : '443';
+        addEditorRuleRow({protocol: firstPort === '443' ? 'https' : 'tcp', port: firstPort, path: '/', target: ''});
+      }
+    }
+    say(servicesText, '');
+    loadPickerSources();
+    drawServices();
+    (editorLockedName ? editorRuleRowsEl.querySelector('input, select') : serviceNameInput)?.focus();
+  }
+
+  function closeServiceEditor(message = '') {
+    editorOpen = false;
+    editorMode = 'new';
+    editorLockedName = '';
+    editorRules = [];
+    serviceNameInput.value = '';
+    serviceNameInput.readOnly = false;
+    editorRuleRowsEl.replaceChildren();
+    serviceEditorHints.replaceChildren();
+    if (message !== undefined) say(servicesText, message);
+    drawServices();
+  }
+
+  async function loadPickerSources() {
+    if (API.locked || !API.connected) return;
+    const epoch = UI.epoch, id = ++pickerLoadId;
+    const [clients, reservations] = await Promise.all([
+      request('/api/network/clients', {timeoutMs: 10000}).catch(() => null),
+      request('/api/router/reservations', {timeoutMs: 10000}).catch(() => null)
+    ]);
+    if (!UI.current(epoch) || id !== pickerLoadId) return;
+    reservationsList = Array.isArray(reservations?.entries) ? reservations.entries : null;
+    pickerOptions = M.buildTargetPickerOptions(clients, reservations);
+    pickerLoaded = true;
+    if (editorOpen) drawServiceEditor();
+  }
+
+  function drawServiceEditorHints() {
+    const nodes = [];
+    const nameText = serviceNameInput.value.trim();
+    if (editorMode === 'new' && nameText) {
+      const nameErr = M.serviceNameProblem(nameText);
+      if (nameErr) {
+        const errEl = el('p', 'relay-problem tailscale-service-hint', nameErr);
+        errEl.dataset.kind = 'error';
+        nodes.push(errEl);
+      }
+    }
+    const hints = M.serviceTargetHints(editorRules, {
+      reservations: reservationsList,
+      advertisedRoutes: servicesData?.advertised_routes || status?.advertise_routes || [],
+      approvedRoutes: servicesData?.approved_routes || (status?.routing?.routes || []).filter(r => r.state === 'approved').map(r => r.prefix),
+      routerIps: servicesData?.router_ips || [],
+      httpsEnabled: servicesData?.https_enabled !== false
+    });
+    if (hints.httpsDisabledWarning) {
+      const box = el('p', 'relay-problem tailscale-service-hint', 'HTTPS certificates are not enabled on your tailnet yet. Enable MagicDNS and HTTPS Certificates in the Tailscale admin console for HTTPS services to issue certificates.');
+      box.dataset.kind = 'https';
+      nodes.push(box);
+    }
+    if (hints.unadvertisedSubnetIps.length || hints.pendingSubnetIps.length) {
+      const box = el('div', 'tailscale-service-hint-note');
+      box.dataset.kind = 'subnet';
+      const parts = [];
+      if (hints.unadvertisedSubnetIps.length) {
+        parts.push(`Subnet route is not enabled for ${hints.unadvertisedSubnetIps.join(', ')}.`);
+      }
+      if (hints.pendingSubnetIps.length) {
+        parts.push(`Subnet route for ${hints.pendingSubnetIps.join(', ')} is still pending approval.`);
+      }
+      const copy = el('p', 'field-help', `${parts.join(' ')} Tailscale Services proxy still reaches these targets directly through this router; enable and approve the matching Subnet Route above if tailnet peers also need direct LAN IP access.`);
+      const jump = button('Go to Subnet routes ↑', () => {
+        routingPanel.scrollIntoView?.({behavior: 'smooth', block: 'start'});
+        routeInput.focus();
+      });
+      box.append(copy, jump);
+      nodes.push(box);
+    }
+    if (hints.unreservedIps.length) {
+      const box = el('div', 'tailscale-service-hint-note');
+      box.dataset.kind = 'dhcp';
+      const copy = el('p', 'field-help', `${hints.unreservedIps.join(', ')} ${hints.unreservedIps.length === 1 ? 'is' : 'are'} not pinned as a static DHCP reservation. Assign a static lease so the target device keeps the same LAN IP.`);
+      const link = el('a', 'button', 'Open LAN & DHCP →');
+      link.href = '#network/lan';
+      box.append(copy, link);
+      nodes.push(box);
+    }
+    serviceEditorHints.replaceChildren(...nodes);
+  }
+
+  function renderEditorRuleRows(disabled) {
+    const rows = editorRules.map((rule, index) => {
+      const row = el('div', 'tailscale-service-rule-row');
+      row.dataset.index = String(index);
+
+      const protoSelect = el('select');
+      protoSelect.id = `tailscale-svc-proto-${index}`;
+      protoSelect.setAttribute('aria-label', `Rule ${index + 1} protocol`);
+      protoSelect.add(new Option('HTTPS', 'https'));
+      protoSelect.add(new Option('TCP', 'tcp'));
+      protoSelect.value = rule.protocol;
+      protoSelect.addEventListener('change', () => {
+        rule.protocol = protoSelect.value;
+        if (rule.protocol === 'https' && !rule.port) rule.port = '443';
+        if (rule.protocol === 'https' && !rule.path) rule.path = '/';
+        renderEditorRuleRows(serviceEditorFields.disabled);
+        drawServiceEditorHints();
+        updateServiceEditorButtons();
+      });
+
+      const portInput = el('input', 'mono');
+      portInput.id = `tailscale-svc-port-${index}`;
+      portInput.type = 'number';
+      portInput.min = '1';
+      portInput.max = '65535';
+      portInput.inputMode = 'numeric';
+      portInput.placeholder = rule.protocol === 'https' ? '443' : '3773';
+      portInput.value = rule.port;
+      portInput.addEventListener('input', () => {
+        rule.port = portInput.value;
+        updateServiceEditorButtons();
+      });
+
+      const pathInput = el('input', 'mono');
+      pathInput.id = `tailscale-svc-path-${index}`;
+      pathInput.type = 'text';
+      pathInput.spellcheck = false;
+      pathInput.placeholder = '/ or /api';
+      pathInput.value = rule.protocol === 'https' ? (rule.path ?? '/') : '';
+      pathInput.disabled = disabled || rule.protocol !== 'https';
+      pathInput.addEventListener('input', () => {
+        rule.path = pathInput.value;
+        updateServiceEditorButtons();
+      });
+
+      const pickerSelect = el('select');
+      pickerSelect.id = `tailscale-svc-pick-${index}`;
+      pickerSelect.setAttribute('aria-label', `Rule ${index + 1} LAN device quick pick`);
+      const promptOpt = new Option(
+        pickerOptions.length ? 'Pick LAN device / static IP…' : (pickerLoaded ? 'No LAN devices reported' : 'Loading LAN devices…'),
+        ''
+      );
+      pickerSelect.add(promptOpt);
+      for (const opt of pickerOptions) {
+        pickerSelect.add(new Option(opt.label, opt.ip));
+      }
+      pickerSelect.addEventListener('change', () => {
+        if (!pickerSelect.value) return;
+        rule.target = M.applyPickedIpToTarget(rule.protocol, rule.target, pickerSelect.value);
+        targetInput.value = rule.target;
+        pickerSelect.value = '';
+        drawServiceEditorHints();
+        updateServiceEditorButtons();
+        targetInput.focus();
+      });
+
+      const targetInput = el('input', 'mono');
+      targetInput.id = `tailscale-svc-target-${index}`;
+      targetInput.type = 'text';
+      targetInput.spellcheck = false;
+      targetInput.placeholder = rule.protocol === 'https'
+        ? 'http://192.168.0.124:3773, https+insecure://…, unix:/…, file:///…'
+        : '192.168.0.124:3773 or unix:/…';
+      targetInput.value = rule.target;
+      targetInput.addEventListener('input', () => {
+        rule.target = targetInput.value;
+        drawServiceEditorHints();
+        updateServiceEditorButtons();
+      });
+
+      const protoWrap = field('Protocol', protoSelect).wrapper;
+      const portWrap = field('External port', portInput).wrapper;
+      const pathWrap = field('URL path', pathInput).wrapper;
+      pathWrap.hidden = rule.protocol !== 'https';
+      const pickWrap = field('Quick pick device', pickerSelect).wrapper;
+      const targetWrap = field('Backend target', targetInput).wrapper;
+      targetWrap.classList.add('tailscale-service-target-field');
+
+      const removeBtn = button('Remove', () => {
+        if (editorRules.length <= 1) return;
+        editorRules.splice(index, 1);
+        drawServiceEditor();
+      });
+      removeBtn.setAttribute('aria-label', `Remove rule ${index + 1}`);
+      removeBtn.disabled = disabled || editorRules.length <= 1;
+
+      row.append(protoWrap, portWrap, pathWrap, pickWrap, targetWrap, removeBtn);
+      return row;
+    });
+    editorRuleRowsEl.replaceChildren(...rows);
+  }
+
+  function updateServiceEditorButtons() {
+    const view = M.view(status);
+    const editable = !busy && API.connected && !API.locked && view.running && servicesData?.available === true;
+    const nameOk = !M.serviceNameProblem(serviceNameInput.value);
+    const rulesCheck = M.validateServiceRules(editorRules);
+    saveServiceBtn.disabled = !editable || !nameOk || !!rulesCheck.error;
+    addRuleBtn.disabled = !editable || editorRules.length >= M.MAX_SERVICE_RULES;
+    cancelServiceBtn.disabled = busy;
+  }
+
+  function drawServiceEditor() {
+    serviceEditor.hidden = !editorOpen;
+    servicesPanel.dataset.dirty = String(editorOpen);
+    if (!editorOpen) return;
+    const view = M.view(status);
+    const editable = !busy && API.connected && !API.locked && view.running && servicesData?.available === true;
+    serviceEditorFields.disabled = !editable;
+    serviceEditorTitle.textContent = editorMode === 'edit'
+      ? `Edit svc:${editorLockedName}`
+      : editorMode === 'configure'
+        ? `Configure svc:${editorLockedName}`
+        : 'Add Tailscale Service';
+    renderEditorRuleRows(!editable);
+    drawServiceEditorHints();
+    updateServiceEditorButtons();
+  }
+
+  function drawServices(view = M.view(status)) {
+    const connected = API.connected && !API.locked;
+    const ready = connected && view.running && servicesData?.available === true;
+    const inactive = busy || !connected;
+
+    if (!connected || !view.running || (servicesData && !servicesData.available)) {
+      servicesUnavailable.hidden = false;
+      servicesUnavailable.textContent = !connected
+        ? 'Connect and unlock the console to manage Tailscale Services.'
+        : !view.installed
+          ? 'Install and sign in to Tailscale before managing Tailscale Services.'
+          : servicesData?.reason || 'Enable and sign in to Tailscale above to manage Tailscale Services.';
+      servicesBar.hidden = true;
+      servicesEnvNotes.hidden = true;
+      servicesList.replaceChildren();
+      servicesEmpty.hidden = true;
+      serviceEditor.hidden = true;
+      servicesPanel.dataset.dirty = 'false';
+      return;
+    }
+
+    if (!servicesData) {
+      servicesUnavailable.hidden = false;
+      servicesUnavailable.textContent = servicesLoading
+        ? 'Loading Tailscale Services…'
+        : servicesError
+          ? `Tailscale Services unavailable: ${servicesError}`
+          : 'Waiting for Tailscale Services…';
+      servicesBar.hidden = false;
+      servicesSuffixLabel.textContent = '—';
+      setRoutingChip(servicesHttpsChip, 'unknown', 'Unknown');
+      servicesTagsLabel.textContent = '—';
+      addServiceBtn.disabled = true;
+      refreshServicesBtn.disabled = servicesLoading || inactive;
+      servicesEnvNotes.hidden = true;
+      servicesList.replaceChildren();
+      servicesEmpty.hidden = true;
+      serviceEditor.hidden = true;
+      servicesPanel.dataset.dirty = 'false';
+      return;
+    }
+
+    servicesUnavailable.hidden = true;
+    servicesBar.hidden = false;
+    servicesSuffixLabel.textContent = servicesData.magic_dns_suffix || 'Unavailable';
+    setRoutingChip(
+      servicesHttpsChip,
+      servicesData.https_enabled ? 'approved' : 'pending',
+      servicesData.https_enabled ? 'Enabled' : 'Disabled'
+    );
+    const tags = Array.isArray(servicesData.tags) ? servicesData.tags : [];
+    servicesTagsLabel.textContent = tags.length ? tags.join(', ') : 'None';
+    addServiceBtn.disabled = inactive || !ready;
+    refreshServicesBtn.disabled = servicesLoading || inactive;
+    refreshServicesBtn.textContent = servicesLoading ? 'Refreshing…' : 'Refresh services';
+
+    const envNotes = [];
+    if (!servicesData.https_enabled) {
+      envNotes.push('HTTPS certificates are not reported on this tailnet. Enable MagicDNS and HTTPS Certificates in Tailscale Admin to serve HTTPS endpoints.');
+    }
+    if (!tags.length) {
+      envNotes.push('This router has no Tailscale node tags. Tailscale Services typically require a node tag or ACL service-host grant.');
+    }
+    servicesEnvNotes.hidden = envNotes.length === 0;
+    servicesEnvNotes.replaceChildren(...envNotes.map(note => el('p', '', note)));
+
+    const list = Array.isArray(servicesData.services) ? servicesData.services : [];
+    servicesEmpty.hidden = list.length > 0;
+    servicesList.replaceChildren(...list.map(svc => {
+      const meta = M.serviceStateMeta(svc.state);
+      const card = el('article', 'tailscale-service-card');
+      card.dataset.service = svc.service;
+      card.dataset.state = meta.state;
+
+      const head = el('div', 'tailscale-service-head');
+      const headCopy = el('div', 'tailscale-service-title');
+      headCopy.append(el('h3', 'mono', svc.service));
+      if (svc.fqdn) headCopy.append(el('p', 'mono field-help', svc.fqdn));
+      if (Array.isArray(svc.vips) && svc.vips.length) {
+        headCopy.append(el('small', 'mono field-help', `VIP: ${svc.vips.join(' · ')}`));
+      }
+      const badge = el('span', 'tailscale-routing-chip tailscale-service-state', meta.label);
+      badge.dataset.state = meta.chipState;
+      head.append(headCopy, badge);
+      card.append(head);
+
+      if (svc.editable === false) {
+        const ro = el('div', 'relay-problem tailscale-service-alert');
+        const reasons = Array.isArray(svc.unsupported_reasons) && svc.unsupported_reasons.length
+          ? svc.unsupported_reasons.join('; ')
+          : 'contains CLI-only advanced handlers';
+        ro.append(el('p', '', `Read-only CLI configuration: ${reasons}. Editing is locked to prevent accidental overwrite; you can still drain, advertise, or clear it.`));
+        card.append(ro);
+      }
+
+      const mismatchMsg = M.formatServicePortDiff(svc);
+      if (mismatchMsg) {
+        const warn = el('div', 'relay-problem tailscale-service-alert');
+        warn.append(el('p', '', mismatchMsg));
+        card.append(warn);
+      } else if (meta.state === 'pending') {
+        card.append(el('p', 'field-help', 'Waiting for Tailscale admin approval (VIP not yet active in PrimaryRoutes).'));
+      } else if (meta.state === 'unconfigured') {
+        card.append(el('p', 'field-help', 'Assigned to this router in Tailscale admin, but no local backend rules are configured yet.'));
+      }
+
+      const rules = Array.isArray(svc.rules) ? svc.rules : [];
+      if (rules.length) {
+        const ul = el('ul', 'tailscale-service-rules');
+        for (const r of rules) {
+          const li = el('li', 'tailscale-service-rule-item');
+          const protoBadge = el(
+            'span',
+            'tag mono',
+            r.protocol === 'https'
+              ? `HTTPS :${r.port}${r.path && r.path !== '/' ? ` ${r.path}` : ' /'}`
+              : `TCP :${r.port}`
+          );
+          const targetCode = el('code', 'mono', `→ ${r.target}`);
+          const detailWrap = el('div', 'tailscale-service-rule-meta');
+          detailWrap.append(protoBadge, targetCode);
+          if (r.port_allowed === false) {
+            const pChip = el('span', 'tailscale-routing-chip', 'Port not allowed');
+            pChip.dataset.state = 'pending';
+            detailWrap.append(pChip);
+          }
+          if (r.subnet_route_state === 'not_advertised' || r.subnet_route_state === 'pending') {
+            const sChip = el(
+              'span',
+              'tailscale-routing-chip',
+              r.subnet_route_state === 'pending' ? 'Subnet pending' : 'No subnet route'
+            );
+            sChip.dataset.state = 'standby';
+            detailWrap.append(sChip);
+          }
+          li.append(detailWrap);
+          if (r.access_url) {
+            const urlRow = el('div', 'tailscale-service-url-row');
+            urlRow.append(el('code', 'mono tailscale-service-url', r.access_url));
+            const cp = button('Copy', () => copyText(r.access_url, servicesText, r.access_url));
+            cp.setAttribute('aria-label', `Copy ${r.access_url}`);
+            urlRow.append(cp);
+            li.append(urlRow);
+          }
+          ul.append(li);
+        }
+        card.append(ul);
+      }
+
+      const actions = el('div', 'form-actions');
+      const primaryUrl = Array.isArray(svc.access_urls) ? svc.access_urls[0] : '';
+      if (primaryUrl) {
+        const copyPrimary = button('Copy address', () => copyText(primaryUrl, servicesText, primaryUrl));
+        actions.append(copyPrimary);
+      }
+      const adminHref = svc.admin_url || M.serviceAdminUrl(svc.name);
+      if (adminHref) {
+        const link = el('a', 'button', 'Tailscale admin ↗');
+        link.href = adminHref;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        actions.append(link);
+      }
+      if (!svc.configured) {
+        const cfgBtn = button('Configure', () => openServiceEditor(svc), 'primary');
+        cfgBtn.disabled = inactive;
+        actions.append(cfgBtn);
+      } else if (svc.editable !== false) {
+        const editBtn = button('Edit', () => openServiceEditor(svc));
+        editBtn.disabled = inactive;
+        actions.append(editBtn);
+      }
+      if (svc.configured) {
+        if (svc.drained) {
+          const advBtn = button('Advertise', () => toggleServiceDrain(svc, false), 'primary');
+          advBtn.disabled = inactive;
+          actions.append(advBtn);
+        } else {
+          const drainBtn = button('Drain', () => toggleServiceDrain(svc, true));
+          drainBtn.disabled = inactive;
+          actions.append(drainBtn);
+        }
+        const clearBtn = button('Clear', () => clearService(svc), 'danger');
+        clearBtn.disabled = inactive;
+        actions.append(clearBtn);
+      }
+      card.append(actions);
+      return card;
+    }));
+
+    drawServiceEditor();
+  }
+
   function draw() {
     const view = M.view(status);
     drawStatus(view);
     drawAuth(view);
     drawConfig(view);
     drawRouting();
+    drawServices(view);
     drawUpdate(view);
   }
 
@@ -831,6 +1404,117 @@
       if (current()) drawUpdate();
     }
   }
+
+  async function loadServices({quiet = false} = {}) {
+    if (servicesLoading || API.locked || !API.connected) return;
+    if (status?.backend_state !== 'Running') return;
+    const epoch = UI.epoch, id = ++servicesLoadId;
+    const current = () => UI.current(epoch) && id === servicesLoadId;
+    servicesLoading = true;
+    servicesAttempted = true;
+    servicesError = '';
+    drawServices();
+    if (!quiet) say(servicesText, 'Loading Tailscale Services…');
+    try {
+      const data = await request('/api/tailscale/services', {timeoutMs: 20000});
+      if (!current()) return;
+      servicesData = data;
+      servicesError = '';
+      if (!quiet) say(servicesText, '');
+    } catch (error) {
+      if (!current()) return;
+      servicesError = error.message || 'Services unavailable';
+      if (!quiet) say(servicesText, `Could not load Tailscale Services: ${servicesError}`, true);
+    } finally {
+      if (id === servicesLoadId) servicesLoading = false;
+      if (current()) drawServices();
+    }
+  }
+
+  async function toggleServiceDrain(svc, drain) {
+    if (!svc || busy) return;
+    const titleText = drain ? `Drain ${svc.service}?` : `Advertise ${svc.service}?`;
+    const bodyText = drain
+      ? `Stop accepting new connections for ${svc.service} on this router. Existing connections stay open and rules remain saved so you can re-advertise later.`
+      : `Resume advertising ${svc.service} from this router to your tailnet.`;
+    if (!await confirm(titleText, bodyText, {label: drain ? 'Drain service' : 'Advertise service'})) return;
+    await mutate(servicesText, async live => {
+      busy = true;
+      draw();
+      say(servicesText, drain ? `Draining ${svc.service}…` : `Advertising ${svc.service}…`);
+      try {
+        const action = drain ? 'drain' : 'advertise';
+        const data = await request(
+          `/api/tailscale/services/${encodeURIComponent(svc.name)}/${action}`,
+          {...json('POST', {}), timeoutMs: 30000}
+        );
+        if (!live()) return;
+        servicesData = data;
+        say(servicesText, drain ? `${svc.service} drained.` : `${svc.service} advertised.`);
+      } catch (error) {
+        if (live()) say(servicesText, error.message, true);
+      } finally {
+        finishBusy(live);
+      }
+    });
+  }
+
+  async function clearService(svc) {
+    if (!svc || busy) return;
+    const copy = `Remove all local serve handlers for ${svc.service} and stop advertising it from this router. Other Tailscale Services are not affected.`;
+    if (!await confirm(`Clear ${svc.service}?`, copy, {label: `Clear ${svc.service}`, destructive: true})) return;
+    await mutate(servicesText, async live => {
+      busy = true;
+      draw();
+      say(servicesText, `Clearing ${svc.service}…`);
+      try {
+        const data = await request(
+          `/api/tailscale/services/${encodeURIComponent(svc.name)}`,
+          {method: 'DELETE', timeoutMs: 30000}
+        );
+        if (!live()) return;
+        servicesData = data;
+        if (editorOpen && editorLockedName === svc.name) closeServiceEditor('');
+        say(servicesText, `${svc.service} cleared.`);
+      } catch (error) {
+        if (live()) say(servicesText, error.message, true);
+      } finally {
+        finishBusy(live);
+      }
+    });
+  }
+
+  serviceNameInput.addEventListener('input', () => {
+    drawServiceEditorHints();
+    updateServiceEditorButtons();
+  });
+
+  serviceEditor.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!editorOpen || busy) return;
+    const parsedName = M.normalizeServiceName(serviceNameInput.value);
+    if (parsedName.error) { say(servicesText, parsedName.error, true); return; }
+    const validated = M.validateServiceRules(editorRules);
+    if (validated.error) { say(servicesText, validated.error, true); return; }
+    await mutate(servicesText, async live => {
+      busy = true;
+      draw();
+      say(servicesText, `Saving ${parsedName.service}…`);
+      try {
+        const data = await request(
+          `/api/tailscale/services/${encodeURIComponent(parsedName.name)}`,
+          {...json('PUT', {rules: validated.rules}), timeoutMs: 30000}
+        );
+        if (!live()) return;
+        servicesData = data;
+        closeServiceEditor(`${parsedName.service} saved.`);
+      } catch (error) {
+        if (live()) say(servicesText, error.message, true);
+      } finally {
+        finishBusy(live);
+      }
+    });
+  });
 
   async function toggleService(enable) {
     if (!status || busy) return;
@@ -1199,12 +1883,19 @@
     clear() {
       loadId++;
       versionsLoadId++;
+      servicesLoadId++;
+      pickerLoadId++;
       routingSession++;
       stopRoutingContext();
       resetRoutingDraft(null);
       status = null; baseline = null; loading = false; attempted = false; busy = false; pendingStatus = null;
       pendingLoginUrl = ''; loginPending = false; logoutWarning = '';
       versionCatalog = null; selectedVersion = ''; versionsLoading = false; versionsAttempted = false; versionsError = ''; versionSelectSignature = '';
+      servicesData = null; servicesLoading = false; servicesAttempted = false; servicesError = '';
+      pickerOptions = []; reservationsList = null; pickerLoaded = false;
+      editorOpen = false; editorMode = 'new'; editorLockedName = ''; editorRules = [];
+      serviceNameInput.value = ''; serviceNameInput.readOnly = false;
+      editorRuleRowsEl.replaceChildren(); serviceEditorHints.replaceChildren();
       manualDetails.open = false;
       authKeyInput.value = '';
       hostnameInput.value = '';
@@ -1212,7 +1903,7 @@
       wakelockChoice.input.checked = false;
       versionInput.value = '';
       sha256Input.value = '';
-      for (const node of [statusText, authText, configText, updateText]) say(node, '');
+      for (const node of [statusText, authText, configText, servicesText, updateText]) say(node, '');
       draw();
     }
   });

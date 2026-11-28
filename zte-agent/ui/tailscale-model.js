@@ -1,16 +1,27 @@
 'use strict';
 ((globalThis) => {
   const ADMIN_CONSOLE_URL = 'https://login.tailscale.com/admin/machines';
+  const ADMIN_SERVICES_BASE_URL = 'https://console.tailscale.com/admin/services/';
   const PACKAGES_URL = 'https://pkgs.tailscale.com/stable/#static';
   const HOSTNAME_RE = /^[A-Za-z0-9-]+$/;
+  const SERVICE_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
   const VERSION_RE = /^\d+(?:\.\d+)*$/;
   const HEX64_RE = /^[0-9a-fA-F]{64}$/;
   const MAX_ADVERTISE_ROUTES = 16;
+  const MAX_SERVICE_RULES = 32;
+  const MAX_SERVICE_PATH_LEN = 256;
   const ROUTE_STATES = Object.freeze({
     approved: 'Approved', standby: 'Standby', pending: 'Pending', new: 'New', unknown: 'Unknown'
   });
   const SYNC_STATES = Object.freeze({
     applied: 'Applied', pending_daemon: 'Pending daemon', drift: 'Drift', unknown: 'Unknown'
+  });
+  const SERVICE_STATES = Object.freeze({
+    active: 'Active',
+    pending: 'Pending approval',
+    drained: 'Drained',
+    port_mismatch: 'Port mismatch',
+    unconfigured: 'Unconfigured'
   });
 
   function cleanDnsName(raw) {
@@ -523,11 +534,394 @@
     return lines.join(' ');
   }
 
+  // ── Tailscale Services (svc:*) model ────────────────────────────────────
+  function hasControlChars(text) {
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code < 0x20 || code === 0x7f) return true;
+    }
+    return false;
+  }
+
+  function normalizeServiceName(raw) {
+    const text = String(raw ?? '').trim();
+    const short = text.startsWith('svc:') ? text.slice(4) : text;
+    if (!short || short.length > 63 || !SERVICE_NAME_RE.test(short)) {
+      return {error: 'Service name must be 1–63 lowercase letters, digits or hyphens, starting and ending with a letter or digit.'};
+    }
+    return {name: short, service: `svc:${short}`};
+  }
+
+  function serviceNameProblem(raw) {
+    return normalizeServiceName(raw).error || '';
+  }
+
+  function serviceAdminUrl(raw) {
+    const parsed = normalizeServiceName(raw);
+    return parsed.service ? `${ADMIN_SERVICES_BASE_URL}${parsed.service}` : '';
+  }
+
+  function isValidHostName(host) {
+    if (!host || host.length > 253) return false;
+    const clean = host.endsWith('.') ? host.slice(0, -1) : host;
+    if (!clean) return false;
+    return clean.split('.').every(label =>
+      label.length > 0 && label.length <= 63 && HOSTNAME_RE.test(label) && !label.startsWith('-') && !label.endsWith('-')
+    );
+  }
+
+  function parseAuthority(authority, requirePort) {
+    if (!authority || hasControlChars(authority) || /\s/.test(authority) || /[@/?#]/.test(authority)) {
+      return {error: 'Invalid backend host or port.'};
+    }
+    let hostPart = '', portStr = null;
+    if (authority.startsWith('[')) {
+      const close = authority.indexOf(']');
+      if (close < 0) return {error: 'Unclosed IPv6 bracket in backend target.'};
+      const addr = authority.slice(1, close);
+      const words = ipv6Words(addr);
+      if (!words) return {error: 'Invalid IPv6 address in backend target.'};
+      const after = authority.slice(close + 1);
+      if (after && !after.startsWith(':')) return {error: 'Invalid port syntax after IPv6 address.'};
+      hostPart = `[${formatIpv6(words)}]`;
+      portStr = after ? after.slice(1) : null;
+    } else {
+      const colon = authority.lastIndexOf(':');
+      if (colon >= 0) {
+        const left = authority.slice(0, colon);
+        if (left.includes(':')) return {error: 'Wrap IPv6 addresses in brackets, e.g. [::1]:8080.'};
+        hostPart = left.toLowerCase();
+        portStr = authority.slice(colon + 1);
+      } else {
+        hostPart = authority.toLowerCase();
+      }
+      if (!ipv4Octets(hostPart) && !isValidHostName(hostPart)) {
+        return {error: `Invalid backend host “${hostPart}”.`};
+      }
+    }
+
+    let port = null;
+    if (portStr !== null) {
+      if (!/^\d+$/.test(portStr)) return {error: 'Backend port must be a whole number from 1 to 65535.'};
+      port = Number(portStr);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        return {error: 'Backend port must be between 1 and 65535.'};
+      }
+    }
+    if (requirePort && port === null) {
+      return {error: 'TCP backend target must include a port (for example 192.168.0.10:22).'};
+    }
+    return {host: hostPart, port};
+  }
+
+  function normalizeUnixTarget(raw) {
+    const rest = raw.startsWith('unix://') ? raw.slice(7) : raw.startsWith('unix:') ? raw.slice(5) : '';
+    if (!rest.startsWith('/') || rest.length < 2 || hasControlChars(rest) || /\s/.test(rest)) {
+      return {error: 'Unix socket target must be an absolute path (for example unix:/tmp/app.sock).'};
+    }
+    return {target: `unix:${rest}`};
+  }
+
+  function normalizeServicePath(raw, isFile = false) {
+    const text = String(raw ?? '').trim();
+    const path = text || '/';
+    if (!path.startsWith('/')) return {error: 'HTTPS URL path must start with “/”.'};
+    if (path.length > MAX_SERVICE_PATH_LEN) return {error: `HTTPS URL path must be at most ${MAX_SERVICE_PATH_LEN} characters.`};
+    if (hasControlChars(path) || /\s/.test(path) || path.includes('?') || path.includes('#') || path.includes('//')) {
+      return {error: 'HTTPS URL path must not contain spaces, query strings, fragments or “//”.'};
+    }
+    const normalized = path === '/' ? '/' : (isFile ? path : path.replace(/\/+$/, '') || '/');
+    const dedupKey = normalized === '/' ? '/' : normalized.replace(/\/+$/, '') || '/';
+    return {path: normalized, dedupKey};
+  }
+
+  function validateHttpsTarget(raw) {
+    const text = String(raw ?? '').trim();
+    if (!text) return {error: 'Enter a backend target.'};
+    if (hasControlChars(text)) return {error: 'Backend target must not contain control characters.'};
+    if (text.startsWith('file://') || text.startsWith('/')) {
+      const fsPath = text.startsWith('file://') ? text.slice(7) : text;
+      if (!fsPath.startsWith('/')) return {error: 'File target must use an absolute path (for example file:///data/share).'};
+      return {target: `file://${fsPath}`, isFile: true};
+    }
+    if (/^unix:/i.test(text)) {
+      const unix = normalizeUnixTarget(`unix:${text.slice(5)}`);
+      return unix.error ? unix : {target: unix.target, isFile: false};
+    }
+    const sep = text.indexOf('://');
+    if (sep < 0) {
+      return {error: 'HTTPS backend target must start with http://, https://, https+insecure://, unix:, or file://.'};
+    }
+    const scheme = text.slice(0, sep).toLowerCase();
+    const rest = text.slice(sep + 3);
+    if (!['http', 'https', 'https+insecure'].includes(scheme)) {
+      return {error: `Unsupported HTTPS backend scheme “${scheme}://”.`};
+    }
+    if (/\s/.test(rest) || rest.includes('?') || rest.includes('#')) {
+      return {error: 'HTTPS backend URL must not contain spaces, query strings or fragments.'};
+    }
+    const slash = rest.indexOf('/');
+    const authority = slash >= 0 ? rest.slice(0, slash) : rest;
+    const suffix = slash >= 0 ? rest.slice(slash) : '';
+    const parsed = parseAuthority(authority, false);
+    if (parsed.error) return parsed;
+    const target = `${scheme}://${parsed.host}${parsed.port !== null ? `:${parsed.port}` : ''}${suffix}`;
+    return {target, isFile: false};
+  }
+
+  function validateTcpTarget(raw) {
+    const text = String(raw ?? '').trim();
+    if (!text) return {error: 'Enter a TCP backend target.'};
+    if (hasControlChars(text) || /\s/.test(text)) return {error: 'TCP backend target must not contain spaces or control characters.'};
+    if (/^unix:/i.test(text)) return normalizeUnixTarget(`unix:${text.slice(5)}`);
+    if (text.startsWith('/') || /^file:\/\//i.test(text)) {
+      return {error: 'file:// targets are only supported for HTTPS rules, not raw TCP.'};
+    }
+    let authority = text;
+    const sep = text.indexOf('://');
+    if (sep >= 0) {
+      const scheme = text.slice(0, sep).toLowerCase();
+      if (scheme !== 'tcp') {
+        return {error: `TCP backend target does not accept “${scheme}://” (use host:port, tcp://host:port, or unix:/path).`};
+      }
+      authority = text.slice(sep + 3);
+    }
+    const parsed = parseAuthority(authority, true);
+    if (parsed.error) return parsed;
+    return {target: `${parsed.host}:${parsed.port}`};
+  }
+
+  function validateServiceRules(rawRules) {
+    if (!Array.isArray(rawRules) || rawRules.length === 0) {
+      return {error: 'Add at least one port rule, or clear the service to remove it.'};
+    }
+    if (rawRules.length > MAX_SERVICE_RULES) {
+      return {error: `A service may configure at most ${MAX_SERVICE_RULES} rules.`};
+    }
+    const portProtocols = new Map(), tcpPorts = new Set(), httpsPaths = new Set(), out = [];
+    for (const [index, item] of rawRules.entries()) {
+      const rowLabel = `Rule ${index + 1}`;
+      const protocol = String(item?.protocol || '').toLowerCase();
+      if (protocol !== 'https' && protocol !== 'tcp') {
+        return {error: `${rowLabel}: protocol must be HTTPS or TCP.`};
+      }
+      const portText = String(item?.port ?? '').trim();
+      if (!/^\d+$/.test(portText)) return {error: `${rowLabel}: enter an external port between 1 and 65535.`};
+      const port = Number(portText);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        return {error: `${rowLabel}: external port must be between 1 and 65535.`};
+      }
+      const prevProto = portProtocols.get(port);
+      if (prevProto && prevProto !== protocol) {
+        return {error: `Port ${port} cannot be used by both HTTPS and TCP rules.`};
+      }
+      portProtocols.set(port, protocol);
+      if (protocol === 'https') {
+        const target = validateHttpsTarget(item?.target);
+        if (target.error) return {error: `${rowLabel}: ${target.error}`};
+        const path = normalizeServicePath(item?.path, target.isFile);
+        if (path.error) return {error: `${rowLabel}: ${path.error}`};
+        const key = `${port}|${path.dedupKey}`;
+        if (httpsPaths.has(key)) return {error: `Duplicate HTTPS path “${path.path}” on port ${port}.`};
+        httpsPaths.add(key);
+        out.push({protocol: 'https', port, path: path.path, target: target.target});
+      } else {
+        if (tcpPorts.has(port)) return {error: `Duplicate TCP rule on port ${port}.`};
+        tcpPorts.add(port);
+        const target = validateTcpTarget(item?.target);
+        if (target.error) return {error: `${rowLabel}: ${target.error}`};
+        out.push({protocol: 'tcp', port, target: target.target});
+      }
+    }
+    return {rules: out};
+  }
+
+  function extractTargetIp(target) {
+    const text = String(target || '').trim();
+    if (!text || /^unix:/i.test(text) || /^file:\/\//i.test(text) || text.startsWith('/')) return '';
+    const sep = text.indexOf('://');
+    const rest = sep >= 0 ? text.slice(sep + 3) : text;
+    const slash = rest.indexOf('/');
+    const authority = slash >= 0 ? rest.slice(0, slash) : rest;
+    if (authority.startsWith('[')) {
+      const close = authority.indexOf(']');
+      if (close < 0) return '';
+      const words = ipv6Words(authority.slice(1, close));
+      return words ? formatIpv6(words) : '';
+    }
+    const colon = authority.lastIndexOf(':');
+    const host = colon >= 0 && !authority.slice(0, colon).includes(':') ? authority.slice(0, colon) : authority;
+    const octets = ipv4Octets(host);
+    return octets ? octets.join('.') : '';
+  }
+
+  function parseIpWords(ip) {
+    const text = String(ip || '').trim();
+    if (!text) return null;
+    if (text.includes(':')) {
+      const words = ipv6Words(text);
+      return words ? {bits: 16, words, canonical: formatIpv6(words)} : null;
+    }
+    const octets = ipv4Octets(text);
+    return octets ? {bits: 8, words: octets, canonical: octets.join('.')} : null;
+  }
+
+  function ipInPrefix(ip, cidr) {
+    const parsedIp = parseIpWords(ip);
+    const prefix = parsePrefix(cidr);
+    if (!parsedIp || !prefix || parsedIp.bits !== prefix.bits) return false;
+    return sameList(maskAddress(parsedIp.words, parsedIp.bits, prefix.length), prefix.network);
+  }
+
+  const TAILNET_V6_PREFIX = parsePrefix('fd7a:115c:a1e0::/48');
+
+  function isPrivateLanIp(ip) {
+    const parsed = parseIpWords(ip);
+    if (!parsed) return false;
+    if (parsed.bits === 8) {
+      const [a, b] = parsed.words;
+      return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+    }
+    if ((parsed.words[0] & 0xfe00) !== 0xfc00) return false;
+    return !sameList(maskAddress(parsed.words, 16, TAILNET_V6_PREFIX.length), TAILNET_V6_PREFIX.network);
+  }
+
+  function maskMac(raw) {
+    const clean = String(raw || '').trim().toLowerCase();
+    if (!/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(clean)) return '';
+    const octets = clean.split(':');
+    return `••:••:••:••:${octets[4]}:${octets[5]}`;
+  }
+
+  function buildTargetPickerOptions(clientsData, reservationsData) {
+    const byIp = new Map();
+    const record = (ip, name, mac, isStatic) => {
+      const parsed = parseIpWords(ip);
+      if (!parsed) return;
+      const key = parsed.canonical;
+      const cleanName = String(name || '').trim();
+      const masked = maskMac(mac);
+      const existing = byIp.get(key);
+      if (!existing) {
+        byIp.set(key, {ip: key, name: cleanName, macMasked: masked, isStatic: !!isStatic});
+      } else {
+        if (isStatic) existing.isStatic = true;
+        if (!existing.name && cleanName) existing.name = cleanName;
+        if (!existing.macMasked && masked) existing.macMasked = masked;
+      }
+    };
+
+    for (const entry of Array.isArray(reservationsData?.entries) ? reservationsData.entries : []) {
+      record(entry?.ip, entry?.name, entry?.mac, true);
+    }
+    for (const [macAddr, host] of Object.entries(clientsData?.hosts || {})) {
+      if (!host || typeof host !== 'object') continue;
+      for (const ip of [...(Array.isArray(host.ipaddrs) ? host.ipaddrs : []), ...(Array.isArray(host.ip6addrs) ? host.ip6addrs : [])]) {
+        if (!String(ip).toLowerCase().startsWith('fe80:')) record(ip, host.name, macAddr, false);
+      }
+    }
+    for (const lease of Array.isArray(clientsData?.dhcp_leases) ? clientsData.dhcp_leases : []) {
+      record(lease?.ipaddr, lease?.hostname, lease?.macaddr, false);
+    }
+
+    return [...byIp.values()]
+      .sort((a, b) => Number(b.isStatic) - Number(a.isStatic) || a.ip.localeCompare(b.ip))
+      .map(item => {
+        const tag = item.isStatic ? 'Static DHCP' : 'LAN device';
+        const title = item.name || item.macMasked || 'Device';
+        return {
+          ...item,
+          label: `${item.ip} — ${title} (${tag})`
+        };
+      });
+  }
+
+  function applyPickedIpToTarget(protocol, currentTarget, ip) {
+    const parsed = parseIpWords(ip);
+    if (!parsed) return currentTarget;
+    const host = parsed.bits === 16 ? `[${parsed.canonical}]` : parsed.canonical;
+    const raw = String(currentTarget || '').trim();
+    if (protocol === 'tcp') {
+      const existingPort = raw.match(/:(\d+)$/)?.[1] || '';
+      return existingPort ? `${host}:${existingPort}` : `${host}:`;
+    }
+    const schemeMatch = raw.match(/^(https\+insecure|https|http):\/\//i);
+    const scheme = schemeMatch ? schemeMatch[1].toLowerCase() : 'http';
+    const rest = schemeMatch ? raw.slice(schemeMatch[0].length) : '';
+    const slash = rest.indexOf('/');
+    const authority = slash >= 0 ? rest.slice(0, slash) : rest;
+    const suffix = slash >= 0 ? rest.slice(slash) : '';
+    const existingPort = authority.match(/:(\d+)$/)?.[1] || '';
+    return `${scheme}://${host}${existingPort ? `:${existingPort}` : ''}${suffix}`;
+  }
+
+  function serviceTargetHints(rules, {
+    reservations = null,
+    advertisedRoutes = [],
+    approvedRoutes = [],
+    routerIps = [],
+    httpsEnabled = true
+  } = {}) {
+    const routerSet = new Set(routerIps.map(ip => parseIpWords(ip)?.canonical).filter(Boolean));
+    const reservedSet = Array.isArray(reservations)
+      ? new Set(reservations.map(entry => parseIpWords(entry?.ip ?? entry)?.canonical).filter(Boolean))
+      : null;
+
+    const unreservedIps = [], unadvertisedSubnetIps = [], pendingSubnetIps = [];
+    let usesHttps = false;
+    const pushUnique = (list, value) => { if (value && !list.includes(value)) list.push(value); };
+
+    for (const rule of Array.isArray(rules) ? rules : []) {
+      if (String(rule?.protocol || '').toLowerCase() === 'https') usesHttps = true;
+      const ip = extractTargetIp(rule?.target);
+      if (!ip || routerSet.has(ip) || !isPrivateLanIp(ip)) continue;
+      const parsed = parseIpWords(ip);
+      if (reservedSet && parsed?.bits === 8 && !reservedSet.has(ip)) {
+        pushUnique(unreservedIps, ip);
+      }
+      const isApproved = approvedRoutes.some(cidr => ipInPrefix(ip, cidr));
+      if (!isApproved) {
+        const isAdvertised = advertisedRoutes.some(cidr => ipInPrefix(ip, cidr));
+        if (isAdvertised) pushUnique(pendingSubnetIps, ip);
+        else pushUnique(unadvertisedSubnetIps, ip);
+      }
+    }
+
+    return {
+      unreservedIps,
+      unadvertisedSubnetIps,
+      pendingSubnetIps,
+      httpsDisabledWarning: usesHttps && httpsEnabled === false
+    };
+  }
+
+  function serviceStateMeta(rawState) {
+    const state = Object.hasOwn(SERVICE_STATES, rawState) ? rawState : 'pending';
+    const chipState = state === 'active'
+      ? 'approved'
+      : state === 'pending' || state === 'port_mismatch'
+        ? 'pending'
+        : 'unknown';
+    return {state, label: SERVICE_STATES[state], chipState};
+  }
+
+  function formatServicePortDiff(service) {
+    const unallowed = Array.isArray(service?.unallowed_ports) ? service.unallowed_ports : [];
+    if (!unallowed.length) return '';
+    const allowed = Array.isArray(service?.tailnet_ports) && service.tailnet_ports.length
+      ? service.tailnet_ports.join(', ')
+      : 'none';
+    return `Ports not allowed in Tailscale admin: ${unallowed.join(', ')} (admin allows: ${allowed}).`;
+  }
+
   const api = {
     ADMIN_CONSOLE_URL,
+    ADMIN_SERVICES_BASE_URL,
     PACKAGES_URL,
     MAX_ADVERTISE_ROUTES,
+    MAX_SERVICE_RULES,
     ROUTE_STATES,
+    SERVICE_STATES,
     cleanDnsName,
     safeLoginUrl,
     validVersion,
@@ -565,7 +959,21 @@
     view,
     facts,
     alerts,
-    configConfirmation
+    configConfirmation,
+    normalizeServiceName,
+    serviceNameProblem,
+    serviceAdminUrl,
+    normalizeServicePath,
+    validateServiceRules,
+    extractTargetIp,
+    ipInPrefix,
+    isPrivateLanIp,
+    maskMac,
+    buildTargetPickerOptions,
+    applyPickedIpToTarget,
+    serviceTargetHints,
+    serviceStateMeta,
+    formatServicePortDiff
   };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else globalThis.OpenU60Tailscale = api;
