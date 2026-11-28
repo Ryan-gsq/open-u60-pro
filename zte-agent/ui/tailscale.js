@@ -326,6 +326,7 @@
   const rulesHeader = el('div', 'tailscale-service-rules-head');
   const addRuleBtn = button('+ Add rule', () => {
     addEditorRuleRow({protocol: 'https', port: '', path: '/', target: ''});
+    editorRowsDirty = true;
     drawServiceEditor();
   });
   rulesHeader.append(el('strong', '', 'Port & route rules'), addRuleBtn);
@@ -445,7 +446,7 @@
   let routeRows = new Map(), lanSuggestionSignature = '';
   let servicesData = null, servicesLoading = false, servicesAttempted = false, servicesError = '', servicesLoadId = 0;
   let pickerOptions = [], reservationsList = null, pickerLoaded = false, pickerLoadId = 0;
-  let editorOpen = false, editorMode = 'new', editorLockedName = '', editorRules = [];
+  let editorOpen = false, editorMode = 'new', editorLockedName = '', editorRules = [], editorRowsDirty = true;
   const READING_STATUS_MESSAGE = 'Reading Tailscale status…';
   const onRoute = () => OpenU60Navigation.current.key === route;
 
@@ -852,6 +853,7 @@
   function openServiceEditor(svc) {
     editorOpen = true;
     editorRules = [];
+    editorRowsDirty = true;
     if (!svc) {
       editorMode = 'new';
       editorLockedName = '';
@@ -878,17 +880,38 @@
     (editorLockedName ? editorRuleRowsEl.querySelector('input, select') : serviceNameInput)?.focus();
   }
 
+  function parkServiceEditor() {
+    if (serviceEditor.parentNode !== servicesPanel) {
+      servicesPanel.insertBefore(serviceEditor, servicesText);
+    }
+    serviceEditor.hidden = true;
+    serviceEditor.dataset.inline = 'false';
+  }
+
   function closeServiceEditor(message = '') {
     editorOpen = false;
     editorMode = 'new';
     editorLockedName = '';
     editorRules = [];
+    editorRowsDirty = true;
     serviceNameInput.value = '';
     serviceNameInput.readOnly = false;
+    parkServiceEditor();
     editorRuleRowsEl.replaceChildren();
     serviceEditorHints.replaceChildren();
     if (message !== undefined) say(servicesText, message);
     drawServices();
+  }
+
+  function refreshPickerSelects() {
+    for (const select of editorRuleRowsEl.querySelectorAll('select[id^="tailscale-svc-pick-"]')) {
+      const promptOpt = new Option(
+        pickerOptions.length ? 'Pick LAN device / static IP…' : (pickerLoaded ? 'No LAN devices reported' : 'Loading LAN devices…'),
+        ''
+      );
+      select.replaceChildren(promptOpt, ...pickerOptions.map(opt => new Option(opt.label, opt.ip)));
+      select.value = '';
+    }
   }
 
   async function loadPickerSources() {
@@ -902,7 +925,10 @@
     reservationsList = Array.isArray(reservations?.entries) ? reservations.entries : null;
     pickerOptions = M.buildTargetPickerOptions(clients, reservations);
     pickerLoaded = true;
-    if (editorOpen) drawServiceEditor();
+    if (editorOpen) {
+      refreshPickerSelects();
+      drawServiceEditorHints();
+    }
   }
 
   function drawServiceEditorHints() {
@@ -1049,6 +1075,7 @@
       const removeBtn = button('Remove', () => {
         if (editorRules.length <= 1) return;
         editorRules.splice(index, 1);
+        editorRowsDirty = true;
         drawServiceEditor();
       });
       removeBtn.setAttribute('aria-label', `Remove rule ${index + 1}`);
@@ -1058,6 +1085,7 @@
       return row;
     });
     editorRuleRowsEl.replaceChildren(...rows);
+    editorRowsDirty = false;
   }
 
   function updateServiceEditorButtons() {
@@ -1071,18 +1099,35 @@
   }
 
   function drawServiceEditor() {
-    serviceEditor.hidden = !editorOpen;
     servicesPanel.dataset.dirty = String(editorOpen);
-    if (!editorOpen) return;
+    if (!editorOpen) {
+      parkServiceEditor();
+      return;
+    }
+    const inline = editorMode !== 'new';
     const view = M.view(status);
     const editable = !busy && API.connected && !API.locked && view.running && servicesData?.available === true;
+    serviceEditor.hidden = false;
+    serviceEditor.dataset.inline = String(inline);
+    serviceEditorTitle.hidden = inline;
+    serviceNameField.wrapper.hidden = inline;
+    if (!inline) {
+      serviceEditorTitle.textContent = 'Add Tailscale Service';
+      if (serviceEditor.parentNode !== servicesPanel) {
+        servicesPanel.insertBefore(serviceEditor, servicesText);
+      }
+    }
     serviceEditorFields.disabled = !editable;
-    serviceEditorTitle.textContent = editorMode === 'edit'
-      ? `Edit svc:${editorLockedName}`
-      : editorMode === 'configure'
-        ? `Configure svc:${editorLockedName}`
-        : 'Add Tailscale Service';
-    renderEditorRuleRows(!editable);
+    if (editorRowsDirty) {
+      renderEditorRuleRows(!editable);
+    } else {
+      for (const [index, row] of [...editorRuleRowsEl.children].entries()) {
+        const pathInput = row.querySelector(`#tailscale-svc-path-${index}`);
+        if (pathInput) pathInput.disabled = !editable || editorRules[index]?.protocol !== 'https';
+        const rmBtn = row.querySelector('button');
+        if (rmBtn) rmBtn.disabled = !editable || editorRules.length <= 1;
+      }
+    }
     drawServiceEditorHints();
     updateServiceEditorButtons();
   }
@@ -1101,9 +1146,9 @@
           : servicesData?.reason || 'Enable and sign in to Tailscale above to manage Tailscale Services.';
       servicesBar.hidden = true;
       servicesEnvNotes.hidden = true;
+      parkServiceEditor();
       servicesList.replaceChildren();
       servicesEmpty.hidden = true;
-      serviceEditor.hidden = true;
       servicesPanel.dataset.dirty = 'false';
       return;
     }
@@ -1122,9 +1167,9 @@
       addServiceBtn.disabled = true;
       refreshServicesBtn.disabled = servicesLoading || inactive;
       servicesEnvNotes.hidden = true;
+      parkServiceEditor();
       servicesList.replaceChildren();
       servicesEmpty.hidden = true;
-      serviceEditor.hidden = true;
       servicesPanel.dataset.dirty = 'false';
       return;
     }
@@ -1155,8 +1200,31 @@
 
     const list = Array.isArray(servicesData.services) ? servicesData.services : [];
     servicesEmpty.hidden = list.length > 0;
-    servicesList.replaceChildren(...list.map(svc => {
+
+    const editingInlineTarget = editorOpen && editorMode !== 'new' ? `svc:${editorLockedName}` : '';
+    const existingEditingCard = editingInlineTarget
+      ? servicesList.querySelector('article.tailscale-service-card[data-editing="true"]')
+      : null;
+    const reuseEditingCard = existingEditingCard && existingEditingCard.dataset.service === editingInlineTarget
+      ? existingEditingCard
+      : null;
+    if (!reuseEditingCard && serviceEditor.parentNode !== servicesPanel) {
+      servicesPanel.insertBefore(serviceEditor, servicesText);
+    }
+
+    const nextCards = list.map(svc => {
       const meta = M.serviceStateMeta(svc.state);
+      const isEditing = editingInlineTarget && svc.service === editingInlineTarget;
+      if (isEditing && reuseEditingCard) {
+        reuseEditingCard.dataset.state = meta.state;
+        const badgeEl = reuseEditingCard.querySelector('.tailscale-service-state');
+        if (badgeEl) {
+          badgeEl.dataset.state = meta.chipState;
+          if (badgeEl.textContent !== meta.label) badgeEl.textContent = meta.label;
+        }
+        return reuseEditingCard;
+      }
+
       const card = el('article', 'tailscale-service-card');
       card.dataset.service = svc.service;
       card.dataset.state = meta.state;
@@ -1173,6 +1241,18 @@
       head.append(headCopy, badge);
       card.append(head);
 
+      const mismatchMsg = M.formatServicePortDiff(svc);
+      if (isEditing) {
+        card.dataset.editing = 'true';
+        if (mismatchMsg) {
+          const warn = el('div', 'relay-problem tailscale-service-alert');
+          warn.append(el('p', '', mismatchMsg));
+          card.append(warn);
+        }
+        card.append(serviceEditor);
+        return card;
+      }
+
       if (svc.editable === false) {
         const ro = el('div', 'relay-problem tailscale-service-alert');
         const reasons = Array.isArray(svc.unsupported_reasons) && svc.unsupported_reasons.length
@@ -1182,7 +1262,6 @@
         card.append(ro);
       }
 
-      const mismatchMsg = M.formatServicePortDiff(svc);
       if (mismatchMsg) {
         const warn = el('div', 'relay-problem tailscale-service-alert');
         warn.append(el('p', '', mismatchMsg));
@@ -1275,7 +1354,25 @@
       }
       card.append(actions);
       return card;
-    }));
+    });
+
+    if (editingInlineTarget && !nextCards.some(card => card.dataset.editing === 'true')) {
+      editorOpen = false;
+      editorMode = 'new';
+      editorLockedName = '';
+      editorRules = [];
+      editorRowsDirty = true;
+    }
+
+    const wanted = new Set(nextCards);
+    for (const child of [...servicesList.children]) {
+      if (!wanted.has(child)) child.remove();
+    }
+    nextCards.forEach((card, index) => {
+      if (servicesList.children[index] !== card) {
+        servicesList.insertBefore(card, servicesList.children[index] || null);
+      }
+    });
 
     drawServiceEditor();
   }
@@ -1893,8 +1990,9 @@
       versionCatalog = null; selectedVersion = ''; versionsLoading = false; versionsAttempted = false; versionsError = ''; versionSelectSignature = '';
       servicesData = null; servicesLoading = false; servicesAttempted = false; servicesError = '';
       pickerOptions = []; reservationsList = null; pickerLoaded = false;
-      editorOpen = false; editorMode = 'new'; editorLockedName = ''; editorRules = [];
+      editorOpen = false; editorMode = 'new'; editorLockedName = ''; editorRules = []; editorRowsDirty = true;
       serviceNameInput.value = ''; serviceNameInput.readOnly = false;
+      parkServiceEditor();
       editorRuleRowsEl.replaceChildren(); serviceEditorHints.replaceChildren();
       manualDetails.open = false;
       authKeyInput.value = '';

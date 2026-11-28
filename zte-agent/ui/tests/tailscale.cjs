@@ -894,6 +894,24 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     assert.equal(await svcAdmin.getAttribute('href'), 'https://console.tailscale.com/admin/services/svc:t3code');
     assert.equal(await svcAdmin.getAttribute('rel'), 'noopener noreferrer');
 
+    // Editing an existing service transforms its card in-place without spawning a duplicate form below.
+    const t3Card = services.locator('[data-service="svc:t3code"]');
+    await t3Card.getByRole('button', {name: 'Edit', exact: true}).click();
+    assert.equal(await services.locator('[data-service="svc:t3code"]').count(), 1, 'no duplicate card while editing');
+    assert.equal(await t3Card.getAttribute('data-editing'), 'true');
+    assert.equal(await t3Card.locator('#tailscale-service-editor').count(), 1, 'editor mounts inside the edited card');
+    assert.equal(await t3Card.locator('.tailscale-service-rules').count(), 0, 'view rules replaced in-place by editor');
+    assert.equal(await t3Card.locator('#tailscale-service-name').isVisible(), false, 'redundant name input hidden in-place');
+    // SSE status ticks while typing preserve in-place editor focus and draft text.
+    await t3Card.locator('#tailscale-svc-target-0').fill('http://192.168.0.124:3774');
+    fixture.patch({tailscale_status: envelope({...status, relay: 'tok'})});
+    await said('#tailscale-status .tailscale-facts', 'DERP tok');
+    assert.equal(await t3Card.locator('#tailscale-svc-target-0').inputValue(), 'http://192.168.0.124:3774');
+    await t3Card.getByRole('button', {name: 'Cancel', exact: true}).click();
+    assert.equal(await t3Card.getAttribute('data-editing'), null);
+    assert.equal(await t3Card.locator('.tailscale-service-rules').count(), 1);
+    assert.equal(await page.locator('#tailscale-service-editor').isHidden(), true);
+
     // Add a new service with multi-path HTTPS + TCP + dynamic DHCP & missing-subnet hints + device quick-pick.
     await button('Add service').click();
     await page.locator('#tailscale-service-editor').waitFor({state: 'visible'});
