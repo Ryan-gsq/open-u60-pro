@@ -4,8 +4,7 @@
 //! internet client to the router's LAN address.
 //!
 //! A connection is served when its peer is
-//! - loopback (every Tailscale client: tailscaled runs with userspace
-//!   networking, so they all arrive as 127.0.0.1),
+//! - confirmed on loopback or the Tailscale tunnel,
 //! - one of the router's own addresses (a process on the router),
 //! - an IPv6 link-local address whose scope (the interface it came in on)
 //!   is not on the mobile side,
@@ -21,8 +20,9 @@
 //! hardware path; probe evidence of 2026-09-11 and 2026-09-14); and the Wi-Fi
 //! relay's station interface (`ids::RELAY_IFACE`; a hotel network is as
 //! foreign as the carrier's; its firewall guard already refuses it, this is
-//! the second line). The PEER is checked, not the address it reached: a port
-//! forward or DMZ to the router reaches its LAN address from the internet.
+//! the second line). A confirmed ingress on either is refused before the
+//! subnet check. The subnet check uses the peer address: a port forward
+//! or DMZ to the router reaches its LAN address from the internet.
 //! TCP needs the replies to reach the peer, and they leave through the
 //! interface whose subnet holds it most specifically, so a client on the
 //! mobile side cannot complete a connection as a LAN one (policy routes the
@@ -32,7 +32,7 @@
 //! the router's kernel wait for its rtnl lock (held for a while by, say, a
 //! Wi-Fi restart), so they run on the blocking pool: open connections keep
 //! being served meanwhile, new ones wait for the answer. It is read at an
-//! accept that needs it (never for loopback): when 5 s old, and when a
+//! accept that needs it: when 5 s old, and when a
 //! connection would be refused, unless such a read ran within the second (a
 //! new address is picked up at once; a flood from the mobile side costs a
 //! read a second). No timer, no thread of its own. A refused connection is
@@ -42,10 +42,9 @@
 //!
 //! A failed read keeps the last table for 10 minutes (a peer it refuses
 //! cannot turn the check off by making a read fail) and is tried again at
-//! most once a second. With no table that recent every connection is served
-//! (fail open: the firewall stays the first line, and the owner is never
-//! locked out over Wi-Fi, USB or Tailscale by a lookup error); that is
-//! logged once and `mobile_served` says so (the firewall questions).
+//! most once a second. Without a table after a timeout or failure, admission
+//! requires a confirmed non-mobile ingress interface. `mobile_served`
+//! reports the suspended subnet check to the firewall questions.
 //! `ZTE_AGENT_ALLOW_MOBILE=1` turns the check off.
 
 use std::ffi::OsStr;
@@ -54,6 +53,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::Via;
 use crate::boottime::{BootClock, BootInstant, Clock};
 
 /// The opt-out: `1` serves the mobile side too.
@@ -82,12 +82,12 @@ const READ_WAIT: Duration = Duration::from_millis(500);
 
 /// Set once at startup by `Guard::from_env`.
 static ALLOW_MOBILE: AtomicBool = AtomicBool::new(false);
-/// Per router listener (:9090, then HTTPS): its guard serves everything
-/// because its lookup fails. Each listener writes only its own flag.
+/// Per router listener (:9090, then HTTPS): its subnet check is open because
+/// it has no table after a lookup failed or timed out.
 static UNGUARDED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
 
 /// Whether the agent serves the mobile side now: `ZTE_AGENT_ALLOW_MOBILE=1`,
-/// or a listener's interface lookup fails with no recent table (the
+/// or a listener's interface lookup fails or times out with no table (the
 /// firewall questions then say this web UI may become reachable).
 pub fn mobile_served() -> bool {
     ALLOW_MOBILE.load(Ordering::Relaxed) || UNGUARDED.iter().any(|f| f.load(Ordering::Relaxed))
@@ -173,7 +173,7 @@ pub fn admits(table: &[IfAddr], peer: SocketAddr) -> bool {
     if link_local(ip) {
         return arrived_on(table, peer).is_some_and(|i| !mobile_side(&i.name));
     }
-    ip.is_loopback() || table.iter().any(|i| i.addr == ip) || subnet_of(table, ip).is_some_and(|i| !mobile_side(&i.name))
+    table.iter().any(|i| i.addr == ip) || subnet_of(table, ip).is_some_and(|i| !mobile_side(&i.name))
 }
 
 /// The interface an IPv6 link-local peer came in on: its scope id (every
@@ -192,11 +192,11 @@ pub struct Guard {
     lookup: Lookup,
     clock: Arc<dyn Clock>,
     /// A router listener's guard: its flag in `mobile_served` (the set and
-    /// this listener's place in it), true while it serves everything
+    /// this listener's place in it), true while its subnet check is open
     /// (cleared when the guard goes, at a stop).
     flag: Option<(&'static [AtomicBool; 2], usize)>,
-    /// The last table read; kept through failed reads for `KEEP`. `None`
-    /// before the first and after that (every connection is then served).
+    /// The last table read; kept through failed reads for `KEEP`. Without a
+    /// table, only a confirmed non-mobile interface is served.
     table: Option<Vec<IfAddr>>,
     /// When `table` was read.
     good_at: Option<BootInstant>,
@@ -266,8 +266,19 @@ impl Guard {
     /// runs on the blocking pool (the runtime keeps serving meanwhile) and is
     /// awaited for at most `READ_WAIT`; while a slower one is still running,
     /// no other starts and the last table decides.
-    pub async fn admit(&mut self, peer: SocketAddr, local: impl FnOnce() -> Option<SocketAddr>) -> bool {
+    pub(super) async fn admit_via(&mut self, peer: SocketAddr, via: Via, iface: Option<&str>, local: impl FnOnce() -> Option<SocketAddr>) -> bool {
         if self.off {
+            return true;
+        }
+        if let Some(iface) = iface.filter(|name| mobile_side(name)) {
+            let mut lines = Vec::new();
+            self.refused(self.clock.now(), peer, Some(iface), local, &mut lines);
+            for line in lines {
+                eprintln!("{line}");
+            }
+            return false;
+        }
+        if via.allows_tailnet() {
             return true;
         }
         let now = self.clock.now();
@@ -284,7 +295,7 @@ impl Guard {
                 Err(_) => self.pending = Some(read),
             }
         }
-        let (ok, lines) = self.decide(now, peer, local, got);
+        let (ok, lines) = self.decide(now, peer, iface, local, got);
         for line in lines {
             eprintln!("{line}");
         }
@@ -293,36 +304,30 @@ impl Guard {
 
     /// `admit` on this thread, with its log lines returned.
     #[cfg(test)]
-    pub(crate) fn check(&mut self, peer: SocketAddr, local: impl FnOnce() -> Option<SocketAddr>) -> (bool, Vec<String>) {
-        if self.off {
+    fn check(&mut self, peer: SocketAddr, iface: Option<&str>, local: impl FnOnce() -> Option<SocketAddr>) -> (bool, Vec<String>) {
+        if self.off || super::classify_via(peer.ip(), iface, false).allows_tailnet() {
             return (true, Vec::new());
         }
         let now = self.clock.now();
         let got = self.wants_read(peer, now).then(|| (self.lookup)());
-        self.decide(now, peer, local, got)
+        self.decide(now, peer, iface, local, got)
     }
 
     /// Whether `peer` needs the table read first: never read, 5 s old, a
     /// failed read a second ago, or it would be refused (unless such a read
-    /// ran within the second). Loopback never does.
+    /// ran within the second).
     fn wants_read(&mut self, peer: SocketAddr, now: BootInstant) -> bool {
-        if peer.ip().to_canonical().is_loopback() {
-            return false;
-        }
         let Some(read) = self.read_at else { return true };
         let age = now.saturating_duration_since(read);
         if age >= MAX_AGE || (self.failing && age >= RETRY) {
             return true;
         }
-        let miss = !self.serves(peer) && self.miss_at.is_none_or(|t| now.saturating_duration_since(t) >= RETRY);
+        let miss = self.table.as_deref().is_some_and(|table| !admits(table, peer))
+            && self.miss_at.is_none_or(|t| now.saturating_duration_since(t) >= RETRY);
         if miss {
             self.miss_at = Some(now);
         }
         miss
-    }
-
-    fn serves(&self, peer: SocketAddr) -> bool {
-        self.table.as_deref().is_none_or(|t| admits(t, peer))
     }
 
     /// Take a read's result (if one ran), then decide.
@@ -330,6 +335,7 @@ impl Guard {
         &mut self,
         now: BootInstant,
         peer: SocketAddr,
+        iface: Option<&str>,
         local: impl FnOnce() -> Option<SocketAddr>,
         got: Option<std::io::Result<Vec<IfAddr>>>,
     ) -> (bool, Vec<String>) {
@@ -337,9 +343,12 @@ impl Guard {
         if let Some(got) = got {
             self.store(now, got, &mut lines);
         }
-        let ok = self.serves(peer);
+        if let Some((flags, index)) = self.flag {
+            flags[index].store(self.open(), Ordering::Relaxed);
+        }
+        let ok = self.table.as_deref().map_or(iface.is_some(), |table| admits(table, peer));
         if !ok {
-            self.refused(now, peer, local, &mut lines);
+            self.refused(now, peer, iface, local, &mut lines);
         }
         (ok, lines)
     }
@@ -362,23 +371,20 @@ impl Guard {
                         lines.push(format!("[http] interface lookup failed ({e}): the last table is used for up to 10 minutes"));
                     }
                 } else if self.table.take().is_some() || !self.failing {
-                    lines.push(format!("[http] interface lookup failed ({e}): every connection is served until it works; the router's firewall is the only guard"));
+                    lines.push(format!("[http] interface lookup failed ({e}): only confirmed non-mobile interfaces are served until it works"));
                 }
                 self.failing = true;
             }
         }
-        if let Some((f, i)) = self.flag {
-            f[i].store(self.open(), Ordering::Relaxed);
-        }
     }
 
-    /// Every connection is served because the lookup fails.
+    /// The subnet check is suspended for confirmed non-mobile interfaces.
     fn open(&self) -> bool {
-        self.failing && self.table.is_none()
+        self.table.is_none() && (self.failing || self.pending.is_some())
     }
 
     /// Count a refusal; a line for the first, then at most one a minute.
-    fn refused(&mut self, now: BootInstant, peer: SocketAddr, local: impl FnOnce() -> Option<SocketAddr>, lines: &mut Vec<String>) {
+    fn refused(&mut self, now: BootInstant, peer: SocketAddr, iface: Option<&str>, local: impl FnOnce() -> Option<SocketAddr>, lines: &mut Vec<String>) {
         self.unlogged += 1;
         if self.logged_at.is_some_and(|t| now.saturating_duration_since(t) < LOG_EVERY) {
             return;
@@ -390,8 +396,8 @@ impl Guard {
         // it; a client in no local subnet (a port forward's or DMZ's) is
         // said so, with the interface of the address it reached.
         let came = if link_local(ip) { arrived_on(table, peer) } else { subnet_of(table, ip) };
-        let via = match came {
-            Some(i) => format!("interface {}", i.name),
+        let via = match iface.or_else(|| came.map(|i| i.name.as_str())) {
+            Some(name) => format!("interface {name}"),
             None => match local.and_then(|l| table.iter().find(|i| i.addr == l.ip())) {
                 Some(i) => format!("no local subnet, reached via {}", i.name),
                 None => "no local subnet".to_owned(),
@@ -399,7 +405,8 @@ impl Guard {
         };
         let to = local.map_or_else(|| "?".to_owned(), |l| l.to_string());
         let count = if self.unlogged > 1 { format!("; {} refused since the last line", self.unlogged) } else { String::new() };
-        lines.push(format!("[http] refused a connection from the mobile side: {} to {to} ({via}){count}; {ENV}=1 serves them", SocketAddr::new(ip, peer.port())));
+        let reason = if self.table.is_none() && iface.is_none() { "with unverified ingress" } else { "from the mobile side" };
+        lines.push(format!("[http] refused a connection {reason}: {} to {to} ({via}){count}; {ENV}=1 serves them", SocketAddr::new(ip, peer.port())));
         self.unlogged = 0;
         self.logged_at = Some(now);
     }
@@ -474,7 +481,7 @@ mod sys {
     }
 }
 
-/// Elsewhere (host builds): no lookup, so every connection is served.
+/// Elsewhere (host builds): no interface table.
 #[cfg(not(target_os = "linux"))]
 mod sys {
     pub fn interfaces() -> std::io::Result<Vec<super::IfAddr>> {
@@ -515,6 +522,25 @@ mod tests {
 
     fn v6(s: &str, scope: u32) -> SocketAddr {
         SocketAddr::V6(SocketAddrV6::new(s.parse::<Ipv6Addr>().unwrap(), 40000, 0, scope))
+    }
+
+    #[tokio::test]
+    async fn tailnet_ingress_bypasses_subnet_lookup_and_mobile_ingress_is_refused() {
+        let lookup: Lookup = Arc::new(|| panic!("confirmed ingress needs no table lookup"));
+        let mut guard = Guard::new(false, lookup, FakeClock::at_secs(1000));
+        for peer in [v4("100.64.0.2"), v6("fd7a:115c:a1e0::2", 0)] {
+            let iface = Some("tailscale0");
+            let via = super::super::classify_via(peer.ip(), iface, false);
+            assert!(guard.admit_via(peer, via, iface, || panic!("tailnet accepted")).await);
+            for iface in [Some("rmnet_data0"), Some("ath20")] {
+                let via = super::super::classify_via(peer.ip(), iface, false);
+                assert!(!guard.admit_via(peer, via, iface, lan_ip).await);
+            }
+        }
+        let iface = Some("rmnet_data0");
+        let peer = v4("127.0.0.1");
+        let via = super::super::classify_via(peer.ip(), iface, false);
+        assert!(!guard.admit_via(peer, via, iface, lan_ip).await);
     }
 
     #[test]
@@ -670,34 +696,34 @@ mod tests {
     #[test]
     fn refusals_are_logged_once_then_once_a_minute() {
         let (mut g, f) = fake(false);
-        assert_eq!(g.check(v4("192.168.0.23"), lan_ip), (true, Vec::new()));
+        assert_eq!(g.check(v4("192.168.0.23"), None, lan_ip), (true, Vec::new()));
         // Over a port forward to the LAN address: refused, the first one logged.
-        let (ok, lines) = g.check(v4("203.0.113.7"), lan_ip);
+        let (ok, lines) = g.check(v4("203.0.113.7"), None, lan_ip);
         assert!(!ok);
         assert_eq!(lines, ["[http] refused a connection from the mobile side: 203.0.113.7:40000 to 192.168.0.1:9090 (no local subnet, reached via br-lan); ZTE_AGENT_ALLOW_MOBILE=1 serves them"]);
         // Within the minute: refused, not logged.
         for _ in 0..3 {
             f.clock.advance(Duration::from_secs(5));
-            assert_eq!(g.check(v4("198.51.100.1"), || Some("198.51.100.10:9090".parse().unwrap())), (false, Vec::new()));
+            assert_eq!(g.check(v4("198.51.100.1"), None, || Some("198.51.100.10:9090".parse().unwrap())), (false, Vec::new()));
         }
         f.clock.advance(Duration::from_secs(50));
-        let (ok, lines) = g.check(v6("::ffff:198.51.100.1", 0), || Some("[::ffff:198.51.100.10]:9090".parse().unwrap()));
+        let (ok, lines) = g.check(v6("::ffff:198.51.100.1", 0), None, || Some("[::ffff:198.51.100.10]:9090".parse().unwrap()));
         assert!(!ok);
         assert_eq!(lines, ["[http] refused a connection from the mobile side: 198.51.100.1:40000 to 198.51.100.10:9090 (interface rmnet_data0); 4 refused since the last line; ZTE_AGENT_ALLOW_MOBILE=1 serves them"]);
         // Link-local: the interface of its scope.
         f.clock.advance(Duration::from_secs(61));
-        let (ok, lines) = g.check(v6("fe80::23", 7), || Some("[fe80::2%7]:9090".parse().unwrap()));
+        let (ok, lines) = g.check(v6("fe80::23", 7), None, || Some("[fe80::2%7]:9090".parse().unwrap()));
         assert!(!ok);
         assert_eq!(lines, ["[http] refused a connection from the mobile side: [fe80::23]:40000 to [fe80::2]:9090 (interface rmnet_data0); ZTE_AGENT_ALLOW_MOBILE=1 serves them"]);
         // The most specific subnet names the interface.
         f.set(Ok(vec![ifa("br-lan", "10.0.0.1", 8, 0), ifa("rmnet_data0", "10.47.3.2", 30, 0)]));
         f.clock.advance(Duration::from_secs(61));
-        let (ok, lines) = g.check(v4("10.47.3.1"), || Some("10.47.3.2:9090".parse().unwrap()));
+        let (ok, lines) = g.check(v4("10.47.3.1"), None, || Some("10.47.3.2:9090".parse().unwrap()));
         assert!(!ok);
         assert_eq!(lines, ["[http] refused a connection from the mobile side: 10.47.3.1:40000 to 10.47.3.2:9090 (interface rmnet_data0); ZTE_AGENT_ALLOW_MOBILE=1 serves them"]);
         // The address it reached is only asked for a line.
-        assert!(g.check(v4("10.0.0.23"), || panic!("asked")).0);
-        assert!(!g.check(v4("10.47.3.1"), || panic!("asked")).0);
+        assert!(g.check(v4("10.0.0.23"), None, || panic!("asked")).0);
+        assert!(!g.check(v4("10.47.3.1"), None, || panic!("asked")).0);
     }
 
     #[test]
@@ -705,56 +731,68 @@ mod tests {
         let (mut g, f) = fake(false);
         let without_usb: Vec<IfAddr> = router().into_iter().filter(|i| i.name != "usb0").collect();
         f.set(Ok(without_usb.clone()));
-        assert!(g.check(v4("192.168.0.23"), lan_ip).0);
+        assert!(g.check(v4("192.168.0.23"), None, lan_ip).0);
         assert_eq!(f.reads(), 1);
         // A USB network that came up since: the miss reads again, served,
         // also right after a read.
         f.set(Ok(router()));
         f.clock.advance(Duration::from_millis(300));
-        assert!(g.check(v4("192.168.42.129"), lan_ip).0);
+        assert!(g.check(v4("192.168.42.129"), None, lan_ip).0);
         assert_eq!(f.reads(), 2);
         // Misses within a second of a miss's read: no read.
         f.clock.advance(Duration::from_millis(500));
-        assert!(!g.check(v4("203.0.113.7"), lan_ip).0);
+        assert!(!g.check(v4("203.0.113.7"), None, lan_ip).0);
         assert_eq!(f.reads(), 2);
         f.clock.advance(Duration::from_millis(600));
-        assert!(!g.check(v4("203.0.113.7"), lan_ip).0);
+        assert!(!g.check(v4("203.0.113.7"), None, lan_ip).0);
         assert_eq!(f.reads(), 3);
         // Served peers read only once the table is 5 s old; loopback never.
         f.clock.advance(Duration::from_secs(3));
-        assert!(g.check(v4("192.168.0.23"), lan_ip).0);
+        assert!(g.check(v4("192.168.0.23"), None, lan_ip).0);
         assert_eq!(f.reads(), 3);
         f.clock.advance(Duration::from_secs(2));
-        assert!(g.check(v4("127.0.0.1"), lan_ip).0 && g.check(v6("::1", 0), lan_ip).0);
+        assert!(g.check(v4("127.0.0.1"), Some("lo"), lan_ip).0 && g.check(v6("::1", 0), Some("lo"), lan_ip).0);
         assert_eq!(f.reads(), 3);
         // The USB network went away: its peers are refused once the table
         // is 5 s old.
         f.set(Ok(without_usb));
-        assert!(!g.check(v4("192.168.42.129"), lan_ip).0);
+        assert!(!g.check(v4("192.168.42.129"), None, lan_ip).0);
         assert_eq!(f.reads(), 4);
     }
 
     #[test]
-    fn a_failed_lookup_serves_everything_and_says_so_once() {
+    fn a_failed_lookup_suspends_subnet_checks_and_says_so_once() {
         let (mut g, f) = fake(false);
         f.set(Err(std::io::Error::other("netlink busy (fake)")));
-        let (ok, lines) = g.check(v4("203.0.113.7"), lan_ip);
+        let (ok, lines) = g.check(v4("192.168.0.23"), Some("br-lan"), lan_ip);
         assert!(ok && g.open());
-        assert_eq!(lines, ["[http] interface lookup failed (netlink busy (fake)): every connection is served until it works; the router's firewall is the only guard"]);
+        assert_eq!(lines, ["[http] interface lookup failed (netlink busy (fake)): only confirmed non-mobile interfaces are served until it works"]);
         f.clock.advance(Duration::from_secs(2));
-        assert_eq!(g.check(v4("198.51.100.1"), lan_ip), (true, Vec::new()));
+        assert_eq!(g.check(v4("192.168.42.129"), Some("usb0"), lan_ip), (true, Vec::new()));
         assert_eq!(f.reads(), 2);
         // Within a second of a failed read: not tried again.
-        assert_eq!(g.check(v4("198.51.100.1"), lan_ip), (true, Vec::new()));
+        assert!(!g.check(v4("203.0.113.7"), None, lan_ip).0);
         assert_eq!(f.reads(), 2);
         // It works again: said, and the mobile side is refused again.
         f.set(Ok(router()));
         f.clock.advance(Duration::from_secs(2));
-        let (ok, lines) = g.check(v4("203.0.113.7"), lan_ip);
+        let (ok, lines) = g.check(v4("203.0.113.7"), None, lan_ip);
         assert!(!ok && !g.open());
         assert_eq!(lines[0], "[http] interface lookup works again: connections from the mobile side are refused");
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 1);
         assert!(!mobile_served(), "only the router's guard says so");
+    }
+
+    #[tokio::test]
+    async fn failed_lookup_requires_a_confirmed_non_mobile_interface() {
+        let (mut guard, fake) = fake(false);
+        fake.set(busy());
+        let peer = v4("192.168.0.23");
+        assert!(!guard.admit_via(peer, Via::Local, None, lan_ip).await);
+        assert!(guard.open());
+        assert!(guard.admit_via(peer, Via::Local, Some("br-lan"), lan_ip).await);
+        assert!(!guard.admit_via(peer, Via::Local, Some("rmnet_data0"), lan_ip).await);
+        assert_eq!(fake.reads(), 1);
     }
 
     /// A refused peer's re-read failing (fd exhaustion, say) does not serve
@@ -762,31 +800,31 @@ mod tests {
     #[test]
     fn a_failed_read_keeps_the_last_table_for_ten_minutes() {
         let (mut g, f) = fake(false);
-        assert!(!g.check(v4("203.0.113.7"), lan_ip).0);
+        assert!(!g.check(v4("203.0.113.7"), None, lan_ip).0);
         f.set(busy());
         f.clock.advance(Duration::from_secs(2));
-        let (ok, lines) = g.check(v4("203.0.113.7"), lan_ip);
+        let (ok, lines) = g.check(v4("203.0.113.7"), None, lan_ip);
         assert!(!ok && !g.open());
         assert_eq!(lines[0], "[http] interface lookup failed (too many open files (fake)): the last table is used for up to 10 minutes");
         assert_eq!(f.reads(), 2);
         // Tried again at most once a second; the LAN is still served.
-        assert_eq!(g.check(v4("192.168.0.23"), lan_ip), (true, Vec::new()));
+        assert_eq!(g.check(v4("192.168.0.23"), None, lan_ip), (true, Vec::new()));
         assert_eq!(f.reads(), 2);
         f.clock.advance(Duration::from_secs(590));
-        assert!(!g.check(v4("203.0.113.7"), lan_ip).0);
-        assert!(g.check(v4("192.168.42.129"), lan_ip).0);
+        assert!(!g.check(v4("203.0.113.7"), None, lan_ip).0);
+        assert!(g.check(v4("192.168.42.129"), None, lan_ip).0);
         assert_eq!(f.reads(), 3);
-        // 10 minutes after the last good read: every connection is served, said.
+        // 10 minutes after the last good read: admission requires a known interface.
         f.clock.advance(Duration::from_secs(8));
-        let (ok, lines) = g.check(v4("203.0.113.7"), lan_ip);
+        let (ok, lines) = g.check(v4("192.168.0.23"), Some("br-lan"), lan_ip);
         assert!(ok && g.open());
-        assert_eq!(lines, ["[http] interface lookup failed (too many open files (fake)): every connection is served until it works; the router's firewall is the only guard"]);
+        assert_eq!(lines, ["[http] interface lookup failed (too many open files (fake)): only confirmed non-mobile interfaces are served until it works"]);
         f.clock.advance(Duration::from_secs(2));
-        assert_eq!(g.check(v4("203.0.113.7"), lan_ip), (true, Vec::new()));
+        assert!(!g.check(v4("203.0.113.7"), None, lan_ip).0);
         // Back: refused again.
         f.set(Ok(router()));
         f.clock.advance(Duration::from_secs(2));
-        let (ok, lines) = g.check(v4("203.0.113.7"), lan_ip);
+        let (ok, lines) = g.check(v4("203.0.113.7"), None, lan_ip);
         assert!(!ok && !g.open());
         assert_eq!(lines, ["[http] interface lookup works again: connections from the mobile side are refused"]);
     }
@@ -803,27 +841,31 @@ mod tests {
         let mut https = plain.twin();
         assert_eq!(https.flag.map(|(_, i)| i), Some(1));
         f.set(Err(std::io::Error::other("netlink busy (fake)")));
-        assert!(plain.check(v4("203.0.113.7"), lan_ip).0 && any());
+        assert!(plain.check(v4("192.168.0.23"), Some("br-lan"), lan_ip).0 && any());
         f.set(Ok(router()));
-        assert!(!https.check(v4("203.0.113.7"), lan_ip).0);
+        assert!(!https.check(v4("203.0.113.7"), None, lan_ip).0);
         assert!(any(), "the HTTPS guard's good read hid :9090 serving everything");
         // Ten minutes on, HTTPS's lookup fails with no recent table.
         f.set(Err(std::io::Error::other("netlink busy (fake)")));
         f.clock.advance(Duration::from_secs(601));
-        assert!(https.check(v4("203.0.113.7"), lan_ip).0);
+        assert!(https.check(v4("192.168.0.23"), Some("br-lan"), lan_ip).0);
         f.set(Ok(router()));
-        assert!(!plain.check(v4("203.0.113.7"), lan_ip).0);
+        assert!(!plain.check(v4("203.0.113.7"), None, lan_ip).0);
         assert!(any(), ":9090's good read hid HTTPS serving everything");
         drop(https);
         assert!(!any());
         assert!(!mobile_served(), "test flags are not the router's");
     }
 
-    #[test]
-    fn the_opt_out_serves_everything_without_a_lookup() {
-        let (mut g, f) = fake(true);
+    #[tokio::test]
+    async fn the_opt_out_serves_everything_without_a_lookup() {
+        let (mut g, f) = fake(opt_out(Some(OsStr::new("1"))).0);
         for peer in [v4("203.0.113.7"), v4("198.51.100.1"), v6("2001:db8:77::1", 0), v4("192.168.0.23")] {
-            assert_eq!(g.check(peer, || panic!("asked")), (true, Vec::new()));
+            for iface in [None, Some("rmnet_data0")] {
+                let via = super::super::classify_via(peer.ip(), iface, false);
+                assert_eq!(via, Via::Local);
+                assert!(g.admit_via(peer, via, iface, || panic!("asked")).await);
+            }
         }
         assert_eq!(f.reads(), 0);
         assert!(!mobile_served(), "only from_env sets it");
@@ -841,10 +883,10 @@ mod tests {
             Ok(router())
         });
         let mut g = Guard::new(false, lookup, FakeClock::at_secs(1000));
-        assert!(g.admit(v4("127.0.0.1"), lan_ip).await);
+        assert!(g.admit_via(v4("127.0.0.1"), Via::Loopback, Some("lo"), lan_ip).await);
         assert!(ran.lock().unwrap().is_empty(), "loopback reads nothing");
-        assert!(g.admit(v4("192.168.0.23"), lan_ip).await);
-        assert!(!g.admit(v4("203.0.113.7"), lan_ip).await);
+        assert!(g.admit_via(v4("192.168.0.23"), Via::Local, Some("br-lan"), lan_ip).await);
+        assert!(!g.admit_via(v4("203.0.113.7"), Via::Local, None, lan_ip).await);
         let ran = ran.lock().unwrap();
         assert_eq!(ran.len(), 2);
         assert!(ran.iter().all(|t| *t != here), "on the runtime thread");
@@ -874,20 +916,20 @@ mod tests {
         });
         let clock = FakeClock::at_secs(1000);
         let mut g = Guard::new(false, lookup, Arc::clone(&clock) as Arc<dyn Clock>);
-        assert!(g.admit(v4("192.168.0.23"), lan_ip).await);
+        assert!(g.admit_via(v4("192.168.0.23"), Via::Local, Some("br-lan"), lan_ip).await);
         // A USB network came up; the miss's read hangs.
         *table.lock().unwrap() = router();
         clock.advance(Duration::from_secs(2));
         let started = std::time::Instant::now();
-        assert!(!g.admit(v4("192.168.42.129"), lan_ip).await, "the last table decides");
+        assert!(!g.admit_via(v4("192.168.42.129"), Via::Local, Some("usb0"), lan_ip).await, "the last table decides");
         let waited = started.elapsed();
         assert!(waited >= READ_WAIT && waited < Duration::from_secs(3), "{waited:?}");
         // While it hangs: no wait, no second read, loopback and the LAN served.
         clock.advance(Duration::from_secs(10));
         let started = std::time::Instant::now();
-        assert!(g.admit(v4("127.0.0.1"), lan_ip).await);
-        assert!(g.admit(v4("192.168.0.23"), lan_ip).await);
-        assert!(!g.admit(v4("203.0.113.7"), lan_ip).await);
+        assert!(g.admit_via(v4("127.0.0.1"), Via::Loopback, Some("lo"), lan_ip).await);
+        assert!(g.admit_via(v4("192.168.0.23"), Via::Local, Some("br-lan"), lan_ip).await);
+        assert!(!g.admit_via(v4("203.0.113.7"), Via::Local, None, lan_ip).await);
         assert!(started.elapsed() < Duration::from_millis(200));
         assert_eq!(*reads.lock().unwrap(), 2);
         // It finishes: the next accept takes its table.
@@ -902,8 +944,35 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(g.admit(v4("192.168.42.129"), lan_ip).await, "the USB network is in the new table");
+        assert!(g.admit_via(v4("192.168.42.129"), Via::Local, Some("usb0"), lan_ip).await, "the USB network is in the new table");
         assert!(g.pending.is_none());
         assert_eq!(*reads.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn first_lookup_timeout_reports_degradation_and_requires_verified_ingress() {
+        let flags = Box::leak(Box::new([AtomicBool::new(false), AtomicBool::new(false)]));
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Mutex::new(wait);
+        let lookup: Lookup = Arc::new(move || {
+            wait.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(router())
+        });
+        let mut guard = Guard::new(false, lookup, FakeClock::at_secs(1000));
+        guard.flag = Some((flags, 0));
+        let unknown = v4("203.0.113.7");
+        let lan = v4("192.168.0.23");
+
+        assert!(!guard.admit_via(unknown, Via::Local, None, lan_ip).await);
+        assert!(guard.open() && flags[0].load(Ordering::Relaxed));
+        assert!(guard.admit_via(lan, Via::Local, Some("br-lan"), lan_ip).await);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !guard.pending.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(guard.admit_via(lan, Via::Local, None, lan_ip).await);
+        assert!(!guard.open() && !flags[0].load(Ordering::Relaxed));
     }
 }

@@ -163,12 +163,28 @@ elif mode == "nohup":
             if time.monotonic() > deadline:
                 sys.exit(3)
             time.sleep(0.005)
+    if (root / "stall-first-rollback-attempt").exists():
+        ota.mkdir(parents=True, exist_ok=True)
+        (ota / "rollback-attempt").write_text("a\n123-0\n")
+        # Leave /proc/<pid> pointing at /usr/bin/nohup (alive, not is_main) so
+        # the launcher exhausts all 100 polls while this first PID stays active.
+        sys.exit(0)
+    if (root / "fail-first-rollback-attempt").exists():
+        first_flag = root / "first-rollback-failed"
+        if not first_flag.exists():
+            first_flag.touch()
+            ota.mkdir(parents=True, exist_ok=True)
+            (ota / "rollback-attempt").write_text("a\n123-0\n")
+            shutil.rmtree(current)
+            sys.exit(1)
+        (ota / "rollback-attempt").unlink(missing_ok=True)
     if (root / "reuse-child").exists():
         stat(pid, 999999)
     (current / "exe").unlink()
     suffix = " (deleted)" if (root / "delete-child").exists() else ""
-    (current / "exe").symlink_to(str(slot) + suffix)
-    (current / "cmdline").write_bytes(os.fsencode(slot) + b"\0")
+    target_bin = (ota / "last-stable" / "zte-agent") if (root / "fail-first-rollback-attempt").exists() else slot
+    (current / "exe").symlink_to(str(target_bin) + suffix)
+    (current / "cmdline").write_bytes(os.fsencode(target_bin) + b"\0")
     (root / "started").touch()
 ''')
         for command in ("flock", "readlink", "sha256sum"):
@@ -193,9 +209,12 @@ elif mode == "nohup":
             "/tmp/zte-agent-run": str(self.run),
             "/tmp/zte-agent.log": str(self.root / "agent.log"),
             "/tmp/u60-panel/agent": str(self.temporary_binary),
+            "/tmp/zte-agent-perf": str(self.root / "perf"),
             "/data/local/tmp/start_zte_agent.sh": str(self.startup),
             "/data/local/tmp/zte-agent-supervisor.sh": str(self.supervisor),
             "/data/open-u60/update": str(self.ota),
+            "/data/tailscale": str(self.root / "tailscale"),
+            "/data/zte-agent-relay": str(self.root / "relay"),
             "/data/zte-agent": str(self.binary),
             "/etc/rc.local": str(self.rc_local),
             "/proc/": str(self.proc) + "/",
@@ -269,10 +288,10 @@ done
         (path / "stat").write_text(f"{pid} (zte agent) worker) " + " ".join(fields) + "\n")
         return path
 
-    def run_launcher(self):
+    def run_launcher(self, timeout=20):
         return subprocess.run(
             ["sh", str(self.launcher)], env=self.env, text=True,
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=timeout,
         )
 
     def launched(self):
@@ -455,6 +474,267 @@ class InstallationTests(unittest.TestCase):
             result = harness.run_launcher()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(len(harness.launched()), 1)
+
+    def test_launcher_retries_once_when_rollback_attempt_exits_early(self):
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.root.joinpath("fail-first-rollback-attempt").touch()
+            result = harness.run_launcher()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout + result.stderr, "")
+            self.assertEqual(len(harness.launched()), 2)
+            self.assertEqual(harness.run.joinpath("pid").read_text().strip(), harness.launched()[1])
+            self.assertFalse((harness.ota / "rollback-attempt").exists())
+
+    def test_launcher_does_not_retry_when_first_supervisor_is_still_alive(self):
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.root.joinpath("stall-first-rollback-attempt").touch()
+            result = harness.run_launcher()
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(len(harness.launched()), 1)
+            self.assertFalse(harness.run.joinpath("pid").exists())
+
+    def test_install_resolves_pending_recovery_before_replacing_slots_and_retires_markers(self):
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            boot_dir = harness.proc / "sys" / "kernel" / "random"
+            boot_dir.mkdir(parents=True)
+            (boot_dir / "boot_id").write_text("boot-install-1\n")
+            (harness.ota / "slot-a").mkdir(parents=True)
+            (harness.ota / "slot-b").mkdir(parents=True)
+            ts_journal = harness.root / "tailscale" / "network.json"
+            ts_journal.parent.mkdir(parents=True)
+            ts_journal.write_text('{"boot":"boot-install-1","undo":[]}\n')
+            recovered_log = harness.root / "orig-cand-recovered"
+            orig_cand = harness.ota / "slot-b" / "zte-agent"
+            orig_cand.write_text(
+                f'#!/bin/sh\nif [ "${{1:-}}" = ota-probe ]; then [ "${{2:-}}" = "2.4.0-beta.9" ] && exit 0; exit 2; fi\n'
+                f'[ "${{1:-}}" = network-recover ] || exit 2\n'
+                f'printf "ok" > "{recovered_log}"\nrm -f "{ts_journal}"\nexit 0\n'
+            )
+            orig_cand.chmod(0o700)
+            orig_cand_sha = hashlib.sha256(orig_cand.read_bytes()).hexdigest()
+            (harness.ota / "slot-b" / "bootstrap.sha256").write_text(f"{orig_cand_sha}\n2.4.0-beta.9\n")
+            (harness.ota / "pending").write_text("b\na\n2.4.0-beta.9\n")
+            (harness.ota / "network-recover-pending").write_text("boot-install-1\ncandidate\n")
+            (harness.ota / "rollback-attempt").write_text("a\n999-0\n")
+            result = harness.run_install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(recovered_log.read_text(), "ok")
+            self.assertFalse(ts_journal.exists())
+            self.assertFalse((harness.ota / "network-recover-pending").exists())
+            self.assertFalse((harness.ota / "rollback-attempt").exists())
+            self.assertFalse((harness.ota / "pending").exists())
+            self.assertEqual((harness.ota / "active").read_text().strip(), "a")
+
+        # When the original candidate fails `network-recover`, installation must
+        # abort BEFORE overwriting original slots or deleting `pending`.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            boot_dir = harness.proc / "sys" / "kernel" / "random"
+            boot_dir.mkdir(parents=True)
+            (boot_dir / "boot_id").write_text("boot-install-2\n")
+            (harness.ota / "slot-a").mkdir(parents=True)
+            (harness.ota / "slot-b").mkdir(parents=True)
+            orig_cand = harness.ota / "slot-b" / "zte-agent"
+            orig_cand.write_text("#!/bin/sh\nif [ \"${1:-}\" = ota-probe ]; then exit 0; fi\nexit 1\n")
+            orig_cand.chmod(0o700)
+            orig_cand_sha = hashlib.sha256(orig_cand.read_bytes()).hexdigest()
+            (harness.ota / "slot-b" / "bootstrap.sha256").write_text(f"{orig_cand_sha}\n2.4.0-beta.9\n")
+            (harness.ota / "pending").write_text("b\na\n2.4.0-beta.9\n")
+            (harness.ota / "network-recover-pending").write_text("boot-install-2\ncandidate\n")
+            result = harness.run_install()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exit 1", orig_cand.read_text())
+            self.assertTrue((harness.ota / "pending").exists())
+            self.assertTrue((harness.ota / "network-recover-pending").exists())
+            self.assertEqual(harness.launched(), [])
+
+    def test_round18_installer_and_launcher_guards(self):
+        # P1 #1: Live `ota-helper` blocks install BEFORE stopping main or touching slots.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            harness.process(77)
+            harness.process(88, args=[str(harness.binary), "ota-helper", "b", "a", "2.4.0"])
+            result = harness.run_install()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("kill -TERM", harness.calls.read_text())
+            self.assertEqual(harness.launched(), [])
+
+        # P1 #2: Live boot supervisor prevents a second launcher from spawning another supervisor.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.process(66, exe="/bin/sh", args=["/bin/sh", str(harness.supervisor)])
+            result = harness.run_launcher()
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(harness.launched(), [])
+
+        # P1 #4: Tampered recovery binary whose bytes disagree with bootstrap.sha256 is refused.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            boot_dir = harness.proc / "sys" / "kernel" / "random"
+            boot_dir.mkdir(parents=True)
+            (boot_dir / "boot_id").write_text("boot-r18\n")
+            (harness.ota / "slot-a").mkdir(parents=True)
+            (harness.ota / "slot-b").mkdir(parents=True)
+            ran_tampered = harness.root / "ran-tampered"
+            orig_cand = harness.ota / "slot-b" / "zte-agent"
+            orig_cand.write_text(f'#!/bin/sh\nprintf "bad" > "{ran_tampered}"\nexit 0\n')
+            orig_cand.chmod(0o700)
+            (harness.ota / "slot-b" / "bootstrap.sha256").write_text(("0" * 64) + "\n2.4.0-beta.9\n")
+            (harness.ota / "pending").write_text("b\na\n2.4.0-beta.9\n")
+            (harness.ota / "network-recover-pending").write_text("boot-r18\ncandidate\n")
+            result = harness.run_install()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(ran_tampered.exists())
+            self.assertTrue((harness.ota / "pending").exists())
+
+        # P1 #5: Legacy active cleaner returns 0 without stopping live `tailscaled`;
+        # installer persists `network-recover-pending` and falls through to staged `agent.ready`.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            boot_dir = harness.proc / "sys" / "kernel" / "random"
+            boot_dir.mkdir(parents=True)
+            (boot_dir / "boot_id").write_text("boot-r18-upg\n")
+            ts_proc = harness.proc / "5555"
+            ts_proc.mkdir()
+            (ts_proc / "stat").write_text("5555 (tailscaled) S 1 1 1 0\n")
+            (ts_proc / "comm").write_text("tailscaled\n")
+            (harness.ota / "slot-a").mkdir(parents=True)
+            (harness.ota / "slot-b").mkdir(parents=True)
+            legacy_a = harness.ota / "slot-a" / "zte-agent"
+            legacy_a.write_text('#!/bin/sh\nif [ "${1:-}" = ota-probe ]; then exit 0; fi\nexit 0\n')
+            legacy_a.chmod(0o700)
+            legacy_sha = hashlib.sha256(legacy_a.read_bytes()).hexdigest()
+            (harness.ota / "slot-a" / "bootstrap.sha256").write_text(f"{legacy_sha}\n2.3.0\n")
+            (harness.ota / "active").write_text("a\n")
+            staged_ran = harness.root / "staged-cleaned"
+            staged_script = (
+                f'#!/bin/sh\nif [ "${{1:-}}" = network-recover ]; then\n'
+                f'  [ -f "{harness.ota}/network-recover-pending" ] || exit 9\n'
+                f'  printf "ok" > "{staged_ran}"\n  rm -rf "{ts_proc}"\n  exit 0\nfi\nexit 0\n'
+            )
+            harness.stage.joinpath("agent.new").write_text(staged_script)
+            harness.agent_sha = hashlib.sha256(harness.stage.joinpath("agent.new").read_bytes()).hexdigest()
+            result = harness.run_install()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(staged_ran.read_text(), "ok")
+            self.assertFalse(ts_proc.exists())
+            self.assertFalse((harness.ota / "network-recover-pending").exists())
+
+        # P1 #6: Malformed `rollback-blocked` with a different boot ID + extra token
+        # MUST NOT be discarded as stale.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            boot_dir = harness.proc / "sys" / "kernel" / "random"
+            boot_dir.mkdir(parents=True)
+            (boot_dir / "boot_id").write_text("boot-r18-cur\n")
+            harness.ota.mkdir(parents=True)
+            (harness.ota / "rollback-blocked").write_text("boot-r18-old\nextra-token\n")
+            result = harness.run_install()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((harness.ota / "rollback-blocked").exists())
+
+        # P1 #7: Quarantined target version in `blocked.json` stops install BEFORE stopping main.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            harness.process(77)
+            harness.ota.mkdir(parents=True)
+            (harness.ota / "blocked.json").write_text(f'["{harness.version}"]\n')
+            result = harness.run_install()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("kill -TERM", harness.calls.read_text())
+            self.assertEqual(harness.launched(), [])
+
+        # P2 #1: Repeat deploy after removing `slot-a/bootstrap.sha256`, adding a
+        # trailing blank line to `bootstrap.sha256`, OR clearing executable bit on
+        # `slot-a/zte-agent` MUST NOT no-op; it must repair the slot layout.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            first = harness.run_install()
+            self.assertEqual(first.returncode, 0, first.stderr)
+            (harness.ota / "slot-a" / "bootstrap.sha256").write_text(
+                harness.agent_sha + "\n" + harness.version + "\n\n"
+            )
+            second = harness.run_install()
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(
+                (harness.ota / "slot-a" / "bootstrap.sha256").read_text(),
+                harness.agent_sha + "\n" + harness.version + "\n",
+            )
+            self.assertEqual(len(harness.launched()), 2)
+
+        # Round 19 checks:
+        # (a) Live trial (`ZTE_OTA_TRIAL=1`) is NOT killed as `is_main` and stops install.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            harness.process(77, environment=b"ZTE_OTA_TRIAL=1\0")
+            result = harness.run_install()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("kill -TERM", harness.calls.read_text())
+            self.assertEqual(harness.launched(), [])
+
+        # (b) Tracked late-finishing supervisor in `starting` publishes verified PID on next launcher.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.process(91, start=43210)
+            (harness.run / "starting").write_text("91\n43210\n")
+            result = harness.run_launcher()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((harness.run / "pid").read_text().strip(), "91")
+            self.assertFalse((harness.run / "starting").exists())
+            self.assertEqual(harness.launched(), [])
+
+        # (c) Ambiguous `pending` (`b\nb`) is rejected before cleanup or slot overwrite.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            harness.ota.mkdir(parents=True)
+            (harness.ota / "pending").write_text("b\nb\n2.4.0\n")
+            result = harness.run_install()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((harness.ota / "pending").exists())
+
+        # (d) Staged fallback with no installed slots persists `staged` (not `stable`) and retries cleanly.
+        with tempfile.TemporaryDirectory() as root:
+            harness = LauncherHarness(root)
+            harness.prepare_install()
+            boot_dir = harness.proc / "sys" / "kernel" / "random"
+            boot_dir.mkdir(parents=True)
+            (boot_dir / "boot_id").write_text("boot-r19-staged\n")
+            ts_proc = harness.proc / "6666"
+            ts_proc.mkdir()
+            (ts_proc / "stat").write_text("6666 (helper) S 1 1 1 0\n")
+            (ts_proc / "comm").write_text("helper\n")
+            (ts_proc / "cmdline").write_bytes(b"/usr/sbin/tailscaled\0")
+            fail_once = harness.root / "staged-fail-once"
+            staged_script = (
+                f'#!/bin/sh\nif [ "${{1:-}}" = network-recover ]; then\n'
+                f'  if [ ! -e "{fail_once}" ]; then printf 1 > "{fail_once}"; exit 1; fi\n'
+                f'  rm -rf "{ts_proc}"\n  exit 0\nfi\nexit 0\n'
+            )
+            harness.stage.joinpath("agent.new").write_text(staged_script)
+            harness.agent_sha = hashlib.sha256(harness.stage.joinpath("agent.new").read_bytes()).hexdigest()
+            r1 = harness.run_install()
+            self.assertNotEqual(r1.returncode, 0)
+            self.assertEqual(
+                (harness.ota / "network-recover-pending").read_text(),
+                "boot-r19-staged\nstaged\n",
+            )
+            r2 = harness.run_install()
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            self.assertFalse(ts_proc.exists())
+            self.assertFalse((harness.ota / "network-recover-pending").exists())
 
     def test_concurrent_launchers_start_exactly_one_main(self):
         with tempfile.TemporaryDirectory() as root:
@@ -688,7 +968,7 @@ class InstallationTests(unittest.TestCase):
             (harness.ota / "pending").write_text("b\na\n")
             (harness.ota / "state.json").write_text("{}\n")
             (harness.ota / "active").write_text("b\n")
-            (harness.ota / "blocked.json").write_text('{"blocked":["1.0.0"]}\n')
+            (harness.ota / "blocked.json").write_text('["1.0.0"]\n')
             result = harness.run_install()
             self.assertEqual(result.returncode, 0, result.stderr)
             for name in ("slot-a", "slot-b"):
@@ -708,7 +988,7 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(harness.ota.joinpath("active").stat().st_mode & 0o777, 0o600)
             self.assertTrue(harness.ota.joinpath("last-stable").is_dir())
             self.assertEqual(harness.ota.stat().st_mode & 0o777, 0o700)
-            self.assertEqual(harness.ota.joinpath("blocked.json").read_text(), '{"blocked":["1.0.0"]}\n')
+            self.assertEqual(harness.ota.joinpath("blocked.json").read_text(), '["1.0.0"]\n')
             self.assertTrue(harness.binary.is_symlink())
             self.assertEqual(os.readlink(harness.binary), str(harness.slot))
             self.assertFalse(harness.binary.parent.joinpath("zte-agent.next").exists())
@@ -766,6 +1046,8 @@ class InstallationTests(unittest.TestCase):
     def test_setup_script_is_valid_bash_and_ships_the_supervisor(self):
         root = Path(__file__).resolve().parents[1]
         subprocess.run(["bash", "-n", str(root / "setup.sh")], check=True)
+        subprocess.run(["bash", "-n", str(root / "deploy.sh")], check=True)
+        self.assertIn("scripts/install-agent.py", root.joinpath("deploy.sh").read_text())
         self.assertTrue(root.joinpath("scripts", "router", "zte-agent-supervisor.sh").is_file())
         subprocess.run(["sh", "-n", str(root / "scripts" / "router" / "zte-agent-supervisor.sh")], check=True)
         self.assertNotIn("<<<<<<<", root.joinpath("setup.sh").read_text())

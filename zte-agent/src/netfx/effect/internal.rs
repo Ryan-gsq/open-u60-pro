@@ -17,6 +17,7 @@ pub(crate) const HANDLERS: &[InternalHandler] = &[
     InternalHandler { name: "@u60-relay-portal", apply: crate::wifi_relay::portal::command, check: None },
     InternalHandler { name: "@u60-sysctl", apply: net::sysctl_command, check: Some(sysctl_present) },
     InternalHandler { name: "@u60-mihomo-nft", apply: crate::mihomo::nft_command, check: None },
+    InternalHandler { name: "@u60-tailscale-nft", apply: crate::tailscale::nft_command, check: None },
     InternalHandler { name: "@u60-relay-steer", apply: crate::wifi_relay::steering::command, check: Some(steering_present) },
     InternalHandler { name: "@u60-relay-power-save", apply: crate::wifi_relay::power_save::command, check: Some(crate::wifi_relay::power_save::present) },
     InternalHandler { name: "@u60-relay-nft", apply: crate::wifi_relay::uplink::command, check: None },

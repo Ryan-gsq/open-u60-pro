@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use super::gate::{GateError, Lane};
 use super::guard::ReqHeaders;
-use super::{Ctx, Peer, DRAIN_MAX, DRAIN_WAIT};
+use super::{Ctx, Peer, Via, DRAIN_MAX, DRAIN_WAIT};
 use crate::auth::{PeerKey, SessionId};
 use crate::events::hub::{Refused, SubscribeReq};
 use crate::events::sse::{self, hello, JsonEmitter};
@@ -38,7 +38,7 @@ pub async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
     let method = Method::from(&parts.method);
     let path = parts.uri.path();
     let addr = parts.extensions.get::<Peer>().map(|p| p.0);
-    let peer = addr.map_or(PeerKey::UNKNOWN, PeerKey::from);
+    let via = Via::of(&parts.extensions);
     let pre = server::precheck(
         &ReqInfo {
             method,
@@ -46,7 +46,8 @@ pub async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
             query: parts.uri.query(),
             bearer: header(headers, "authorization").and_then(|v| v.strip_prefix("Bearer ")),
             headers: req_headers(headers),
-            loopback: addr.is_some_and(|a| a.ip().to_canonical().is_loopback()),
+            via,
+            peer_ip: addr.map(|addr| addr.ip()),
             secure: parts.extensions.get::<super::tls::Secure>().is_some(),
         },
         &PreEnv {
@@ -61,6 +62,7 @@ pub async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
             finish_early(headers, body.into_data_stream(), 0, json_reply(status, &v)).await
         }
         Pre::Login => {
+            let peer = addr.map_or(PeerKey::UNKNOWN, |addr| PeerKey::from_ingress(addr, via));
             let body = match read_capped(headers, body, LOGIN_BODY_MAX, ctx.body_wait).await {
                 Ok(body) => body,
                 Err(e) => return read_failed(headers, e).await,
@@ -785,8 +787,36 @@ mod tests {
             axum::http::Request::builder().uri("/api/lan/ping").header("host", "localhost:9090").extension(p)
         };
         let lo = Peer(SocketAddr::from(([127, 0, 0, 1], 5000)));
-        send(&c, local(lo).body(Body::empty()).unwrap()).await.assert_json(200, json!({"ok": true}));
+        send(&c, local(lo).extension(Via::Loopback).body(Body::empty()).unwrap()).await.assert_json(200, json!({"ok": true}));
+        send(&c, local(lo).body(Body::empty()).unwrap()).await.assert_json(403, err("host not allowed"));
         send(&c, local(peer(8, 4)).body(Body::empty()).unwrap()).await.assert_json(403, err("host not allowed"));
+    }
+
+    #[tokio::test]
+    async fn local_token_requires_verified_loopback_and_an_exact_loopback_address() {
+        let c = ctx(Some(PW));
+        let token = c.app.auth.issue_local().unwrap();
+        let request = |ip: &str, via| {
+            let peer = Peer(SocketAddr::new(ip.parse().unwrap(), 5000));
+            let mut builder = req("GET", "/api/lan/ping", peer)
+                .header("authorization", format!("Bearer {}", token.expose()));
+            if let Some(via) = via {
+                builder = builder.extension(via);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            send(&c, request(ip, Some(Via::Loopback))).await.assert_json(200, json!({"ok": true}));
+        }
+        for (ip, via) in [
+            ("127.0.0.1", None),
+            ("127.0.0.1", Some(Via::Local)),
+            ("::ffff:127.0.0.1", Some(Via::Tailnet)),
+            ("100.64.0.1", Some(Via::Tailnet)),
+            ("127.0.0.2", Some(Via::Loopback)),
+        ] {
+            send(&c, request(ip, via)).await.assert_json(401, err("unauthorized"));
+        }
     }
 
     #[tokio::test]

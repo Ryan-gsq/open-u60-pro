@@ -21,6 +21,30 @@ struct World {
     prepare_hotspot: bool,
     scan_rounds: bool,
     record_subscription_dns: bool,
+    cellular: Option<CellularFixture>,
+}
+
+struct CellularFixture {
+    dir: test_dir::TestDir,
+    pause: cellular::Pause,
+    modem: cellular::tests::Modem,
+}
+
+impl CellularFixture {
+    fn new(strict: bool) -> Self {
+        let dir = test_dir::TestDir::new("relayctl-cellular");
+        cellular::save(dir.path(), strict).unwrap();
+        let modem = cellular::tests::Modem::new(dir.path(), true);
+        Self { dir, pause: cellular::Pause::default(), modem }
+    }
+
+    fn set(&mut self, enabled: bool) -> Result<(), String> {
+        self.modem.set(&mut self.pause, enabled)
+    }
+
+    fn reconcile(&mut self) -> Result<(), String> {
+        self.modem.reconcile(&mut self.pause)
+    }
 }
 
 #[derive(Clone)]
@@ -95,7 +119,12 @@ impl Port for FakePort {
             self.call("snapshot");
         }
         let mut value = snapshot(state, self.boot_now());
-        value["autostart"] = json!(self.world.lock().unwrap().target.is_some());
+        let world = self.world.lock().unwrap();
+        value["autostart"] = json!(world.target.is_some());
+        if let Some(cellular) = &world.cellular {
+            value["strict_zero_cellular"] = json!(cellular::enabled(cellular.dir.path()));
+            value["cellular_pause"] = json!(cellular.pause);
+        }
         if !value["offload"].is_object() {
             value["offload"] = json!({});
         }
@@ -124,17 +153,27 @@ impl Port for FakePort {
         if let Some(error) = world.cleanup_error.clone() {
             return Err(error);
         }
+        if let Some(cellular) = world.cellular.as_mut() {
+            cellular.set(false)?;
+        }
         world.pending = false;
         Ok(())
     }
-    fn adopt(&mut self) -> Option<Session> {
+    fn adopt(&mut self, allow_cellular_pause: bool) -> Option<Session> {
         self.call("adopt");
-        self.world.lock().unwrap().adopted.then(|| {
-            let mut session = Session::new(Path::new("/tmp/u60-test/work/relayctl/fake"));
-            session.selected = Some(network());
-            session.lease = Some(lease());
-            session
-        })
+        let mut world = self.world.lock().unwrap();
+        if !world.adopted {
+            return None;
+        }
+        if allow_cellular_pause {
+            if let Some(cellular) = world.cellular.as_mut() {
+                let _ = cellular.reconcile();
+            }
+        }
+        let mut session = Session::new(Path::new("/tmp/u60-test/work/relayctl/fake"));
+        session.selected = Some(network());
+        session.lease = Some(lease());
+        Some(session)
     }
     fn scan(&mut self, state: &mut State, cancel: &Cancellation) -> Result<Vec<Network>, String> {
         self.call("scan");
@@ -150,7 +189,7 @@ impl Port for FakePort {
         }
         Ok(self.world.lock().unwrap().scans.clone())
     }
-    fn join(&mut self, state: &mut State, selection: Selection, _: bool, cancel: &Cancellation) -> Result<Session, String> {
+    fn join(&mut self, state: &mut State, selection: Selection, _: bool, cancel: &Cancellation, allow_cellular_pause: bool) -> Result<Session, String> {
         self.call("join");
         let hotspot_state = self.world.lock().unwrap().off_during_join.take();
         if let Some(hotspot_state) = hotspot_state {
@@ -182,6 +221,16 @@ impl Port for FakePort {
                 self.cleanup(&mut session)?;
                 return Err(error);
             }
+        }
+        let paused = if allow_cellular_pause {
+            self.world.lock().unwrap().cellular.as_mut()
+                .filter(|cellular| cellular::enabled(cellular.dir.path()))
+                .map_or(Ok(()), |cellular| cellular.set(true))
+        } else {
+            Ok(())
+        };
+        if let Err(error) = paused {
+            return self.cleanup(&mut session).and(Err(error));
         }
         session.selected = Some(selection.network);
         session.lease = Some(lease());
@@ -220,9 +269,37 @@ impl Port for FakePort {
     fn renew(&mut self, _: &mut Session) {
         self.call("renew");
     }
-    fn maintain(&mut self, _: &mut Session) -> Result<bool, String> {
+    fn maintain(&mut self, _: &mut Session, allow_cellular_pause: bool) -> Result<bool, String> {
         self.call("maintain");
+        if allow_cellular_pause {
+            if let Some(cellular) = self.world.lock().unwrap().cellular.as_mut() {
+                let _ = cellular.reconcile();
+            }
+        }
         Ok(false)
+    }
+    fn prepare_slot_change(&mut self, state: &mut State) -> Result<(), String> {
+        self.call("prepare-slot-change");
+        if let Some(cellular) = self.world.lock().unwrap().cellular.as_mut() {
+            if cellular.pause.error().is_some_and(|error| state.error.as_deref() == Some(error)) {
+                state.error = None;
+            }
+            cellular.set(false)?;
+            if cellular.dir.path().join(cellular::JOURNAL).exists() {
+                return Err("cellular pause journal still present after cleanup".into());
+            }
+        }
+        Ok(())
+    }
+    fn resume_slot_change(&mut self, state: &mut State) {
+        self.call("resume-slot-change");
+        if state.session.is_some() {
+            if let Some(cellular) = self.world.lock().unwrap().cellular.as_mut() {
+                if cellular::enabled(cellular.dir.path()) {
+                    let _ = cellular.reconcile();
+                }
+            }
+        }
     }
     fn uplink_changed(&self) {
         self.call("egress");
@@ -231,6 +308,16 @@ impl Port for FakePort {
         self.call("power-save");
         Ok(())
     }
+    fn strict_zero_cellular(&mut self, state: &mut State, enabled: bool) -> Result<(), String> {
+        if let Some(cellular) = self.world.lock().unwrap().cellular.as_mut() {
+            cellular::save(cellular.dir.path(), enabled)?;
+            if state.session.is_some() || !enabled {
+                cellular.set(enabled).map_err(|error| format!("Setting saved. {error}"))?;
+            }
+        }
+        Ok(())
+    }
+
     fn offload(&mut self, _: &mut State, _: bool) -> Result<Option<Value>, String> {
         self.call("offload");
         Ok(None)
@@ -345,6 +432,296 @@ impl Drop for Harness {
             let _ = thread.join();
         }
     }
+}
+
+#[test]
+fn strict_connect_returns_pause_failure_and_cleans_up_without_publishing_a_session() {
+    let mut cellular = CellularFixture::new(true);
+    cellular.modem.fail_write = true;
+    let harness = Harness::new(World { cellular: Some(cellular), ..World::default() });
+
+    assert_eq!(harness.connect(), Err("Cannot pause cellular data: write failed".into()));
+    let status = harness.relay.status();
+    assert_eq!(status["phase"], "idle");
+    assert_eq!(status["connected"], false);
+    assert_eq!(status["error"], "Cannot pause cellular data: write failed");
+    let calls = harness.calls();
+    assert!(calls.contains(&"enter cleanup".into()));
+    assert!(!calls.contains(&"enter persist".into()));
+    assert!(!calls.contains(&"enter egress".into()));
+    let world = harness.port.world.lock().unwrap();
+    let cellular = world.cellular.as_ref().unwrap();
+    assert_eq!(cellular.modem.writes, [false]);
+    assert!(!cellular.dir.path().join(cellular::JOURNAL).exists());
+}
+
+#[test]
+fn enabling_strict_mode_on_a_live_relay_returns_and_publishes_the_pause_failure() {
+    let mut cellular = CellularFixture::new(false);
+    cellular.modem.fail_write = true;
+    let harness = Harness::new(World { cellular: Some(cellular), ..World::default() });
+    harness.connect().unwrap();
+
+    assert_eq!(harness.relay.set_strict_zero_cellular(true), Err("Setting saved. Cannot pause cellular data: write failed".into()));
+    let status = harness.relay.status();
+    assert_eq!(status["connected"], true);
+    assert_eq!(status["strict_zero_cellular"], true);
+    assert_eq!(status["cellular_pause"], json!({"state":"error","original_enabled":true,"error":"Cannot pause cellular data: write failed"}));
+}
+
+#[test]
+fn maintenance_publishes_a_restarted_modem_failure_and_clears_it_after_verified_repause() {
+    let harness = Harness::new(World { cellular: Some(CellularFixture::new(true)), ..World::default() });
+    harness.connect().unwrap();
+    assert_eq!(harness.relay.status()["cellular_pause"]["state"], "paused");
+    {
+        let mut world = harness.port.world.lock().unwrap();
+        let cellular = world.cellular.as_mut().unwrap();
+        cellular.modem.on = true;
+        cellular.modem.fail_write = true;
+    }
+
+    harness.tick(observation("COMPLETED"), 0);
+    let status = harness.relay.status();
+    assert_eq!(status["connected"], true);
+    assert_eq!(status["cellular_pause"], json!({"state":"error","original_enabled":true,"error":"Cannot pause cellular data: write failed"}));
+    harness.port.world.lock().unwrap().cellular.as_mut().unwrap().modem.fail_write = false;
+
+    harness.tick(observation("COMPLETED"), 0);
+    let status = harness.relay.status();
+    assert_eq!(status["cellular_pause"], json!({"state":"paused","original_enabled":true,"error":null}));
+    let world = harness.port.world.lock().unwrap();
+    let cellular = world.cellular.as_ref().unwrap();
+    assert_eq!(cellular.modem.writes, [false, false, false]);
+    assert!(!cellular.modem.on);
+    assert_eq!(fs::read(cellular.dir.path().join(cellular::JOURNAL)).unwrap(), b"1\n");
+}
+
+#[test]
+fn slot_change_restores_strict_cellular_pause_and_blocks_repausing_during_handoff() {
+    let harness = Harness::new(World { cellular: Some(CellularFixture::new(true)), ..World::default() });
+    harness.connect().unwrap();
+    assert_eq!(harness.relay.status()["cellular_pause"]["state"], "paused");
+    {
+        let world = harness.port.world.lock().unwrap();
+        let cellular = world.cellular.as_ref().unwrap();
+        assert!(!cellular.modem.on);
+        assert!(cellular.dir.path().join(cellular::JOURNAL).exists());
+    }
+
+    // 1. If restoring cellular fails, slot change aborts BEFORE the callback,
+    //    keeps `cellular-pause` on disk, and leaves the relay unlocked.
+    harness.port.world.lock().unwrap().cellular.as_mut().unwrap().modem.fail_write = true;
+    let mut callback_calls = 0usize;
+    let err = harness
+        .relay
+        .before_slot_change(|| {
+            callback_calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(err.contains("relay slot-change cleanup failed"), "unexpected err: {err}");
+    assert_eq!(callback_calls, 0);
+    {
+        let world = harness.port.world.lock().unwrap();
+        let cellular = world.cellular.as_ref().unwrap();
+        assert!(!cellular.modem.on);
+        assert!(cellular.dir.path().join(cellular::JOURNAL).exists());
+    }
+
+    // 2. If the OTA callback itself fails after cellular was restored, the hold
+    //    is released and strict zero-cellular re-pauses cellular cleanly.
+    harness.port.world.lock().unwrap().cellular.as_mut().unwrap().modem.fail_write = false;
+    let aborted = harness
+        .relay
+        .before_slot_change(|| -> Result<(), String> {
+            let world = harness.port.world.lock().unwrap();
+            let cellular = world.cellular.as_ref().unwrap();
+            assert!(cellular.modem.on, "cellular must be restored before OTA callback runs");
+            assert!(!cellular.dir.path().join(cellular::JOURNAL).exists());
+            Err("simulated OTA launch error".into())
+        })
+        .unwrap_err();
+    assert_eq!(aborted, "simulated OTA launch error");
+    // Drain controller queue via a harmless status/tick cycle so ResumeSlotChange completes.
+    harness.tick(observation("COMPLETED"), 0);
+    assert_eq!(harness.relay.status()["cellular_pause"]["state"], "paused");
+    {
+        let world = harness.port.world.lock().unwrap();
+        let cellular = world.cellular.as_ref().unwrap();
+        assert!(!cellular.modem.on);
+        assert!(cellular.dir.path().join(cellular::JOURNAL).exists());
+    }
+
+    // 3. On a successful slot change, cellular is restored and `cellular-pause`
+    //    is removed BEFORE the callback, AND subsequent maintenance ticks or
+    //    strict-mode writes CANNOT re-pause cellular while handoff proceeds!
+    harness
+        .relay
+        .before_slot_change(|| {
+            callback_calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(callback_calls, 1);
+    assert_eq!(harness.relay.status()["cellular_pause"]["state"], "idle");
+    // Periodic maintenance tick must NOT re-pause cellular.
+    harness.tick(observation("COMPLETED"), 0);
+    // Explicit strict-mode toggle must be refused during handoff.
+    assert!(harness.relay.set_strict_zero_cellular(true).is_err());
+    {
+        let world = harness.port.world.lock().unwrap();
+        let cellular = world.cellular.as_ref().unwrap();
+        assert!(cellular.modem.on, "cellular must remain restored throughout slot handoff");
+        assert!(
+            !cellular.dir.path().join(cellular::JOURNAL).exists(),
+            "cellular-pause journal must never be recreated during slot handoff"
+        );
+    }
+}
+
+#[test]
+fn pending_ota_trial_defers_cellular_pause_until_commit_across_adopt_join_and_ticks() {
+    // 1. Adoption during a pending trial must NOT pause cellular or create
+    //    `cellular-pause`; once `pending` clears on commit, the next tick
+    //    reconciles strict mode cleanly.
+    let harness = Harness::new(World {
+        adopted: true,
+        cellular: Some(CellularFixture::new(true)),
+        ..World::default()
+    });
+    // Start fresh with trial pending enabled before Boot adoption runs.
+    let trial_world = Arc::new(Mutex::new(World {
+        adopted: true,
+        cellular: Some(CellularFixture::new(true)),
+        ..World::default()
+    }));
+    let lock: NetworkLock = Arc::new(crate::netfx::admission::Gate::new());
+    let shared = Arc::new(Shared::new());
+    shared.test_ota_trial_pending.store(true, Ordering::SeqCst);
+    let (sender, receiver) = mpsc::channel();
+    let (boot_tx, boot_rx) = mpsc::sync_channel(1);
+    boot(&sender, boot_tx);
+    let relay = Arc::new(WifiRelay {
+        lock: Arc::clone(&lock),
+        shared: Arc::clone(&shared),
+        commands: OnceLock::from(sender.clone()),
+        mihomo: None,
+        tailscale: None,
+    });
+    let port = FakePort { world: Arc::clone(&trial_world), epoch: Instant::now() };
+    let controller = Controller::new(port, receiver, sender.clone(), Arc::clone(&shared), lock, Timings { tick: Duration::from_secs(3600), retries: vec![Duration::from_secs(1)] });
+    let handle = std::thread::spawn(move || controller.run());
+    boot_rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+    {
+        let world = trial_world.lock().unwrap();
+        let cellular = world.cellular.as_ref().unwrap();
+        assert!(cellular.modem.on, "adoption during pending OTA trial must not pause cellular");
+        assert!(!cellular.dir.path().join(cellular::JOURNAL).exists());
+    }
+    // Strict-mode write is refused while trial is pending.
+    assert!(relay.set_strict_zero_cellular(true).is_err());
+    // Maintenance tick while trial is still pending must not pause cellular.
+    let _ = relay.send(Message::Tick);
+    let _ = relay.call(Command::Clock);
+    {
+        let world = trial_world.lock().unwrap();
+        let cellular = world.cellular.as_ref().unwrap();
+        assert!(cellular.modem.on);
+        assert!(!cellular.dir.path().join(cellular::JOURNAL).exists());
+    }
+    // Once commit clears `pending`, the next tick reconciles strict mode!
+    shared.test_ota_trial_pending.store(false, Ordering::SeqCst);
+    let _ = relay.send(Message::Tick);
+    let _ = relay.call(Command::Clock);
+    {
+        let world = trial_world.lock().unwrap();
+        let cellular = world.cellular.as_ref().unwrap();
+        assert!(!cellular.modem.on, "strict mode must reconcile after OTA commit");
+        assert_eq!(fs::read(cellular.dir.path().join(cellular::JOURNAL)).unwrap(), b"1\n");
+    }
+    let _ = sender.send(Message::Stop);
+    handle.join().unwrap();
+
+    // 2. Join during a pending trial must also skip pausing cellular until commit.
+    let join_harness = Harness::new(World {
+        cellular: Some(CellularFixture::new(true)),
+        ..World::default()
+    });
+    join_harness.relay.shared.test_ota_trial_pending.store(true, Ordering::SeqCst);
+    join_harness.connect().unwrap();
+    {
+        let world = join_harness.port.world.lock().unwrap();
+        let cellular = world.cellular.as_ref().unwrap();
+        assert!(cellular.modem.on, "join during pending OTA trial must not pause cellular");
+        assert!(!cellular.dir.path().join(cellular::JOURNAL).exists());
+    }
+    join_harness.relay.shared.test_ota_trial_pending.store(false, Ordering::SeqCst);
+    join_harness.tick(observation("COMPLETED"), 0);
+    {
+        let world = join_harness.port.world.lock().unwrap();
+        let cellular = world.cellular.as_ref().unwrap();
+        assert!(!cellular.modem.on);
+        assert!(cellular.dir.path().join(cellular::JOURNAL).exists());
+    }
+    drop(harness);
+}
+
+#[test]
+fn aborted_slot_change_rearms_suppressed_relay_restore_attempt() {
+    let harness = Harness::new(World {
+        target: Some(resume::Resume {
+            ssid: "Test".into(),
+            security: "open".into(),
+            bssid: "02:00:00:00:00:01".into(),
+            ipv6: false,
+        }),
+        scans: vec![network()],
+        // First attempt fails so attempt 1 is scheduled for the retry wait.
+        joins: [Err("temporary AP miss".into())].into(),
+        ..World::default()
+    });
+    let relay = Arc::clone(&harness.relay);
+    let restore_thread = std::thread::spawn(move || relay.restore());
+    // Wait until attempt 0 has failed and attempt 1 is scheduled (`restoring == Some("Test")`).
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let calls = harness.port.world.lock().unwrap().calls.clone();
+        if calls.iter().any(|c| c == "exit join") && !harness.relay.status()["restoring"].is_null() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "restore did not schedule retry");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Start a slot change that aborts AFTER the scheduled restore retry becomes
+    // due (and also receives an explicit queued `Message::Retry`) while
+    // `slot_change_paused` is active.
+    let err = harness
+        .relay
+        .before_slot_change(|| -> Result<(), String> {
+            harness.port.world.lock().unwrap().elapsed += Duration::from_secs(60);
+            let _ = harness.relay.send(Message::Retry { generation: 0, attempt: 1 });
+            // Synchronize with controller loop so both the timer check and the
+            // queued `Message::Retry` are processed while `slot_change_paused == true`.
+            assert!(harness.relay.set_strict_zero_cellular(true).is_err());
+            assert_eq!(harness.relay.status()["connected"], false);
+            Err("aborted OTA".into())
+        })
+        .unwrap_err();
+    assert_eq!(err, "aborted OTA");
+
+    // `ResumeSlotChange` MUST rearm the suppressed restore attempt so the
+    // waiting restore thread finishes and connects instead of stranding!
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        restore_thread.join().unwrap();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("suppressed restore must be rearmed and complete after aborted OTA");
+    assert_eq!(harness.relay.status()["connected"], true);
 }
 
 #[test]
@@ -567,7 +944,7 @@ fn restore_rechecks_changed_target_and_same_target_owner_replacement() {
     let root = temp.path();
     resume::save(root, &network(), false).unwrap();
     let shared = Arc::new(Shared::new());
-    let port = DevicePort { control: None, settings: None, shared: Arc::clone(&shared), mihomo: None, tailscale: None };
+    let port = DevicePort { control: None, settings: None, cellular_pause: cellular::Pause::default(), cellular_deferred_by_trial: false, shared: Arc::clone(&shared), mihomo: None, tailscale: None };
     let cancel = Cancellation { shared: Arc::clone(&shared), generation: 0, target: Some(target()) };
     assert!(cancel.check().is_ok());
     let mut changed = network();

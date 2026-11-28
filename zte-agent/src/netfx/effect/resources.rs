@@ -4,7 +4,7 @@ use crate::net_tools::Cmd;
 #[cfg(test)]
 use crate::net_tools::Step;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     V4,
     V6,
@@ -134,18 +134,55 @@ impl Route {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuleAction {
+    Lookup(String),
+    Unreachable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub family: Family,
     pub priority: u32,
-    pub table: String,
+    pub to: Option<String>,
     pub mark: Option<String>,
+    pub action: RuleAction,
 }
 
 impl Rule {
+    pub fn lookup(family: Family, priority: u32, table: impl Into<String>) -> Self {
+        Self {
+            family,
+            priority,
+            to: None,
+            mark: None,
+            action: RuleAction::Lookup(table.into()),
+        }
+    }
+
+    pub fn unreachable(family: Family, priority: u32, to: impl Into<String>) -> Self {
+        Self {
+            family,
+            priority,
+            to: Some(to.into()),
+            mark: None,
+            action: RuleAction::Unreachable,
+        }
+    }
+
     pub(super) fn command(&self, action: &str) -> Cmd {
-        let mut args = vec![self.family.flag().into(), "rule".into(), action.into(), "pref".into(), self.priority.to_string()];
+        let mut args = vec![
+            self.family.flag().into(),
+            "rule".into(),
+            action.into(),
+            "pref".into(),
+            self.priority.to_string(),
+        ];
+        pair(&mut args, "to", self.to.as_deref());
         pair(&mut args, "fwmark", self.mark.as_deref());
-        pair(&mut args, "lookup", Some(&self.table));
+        match &self.action {
+            RuleAction::Lookup(table) => pair(&mut args, "lookup", Some(table)),
+            RuleAction::Unreachable => args.push("unreachable".into()),
+        }
         Cmd { program: "ip".into(), args }
     }
 }
@@ -227,7 +264,7 @@ pub enum Key {
     LegacyChain(LegacyTool, String, String),
     LegacyHook(LegacyTool, String, String, Vec<String>),
     Route(Family, RouteType, String, String, Option<String>, Option<u32>),
-    Rule(Family, u32),
+    Rule(Family, u32, Option<String>),
     Addr(Family, String, String),
     Sysctl(String),
     Internal(&'static str, Cmd),
@@ -255,7 +292,7 @@ impl Resource {
             Self::LegacyChain(chain) => Key::LegacyChain(chain.tool, chain.table.clone(), chain.name.clone()),
             Self::LegacyHook(hook) => Key::LegacyHook(hook.tool, hook.table.clone(), hook.chain.clone(), hook.rule.clone()),
             Self::Route(route) => Key::Route(route.family, route.kind, super::shared::route_destination(&route.destination), super::shared::route_table(&route.table).into(), route.device.clone(), route.metric),
-            Self::Rule(rule) => Key::Rule(rule.family, rule.priority),
+            Self::Rule(rule) => Key::Rule(rule.family, rule.priority, rule.to.as_deref().map(super::shared::route_destination)),
             Self::Addr(addr) => Key::Addr(addr.family, addr.device.clone(), addr.address.clone()),
             Self::Sysctl(setting) => Key::Sysctl(setting.key.clone()),
             Self::Internal(internal) => Key::Internal(internal.name, internal.undo.clone()),
@@ -328,6 +365,7 @@ impl NftTable {
         match (self.owner, self.name) {
             ("mihomo", crate::netfx::ids::MIHOMO_NFT) => Ok((Cmd::new("@u60-mihomo-nft", &["remove"]), None)),
             ("relay", crate::netfx::ids::RELAY_NFT) => Ok((Cmd::new("@u60-relay-nft", &["remove", "ip"]), Some(Cmd::new("@u60-relay-nft", &["remove", "ip6"])))),
+            ("tailscale", crate::netfx::ids::TAILSCALE_NFT) => Ok((Cmd::new("@u60-tailscale-nft", &["remove"]), None)),
             _ => Err("Unknown owned nftables table".into()),
         }
     }

@@ -33,6 +33,14 @@ const bare=R.facts({connected:true});
 assert.equal(bare.find(f=>f[0]==='Upstream IPv4')[1],'—');assert.equal(bare.find(f=>f[0]==='Upstream link')[1],'—');assert.equal(bare.find(f=>f[0]==='After a restart')[1],'Unknown');
 assert.equal(R.facts({connected:true,frequency:2437,ipv6:{state:'no_upstream'}}).find(f=>f[0]==='Upstream link')[1],'2.4 GHz · negotiated bandwidth');
 
+assert.deepEqual(R.cellular(null),{enabled:false,label:'Strict mode off',error:''});
+assert.deepEqual(R.cellular({strict_zero_cellular:true}),{enabled:true,label:'Waiting to pause cellular data',error:''});
+const paused={connected:true,strict_zero_cellular:true,cellular_pause:{state:'paused',original_enabled:true}};
+assert.deepEqual(R.cellular(paused),{enabled:true,label:'Cellular data paused',error:''});
+assert.deepEqual(R.facts(paused).find(f=>f[0]==='Cellular data'),['Cellular data','Cellular data paused',false]);
+assert.equal(R.cellular({strict_zero_cellular:true,cellular_pause:{state:'already_off',original_enabled:false}}).label,'Cellular data was already off');
+assert.deepEqual(R.cellular({strict_zero_cellular:false,cellular_pause:{state:'error',original_enabled:true,error:'Cannot restore cellular data'}}),{enabled:false,label:'Change failed',error:'Cannot restore cellular data'});
+
 // Password rules mirror the router so mistakes are caught before the hotspot is disturbed.
 const wpa={supported:true,security:'wpa2'},open={supported:true,security:'open'};
 assert.equal(R.passwordProblem(null,'x',false),'Select a network first.');

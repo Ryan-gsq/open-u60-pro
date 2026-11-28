@@ -9,7 +9,7 @@ use maud::{html, Markup};
 
 use crate::auth::{retry_after_secs, Kind, LoginError, PeerKey};
 use crate::httpd::guard::ui_post_allowed;
-use crate::httpd::{api, Ctx, Peer};
+use crate::httpd::{api, Ctx, Peer, Via};
 use crate::web::kit::{self, Icon, Tab};
 use crate::web::render::{self, PageCtx};
 use crate::web::session::{self, Session};
@@ -107,7 +107,8 @@ fn entropy_page(nonce: &str) -> Response {
 /// the password (rate limited per peer and globally).
 pub async fn submit(State(ctx): State<Ctx>, req: Request) -> Response {
     let nonce = CspNonce::of(&req);
-    let peer = req.extensions().get::<Peer>().map(|p| PeerKey::from(p.0)).unwrap_or(PeerKey::UNKNOWN);
+    let ext = req.extensions();
+    let peer = ext.get::<Peer>().map_or(PeerKey::UNKNOWN, |p| PeerKey::from_ingress(p.0, Via::of(ext)));
     let (parts, body) = req.into_parts();
     let headers = &parts.headers;
     if !ui_post_allowed(&api::req_headers(headers)) {

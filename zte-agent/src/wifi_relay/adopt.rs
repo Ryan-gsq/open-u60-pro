@@ -20,8 +20,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::{
-    decode_ssid, input_guards, lease_change, lease_file, net, network_id, offload, power_save, read_lease, relay_layout,
-    relay_plan, resolvers_acceptable, resume, start_dhcp, steering, validate_lease, wpa, Helper, Lease,
+    cellular, decode_ssid, input_guards, lease_change, lease_file, net, network_id, offload, power_save, read_lease, relay_layout,
+    relay_plan, resolvers_acceptable, resume, start_dhcp, validate_lease, wpa, Helper, Lease,
     LeaseChange, Network, Session, EffectSet, IFACE, JOURNAL, ROOT,
 };
 
@@ -127,22 +127,23 @@ fn take_over_with(
     // Remove precisely the old tagged rule before any declaration of nat4.
     retire_legacy_hook(&mut session.network)?;
     declare(&mut session.network, relay_plan(installed, prefix, lan_ip, lan_mask))?;
+    // Retire the previous policy priority (18640) only after the new priority (5120) is active.
+    session.network.retire_legacy_commands(|undo| {
+        undo.program == "ip"
+            && undo.args.windows(2).any(|w| w == ["pref", crate::netfx::ids::LEGACY_RELAY_PREF])
+    })?;
     session.routed = true;
-    for step in steering::plan() {
-        if let Err(e) = declare(&mut session.network, vec![step]) {
-            crate::netlog!("[relay] receive steering not applied: {e}");
-        }
-    }
     session.dns = EffectSet::load("relay", &root.join(super::journals::DNS))?;
     declare(&mut session.dns, super::portal::web_bypasses())?;
     let redirect = super::portal::web_redirect(&session.dns);
     declare(&mut session.dns, redirect)?;
     declare(&mut session.dns, vec![super::resolver(installed)])?;
     // Verify the previous tables and stage IPv4 before IPv6 takeover.
-    session.uplink.adopt(relay_layout(installed, lan_ip, lan_mask))
+    session.uplink.adopt(relay_layout(installed, lan_ip, lan_mask), cellular::enabled(root))
 }
 
 fn retire_legacy_hook(network: &mut EffectSet) -> Result<(), String> {
+    network.retire_legacy_commands(|undo| undo.program == "@u60-relay-steer")?;
     let hook = super::LegacyHook {
         tool: super::LegacyTool::V4, table: "nat".into(), chain: "POSTROUTING".into(), position: super::Position::InsertFirst,
         rule: super::words(&["-o", IFACE, "-m", "comment", "--comment", crate::netfx::ids::RELAY_COMMENT, "-j", "MASQUERADE"]),
@@ -152,7 +153,7 @@ fn retire_legacy_hook(network: &mut EffectSet) -> Result<(), String> {
 
 /// A new DHCP client renews the same address (the old one died with the
 /// previous agent); then power save and the hardware path are taken over.
-fn renew(session: &mut Session, installed: &Lease, prefix: u32) -> Result<(), String> {
+fn renew(session: &mut Session, installed: &Lease, _: u32) -> Result<(), String> {
     let root = Path::new(JOURNAL);
     let (nonce, dhcp) = start_dhcp(Some(installed.ip))?;
     session.dhcp_session = Some(nonce.clone());
@@ -166,8 +167,7 @@ fn renew(session: &mut Session, installed: &Lease, prefix: u32) -> Result<(), St
     if power_save::auto_off(root) {
         let _ = session.power_save.set(&mut session.network, true);
     }
-    let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(installed.ip) & u32::from(installed.subnet)));
-    session.offload = offload::Runtime::start(&mut session.network, installed.gateway, subnet);
+    session.offload = offload::Runtime::adopt(&mut session.network, installed.gateway)?;
     Ok(())
 }
 

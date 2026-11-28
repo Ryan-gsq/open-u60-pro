@@ -41,18 +41,52 @@ pub(super) enum Shape<'a> {
     FakeReject,
 }
 
-/// Both families' definitions for the owner's NftTable resource.
+/// Optional Strategy B interception parameters for Tailscale Exit Node
+/// (`tailscale0`). Active only when `exit_via_mihomo` is enabled AND Exit Node
+/// is approved for that address family.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct TailscaleExit<'a> {
+    pub v4: bool,
+    pub v6: bool,
+    pub skip_v4: &'a [String],
+    pub skip_v6: &'a [String],
+    pub chain: Option<&'a routing::Chain>,
+}
+
+/// Both families' definitions for the owner's NftTable resource (LAN only).
 pub(super) fn tables(shape: Shape) -> [String; 2] {
-    FAMILIES.map(|family| family_table(family, shape))
+    tables_with_tailscale(shape, TailscaleExit::default())
 }
 
-fn guard() -> Vec<String> {
-    vec![format!("iifname != {{ \"br-lan\", \"lo\" }} meta l4proto {{ tcp, udp }} th dport {{ {}, {} }} drop", ids::DNS_PORT, ids::TPROXY_PORT)]
+/// Both families' definitions with optional Tailscale Strategy B interception.
+pub(super) fn tables_with_tailscale(shape: Shape, ts: TailscaleExit) -> [String; 2] {
+    FAMILIES.map(|family| family_table(family, shape, ts))
 }
 
-fn family_table(family: &str, shape: Shape) -> String {
+fn guard(allow_ts_tproxy: bool) -> Vec<String> {
+    let mut rules = Vec::new();
+    if allow_ts_tproxy {
+        // Accept only packets already transparently proxied on `tailscale0`
+        // (`meta mark 0x700/0xff00` + `socket transparent 1`), never exposing
+        // raw `:1053` or `:17894` to unsolicited packets from `tailscale0`.
+        rules.push(format!(
+            "iifname \"{}\" meta mark and 0x0000ff00 == 0x700 socket transparent 1 return",
+            ids::TAILSCALE_IFACE
+        ));
+    }
+    rules.push(format!(
+        "iifname != {{ \"br-lan\", \"lo\" }} meta l4proto {{ tcp, udp }} th dport {{ {}, {} }} drop",
+        ids::DNS_PORT,
+        ids::TPROXY_PORT
+    ));
+    rules
+}
+
+fn family_table(family: &str, shape: Shape, ts: TailscaleExit) -> String {
     let v4 = family == "ip";
-    let input = ("input", "type filter hook input priority filter - 1; policy accept;", guard());
+    let ts_active = if v4 { ts.v4 } else { ts.v6 };
+    let allow_ts_input = matches!(shape, Shape::Hold | Shape::Full(_)) && ts_active;
+    let input = ("input", "type filter hook input priority filter - 1; policy accept;", guard(allow_ts_input));
     let chain = match shape {
         Shape::Guard => return table(family, NAME, &[], &[input]),
         Shape::FakeReject => {
@@ -60,6 +94,9 @@ fn family_table(family: &str, shape: Shape) -> String {
                 vec![
                     format!("iifname \"br-lan\" ip daddr {} meta l4proto tcp reject with tcp reset", routing::FAKE_NET),
                     format!("iifname \"br-lan\" ip daddr {} meta l4proto udp reject", routing::FAKE_NET),
+                    format!("iifname \"{}\" ip daddr {} meta l4proto tcp reject with tcp reset", ids::TAILSCALE_IFACE, routing::FAKE_NET),
+                    format!("iifname \"{}\" ip daddr {} meta l4proto udp reject", ids::TAILSCALE_IFACE, routing::FAKE_NET),
+                    format!("iifname \"{}\" ip daddr {} reject", ids::TAILSCALE_IFACE, routing::FAKE_NET),
                 ]
             } else {
                 Vec::new()
@@ -72,12 +109,16 @@ fn family_table(family: &str, shape: Shape) -> String {
         Shape::Full(chain) => Some(chain),
     };
     let (address, private) = if v4 { ("ip", ids::PRIVATE_V4.join(", ")) } else { ("ip6", ids::PRIVATE_V6.join(", ")) };
-    let mut prerouting = vec![
+    let mut prerouting = Vec::new();
+    if ts_active {
+        prerouting.push(format!("iifname \"{}\" goto ts_pre", ids::TAILSCALE_IFACE));
+    }
+    prerouting.extend([
         "iifname != \"br-lan\" return".to_owned(),
         format!("meta l4proto tcp socket transparent 1 socket wildcard 0 {MARK}"),
         "meta l4proto { tcp, udp } th dport 53 return".to_owned(),
         "fib daddr type local return".to_owned(),
-    ];
+    ]);
     if v4 {
         prerouting.push(format!("ip daddr {} goto {CORE}", routing::FAKE_NET));
     }
@@ -94,19 +135,57 @@ fn family_table(family: &str, shape: Shape) -> String {
         "meta l4proto { tcp, udp } drop".to_owned(),
     ];
     let dns = vec![format!("iifname \"br-lan\" meta l4proto {{ tcp, udp }} th dport 53 redirect to :{}", ids::DNS_PORT)];
+
+    let mut ts_pre = Vec::new();
+    if ts_active {
+        if v4 {
+            // Never TPROXY LAN fake-IP destinations from `tailscale0`: let them
+            // reach `forward` where they are immediately rejected.
+            ts_pre.push(format!("ip daddr {} return", routing::FAKE_NET));
+        }
+        ts_pre.push(format!("meta l4proto tcp socket transparent 1 socket wildcard 0 {MARK}"));
+        ts_pre.push("fib daddr type local return".to_owned());
+        ts_pre.push(format!("{address} daddr {{ {private} }} return"));
+        let skips = if v4 { ts.skip_v4 } else { ts.skip_v6 };
+        if !skips.is_empty() {
+            ts_pre.push(format!("{address} daddr {{ {} }} return", skips.join(", ")));
+        }
+        if let (true, Some(_), Some(ts_chain)) = (v4, chain, ts.chain) {
+            ts_pre.extend(ts_chain.rules.iter().cloned());
+            for (name, elements) in &ts_chain.sets {
+                if !sets.iter().any(|(existing, _, _)| *existing == name.as_str()) {
+                    sets.push((name.as_str(), SET_SPEC, elements.as_slice()));
+                }
+            }
+        }
+        ts_pre.push(format!("goto {CORE}"));
+    }
+
+    let ts_forward = if v4 && ts_active {
+        vec![
+            format!("iifname \"{}\" ip daddr {} meta l4proto tcp reject with tcp reset", ids::TAILSCALE_IFACE, routing::FAKE_NET),
+            format!("iifname \"{}\" ip daddr {} meta l4proto udp reject", ids::TAILSCALE_IFACE, routing::FAKE_NET),
+            format!("iifname \"{}\" ip daddr {} reject", ids::TAILSCALE_IFACE, routing::FAKE_NET),
+        ]
+    } else {
+        Vec::new()
+    };
+
+    let mut chains = vec![
+        input,
+        (CORE, "", core),
+    ];
+    if ts_active {
+        chains.push(("ts_pre", "", ts_pre));
+    }
+    chains.push(("prerouting", "type filter hook prerouting priority mangle - 1; policy accept;", prerouting));
+    if !ts_forward.is_empty() {
+        chains.push(("forward", "type filter hook forward priority filter - 1; policy accept;", ts_forward));
+    }
     // Ahead of the relay's DNS chains (`uplink::DNS_PRIORITY`), so the core's
-    // DNS wins while it runs.
-    table(
-        family,
-        NAME,
-        &sets,
-        &[
-            input,
-            (CORE, "", core),
-            ("prerouting", "type filter hook prerouting priority mangle - 1; policy accept;", prerouting),
-            ("dns", "type nat hook prerouting priority dstnat - 2; policy accept;", dns),
-        ],
-    )
+    // DNS wins while it runs. Strictly `br-lan` only, never `tailscale0`.
+    chains.push(("dns", "type nat hook prerouting priority dstnat - 2; policy accept;", dns));
+    table(family, NAME, &sets, &chains)
 }
 
 #[cfg(test)]
@@ -177,5 +256,67 @@ mod tests {
         assert!(reject.contains("ip daddr 198.18.0.0/16 meta l4proto tcp reject with tcp reset") && reject.contains("meta l4proto udp reject"));
         assert!(!reject.contains("tproxy") && !reject.contains("redirect") && !reject6.contains("reject"), "D3: no interception, no DNS redirect");
         assert!(reject.contains("dport { 1053, 17894 } drop") && reject6.contains("dport { 1053, 17894 } drop"), "a start from D3 binds behind the guard");
+    }
+
+    #[test]
+    fn tailscale_strategy_b_tproxy_guards_input_rejects_fake_ip_and_keeps_dns_lan_only() {
+        let lan = rules_chain();
+        let ts_chain = routing::Chain {
+            sets: vec![
+                ("geo_cn".into(), vec!["1.0.1.0/24".into(), "1.0.2.0/23".into()]),
+                ("ts_ip_0".into(), vec!["91.108.4.0/22".into()]),
+            ],
+            rules: vec![
+                "ip daddr @ts_ip_0 goto to_core".into(),
+                "ip daddr @geo_cn return".into(),
+            ],
+            returns: 1,
+            ..routing::Chain::default()
+        };
+        let skip_v6 = vec!["2001:db8:lan::/64".to_owned()];
+        let ts = TailscaleExit {
+            v4: true,
+            v6: true,
+            skip_v4: &[],
+            skip_v6: &skip_v6,
+            chain: Some(&ts_chain),
+        };
+        let [v4, v6] = tables_with_tailscale(Shape::Full(&lan), ts);
+        // Shared `geo_cn` set must appear exactly once in `ip u60_mihomo`!
+        assert_eq!(v4.matches("set geo_cn ").count(), 1, "geo_cn must be deduplicated");
+        assert!(v4.contains("set ts_ip_0 "));
+        // Input guard allows ONLY TPROXY-marked transparent sockets from tailscale0,
+        // keeping raw :1053/:17894 blocked by the drop rule right below.
+        for part in [&v4, &v6] {
+            let allow = at(part, "iifname \"tailscale0\" meta mark and 0x0000ff00 == 0x700 socket transparent 1 return");
+            let drop = at(part, "iifname != { \"br-lan\", \"lo\" } meta l4proto { tcp, udp } th dport { 1053, 17894 } drop");
+            assert!(allow < drop);
+            // DNS redirect stays strictly br-lan only!
+            assert!(part.contains("iifname \"br-lan\" meta l4proto { tcp, udp } th dport 53 redirect to :1053"));
+            assert!(!part.contains("iifname \"tailscale0\" meta l4proto { tcp, udp } th dport 53 redirect"));
+        }
+        // `ts_pre` rejects fake-IP by returning to `forward` where TCP reset / UDP reject fires.
+        let ts_pre = &v4[at(&v4, "chain ts_pre {")..];
+        let ts_pre = &ts_pre[..at(ts_pre, "\t}\n")];
+        assert!(at(ts_pre, "ip daddr 198.18.0.0/16 return") < at(ts_pre, "ip daddr @ts_ip_0 goto to_core"));
+        assert!(at(ts_pre, "ip daddr @ts_ip_0 goto to_core") < at(ts_pre, "ip daddr @geo_cn return"));
+        assert!(ts_pre.trim_end().ends_with("goto to_core"));
+        assert!(v4.contains("iifname \"tailscale0\" ip daddr 198.18.0.0/16 meta l4proto tcp reject with tcp reset"));
+        assert!(v4.contains("iifname \"tailscale0\" ip daddr 198.18.0.0/16 meta l4proto udp reject"));
+        // IPv6 skips approved GUA subnet then goes to core
+        assert!(v6.contains("ip6 daddr { 2001:db8:lan::/64 } return"));
+        assert!(v6.contains("iifname \"tailscale0\" goto ts_pre"));
+
+        // D3 (`FakeReject`) and `Guard` MUST completely withdraw `tailscale0` TPROXY and input allow!
+        for [d4, d6] in [
+            tables_with_tailscale(Shape::FakeReject, ts),
+            tables_with_tailscale(Shape::Guard, ts),
+        ] {
+            for part in [&d4, &d6] {
+                assert!(!part.contains("chain ts_pre"));
+                assert!(!part.contains("socket transparent 1 return"));
+                assert!(!part.contains("tproxy to"));
+            }
+        }
     }
 }

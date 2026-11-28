@@ -54,13 +54,18 @@ pub struct Paths {
 
 impl Paths {
     pub fn system() -> Self {
+        let supervisor = std::env::var_os("ZTE_OTA_REAL_SUPERVISOR")
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var_os("ZTE_OTA_SUPERVISOR").filter(|value| !value.is_empty())
+            })
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/data/local/tmp/zte-agent-supervisor.sh"));
         Self::new(
             std::env::var_os("ZTE_OTA_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/data/open-u60/update")),
-            std::env::var_os("ZTE_OTA_SUPERVISOR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/data/local/tmp/zte-agent-supervisor.sh")),
+            supervisor,
             std::env::var_os("ZTE_OTA_LEGACY_LINK")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/data/zte-agent")),
@@ -118,6 +123,14 @@ impl Paths {
         self.stable_dir().join("zte-agent")
     }
 
+    pub fn legacy_supervisor_shadow(&self) -> PathBuf {
+        self.root.join("legacy-supervisor.shadow")
+    }
+
+    pub fn rollback_attempt(&self) -> PathBuf {
+        self.root.join("rollback-attempt")
+    }
+
     pub fn stable_meta(&self) -> PathBuf {
         self.stable_dir().join("release.json")
     }
@@ -136,8 +149,9 @@ impl Paths {
     }
 
     pub fn active_slot(&self) -> Option<Slot> {
-        fs::read_to_string(&self.active)
+        read_regular_bounded(&self.active, 64)
             .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
             .and_then(|value| Slot::parse(&value))
     }
 
@@ -232,11 +246,68 @@ pub fn executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let bytes = fs::read(path).ok()?;
-    if bytes.len() > 256 * 1024 {
-        return None;
+pub const MAX_JSON_BYTES: usize = 256 * 1024;
+
+/// Returns `Ok(true)` if any directory entry exists at `path` (including
+/// dangling symlinks, directories, or FIFOs — never follows symlinks),
+/// `Ok(false)` only when ENOENT, and `Err` on other stat errors.
+pub fn entry_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
+}
+
+/// Open a regular file without blocking on FIFOs or device nodes.
+pub fn open_regular_nonblocking(path: &Path) -> io::Result<File> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Read a regular file bounded to `max_bytes` without blocking on FIFOs or
+/// device nodes. Rejects non-regular entries and files larger than `max_bytes`.
+pub fn read_regular_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    use io::Read as _;
+
+    let file = open_regular_nonblocking(path)?;
+    let meta = file.metadata()?;
+    if meta.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(meta.len().min(max_bytes as u64) as usize);
+    let mut limited = file.take((max_bytes as u64) + 1);
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = read_regular_bounded(path, MAX_JSON_BYTES).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -246,16 +317,26 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     atomic_write(path, &bytes, 0o600)
 }
 
-pub fn atomic_copy(source: &Path, destination: &Path, mode: u32) -> io::Result<()> {
+pub fn atomic_copy_reader(
+    source: &mut impl io::Read,
+    destination: &Path,
+    mode: u32,
+) -> io::Result<()> {
     let parent = destination
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
     create_private_dir(parent)?;
     let tmp = temporary_path(destination);
     let _ = fs::remove_file(&tmp);
-    fs::copy(source, &tmp)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(mode)
+        .open(&tmp)?;
+    io::copy(source, &mut file)?;
+    file.sync_all()?;
+    drop(file);
     fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
-    File::open(&tmp)?.sync_all()?;
     fs::rename(&tmp, destination)?;
     File::open(parent)?.sync_all()
 }
@@ -283,6 +364,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 /// OTA state lives in private directories, while the supervisor lives in
 /// `/data/local/tmp`, whose shared directory mode must remain untouched.
 pub fn atomic_write_preserving_parent(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    atomic_write_preserving_parent_with(path, bytes, mode, sync_parent)
+}
+
+pub fn atomic_write_preserving_parent_with(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    sync_parent_fn: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
@@ -298,7 +388,7 @@ pub fn atomic_write_preserving_parent(path: &Path, bytes: &[u8], mode: u32) -> i
     file.sync_all()?;
     drop(file);
     fs::rename(&tmp, path)?;
-    File::open(parent)?.sync_all()
+    sync_parent_fn(path)
 }
 
 pub fn sync_parent(path: &Path) -> io::Result<()> {
@@ -306,6 +396,48 @@ pub fn sync_parent(path: &Path) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
     File::open(parent)?.sync_all()
+}
+
+/// Atomically exchange two existing directories on the same filesystem so a
+/// multi-file pair (such as `last-stable/zte-agent` + `last-stable/release.json`)
+/// switches generations in a single kernel operation.
+pub fn exchange_directories(staging: &Path, target: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let c_staging = CString::new(staging.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let c_target = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    #[cfg(target_os = "linux")]
+    let rc = {
+        const RENAME_EXCHANGE: libc::c_uint = 2;
+        // SAFETY: both paths are NUL-terminated C strings.
+        unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                c_staging.as_ptr(),
+                libc::AT_FDCWD,
+                c_target.as_ptr(),
+                RENAME_EXCHANGE,
+            )
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let rc = {
+        // SAFETY: both paths are NUL-terminated C strings.
+        unsafe { libc::renamex_np(c_staging.as_ptr(), c_target.as_ptr(), libc::RENAME_SWAP) }
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let rc: i64 = {
+        return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 pub fn available_bytes(path: &Path) -> io::Result<u64> {

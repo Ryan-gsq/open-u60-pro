@@ -29,6 +29,7 @@ pub struct AppState {
     pub sms_forward: Arc<SmsForwarder>,
     pub tailscale: Arc<crate::tailscale::TailscaleManager>,
     pub network_lock: crate::net_tools::NetworkLock,
+    pub(crate) perf: Arc<crate::netfx::perf::Perf>,
     pub cellular_control: crate::modem_ext::CellularControl,
     pub mihomo: Arc<crate::mihomo::Mihomo>,
     pub wifi_relay: Arc<crate::wifi_relay::WifiRelay>,
@@ -57,17 +58,22 @@ impl AppState {
         let live_activity = Arc::new(crate::live_activity::LiveActivity::new());
         let network_lock = Arc::new(crate::netfx::admission::Gate::new());
         let mihomo = Arc::new(crate::mihomo::Mihomo::new());
+        let perf = Arc::clone(mihomo.perf());
         let dashboard = Arc::new(crate::dashboard::Dashboard::default());
         let ota = crate::ota::OtaManager::system(Arc::downgrade(&dashboard));
-        let tailscale = Arc::new(crate::tailscale::TailscaleManager::new());
+        let tailscale = Arc::new(crate::tailscale::TailscaleManager::with_perf(Arc::clone(&perf)));
         let wifi_relay = Arc::new(
             crate::wifi_relay::WifiRelay::with_core(Arc::clone(&network_lock), Arc::clone(&mihomo))
                 .with_tailscale(Arc::clone(&tailscale)),
         );
         tailscale.set_relay(&wifi_relay);
+        tailscale.set_mihomo(&mihomo);
+        mihomo.set_tailscale(&tailscale);
+        tailscale.sync_mihomo_exit_state();
         Self {
             wifi_relay,
             mihomo,
+            perf,
             network_lock,
             cellular_control: crate::modem_ext::CellularControl::default(),
             client_details: crate::client_details::ClientMonitor::default(),

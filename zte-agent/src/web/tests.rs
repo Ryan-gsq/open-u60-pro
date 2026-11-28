@@ -19,7 +19,7 @@ use crate::auth::{AuthConfig, AuthState, FailRng, Kind, PeerKey, SeqRng};
 use crate::boottime::FakeClock;
 use crate::handlers::AppState;
 use crate::httpd::gate::Gate;
-use crate::httpd::{Ctx, Peer};
+use crate::httpd::{Ctx, Peer, Via};
 
 fn app(ctx: Ctx) -> axum::Router {
     axum::Router::new().merge(super::router(&ctx)).fallback(crate::httpd::api::api_entry).with_state(ctx)
@@ -29,8 +29,24 @@ const PW: &str = "test-password";
 const HOST: &str = "192.168.0.1:9090";
 const ORIGIN: &str = "http://192.168.0.1:9090";
 
-fn peer(test: u8, n: u8) -> Peer {
-    Peer(SocketAddr::from(([10, 1, test, n], 5000)))
+#[derive(Clone, Copy)]
+struct FixturePeer {
+    addr: SocketAddr,
+    via: Via,
+}
+
+impl FixturePeer {
+    fn request(self, builder: Builder) -> Builder {
+        builder.extension(Peer(self.addr)).extension(self.via)
+    }
+}
+
+fn peer(test: u8, n: u8) -> FixturePeer {
+    FixturePeer { addr: SocketAddr::from(([10, 1, test, n], 5000)), via: Via::Local }
+}
+
+fn tailnet(port: u16) -> FixturePeer {
+    FixturePeer { addr: SocketAddr::from(([127, 0, 0, 1], port)), via: Via::Tailnet }
 }
 
 fn ctx(password: Option<&str>) -> Ctx {
@@ -49,8 +65,8 @@ fn ctx_at(clock: Arc<FakeClock>) -> Ctx {
     Ctx::new(Arc::new(state), 2)
 }
 
-fn req(method: &str, uri: &str, peer: Peer) -> Builder {
-    axum::http::Request::builder().method(method).uri(uri).header("host", HOST).extension(peer)
+fn req(method: &str, uri: &str, peer: FixturePeer) -> Builder {
+    peer.request(axum::http::Request::builder().method(method).uri(uri).header("host", HOST))
 }
 
 struct Reply {
@@ -143,15 +159,15 @@ async fn send(ctx: &Ctx, req: axum::http::Request<Body>) -> Reply {
     Reply { status, headers, body }
 }
 
-async fn get(ctx: &Ctx, uri: &str, peer: Peer) -> Reply {
+async fn get(ctx: &Ctx, uri: &str, peer: FixturePeer) -> Reply {
     send(ctx, req("GET", uri, peer).body(Body::empty()).unwrap()).await
 }
 
-async fn get_with(ctx: &Ctx, uri: &str, peer: Peer, cookie: &str) -> Reply {
+async fn get_with(ctx: &Ctx, uri: &str, peer: FixturePeer, cookie: &str) -> Reply {
     send(ctx, req("GET", uri, peer).header("cookie", cookie).body(Body::empty()).unwrap()).await
 }
 
-fn form(uri: &str, peer: Peer, cookie: &str, body: &str) -> Builder {
+fn form(uri: &str, peer: FixturePeer, cookie: &str, body: &str) -> Builder {
     let b = req("POST", uri, peer)
         .header("content-type", "application/x-www-form-urlencoded")
         .header("content-length", body.len());
@@ -162,13 +178,13 @@ fn form(uri: &str, peer: Peer, cookie: &str, body: &str) -> Builder {
     }
 }
 
-async fn post(ctx: &Ctx, uri: &str, peer: Peer, cookie: &str, body: &str) -> Reply {
+async fn post(ctx: &Ctx, uri: &str, peer: FixturePeer, cookie: &str, body: &str) -> Reply {
     let r = form(uri, peer, cookie, body).header("origin", ORIGIN).body(Body::from(body.to_owned())).unwrap();
     send(ctx, r).await
 }
 
 /// The login form: (pre cookie, login_csrf).
-async fn login_form(ctx: &Ctx, peer: Peer) -> (String, String) {
+async fn login_form(ctx: &Ctx, peer: FixturePeer) -> (String, String) {
     let r = get(ctx, "/ui/login", peer).await;
     assert_eq!(r.status, 200);
     (r.cookie("zte_ui_pre").unwrap(), r.input("login_csrf"))
@@ -242,26 +258,26 @@ fn no_rule_sets_display_on_every_span() {
 #[tokio::test]
 async fn host_allowlist_and_redirects() {
     let c = ctx(Some(PW));
-    let evil = axum::http::Request::builder()
+    let evil = peer(1, 1).request(axum::http::Request::builder()
         .uri("/ui/login")
-        .header("host", "evil.example")
-        .extension(peer(1, 1))
+        .header("host", "evil.example"))
         .body(Body::empty())
         .unwrap();
     let r = send(&c, evil).await;
     assert_eq!((r.status, r.text().as_str()), (403, "Host not allowed"));
     r.assert_security_headers();
-    let none = axum::http::Request::builder().uri("/ui/").extension(peer(1, 2)).body(Body::empty()).unwrap();
+    let none = peer(1, 2).request(axum::http::Request::builder().uri("/ui/")).body(Body::empty()).unwrap();
     let r = send(&c, none).await;
     assert_eq!((r.status, r.text().as_str()), (400, "Missing Host"));
-    // `localhost` (like the Tailscale names) only from this device: a LAN
-    // browser never gets there for that name.
-    let local = |p: Peer| {
-        axum::http::Request::builder().uri("/ui/login").header("host", "localhost:9090").extension(p).body(Body::empty()).unwrap()
+    let local = |p: FixturePeer| {
+        p.request(axum::http::Request::builder().uri("/ui/login").header("host", "localhost:9090")).body(Body::empty()).unwrap()
     };
     let r = send(&c, local(peer(1, 8))).await;
     assert_eq!((r.status, r.text().as_str()), (403, "Host not allowed"));
-    send(&c, local(Peer(SocketAddr::from(([127, 0, 0, 1], 40002))))).await.assert_secure_html(200);
+    let r = send(&c, local(tailnet(40002))).await;
+    assert_eq!((r.status, r.text().as_str()), (403, "Host not allowed"));
+    let loopback = FixturePeer { addr: SocketAddr::from(([127, 0, 0, 1], 40002)), via: Via::Loopback };
+    send(&c, local(loopback)).await.assert_secure_html(200);
     get(&c, "/ui/login", peer(1, 3)).await.assert_secure_html(200);
     get(&c, "/", peer(1, 4)).await.assert_see_other("/ui/");
     get(&c, "/ui", peer(1, 5)).await.assert_see_other("/ui/");
@@ -298,7 +314,8 @@ async fn unknown_ui_paths_get_the_html_404() {
 async fn sessions_are_separate_from_bearer_tokens() {
     let c = ctx(Some(PW));
     get(&c, "/ui/", peer(3, 1)).await.assert_see_other("/ui/login?next=%2Fui%2F");
-    let bearer = c.app.auth.login(PW, Kind::Bearer, PeerKey::from(peer(3, 2).0), &[]).unwrap();
+    let bearer_peer = peer(3, 2);
+    let bearer = c.app.auth.login(PW, Kind::Bearer, PeerKey::from_ingress(bearer_peer.addr, bearer_peer.via), &[]).unwrap();
     let r = send(
         &c,
         req("GET", "/ui/", peer(3, 3)).header("authorization", format!("Bearer {}", bearer.token.expose())).body(Body::empty()).unwrap(),
@@ -879,7 +896,7 @@ async fn network_mode_in_both_mounts() {
         }
     }
     // Over Tailscale: what a mode without coverage does to this connection.
-    let tailnet = Peer(SocketAddr::from(([127, 0, 0, 1], 40002)));
+    let tailnet = tailnet(40002);
     let html = get_with(&c, &format!("{RT}/confirm?mode=Only_5G"), tailnet, &cookie).await.text();
     assert!(html.contains(
         "You are connected remotely: if 5G SA Only has no coverage here, this page can’t be reached until the mode is changed on the router."
@@ -1144,7 +1161,7 @@ async fn mobile_network_page_and_confirmations() {
     get_with(&c, &apply("0", "1"), peer(17, 3), &cookie).await.assert_see_other(MN);
     // Over Tailscale (loopback peer): the warning, and nothing that says
     // this page keeps working.
-    let tailnet = Peer(SocketAddr::from(([127, 0, 0, 1], 40000)));
+    let tailnet = tailnet(40000);
     let r = get_with(&c, &format!("{MN}/airplane/confirm?mode=LPM"), tailnet, &cookie).await;
     assert!(r.text().contains("You are connected remotely: this cuts the connection, and this page can’t be reached until it is turned back on at the router."));
     let r = get_with(&c, &format!("{MN}/mobile-data/confirm?enable=0"), tailnet, &cookie).await;
@@ -1202,7 +1219,7 @@ async fn router_posts_check_session_csrf_confirm_and_values() {
     p(at("apply"), format!("csrf={csrf}&{}", fields("1", "0"))).await.assert_see_other(&at(&format!("apply?{}", fields("1", "0"))));
     p(at("mobile-data"), format!("csrf={csrf}&enable=0")).await.assert_see_other(&at("mobile-data/confirm?enable=0"));
     p(at("airplane"), format!("csrf={csrf}&mode=LPM")).await.assert_see_other(&at("airplane/confirm?mode=LPM"));
-    let tailnet = Peer(SocketAddr::from(([127, 0, 0, 1], 40001)));
+    let tailnet = tailnet(40001);
     post(&c, &at("apply"), tailnet, &cookie, &format!("csrf={csrf}&{}", fields("0", "1"))).await.assert_see_other(&at(&format!("apply?{}", fields("0", "1"))));
     // Nothing changed: nothing to do.
     p(at("apply"), format!("csrf={csrf}&{}", fields("1", "1"))).await.assert_see_other(MN);
@@ -1350,7 +1367,7 @@ async fn frame(b: &mut axum::body::BodyDataStream) -> Option<String> {
     }
 }
 
-async fn open_live(c: &Ctx, uri: &str, peer: Peer, cookie: &str) -> axum::response::Response {
+async fn open_live(c: &Ctx, uri: &str, peer: FixturePeer, cookie: &str) -> axum::response::Response {
     let mut r = req("GET", uri, peer).header("datastar-request", "true");
     if !cookie.is_empty() {
         r = r.header("cookie", cookie);

@@ -82,7 +82,10 @@ impl ReleaseManifest {
         {
             return Err(ManifestError::InvalidCommit);
         }
-        if self.published_at.is_empty() || self.published_at.len() > 64 {
+        if self.published_at.is_empty()
+            || self.published_at.len() > 64
+            || self.published_at.contains('\0')
+        {
             return Err(ManifestError::InvalidPublishedAt);
         }
         self.minimum_updater_semver()?;
@@ -213,7 +216,7 @@ fn validate_release_url(value: &str, tag: &str, binary: bool) -> Result<(), Mani
     } else {
         format!("/jesther-ai/open-u60-pro/releases/tag/{tag}")
     };
-    if url.path() != expected {
+    if url.path() != expected || value != format!("https://github.com{expected}") {
         return Err(ManifestError::InvalidUrl);
     }
     Ok(())

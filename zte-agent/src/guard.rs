@@ -86,7 +86,18 @@ pub fn spawn() {
     let Some(start) = crate::netfx::exec::process_start(pid) else { return };
     let Ok(exe) = std::env::current_exe() else { return };
     let mut command = Command::new(exe);
-    command.args(["guard", &pid.to_string(), &start.to_string()]).stdin(Stdio::null());
+    command
+        .args(["guard", &pid.to_string(), &start.to_string()])
+        .env_remove("ZTE_OTA_TRIAL")
+        .env_remove("ZTE_OTA_PROMOTED")
+        .stdin(Stdio::null());
+    if let Some(real_supervisor) = std::env::var_os("ZTE_OTA_REAL_SUPERVISOR")
+        .filter(|value| !value.is_empty())
+    {
+        command
+            .env("ZTE_OTA_SUPERVISOR", real_supervisor)
+            .env_remove("ZTE_OTA_REAL_SUPERVISOR");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -115,7 +126,20 @@ fn launcher() -> String {
 /// with it (seen on B31, 2026-11-10). On a timeout only the launcher dies.
 fn run_launcher(launcher: &str, timeout: Duration) -> bool {
     let mut command = Command::new("sh");
-    command.arg(launcher).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .arg(launcher)
+        .env_remove("ZTE_OTA_TRIAL")
+        .env_remove("ZTE_OTA_PROMOTED")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(real_supervisor) = std::env::var_os("ZTE_OTA_REAL_SUPERVISOR")
+        .filter(|value| !value.is_empty())
+    {
+        command
+            .env("ZTE_OTA_SUPERVISOR", real_supervisor)
+            .env_remove("ZTE_OTA_REAL_SUPERVISOR");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

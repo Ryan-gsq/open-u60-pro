@@ -14,6 +14,7 @@ pub mod effect;
 pub mod exec;
 pub mod files;
 pub mod neighbours;
+pub(crate) mod perf;
 #[cfg(target_os = "linux")]
 pub(crate) mod netlink;
 pub mod ids;
@@ -61,7 +62,6 @@ mod boundary {
 
     // Match file, function AND command prefix; a new write in that file still fails.
     const ALLOWED: &[(&str, &str, &str, &str)] = &[
-        ("wifi_relay/steering.rs", "command", "fs::write BACKLOG", "the journaled @u60-relay-steer step implements its backlog apply/undo here"),
         ("wifi_relay/ipv6.rs", "tick_inner", "ip -6 addr change", "refresh only the lifetime of the LAN address already held by the IPv6 journal"),
         ("wifi_relay/ipv6.rs", "refresh_path", "ip -6 addr change", "refresh only the lifetimes of upstream addresses already held by the IPv6 journal"),
         ("wifi_relay/ipv6.rs", "lan_route", "ip -6 route {action}", "this command factory feeds journaled steps and refreshes their existing finite lifetimes"),
@@ -445,7 +445,13 @@ mod boundary {
     #[test]
     fn the_relay_and_mihomo_write_network_state_only_through_netfx() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = vec![src.join("wifi_relay.rs"), src.join("mihomo.rs"), src.join("wireguard.rs"), src.join("ttl.rs")];
+        let mut files = vec![
+            src.join("wifi_relay.rs"),
+            src.join("mihomo.rs"),
+            src.join("wireguard.rs"),
+            src.join("ttl.rs"),
+            src.join("tailscale/netplane.rs"),
+        ];
         sources(&src.join("wifi_relay"), &mut files);
         sources(&src.join("mihomo"), &mut files);
         assert!(files.len() > 20, "{files:?}");
@@ -569,7 +575,7 @@ mod boundary {
         let rejected = violations("case.rs", &source.replace("&[\"link\", \"set\", \"x\", \"up\"])", "&[\"link\", \"set\", \"x\", \"up\"]).run()"));
         assert_eq!(rejected.len(), 1);
         assert!(rejected[0].contains("EffectSet resource/step"));
-        assert_eq!(ALLOWED.len(), 5);
+        assert_eq!(ALLOWED.len(), 4);
     }
 
     #[test]

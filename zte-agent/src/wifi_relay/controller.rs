@@ -13,9 +13,11 @@ pub(super) enum Command {
     Scan,
     Connect { selection: Selection, ipv6: bool, remember: bool, generation: u64 },
     PowerSave(bool),
+    StrictZeroCellular(bool),
     Offload(bool),
     Forget(String),
     Clock,
+    PrepareSlotChange,
 }
 
 pub(super) enum Message {
@@ -27,6 +29,7 @@ pub(super) enum Message {
         attempt: usize,
     },
     Wake,
+    ResumeSlotChange,
     #[cfg(test)]
     Stop,
 }
@@ -142,17 +145,20 @@ pub(super) trait Port: Send + 'static {
     fn clear(&mut self) -> Result<(), String>;
     fn hotspot(&mut self) -> (bool, bool);
     fn recover(&mut self) -> Result<(), String>;
-    fn adopt(&mut self) -> Option<Session>;
+    fn adopt(&mut self, allow_cellular_pause: bool) -> Option<Session>;
     fn scan(&mut self, state: &mut State, cancel: &Cancellation) -> Result<Vec<Network>, String>;
-    fn join(&mut self, state: &mut State, selection: Selection, ipv6: bool, cancel: &Cancellation) -> Result<Session, String>;
+    fn join(&mut self, state: &mut State, selection: Selection, ipv6: bool, cancel: &Cancellation, allow_cellular_pause: bool) -> Result<Session, String>;
     fn persist(&mut self, selection: &Selection, ipv6: bool, remember: bool) -> Option<String>;
     fn cleanup(&mut self, session: &mut Session) -> Result<(), String>;
     fn observe_link(&mut self) -> (Option<String>, u128);
     fn observe(&mut self, session: &mut Session) -> Observation;
     fn renew(&mut self, session: &mut Session);
-    fn maintain(&mut self, session: &mut Session) -> Result<bool, String>;
+    fn maintain(&mut self, session: &mut Session, allow_cellular_pause: bool) -> Result<bool, String>;
+    fn prepare_slot_change(&mut self, state: &mut State) -> Result<(), String>;
+    fn resume_slot_change(&mut self, state: &mut State);
     fn uplink_changed(&self);
     fn power_save(&mut self, state: &mut State, enabled: bool) -> Result<(), String>;
+    fn strict_zero_cellular(&mut self, state: &mut State, enabled: bool) -> Result<(), String>;
     fn offload(&mut self, state: &mut State, enabled: bool) -> Result<Option<Value>, String>;
     fn forget(&mut self, id: &str) -> Result<(), String>;
     fn clock(&mut self) -> Result<(), String>;
@@ -192,6 +198,7 @@ pub(super) struct Controller<P: Port> {
     unpublished_scans: Option<(u64, Vec<Network>)>,
     restore_replies: Vec<Reply>,
     notify: bool,
+    deferred_restore: bool,
 }
 
 impl<P: Port> Controller<P> {
@@ -219,6 +226,7 @@ impl<P: Port> Controller<P> {
             unpublished_scans: None,
             restore_replies: Vec::new(),
             notify: false,
+            deferred_restore: false,
         }
     }
 
@@ -242,7 +250,11 @@ impl<P: Port> Controller<P> {
             }
             if let Some(restore) = self.restoring.as_mut().filter(|restore| restore.due.is_some_and(|due| due <= now)) {
                 restore.due = None;
-                let _ = self.sender.send(Message::Retry { generation: restore.generation, attempt: restore.attempt });
+                if self.shared.slot_change_paused.load(Ordering::Acquire) {
+                    self.deferred_restore = true;
+                } else {
+                    let _ = self.sender.send(Message::Retry { generation: restore.generation, attempt: restore.attempt });
+                }
             }
             let due = self.tick_at.into_iter().chain(self.restoring.as_ref().and_then(|restore| restore.due)).min();
             let wait = due.map_or(Duration::from_secs(3600), |due| due.saturating_duration_since(now));
@@ -256,6 +268,18 @@ impl<P: Port> Controller<P> {
                     }
                 }
                 Ok(Message::Wake) => {}
+                Ok(Message::ResumeSlotChange) => {
+                    if !self.shared.slot_change_paused.load(Ordering::Acquire) {
+                        self.port.resume_slot_change(&mut self.state);
+                        if self.deferred_restore {
+                            self.deferred_restore = false;
+                            if let Some(restore) = self.restoring.as_mut() {
+                                restore.due = Some(self.port.now());
+                            }
+                        }
+                        self.finish(None);
+                    }
+                }
                 #[cfg(test)]
                 Ok(Message::Stop) => return,
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -306,7 +330,8 @@ impl<P: Port> Controller<P> {
             Command::Boot => {
                 if !self.booted && self.state.session.is_none() {
                     self.phase(Phase::Recovering);
-                    self.state.session = self.port.adopt();
+                    let allow_cellular_pause = !self.shared.slot_change_blocked();
+                    self.state.session = self.port.adopt(allow_cellular_pause);
                     if self.state.session.is_some() {
                         self.unpublished = Some((generation, false));
                     }
@@ -326,9 +351,20 @@ impl<P: Port> Controller<P> {
             }
             Command::Scan => self.scan(self.cancellation(generation, None)).map(|_| None),
             Command::Connect { selection, ipv6, remember, generation } => {
-                self.join(selection, ipv6, Origin::Owner { remember, generation }).map(|_| None)
+                if self.shared.slot_change_paused.load(Ordering::Acquire) {
+                    Err("OTA slot change is in progress; retry after restart".into())
+                } else {
+                    self.join(selection, ipv6, Origin::Owner { remember, generation }).map(|_| None)
+                }
             }
             Command::PowerSave(enabled) => self.port.power_save(&mut self.state, enabled).map(|_| None),
+            Command::StrictZeroCellular(enabled) => {
+                if self.shared.slot_change_blocked() {
+                    Err("OTA slot change or health trial is in progress; retry after commit".into())
+                } else {
+                    self.port.strict_zero_cellular(&mut self.state, enabled).map(|_| None)
+                }
+            }
             Command::Offload(enabled) => self.port.offload(&mut self.state, enabled),
             Command::Forget(id) => self.port.forget(&id).map(|_| None),
             Command::Clock => {
@@ -338,6 +374,7 @@ impl<P: Port> Controller<P> {
                     Err("Connect Wi-Fi relay before checking time".into())
                 }
             }
+            Command::PrepareSlotChange => self.port.prepare_slot_change(&mut self.state).map(|_| None),
         };
         self.finish(Some((request.reply, result)));
     }
@@ -466,7 +503,8 @@ impl<P: Port> Controller<P> {
         self.phase(Phase::Connecting);
         self.state.error = None;
         let saved = Selection { network: selection.network.clone(), password: selection.password.clone(), config: String::new() };
-        let result = self.port.join(&mut self.state, selection, ipv6, &cancel);
+        let allow_cellular_pause = !self.shared.slot_change_blocked();
+        let result = self.port.join(&mut self.state, selection, ipv6, &cancel, allow_cellular_pause);
         let mut session = match result {
             Ok(session) => session,
             Err(error) => {
@@ -526,6 +564,7 @@ impl<P: Port> Controller<P> {
     }
 
     fn end_restore(&mut self, error: Option<String>) {
+        self.deferred_restore = false;
         let Some(restore) = self.restoring.take() else { return };
         let mut cancel = self.shared.cancel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if cancel.restore_generation == restore.generation {
@@ -538,6 +577,12 @@ impl<P: Port> Controller<P> {
     }
 
     fn restore_attempt(&mut self) {
+        if self.shared.slot_change_paused.load(Ordering::Acquire) {
+            if self.restoring.is_some() {
+                self.deferred_restore = true;
+            }
+            return;
+        }
         let Some(restore) = self.restoring.as_ref() else { return };
         let (target, generation, attempt) = (restore.target.clone(), restore.generation, restore.attempt);
         {
@@ -659,7 +704,8 @@ impl<P: Port> Controller<P> {
                 if let Some(next) = next {
                     session.lease = Some(next);
                 }
-                match self.port.maintain(session) {
+                let allow_cellular_pause = !self.shared.slot_change_blocked();
+                match self.port.maintain(session, allow_cellular_pause) {
                     Err(error) => {
                         self.phase(Phase::Disconnecting);
                         let mut session = self.state.session.take().unwrap();

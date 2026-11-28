@@ -91,7 +91,14 @@ pub(super) fn data() -> Result<Map<String, Value>, String> {
 }
 
 fn set(values: &Map<String, Value>) -> Result<(), String> {
-    Cmd::new(
+    set_with(values, |command| command.run().map(|_| ()))
+}
+
+fn set_with(
+    values: &Map<String, Value>,
+    run: impl FnOnce(Cmd) -> Result<(), String>,
+) -> Result<(), String> {
+    let result = run(Cmd::new(
         "ubus",
         &[
             "call",
@@ -99,9 +106,9 @@ fn set(values: &Map<String, Value>) -> Result<(), String> {
             "set_data",
             &Value::Object(values.clone()).to_string(),
         ],
-    )
-    .run()
-    .map(|_| ())
+    ));
+    crate::net_guard::poke();
+    result
 }
 
 fn read() -> Result<Option<Overlay>, String> {
@@ -232,6 +239,38 @@ pub(super) fn release() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_runtime_data_write_wakes_mihomo_and_repairs_a_later_firewall_reload() {
+        const ISOLATED: &str = "U60_RA_GUARD_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let qualified = concat!(
+                module_path!(),
+                "::a_runtime_data_write_wakes_mihomo_and_repairs_a_later_firewall_reload"
+            );
+            let (_, test) = qualified.split_once("::").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::mihomo::tests::assert_ra_firewall_guard(|| {
+            let values = Map::from_iter([("ra_lifetime".into(), json!(0))]);
+            let result = set_with(&values, |command| {
+                assert_eq!(command, Cmd::new("ubus", &["call", "network.interface.lan", "set_data", r#"{"ra_lifetime":0}"#]));
+                Err("ubus timed out".to_owned())
+            });
+            assert_eq!(result.unwrap_err(), "ubus timed out");
+        });
+    }
 
     #[test]
     fn external_zero_lifetime_survives_but_journaled_withdrawal_is_released() {

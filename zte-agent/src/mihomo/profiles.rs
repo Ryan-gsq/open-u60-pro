@@ -302,7 +302,7 @@ impl Mihomo {
 
     pub(super) fn validate_profile(&self, source: &str) -> Result<(), String> {
         if !self.root.join("mihomo").is_file() { return Err("Install Mihomo first".into()); }
-        let (mapping, _) = super::managed_mapping(source, "validation-only", None, true)?;
+        let (mapping, _) = super::managed_mapping(source, "validation-only", None, true, self.tailscale_exit().sniffer)?;
         let config = serde_yaml_ng::to_string(&mapping).map_err(|_| "Cannot encode Mihomo configuration")?;
         self.validate_candidate("check.yaml", &config, "validation-only", &geodata::required(&mapping), self.running())
     }

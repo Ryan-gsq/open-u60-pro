@@ -35,7 +35,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tokio::sync::watch;
 
-use super::{accept_loop_with, listen, Admit, Caps, ConnectionLifetime, Ctx, Peer};
+use super::{accept_loop, listen, Admit, Caps, ConnectionLifetime, Ctx, Peer, Via};
 use crate::tls::{Keys, Tls};
 
 /// A TLS handshake must be done within this (a stalled one holds a slot).
@@ -93,7 +93,7 @@ impl Wire {
     /// check itself on the blocking pool, at most once a minute), then the
     /// handshake, then HTTP/1.1 with the translations above; all of it
     /// until the listener stops.
-    pub(super) async fn serve(&self, tcp: tokio::net::TcpStream, addr: SocketAddr, router: Router, idle: Duration, mut connection: ConnectionLifetime) {
+    pub(super) async fn serve(&self, tcp: tokio::net::TcpStream, addr: SocketAddr, via: Via, router: Router, idle: Duration, mut connection: ConnectionLifetime) {
         let mut stop = self.stop.clone();
         connection.stop = Some(self.stop.clone());
         let setup = async {
@@ -111,6 +111,7 @@ impl Wire {
         };
         let svc = hyper::service::service_fn(move |mut req: axum::http::Request<hyper::body::Incoming>| {
             req.extensions_mut().insert(Peer(addr));
+            req.extensions_mut().insert(via);
             req.extensions_mut().insert(Secure);
             req.extensions_mut().insert(connection.clone());
             inbound(req.headers_mut());
@@ -135,7 +136,7 @@ impl Wire {
 /// reported in Settings and tried again at the next change (Turn On again
 /// sends one); it never retries on its own.
 pub(super) async fn supervise<A: Admit>(tls: Arc<Tls>, ctx: Ctx, caps: Caps, side: impl Fn() -> A) {
-    supervise_with(tls, |listener, wire| accept_loop_with(listener, ctx.clone(), caps.clone(), side(), super::Wire::Tls(wire))).await
+    supervise_with(tls, |listener, wire| accept_loop(listener, ctx.clone(), caps.clone(), side(), super::Wire::Tls(wire))).await
 }
 
 /// `supervise` with the accept loop as `serve` (tests swap it).

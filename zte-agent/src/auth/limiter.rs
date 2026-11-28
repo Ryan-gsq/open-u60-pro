@@ -3,51 +3,40 @@
 //! at and is not recorded, so hammering cannot extend a block, and every block
 //! ends on its own (no permanent lockout). Successes are never counted.
 //!
-//! Loopback is every Tailscale client at once (userspace networking), so its
+//! Loopback can aggregate clients forwarded by legacy userspace networking. Its
 //! blocks stay short: one phone with an old password, retrying as soon as
 //! each block ends, must not lock every remote user out for minutes. The
 //! global bucket still bounds guessing from there (one failure per refill).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use crate::boottime::BootInstant;
+use crate::httpd::{is_canonical_loopback, Via};
 
-/// The socket peer address, never `X-Forwarded-For`. Tailnet peers all arrive
-/// as 127.0.0.1 (userspace networking) and share one key.
+/// The socket peer address, never `X-Forwarded-For`. Peers from the
+/// Tailnet tunnel retain their original IPv4 or IPv6 address.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum PeerKey {
-    V4([u8; 4]),
-    /// The full /128.
-    V6([u8; 16]),
+pub struct PeerKey {
+    ip: IpAddr,
+    shared: bool,
 }
 
 impl PeerKey {
     /// For callers without a socket address (the in-process `route()` arm).
-    pub const UNKNOWN: PeerKey = PeerKey::V4([0; 4]);
+    pub const UNKNOWN: PeerKey = PeerKey { ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED), shared: false };
 
-    fn ip(self) -> IpAddr {
-        match self {
-            PeerKey::V4(a) => IpAddr::V4(Ipv4Addr::from(a)),
-            PeerKey::V6(a) => IpAddr::V6(Ipv6Addr::from(a)),
-        }
-    }
-
-    /// This device: shared by every Tailscale client.
-    fn shared(self) -> bool {
-        self.ip().is_loopback()
+    pub fn from_ingress(addr: SocketAddr, via: Via) -> Self {
+        let ip = addr.ip().to_canonical();
+        let shared = is_canonical_loopback(ip) && matches!(via, Via::Loopback | Via::Tailnet);
+        Self { ip, shared }
     }
 }
 
+#[cfg(test)]
 impl From<SocketAddr> for PeerKey {
     fn from(addr: SocketAddr) -> Self {
-        match addr.ip() {
-            IpAddr::V4(v4) => PeerKey::V4(v4.octets()),
-            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => PeerKey::V4(v4.octets()),
-                None => PeerKey::V6(v6.octets()),
-            },
-        }
+        Self::from_ingress(addr, Via::Local)
     }
 }
 
@@ -58,7 +47,7 @@ pub struct LimiterConfig {
     /// Block after the `free_failures`-th failure; doubles per further failure.
     pub base: Duration,
     pub max_backoff: Duration,
-    /// Longest block of the shared loopback key (Tailscale clients); at most
+    /// Longest block of a loopback key, at most
     /// `global_refill`, so it cannot use up the global bucket on its own.
     pub shared_max_backoff: Duration,
     /// A peer with no failure for this long starts over.
@@ -132,7 +121,7 @@ impl LoginLimiter {
         let factor = 1u32
             .checked_shl(n - self.cfg.free_failures)
             .unwrap_or(u32::MAX);
-        let max = if key.shared() { self.cfg.shared_max_backoff } else { self.cfg.max_backoff };
+        let max = if key.shared { self.cfg.shared_max_backoff } else { self.cfg.max_backoff };
         self.cfg.base.saturating_mul(factor).min(max)
     }
 
@@ -202,7 +191,7 @@ impl LoginLimiter {
                 1
             }
         };
-        let ip = key.ip();
+        let ip = key.ip;
         if self.tokens == 0 && !self.empty_logged {
             self.empty_logged = true;
             return Some(format!("[auth] too many wrong passwords from all clients: new logins refused for now (last from {ip})"));
@@ -269,12 +258,31 @@ mod tests {
         let secs: Vec<u64> = (1..=16).map(|n| l.block(peer(1), n).as_secs()).collect();
         assert_eq!(secs, [0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
         assert_eq!(l.block(peer(1), u32::MAX), Duration::from_secs(300));
-        // The shared loopback key (every Tailscale client): at most 10 s.
-        for lo in ["127.0.0.1:5000", "[::1]:5000", "[::ffff:127.0.0.1]:5000"] {
-            let lo = PeerKey::from(lo.parse::<SocketAddr>().unwrap());
-            let secs: Vec<u64> = (1..=10).map(|n| l.block(lo, n).as_secs()).collect();
-            assert_eq!(secs, [0, 0, 0, 0, 1, 2, 4, 8, 10, 10]);
-            assert_eq!(l.block(lo, u32::MAX), Duration::from_secs(10));
+        // The loopback key, including legacy userspace forwards: at most 10 s.
+        for via in [Via::Loopback, Via::Tailnet] {
+            for addr in ["127.0.0.1:5000", "[::1]:5000", "[::ffff:127.0.0.1]:5000"] {
+                let key = PeerKey::from_ingress(addr.parse().unwrap(), via);
+                let secs: Vec<u64> = (1..=10).map(|n| l.block(key, n).as_secs()).collect();
+                assert_eq!(secs, [0, 0, 0, 0, 1, 2, 4, 8, 10, 10]);
+                assert_eq!(l.block(key, u32::MAX), Duration::from_secs(10));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_peer_backoff_requires_no_loopback_exemption() {
+        let limiter = LoginLimiter::new(LimiterConfig::default(), at(0));
+        for (addr, via) in [
+            ("127.0.0.1:5000", Via::Local),
+            ("127.0.0.2:5000", Via::Local),
+            ("[::ffff:127.0.0.2]:5000", Via::Local),
+            ("100.64.0.1:5000", Via::Tailnet),
+            ("[fd7a:115c:a1e0::1]:5000", Via::Tailnet),
+        ] {
+            let key = PeerKey::from_ingress(addr.parse().unwrap(), via);
+            assert_eq!(limiter.block(key, 9), Duration::from_secs(16), "{addr}");
+            assert_eq!(limiter.block(key, 10), Duration::from_secs(32), "{addr}");
+            assert_eq!(limiter.block(key, u32::MAX), Duration::from_secs(300), "{addr}");
         }
     }
 
@@ -284,7 +292,7 @@ mod tests {
     #[test]
     fn stale_tailnet_phone_neither_locks_out_remote_users_nor_empties_the_bucket() {
         let mut l = LoginLimiter::new(LimiterConfig::default(), at(0));
-        let lo = PeerKey::from(SocketAddr::from(([127, 0, 0, 1], 40000)));
+        let lo = PeerKey::from_ingress(SocketAddr::from(([127, 0, 0, 1], 40000)), Via::Tailnet);
         let mut t = 0;
         let mut longest = Duration::ZERO;
         while t < 3_600_000 {
@@ -363,6 +371,19 @@ mod tests {
     }
 
     #[test]
+    fn tailnet_peers_have_individual_backoff() {
+        let mut limiter = LoginLimiter::new(LimiterConfig::default(), at(0));
+        let peer = |addr: &str| PeerKey::from(addr.parse::<SocketAddr>().unwrap());
+        for (first, second) in [("100.64.0.1:5000", "100.64.0.2:5000"), ("[fd7a:115c:a1e0::1]:5000", "[fd7a:115c:a1e0::2]:5000")] {
+            for _ in 0..9 {
+                limiter.record_failure(peer(first), at(0));
+            }
+            assert_eq!(deny_for(limiter.check(peer(first), at(0))), Duration::from_secs(16));
+            assert_eq!(limiter.check(peer(second), at(0)), Admit::Allow);
+        }
+    }
+
+    #[test]
     fn slots_bounded_64_evict_oldest_last_failure() {
         let cfg = LimiterConfig { global_burst: 1000, ..LimiterConfig::default() };
         let mut l = LoginLimiter::new(cfg, at(0));
@@ -396,11 +417,11 @@ mod tests {
     fn v4_mapped_is_v4() {
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:5000".parse().unwrap();
         let plain: SocketAddr = "10.0.0.1:1234".parse().unwrap();
-        assert_eq!(PeerKey::from(mapped), PeerKey::V4([10, 0, 0, 1]));
+        assert_eq!(PeerKey::from(mapped).ip, IpAddr::from([10, 0, 0, 1]));
         assert_eq!(PeerKey::from(mapped), PeerKey::from(plain));
         // Loopback v6 is not v4-mapped.
         let lo: SocketAddr = "[::1]:5000".parse().unwrap();
-        assert!(matches!(PeerKey::from(lo), PeerKey::V6(_)));
+        assert!(PeerKey::from(lo).ip.is_ipv6());
     }
 
     #[test]

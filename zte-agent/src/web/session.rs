@@ -30,7 +30,7 @@ use super::render;
 use crate::auth::{AuthState, Kind, Principal};
 use crate::httpd::api::{self, ReadErr};
 use crate::httpd::guard::ui_post_allowed;
-use crate::httpd::{Ctx, Peer};
+use crate::httpd::{Ctx, Via};
 
 pub const SESSION_COOKIE: &str = "zte_ui_session";
 pub const PRE_COOKIE: &str = "zte_ui_pre";
@@ -279,13 +279,8 @@ pub fn after_hop(path: &str, query: Option<&str>) -> Option<Response> {
     })
 }
 
-/// Connected remotely: Tailscale's userspace networking makes every tailnet
-/// request come from the loopback address.
-pub fn is_remote(peer: Option<&Peer>) -> bool {
-    peer.is_some_and(|p| match p.0.ip() {
-        std::net::IpAddr::V4(a) => a.is_loopback(),
-        std::net::IpAddr::V6(a) => a.is_loopback() || a.to_ipv4_mapped().is_some_and(|v| v.is_loopback()),
-    })
+pub fn is_remote(via: Via) -> bool {
+    via == Via::Tailnet
 }
 
 /// An authenticated browser session (request extractor) for GET pages.
@@ -475,10 +470,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_peers_are_loopback() {
-        let peer = |ip: &str| Peer(std::net::SocketAddr::new(ip.parse().unwrap(), 1));
-        assert!(is_remote(Some(&peer("127.0.0.1"))) && is_remote(Some(&peer("::1"))) && is_remote(Some(&peer("::ffff:127.0.0.1"))));
-        assert!(!is_remote(Some(&peer("192.168.0.20"))) && !is_remote(None));
+    fn tailnet_is_remote_and_legacy_fixtures_keep_their_proxy_peer() {
+        assert!(is_remote(Via::Tailnet));
+        assert!(!is_remote(Via::Loopback));
+        assert!(!is_remote(Via::Local));
     }
 
     /// The marker hop (owner decision 61).

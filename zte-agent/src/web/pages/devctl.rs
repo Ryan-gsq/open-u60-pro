@@ -37,7 +37,7 @@ use super::confirm::{Bad, Input, Kind, Next, Question, REMOTE};
 use super::netcfg::{field, foot, on_fields, select_row, switch, text, Vals};
 use crate::auth::{retry_after_secs, LoginError, PeerKey};
 use crate::handlers::AppState;
-use crate::httpd::{Ctx, Peer};
+use crate::httpd::{Ctx, Peer, Via};
 use crate::server::Method;
 use crate::web::job::{self, OnceJob, Sent};
 use crate::web::kit::{self, Act, Icon, Tab};
@@ -397,7 +397,8 @@ fn done(nonce: &str, w: Power) -> Response {
 /// the "Rebooting…" page as the answer, also to a replay.
 pub async fn post(ctx: Ctx, req: Request, w: Power) -> Response {
     let nonce = CspNonce::of(&req);
-    let peer = req.extensions().get::<Peer>().map(|p| PeerKey::from(p.0)).unwrap_or(PeerKey::UNKNOWN);
+    let ext = req.extensions();
+    let peer = ext.get::<Peer>().map_or(PeerKey::UNKNOWN, |p| PeerKey::from_ingress(p.0, Via::of(ext)));
     let s = w.screen();
     let mut r = Req { query: None, ..Req::of(&ctx, &req) };
     let shown = Req { query: None, ..Req::of(&ctx, &req) };

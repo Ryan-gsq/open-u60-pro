@@ -5,8 +5,13 @@
   const HOSTNAME_RE = /^[A-Za-z0-9-]+$/;
   const VERSION_RE = /^\d+(?:\.\d+)*$/;
   const HEX64_RE = /^[0-9a-fA-F]{64}$/;
-  const OCTET_RE = /^\d{1,3}$/;
-  const PREFIX_RE = /^\d{1,2}$/;
+  const MAX_ADVERTISE_ROUTES = 16;
+  const ROUTE_STATES = Object.freeze({
+    approved: 'Approved', standby: 'Standby', pending: 'Pending', new: 'New', unknown: 'Unknown'
+  });
+  const SYNC_STATES = Object.freeze({
+    applied: 'Applied', pending_daemon: 'Pending daemon', drift: 'Drift', unknown: 'Unknown'
+  });
 
   function cleanDnsName(raw) {
     return String(raw || '').trim().replace(/\.+$/, '');
@@ -109,25 +114,83 @@
     return validVersion(text) ? `https://pkgs.tailscale.com/stable/tailscale_${text}_arm64.tgz` : '';
   }
 
-  function validCidr(raw) {
-    const text = String(raw || '').trim();
-    const slash = text.indexOf('/');
-    if (slash < 1 || text.indexOf('/', slash + 1) !== -1) return false;
-    const addr = text.slice(0, slash), prefix = text.slice(slash + 1);
-    if (!PREFIX_RE.test(prefix) || Number(prefix) > 32) return false;
-    const octets = addr.split('.');
-    return octets.length === 4 && octets.every(part => OCTET_RE.test(part) && Number(part) <= 255);
+  function ipv4Octets(address) {
+    const octets = address.split('.');
+    if (octets.length !== 4 || !octets.every(octet => /^(?:0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255)) {
+      return null;
+    }
+    return octets.map(Number);
   }
 
-  function parseRoutes(raw) {
-    const seen = new Set(), routes = [];
-    for (const part of String(raw || '').split(/[\s,]+/)) {
-      const route = part.trim();
-      if (!route || seen.has(route)) continue;
-      seen.add(route);
-      routes.push(route);
+  function ipv6Words(address) {
+    if (!/^[0-9a-f:.]+$/i.test(address)) return null;
+    let canonical;
+    try { canonical = new URL(`http://[${address}]/`).hostname.slice(1, -1); }
+    catch { return null; }
+    const [start, end] = canonical.split('::');
+    const parse = side => side ? side.split(':').map(word => parseInt(word, 16)) : [];
+    const left = parse(start);
+    if (end === undefined) return left;
+    const right = parse(end);
+    return [...left, ...Array(8 - left.length - right.length).fill(0), ...right];
+  }
+
+  function formatIpv6(words) {
+    if (words.slice(0, 5).every(word => word === 0) && words[5] === 0xffff) {
+      return `::ffff:${[words[6] >> 8, words[6] & 255, words[7] >> 8, words[7] & 255].join('.')}`;
     }
-    return routes;
+    const address = words.map(word => word.toString(16)).join(':');
+    return new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  }
+
+  function parsePrefix(raw) {
+    const parts = String(raw ?? '').trim().split('/');
+    if (parts.length !== 2 || /\s/.test(parts[0]) || !/^\+?\d+$/.test(parts[1])) return null;
+    const [address, lengthText] = parts, length = Number(lengthText);
+    const bits = address.includes(':') ? 16 : 8;
+    if (length > (bits === 16 ? 128 : 32)) return null;
+    const words = bits === 16 ? ipv6Words(address) : ipv4Octets(address);
+    if (!words) return null;
+    const network = maskAddress(words, bits, length);
+    return {
+      bits, length, network,
+      prefix: `${bits === 16 ? formatIpv6(network) : network.join('.')}/${length}`,
+      hasHostBits: !sameList(words, network)
+    };
+  }
+
+  function maskAddress(words, bits, length) {
+    return words.map((word, index) => {
+      const keep = Math.min(bits, Math.max(0, length - index * bits));
+      return (word >> (bits - keep)) << (bits - keep);
+    });
+  }
+
+  const RESERVED_ROUTES = [
+    '100.64.0.0/10', 'fd7a:115c:a1e0::/48', '0.0.0.0/32', '127.0.0.0/8',
+    '224.0.0.0/4', '::/128', '::1/128', 'ff00::/8'
+  ].map(parsePrefix);
+
+  function normalizeRoute(raw) {
+    const route = parsePrefix(raw);
+    if (!route) return {error: 'Enter a valid IPv4 or IPv6 CIDR, such as 192.168.0.0/24 or fd00::/64.'};
+    if (route.length === 0) return {error: 'Use the Advertise Exit Node switch for default routes (/0).'};
+    for (const reserved of RESERVED_ROUTES) {
+      if (route.bits !== reserved.bits) continue;
+      const shared = Math.min(route.length, reserved.length);
+      if (sameList(maskAddress(route.network, route.bits, shared), maskAddress(reserved.network, route.bits, shared))) {
+        return {error: `This route overlaps the reserved range ${reserved.prefix}.`};
+      }
+    }
+    return {prefix: route.prefix, hasHostBits: route.hasHostBits};
+  }
+
+  function routeCandidate(raw, routes) {
+    const route = normalizeRoute(raw);
+    if (route.error) return route;
+    if (routes.includes(route.prefix)) return {error: `${route.prefix} is already in the list.`};
+    if (routes.length >= MAX_ADVERTISE_ROUTES) return {error: `You can advertise up to ${MAX_ADVERTISE_ROUTES} subnet routes.`};
+    return route;
   }
 
   function hostnameProblem(raw) {
@@ -138,24 +201,10 @@
     return '';
   }
 
-  function routesProblem(raw) {
-    for (const route of parseRoutes(raw)) {
-      if (!validCidr(route)) {
-        return `Invalid IPv4 CIDR route: ${route} (use format like 192.168.0.0/24).`;
-      }
-    }
-    return '';
-  }
-
-  function configProblem({hostname, routesText}) {
-    return hostnameProblem(hostname) || routesProblem(routesText);
-  }
-
   function configBaseline(status) {
     const data = status || {};
     return {
       hostname: typeof data.hostname === 'string' && data.hostname.trim() ? data.hostname.trim() : 'u60-pro',
-      advertise_routes: Array.isArray(data.advertise_routes) ? data.advertise_routes.map(item => String(item).trim()).filter(Boolean) : [],
       tailscale_ssh: data.tailscale_ssh === true,
       hold_wakelock: data.hold_wakelock !== false
     };
@@ -168,14 +217,111 @@
   function configDiff(baseline, draft) {
     const patch = {};
     const hostname = String(draft.hostname || '').trim();
-    const routes = parseRoutes(draft.routesText);
     const ssh = draft.tailscale_ssh === true;
     const wakelock = draft.hold_wakelock === true;
     if (hostname !== baseline.hostname) patch.hostname = hostname;
-    if (!sameList(routes, baseline.advertise_routes)) patch.advertise_routes = routes;
     if (ssh !== baseline.tailscale_ssh) patch.tailscale_ssh = ssh;
     if (wakelock !== baseline.hold_wakelock) patch.hold_wakelock = wakelock;
     return patch;
+  }
+
+  function routingBaseline(status) {
+    return {
+      advertise_routes: Array.isArray(status?.advertise_routes) ? [...new Set(status.advertise_routes)] : [],
+      advertise_exit_node: status?.advertise_exit_node === true,
+      exit_via_mihomo: status?.exit_via_mihomo === true
+    };
+  }
+
+  function routingDiff(baseline, draft) {
+    const patch = {};
+    if (baseline.advertise_routes.length !== draft.advertise_routes.length ||
+        baseline.advertise_routes.some(prefix => !draft.advertise_routes.includes(prefix))) {
+      patch.advertise_routes = draft.advertise_routes;
+    }
+    if (baseline.advertise_exit_node !== draft.advertise_exit_node) patch.advertise_exit_node = draft.advertise_exit_node;
+    if (baseline.exit_via_mihomo !== draft.exit_via_mihomo) patch.exit_via_mihomo = draft.exit_via_mihomo;
+    return patch;
+  }
+
+  const routingBaselineChanged = (before, after) => Object.keys(routingDiff(before, after)).length > 0;
+
+  function rebaseRouting(baseline, previous = {}) {
+    const saved = baseline ?? routingBaseline();
+    const edits = {
+      addedRoutes: [...new Set(previous.edits?.addedRoutes)].filter(prefix => !saved.advertise_routes.includes(prefix)),
+      removedRoutes: [...new Set(previous.edits?.removedRoutes)].filter(prefix => saved.advertise_routes.includes(prefix)),
+      advertiseExitNode: previous.edits?.advertiseExitNode ?? null,
+      exitViaMihomo: previous.edits?.exitViaMihomo ?? null
+    };
+    if (edits.advertiseExitNode === saved.advertise_exit_node) edits.advertiseExitNode = null;
+    if (edits.exitViaMihomo === saved.exit_via_mihomo) edits.exitViaMihomo = null;
+    const dirty = edits.addedRoutes.length > 0 || edits.removedRoutes.length > 0 ||
+      edits.advertiseExitNode !== null || edits.exitViaMihomo !== null;
+    const draft = {
+      advertise_routes: [
+        ...saved.advertise_routes.filter(prefix => !edits.removedRoutes.includes(prefix)),
+        ...edits.addedRoutes
+      ],
+      advertise_exit_node: edits.advertiseExitNode ?? saved.advertise_exit_node,
+      exit_via_mihomo: edits.exitViaMihomo ?? saved.exit_via_mihomo
+    };
+    let reviewBaseline = null;
+    if (dirty && previous.baseline) {
+      reviewBaseline = routingBaselineChanged(previous.baseline, saved) ? previous.baseline : previous.reviewBaseline;
+    }
+    const overLimit = draft.advertise_routes.length > MAX_ADVERTISE_ROUTES;
+    return {baseline, edits, draft, dirty, reviewBaseline: reviewBaseline ?? null, overLimit};
+  }
+
+  function routeState(prefix, savedRoutes, liveRoutes) {
+    if (!savedRoutes.includes(prefix)) return 'new';
+    const state = liveRoutes?.find(route => route.prefix === prefix)?.state;
+    return ['approved', 'standby', 'pending'].includes(state) ? state : 'unknown';
+  }
+
+  function lanRouteSuggestions(lanSubnets, draftRoutes) {
+    if (!Array.isArray(lanSubnets)) return [];
+    const routes = lanSubnets.map(normalizeRoute).filter(route => route.prefix).map(route => route.prefix);
+    return [...new Set(routes)].filter(prefix => !draftRoutes.includes(prefix));
+  }
+
+  function routingStatus(raw) {
+    const mode = raw?.tun?.mode;
+    const modeLabel = mode === 'kernel' ? 'Kernel TUN' : mode === 'userspace' ? 'Userspace networking' : 'Unknown';
+    const sync = Object.hasOwn(SYNC_STATES, raw?.sync) ? raw.sync : 'unknown';
+    return {modeLabel, sync, syncLabel: SYNC_STATES[sync]};
+  }
+
+  function exitApproval(state) {
+    if (state === 'off') return {state, label: 'Off'};
+    if (state === 'approved' || state === 'pending') return {state, label: ROUTE_STATES[state]};
+    return {state: 'unknown', label: ROUTE_STATES.unknown};
+  }
+
+  function exitEnableConfirmation(saved, next) {
+    if (saved || !next) return '';
+    return 'Tailnet peers can send their internet traffic through this router once the exit node is approved. Peer traffic may consume your router’s cellular data.';
+  }
+
+  function cleanDnsLabel(dns) {
+    switch (dns?.state ?? dns?.status ?? dns) {
+      case 'active': case 'running': return 'Active';
+      case 'disabled': case 'off': return 'Off';
+      case 'inactive': case 'stopped': return 'Inactive';
+      case 'degraded': case 'error': return 'Degraded';
+    }
+    if (dns?.enabled === false) return 'Off';
+    if (dns?.degraded === true || dns?.error) return 'Degraded';
+    const active = dns?.active ?? dns?.running;
+    if (active === true) return 'Active';
+    if (active === false) return 'Inactive';
+    return 'Unknown';
+  }
+
+  function exitContext(mihomo, routing) {
+    const mihomoLabel = mihomo?.running === true ? 'Running' : mihomo?.running === false ? 'Stopped' : 'Unknown';
+    return {mihomoLabel, dnsLabel: cleanDnsLabel(routing?.clean_dns ?? routing?.exit?.clean_dns)};
   }
 
   function authKeyProblem(raw) {
@@ -278,7 +424,7 @@
       needs_login: ['warn', 'NEEDS LOGIN', 'Re-authentication required', 'This enrolled node needs to sign in again. Its node key may have expired or been revoked.'],
       pending_approval: ['warn', 'PENDING APPROVAL', 'Waiting for admin approval', 'Approve this machine in the Tailscale admin console to bring it online.'],
       paused: ['off', 'PAUSED', 'Tailscale backend is stopped', 'Enable Tailscale or wait for the supervisor to bring the backend up.'],
-      healthy: ['active', 'CONNECTED', dnsName || status.hostname || 'Tailscale connected', 'Connected to your tailnet in userspace mode. Console and API traffic over Tailscale are accepted.'],
+      healthy: ['active', 'CONNECTED', dnsName || status.hostname || 'Tailscale connected', 'Connected to your tailnet. Console and API traffic over Tailscale are accepted.'],
       degraded: ['warn', 'OFFLINE', 'Tailscale is offline', 'The daemon is running, but this node is currently offline on the tailnet. Check your internet uplink.']
     }[state] || ['off', 'UNKNOWN', 'Tailscale status unknown', 'The router reported an unrecognized Tailscale state.'];
 
@@ -364,11 +510,6 @@
     if (Object.hasOwn(patch, 'hostname')) {
       lines.push(`Hostname becomes “${patch.hostname}”.${enabled ? ' If you open this console by MagicDNS name, you may need the new name afterward.' : ''}`);
     }
-    if (Object.hasOwn(patch, 'advertise_routes')) {
-      lines.push(patch.advertise_routes.length
-        ? `Advertised subnet routes become ${patch.advertise_routes.join(', ')} (approve them in the Tailscale admin console).`
-        : 'All advertised subnet routes will be cleared.');
-    }
     if (Object.hasOwn(patch, 'tailscale_ssh')) {
       lines.push(patch.tailscale_ssh
         ? 'Tailscale SSH will be enabled for tailnet peers allowed by your ACLs.'
@@ -385,6 +526,8 @@
   const api = {
     ADMIN_CONSOLE_URL,
     PACKAGES_URL,
+    MAX_ADVERTISE_ROUTES,
+    ROUTE_STATES,
     cleanDnsName,
     safeLoginUrl,
     validVersion,
@@ -396,11 +539,19 @@
     versionOptionLabel,
     updateIntent,
     packageUrl,
-    validCidr,
-    parseRoutes,
+    normalizeRoute,
+    routeCandidate,
+    routingBaseline,
+    routingDiff,
+    routingBaselineChanged,
+    rebaseRouting,
+    routeState,
+    lanRouteSuggestions,
+    routingStatus,
+    exitApproval,
+    exitEnableConfirmation,
+    exitContext,
     hostnameProblem,
-    routesProblem,
-    configProblem,
     configBaseline,
     configDiff,
     authKeyProblem,

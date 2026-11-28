@@ -59,7 +59,7 @@ use axum::response::Response;
 use axum::routing::{any, get};
 use axum::Router;
 
-use crate::httpd::{api, Ctx, Peer};
+use crate::httpd::{api, Ctx, Via};
 
 /// This response's CSP nonce (request extension set by `guard`).
 #[derive(Clone)]
@@ -122,11 +122,11 @@ async fn guard(State(ctx): State<Ctx>, mut req: Request, next: Next) -> Response
     let page = is_page(req.uri().path());
     // This browser's theme (Settings › Appearance) for its pages.
     let theme = if page { prefs::Prefs::of(req.headers()).theme } else { prefs::Theme::System };
-    let loopback = req.extensions().get::<Peer>().is_some_and(|p| p.0.ip().to_canonical().is_loopback());
+    let via = Via::of(req.extensions());
     let over_tls = req.extensions().get::<crate::httpd::tls::Secure>().is_some();
     match api::header(req.headers(), "host") {
         None => return early(req, text(StatusCode::BAD_REQUEST, "Missing Host"), None).await,
-        Some(h) if !ctx.hosts.allows_via(h, loopback, over_tls, &|| ctx.ts.get()) => {
+        Some(h) if !ctx.hosts.allows_via(h, via, over_tls, &|| ctx.ts.get()) => {
             return early(req, text(StatusCode::FORBIDDEN, "Host not allowed"), None).await
         }
         Some(_) => {}

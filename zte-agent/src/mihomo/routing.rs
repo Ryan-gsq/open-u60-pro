@@ -178,6 +178,7 @@ pub(super) struct Routes {
     providers: HashMap<String, Provider>,
     /// The subscription's own fake-ip-filter blacklist, as real-ip rules.
     compat: Vec<String>,
+    compat_dropped: usize,
     /// `GEOIP` uses GeoIP.dat (the only database the kernel can read).
     geodata: bool,
     /// Nodes whose server is an IPv6 address: unreachable without an IPv6 egress.
@@ -232,6 +233,7 @@ pub(super) struct Compiled {
     /// (the core's default), the core after any other `MATCH` or a cut.
     tail: Verdict,
     cut: Option<String>,
+    skipped_direct_alternatives: usize,
     /// `GEOIP` codes (upper case) whose ranges `render` needs.
     pub geoip: Vec<String>,
     /// Rule-set files read: compile again when one's content changes.
@@ -252,6 +254,14 @@ impl Source {
     fn read(path: PathBuf, bytes: Option<&[u8]>) -> Self {
         let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
         Self { path, modified, digest: bytes.map(digest) }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn same_content(&self, other: &Self) -> bool {
+        self.path == other.path && self.digest == other.digest
     }
 
     /// Whether the content differs from what the plan read. A file only
@@ -281,15 +291,37 @@ pub(super) struct Chain {
     pub returns: usize,
     /// Why the chain ends before the rules do.
     pub cut: Option<String>,
+    pub skipped_direct_alternatives: usize,
     /// Each rule as (returns, destination ranges) when it matches by
     /// destination alone; `None` for a source, port or protocol condition.
     pub plain: Vec<Option<(bool, Vec<String>)>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(super) struct Compilation {
+    truncation_reason: Option<String>,
+    nft_rules: usize,
+    direct_returns: usize,
+    cidr_sets: usize,
+    cidr_set_entries: usize,
+    skipped_direct_alternatives: usize,
 }
 
 impl Chain {
     /// Direct mode: all IPv4 skips the core.
     pub(super) fn all() -> Self {
         Self { rules: vec!["return".into()], returns: 1, plain: vec![Some((true, vec!["0.0.0.0/0".into()]))], ..Self::default() }
+    }
+
+    pub(super) fn compilation(&self) -> Compilation {
+        Compilation {
+            truncation_reason: self.cut.clone(),
+            nft_rules: self.rules.len(),
+            direct_returns: self.rules.iter().filter(|rule| rule.split_ascii_whitespace().next_back() == Some("return")).count(),
+            cidr_sets: self.sets.len(),
+            cidr_set_entries: self.sets.iter().map(|(_, ranges)| ranges.len()).sum(),
+            skipped_direct_alternatives: self.skipped_direct_alternatives,
+        }
     }
 
     /// The IPv4 the chain lets skip the core, first match wins, as sorted
@@ -308,6 +340,21 @@ impl Chain {
         }
         Some(bypass)
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct DnsFilter {
+    pub rules: Vec<String>,
+    pub diagnostics: DnsDiagnostics,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(super) struct DnsDiagnostics {
+    truncation_reason: Option<String>,
+    rules: usize,
+    fake_ip_rules: usize,
+    compatibility_rules_skipped: usize,
+    default_action: &'static str,
 }
 
 /// `lost_from` one chain.
@@ -329,7 +376,7 @@ pub(super) fn lost(old: &Chain, new: &Chain) -> crate::netfx::conntrack::Scope {
 pub(super) fn lost_from(olds: &[Chain], new: &Chain) -> crate::netfx::conntrack::Scope {
     use crate::netfx::conntrack::Scope;
     let mut before = Vec::new();
-    for old in olds.iter().filter(|old| old.returns > 0) {
+    for old in olds.iter().filter(|old| old.returns > 0 && *old != new) {
         let Some(bypass) = old.bypass() else { return Scope::Lan { v4: true, v6: false } };
         before = ranges::union(&before, &bypass);
     }
@@ -344,11 +391,37 @@ pub(super) fn lost_from(olds: &[Chain], new: &Chain) -> crate::netfx::conntrack:
     Scope::Destinations(lost)
 }
 
-/// IPv4 address ranges as sorted, disjoint, inclusive `u32` pairs.
+/// True when any IPv4 prefix in `olds` is not covered by `new`.
+pub(super) fn lost_cidrs_v4(olds: &[String], new: &[String]) -> bool {
+    if olds.is_empty() {
+        return false;
+    }
+    if olds.iter().any(|c| c.parse::<ipnet::Ipv4Net>().is_err() && !new.contains(c)) {
+        return true;
+    }
+    let before = ranges::from_cidrs(olds);
+    let after = ranges::from_cidrs(new);
+    !ranges::subtract(&before, &after).is_empty()
+}
+
+/// True when any IPv6 prefix in `olds` is not covered by `new`.
+pub(super) fn lost_cidrs_v6(olds: &[String], new: &[String]) -> bool {
+    if olds.is_empty() {
+        return false;
+    }
+    if olds.iter().any(|c| c.parse::<ipnet::Ipv6Net>().is_err() && !new.contains(c)) {
+        return true;
+    }
+    let before = ranges::from_cidrs_v6(olds);
+    let after = ranges::from_cidrs_v6(new);
+    !ranges::subtract_v6(&before, &after).is_empty()
+}
+
+/// IPv4/IPv6 address ranges as sorted, disjoint, inclusive pairs.
 mod ranges {
     use std::net::Ipv4Addr;
 
-    use ipnet::Ipv4Net;
+    use ipnet::{Ipv4Net, Ipv6Net};
 
     pub(super) fn from_cidrs(cidrs: &[String]) -> Vec<(u32, u32)> {
         let mut out: Vec<(u32, u32)> = cidrs
@@ -389,6 +462,59 @@ mod ranges {
     }
 
     pub(super) fn subtract(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut cut = 0;
+        for &(start, high) in a {
+            let mut low = Some(start);
+            while cut < b.len() {
+                let (cut_low, cut_high) = b[cut];
+                let at = low.unwrap();
+                if cut_high < at {
+                    cut += 1;
+                    continue;
+                }
+                if cut_low > high {
+                    break;
+                }
+                if cut_low > at {
+                    out.push((at, cut_low - 1));
+                }
+                if cut_high >= high {
+                    low = None;
+                    break;
+                }
+                low = Some(cut_high + 1);
+                cut += 1;
+            }
+            if let Some(at) = low {
+                out.push((at, high));
+            }
+        }
+        out
+    }
+
+    pub(super) fn from_cidrs_v6(cidrs: &[String]) -> Vec<(u128, u128)> {
+        let mut out: Vec<(u128, u128)> = cidrs
+            .iter()
+            .filter_map(|c| c.parse::<Ipv6Net>().ok())
+            .map(|net| (u128::from(net.network()), u128::from(net.broadcast())))
+            .collect();
+        out.sort_unstable();
+        merge_v6(out)
+    }
+
+    fn merge_v6(sorted: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
+        let mut out: Vec<(u128, u128)> = Vec::new();
+        for (low, high) in sorted {
+            match out.last_mut() {
+                Some(last) if low <= last.1.saturating_add(1) => last.1 = last.1.max(high),
+                _ => out.push((low, high)),
+            }
+        }
+        out
+    }
+
+    pub(super) fn subtract_v6(a: &[(u128, u128)], b: &[(u128, u128)]) -> Vec<(u128, u128)> {
         let mut out = Vec::new();
         let mut cut = 0;
         for &(start, high) in a {
@@ -599,8 +725,9 @@ impl Routes {
             .collect();
         let dns = &config["dns"];
         let blacklist = dns["fake-ip-filter-mode"].as_str().is_none_or(|m| m.eq_ignore_ascii_case("blacklist"));
-        let compat = if blacklist { strings(&dns["fake-ip-filter"]).unwrap_or_default() } else { Vec::new() };
-        let compat = compat.iter().filter_map(|entry| compat_rule(entry, &providers)).collect();
+        let blacklist_entries = if blacklist { strings(&dns["fake-ip-filter"]).unwrap_or_default() } else { Vec::new() };
+        let compat: Vec<_> = blacklist_entries.iter().filter_map(|entry| compat_rule(entry, &providers)).collect();
+        let compat_dropped = blacklist_entries.len() - compat.len();
         let v6_only = config["proxies"]
             .as_sequence()
             .into_iter()
@@ -608,7 +735,7 @@ impl Routes {
             .filter(|p| p["server"].as_str().is_some_and(|s| s.trim_start_matches('[').trim_end_matches(']').parse::<std::net::Ipv6Addr>().is_ok()))
             .filter_map(|p| p["name"].as_str().map(str::to_owned))
             .collect();
-        Self { rules, groups, providers, compat, geodata: config["geodata-mode"].as_bool() == Some(true), v6_only }
+        Self { rules, groups, providers, compat, compat_dropped, geodata: config["geodata-mode"].as_bool() == Some(true), v6_only }
     }
 
     /// The nodes with only an IPv6 server address that traffic can reach now:
@@ -689,25 +816,36 @@ impl Routes {
     /// lose the name at a refresh); a rule set that can gain any name, or a
     /// rule this filter cannot express, fakes everything from there on. Then
     /// the subscription's own list and the rest keep their real address.
-    pub(super) fn dns(&self, bypass: bool) -> Vec<String> {
-        let mut out: Vec<String> = LOCAL.iter().map(|d| format!("DOMAIN-SUFFIX,{d},real-ip")).collect();
-        if !bypass {
-            out.extend(self.compat.iter().cloned());
-            out.push("MATCH,fake-ip".into());
-            return out;
+    pub(super) fn dns_filter(&self, bypass: bool) -> DnsFilter {
+        let mut rules: Vec<String> = LOCAL.iter().map(|d| format!("DOMAIN-SUFFIX,{d},real-ip")).collect();
+        let truncation_reason = if bypass { self.real_until(&mut rules).err() } else { None };
+        let default_action = if bypass && truncation_reason.is_none() { "real-ip" } else { "fake-ip" };
+        if truncation_reason.is_none() {
+            rules.extend(self.compat.iter().cloned());
         }
-        let tail = self.real_until(&mut out);
-        if tail == "real-ip" {
-            out.extend(self.compat.iter().cloned());
+        rules.push(format!("MATCH,{default_action}"));
+        DnsFilter {
+            diagnostics: DnsDiagnostics {
+                rules: rules.len(),
+                fake_ip_rules: rules.iter().filter(|rule| rule.ends_with(",fake-ip")).count(),
+                compatibility_rules_skipped: self.compat_dropped + truncation_reason.as_ref().map_or(0, |_| self.compat.len()),
+                truncation_reason,
+                default_action,
+            },
+            rules,
         }
-        out.push(format!("MATCH,{tail}"));
-        out
     }
 
-    /// The per-rule entries of `dns`; the action for the names left over.
-    fn real_until(&self, out: &mut Vec<String>) -> &'static str {
+    #[cfg(test)]
+    pub(super) fn dns(&self, bypass: bool) -> Vec<String> {
+        self.dns_filter(bypass).rules
+    }
+
+    /// The per-rule entries of the filter, or why the remaining names need fake IPs.
+    fn real_until(&self, out: &mut Vec<String>) -> Result<(), String> {
         let end = self.last_return().map_or(0, |last| last + 1);
-        for (rule, _) in &self.rules[..end] {
+        for (index, (rule, _)) in self.rules[..end].iter().enumerate() {
+            let truncated = |why| Err(format!("Rule {}: {why}", index + 1));
             let fixed = rule.target == "DIRECT";
             let action = if fixed { "real-ip" } else { "fake-ip" };
             match rule.kind.as_str() {
@@ -722,9 +860,13 @@ impl Routes {
                             match member.kind.as_str() {
                                 kind if domain_kind(kind) => out.push(format!("{kind},{},{action}", member.payload)),
                                 "AND" | "OR" if !fixed => {
-                                    if !self.domain_leaves(&member, 0, out) { return "fake-ip"; }
+                                    if !self.domain_leaves(&member, 0, out) {
+                                        return truncated("a logical rule set member cannot be represented by the DNS filter");
+                                    }
                                 }
-                                "NOT" | "SUB-RULE" | "RULE-SET" if !fixed => return "fake-ip",
+                                "NOT" | "SUB-RULE" | "RULE-SET" if !fixed => {
+                                    return truncated("a rule set member cannot be represented by the DNS filter");
+                                }
                                 _ => {}
                             }
                         }
@@ -736,23 +878,23 @@ impl Routes {
                     Some(_) => {
                         // Its current names stay fake ahead of the subscription's list.
                         out.push(format!("RULE-SET,{},fake-ip", rule.payload));
-                        return "fake-ip";
+                        return truncated("a rule set can gain new domain names");
                     }
-                    None => return "fake-ip",
+                    None => return truncated("the rule set is undefined"),
                 },
                 // DIRECT only in part (a network or a port as well): the
                 // rules after it decide the rest, as for any other name.
                 "AND" | "OR" if fixed => {}
                 "AND" | "OR" => {
                     if !self.domain_leaves(rule, 0, out) {
-                        return "fake-ip";
+                        return truncated("the logical rule cannot be represented by the DNS filter");
                     }
                 }
-                "NOT" | "SUB-RULE" if !fixed => return "fake-ip",
+                "NOT" | "SUB-RULE" if !fixed => return truncated("the rule cannot be represented by the DNS filter"),
                 _ => {}
             }
         }
-        "real-ip"
+        Ok(())
     }
 
     /// Index of the last rule that may ever let traffic skip the core in the
@@ -848,7 +990,7 @@ impl Routes {
     /// set in `unsettled` (being refreshed) counts as unknown: skipped where
     /// it sends DIRECT, the end of the chain otherwise.
     pub(super) fn compile(&self, selected: &Selected, root: &Path, unsettled: &[String]) -> Compiled {
-        let mut out = Compiled { steps: Vec::new(), tail: Verdict::Direct, cut: None, geoip: Vec::new(), sources: Vec::new() };
+        let mut out = Compiled { steps: Vec::new(), tail: Verdict::Direct, cut: None, skipped_direct_alternatives: 0, geoip: Vec::new(), sources: Vec::new() };
         for (index, (rule, summary)) in self.rules.iter().enumerate() {
             let verdict = if self.direct(&rule.target, selected) { Verdict::Direct } else { Verdict::Core };
             if rule.kind == "MATCH" {
@@ -861,7 +1003,7 @@ impl Routes {
                 match alt {
                     Ok(alt) => alts.push(alt),
                     // Skipping a DIRECT condition only sends more to the core.
-                    Err(_) if verdict == Verdict::Direct => {}
+                    Err(_) if verdict == Verdict::Direct => out.skipped_direct_alternatives += 1,
                     Err(why) => {
                         out.cut = Some(format!("{}: {why}", label()));
                         out.tail = Verdict::Core;
@@ -874,6 +1016,94 @@ impl Routes {
             }
         }
         out.with_codes()
+    }
+
+    /// Rule mode (Tailscale Strategy B Option 2): compile explicit IP/GeoIP/port
+    /// rules in strict configuration order. Because Exit Node clients receive
+    /// real IPs from Clean DNS (never fake-IPs), the kernel cannot evaluate
+    /// domain rules:
+    /// - Explicit IP/GeoIP/port DIRECT and PROXY/REJECT rules that precede any
+    ///   non-DIRECT domain rule are preserved verbatim in order.
+    /// - The first non-DIRECT rule that can match by domain (`DOMAIN*`,
+    ///   `GEOSITE`, non-`ipcidr` `RULE-SET`, logical domain rule, `NOT`,
+    ///   `SUB-RULE`) cuts the kernel chain immediately (`tail = Verdict::Core`)
+    ///   so NO later `DIRECT` rule (`DST-PORT`, `IP-CIDR`, `GEOIP`,
+    ///   `MATCH,DIRECT`, or implicit end-of-rules DIRECT) can ever bypass an
+    ///   earlier domain rule.
+    pub(super) fn compile_tailscale(&self, selected: &Selected, root: &Path, unsettled: &[String]) -> Compiled {
+        let mut out = Compiled { steps: Vec::new(), tail: Verdict::Direct, cut: None, skipped_direct_alternatives: 0, geoip: Vec::new(), sources: Vec::new() };
+        for (index, (rule, summary)) in self.rules.iter().enumerate() {
+            let verdict = if self.direct(&rule.target, selected) { Verdict::Direct } else { Verdict::Core };
+            if rule.kind == "MATCH" {
+                out.tail = verdict;
+                break;
+            }
+            let label = || format!("Rule {} ({summary})", index + 1);
+            if verdict == Verdict::Core && self.rule_matches_domain(rule, root, 0, &mut out.sources, unsettled) {
+                out.cut = Some(format!("{}: domain rule needs Mihomo sniffer", label()));
+                out.tail = Verdict::Core;
+                return out.with_codes();
+            }
+            let mut alts = Vec::new();
+            for alt in self.effect(rule, root, 0, &mut out.sources, unsettled) {
+                match alt {
+                    Ok(alt) => alts.push(alt),
+                    Err(_) if verdict == Verdict::Direct => out.skipped_direct_alternatives += 1,
+                    Err(why) => {
+                        out.cut = Some(format!("{}: {why}", label()));
+                        out.tail = Verdict::Core;
+                        return out.with_codes();
+                    }
+                }
+            }
+            if !alts.is_empty() {
+                out.steps.push(Step { verdict, alts, label: label() });
+            }
+        }
+        out.with_codes()
+    }
+
+    /// Whether a non-DIRECT rule can match by domain (fail-closed on unknown,
+    /// dynamic, unsettled, or malformed rules so blacklist subscriptions never
+    /// emit a catch-all kernel `return` on `tailscale0`).
+    fn rule_matches_domain(&self, rule: &Rule, root: &Path, depth: usize, sources: &mut Vec<Source>, unsettled: &[String]) -> bool {
+        if depth > MAX_DEPTH {
+            return true;
+        }
+        match rule.kind.as_str() {
+            kind if domain_kind(kind) => true,
+            "NOT" | "SUB-RULE" => true,
+            "AND" | "OR" => {
+                let Some(subs) = sub_rules(&rule.payload).filter(|s| !s.is_empty()) else {
+                    return true;
+                };
+                subs.iter()
+                    .any(|sub| self.rule_matches_domain(sub, root, depth + 1, sources, unsettled))
+            }
+            "RULE-SET" => {
+                let Some(provider) = self.providers.get(&rule.payload) else {
+                    return true;
+                };
+                match provider.behavior.as_str() {
+                    "ipcidr" => false,
+                    "domain" => true,
+                    "classical" => {
+                        if provider.dynamic() || unsettled.iter().any(|u| u == &rule.payload) {
+                            return true;
+                        }
+                        match entries(&rule.payload, provider, root, sources) {
+                            Ok(lines) => lines.iter().any(|line| {
+                                let member = parse(line, false);
+                                self.rule_matches_domain(&member, root, depth + 1, sources, unsettled)
+                            }),
+                            Err(_) => true,
+                        }
+                    }
+                    _ => true,
+                }
+            }
+            _ => false,
+        }
     }
 
     fn effect(&self, rule: &Rule, root: &Path, depth: usize, sources: &mut Vec<Source>, unsettled: &[String]) -> Effect {
@@ -926,17 +1156,18 @@ impl Routes {
                 }
                 all
             }
-            "RULE-SET" => self.rule_set(payload, root, depth, sources, unsettled),
+            "RULE-SET" => self.rule_set(payload, rule.src, root, depth, sources, unsettled),
             kind => cannot(format!("{kind} rules need the core")),
         }
     }
 
-    fn rule_set(&self, name: &str, root: &Path, depth: usize, sources: &mut Vec<Source>, unsettled: &[String]) -> Effect {
+    fn rule_set(&self, name: &str, src: bool, root: &Path, depth: usize, sources: &mut Vec<Source>, unsettled: &[String]) -> Effect {
         let Some(provider) = self.providers.get(name) else { return vec![Err(format!("rule set {} is not defined", short(name)))] };
         match provider.behavior.as_str() {
             "domain" => Vec::new(),
             "ipcidr" | "classical" if provider.dynamic() => vec![Err(format!("rule set {} is reloaded by the core whenever it changes", short(name)))],
             "ipcidr" | "classical" if unsettled.iter().any(|u| u == name) => vec![Err(format!("rule set {} is being refreshed", short(name)))],
+            "classical" if src => vec![Err(format!("source-qualified classical rule set {} needs the core", short(name)))],
             behavior @ ("ipcidr" | "classical") if depth < MAX_DEPTH => {
                 let lines = match entries(name, provider, root, sources) {
                     Ok(lines) => lines,
@@ -944,7 +1175,11 @@ impl Routes {
                 };
                 let mut effect = Vec::new();
                 for line in lines {
-                    let rule = if behavior == "ipcidr" { Rule { kind: "IP-CIDR".into(), payload: line, ..Rule::default() } } else { parse(&line, false) };
+                    let rule = if behavior == "ipcidr" {
+                        Rule { kind: "IP-CIDR".into(), payload: line, src, ..Rule::default() }
+                    } else {
+                        parse(&line, false)
+                    };
                     effect.extend(self.effect(&rule, root, depth + 1, sources, unsettled).into_iter().map(|alt| alt.map_err(|why| format!("rule set {}: {why}", short(name)))));
                 }
                 effect
@@ -981,7 +1216,13 @@ impl Compiled {
     /// The chain, given each `GEOIP` code's ranges (`Err`: the code's
     /// conditions cannot be checked; an empty list never matches IPv4).
     pub(super) fn render<'g>(&self, geo: &dyn Fn(&str) -> Result<&'g [String], String>) -> Chain {
-        let mut chain = Chain { cut: self.cut.clone(), ..Chain::default() };
+        self.render_with_prefix(geo, "ip_")
+    }
+
+    /// Render using a caller-chosen prefix for plain IP CIDR sets (`ip_` for LAN,
+    /// `ts_ip_` for Tailscale) while sharing canonical `geo_<code>` set names.
+    pub(super) fn render_with_prefix<'g>(&self, geo: &dyn Fn(&str) -> Result<&'g [String], String>, ip_prefix: &str) -> Chain {
+        let mut chain = Chain { cut: self.cut.clone(), skipped_direct_alternatives: self.skipped_direct_alternatives, ..Chain::default() };
         let mut names = BTreeMap::new();
         let mut ranges_sets = 0;
         let mut at = 0;
@@ -999,7 +1240,10 @@ impl Compiled {
                         Ok(Some(Expr::Match(m, _))) if lines.iter().any(|(l, _)| *l == m) => {}
                         Ok(Some(Expr::Match(m, plain))) => lines.push((m, plain)),
                         Ok(None) => continue,
-                        Err(_) if verdict == Verdict::Direct => continue,
+                        Err(_) if verdict == Verdict::Direct => {
+                            chain.skipped_direct_alternatives += 1;
+                            continue;
+                        }
                         Err(why) => {
                             cut = Some(format!("{}: {why}", step.label));
                             break 'run;
@@ -1011,7 +1255,7 @@ impl Compiled {
             }
             let returns = verdict == Verdict::Direct;
             if !ranges.is_empty() {
-                let name = format!("ip_{ranges_sets}");
+                let name = format!("{ip_prefix}{ranges_sets}");
                 ranges_sets += 1;
                 chain.rules.push(format!("ip daddr @{name} {}", verdict.nft()));
                 chain.plain.push(Some((returns, ranges.clone())));
@@ -1321,6 +1565,36 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
     fn with_rules(rules: &[&str]) -> Routes {
         let rules: Vec<String> = rules.iter().map(|r| format!("'{r}'")).collect();
         Routes::from(&serde_yaml_ng::from_str(&format!("geodata-mode: true\nproxy-groups: [{{name: 直连, type: select, proxies: [DIRECT, P]}}]\nrules: [{}]", rules.join(", "))).unwrap())
+    }
+
+    #[test]
+    fn compilation_counts_the_emitted_return_after_merging_direct_cidrs() {
+        let routes = with_rules(&[
+            "IP-CIDR,1.2.3.0/24,DIRECT",
+            "IP-CIDR,4.5.6.0/24,DIRECT",
+            "MATCH,PROXY",
+        ]);
+        let home = home("merged-returns");
+        let chain = chain(&routes, &Selected::new(), home.path());
+        let diagnostics = chain.compilation();
+        assert_eq!(chain.returns, 2);
+        assert_eq!(diagnostics.nft_rules, 1);
+        assert_eq!(diagnostics.direct_returns, 1);
+    }
+
+    #[test]
+    fn dns_diagnostics_count_unconvertible_and_truncated_compatibility_rules() {
+        let parse = |rules: &str| {
+            let config = format!("dns:\n  fake-ip-filter: ['rule-set:Missing', '+.example.test']\nrules: {rules}");
+            Routes::from(&serde_yaml_ng::from_str(&config).unwrap()).dns_filter(true)
+        };
+        let complete = parse("['MATCH,DIRECT']");
+        assert!(complete.diagnostics.truncation_reason.is_none());
+        assert_eq!(complete.diagnostics.compatibility_rules_skipped, 1);
+
+        let truncated = parse("['RULE-SET,Missing,REJECT', 'MATCH,DIRECT']");
+        assert!(truncated.diagnostics.truncation_reason.is_some());
+        assert_eq!(truncated.diagnostics.compatibility_rules_skipped, 2);
     }
 
     fn home(test: &str) -> super::super::test_dir::TestDir {
@@ -1750,5 +2024,166 @@ rules: [{claude}'GEOIP,CN,DIRECT', 'MATCH,Proxy']")).unwrap())
         assert!(selected_from(&serde_json::json!({})).is_none());
         assert_eq!(Mode::parse("Global"), Mode::Global);
         assert_eq!(Mode::parse("anything"), Mode::Rule);
+    }
+
+    #[test]
+    fn tailscale_strategy_b_compiles_whitelist_and_guards_blacklist_ordering() {
+        let temp = home("ts-strategy-b");
+        let root = temp.path().to_path_buf();
+        let cn = vec!["1.0.1.0/24".to_owned()];
+        let geo = |code: &str| match code {
+            "CN" => Ok(cn.as_slice()),
+            _ => Err("not in GeoIP.dat".to_owned()),
+        };
+
+        // 1. Whitelist subscription where explicit IP/GeoIP DIRECT precedes domain rules
+        //    (plus DIRECT domain rules are harmless and do not cut).
+        let whitelist = with_rules(&[
+            "DOMAIN-SUFFIX,baidu.com,DIRECT",
+            "IP-CIDR,91.108.4.0/22,P",
+            "GEOIP,CN,DIRECT",
+            "DOMAIN-SUFFIX,google.com,P",
+            "MATCH,P",
+        ]);
+        let wl = whitelist
+            .compile_tailscale(&Selected::new(), &root, &[])
+            .render_with_prefix(&geo, "ts_ip_");
+        assert_eq!(
+            wl.rules,
+            [
+                "ip daddr @ts_ip_0 goto to_core",
+                "ip daddr @geo_cn return",
+            ]
+        );
+        assert!(!wl.rules.iter().any(|r| r == "return"));
+        assert_eq!(wl.returns, 1);
+
+        // 2. Blacklist subscription with explicit DIRECT IP/GeoIP winning BEFORE
+        //    the domain blacklist + MATCH,DIRECT: preserves earlier explicit DIRECT
+        //    rules and cuts at the domain rule so NO later DIRECT or MATCH,DIRECT
+        //    can bypass the domain blacklist!
+        let blacklist = with_rules(&[
+            "IP-CIDR,91.108.4.0/22,P",
+            "GEOIP,CN,DIRECT",
+            "IP-CIDR,1.2.3.0/24,DIRECT",
+            "DOMAIN-SUFFIX,google.com,P",
+            "DST-PORT,443,DIRECT",
+            "IP-CIDR,8.8.4.0/24,DIRECT",
+            "MATCH,DIRECT",
+        ]);
+        let bl = blacklist
+            .compile_tailscale(&Selected::new(), &root, &[])
+            .render_with_prefix(&geo, "ts_ip_");
+        assert_eq!(
+            bl.rules,
+            [
+                "ip daddr @ts_ip_0 goto to_core",
+                "ip daddr @ts_ip_1 return",
+                "ip daddr @geo_cn return",
+            ]
+        );
+        assert!(
+            !bl.rules.iter().any(|r| r == "return" || r.contains("443") || r.contains("8.8.4.0")),
+            "rules after a non-DIRECT domain rule must NEVER bypass Mihomo sniffer: {:?}",
+            bl.rules
+        );
+        assert_eq!(bl.returns, 2);
+
+        // 3. Earlier non-DIRECT domain blacklist BEFORE DST-PORT,443,DIRECT or
+        //    later DIRECT CIDR / GEOIP MUST cut immediately so HTTPS/CIDR traffic
+        //    cannot bypass the domain blacklist!
+        let domain_first = with_rules(&[
+            "DOMAIN-SUFFIX,google.com,P",
+            "DST-PORT,443,DIRECT",
+            "IP-CIDR,1.2.3.0/24,DIRECT",
+            "GEOIP,CN,DIRECT",
+            "MATCH,DIRECT",
+        ]);
+        let df = domain_first
+            .compile_tailscale(&Selected::new(), &root, &[])
+            .render_with_prefix(&geo, "ts_ip_");
+        assert!(
+            df.rules.is_empty() && df.returns == 0,
+            "a later DIRECT rule must never bypass an earlier non-DIRECT domain rule: {:?}",
+            df.rules
+        );
+        assert!(df.cut.as_deref().is_some_and(|c| c.contains("domain rule")));
+
+        // 4. Blacklist with domain RULE-SET after GEOIP,CN,DIRECT + implicit default (no MATCH)
+        let bl_ruleset = Routes::from(&serde_yaml_ng::from_str(
+            "geodata-mode: true\nrule-providers:\n  gfw: {type: http, behavior: domain, url: 'https://example.invalid/gfw.yaml'}\nrules:\n  - GEOIP,CN,DIRECT\n  - RULE-SET,gfw,P\n  - IP-CIDR,4.4.4.0/24,DIRECT\n",
+        ).unwrap());
+        let blr = bl_ruleset
+            .compile_tailscale(&Selected::new(), &root, &[])
+            .render_with_prefix(&geo, "ts_ip_");
+        assert_eq!(blr.rules, ["ip daddr @geo_cn return"]);
+        assert!(!blr.rules.iter().any(|r| r == "return"));
+
+        // 5. Logical domain rule cuts before later DIRECT rules
+        let bl_logical = with_rules(&[
+            "AND,((DOMAIN-SUFFIX,openai.com),(DST-PORT,443)),P",
+            "DST-PORT,443,DIRECT",
+            "MATCH,DIRECT",
+        ]);
+        let bll = bl_logical
+            .compile_tailscale(&Selected::new(), &root, &[])
+            .render_with_prefix(&geo, "ts_ip_");
+        assert!(bll.rules.is_empty() && bll.returns == 0);
+
+        // 6. Pure IP subscription with ZERO non-DIRECT domain rules MAY keep MATCH,DIRECT return
+        let pure_ip = with_rules(&["IP-CIDR,91.108.4.0/22,P", "MATCH,DIRECT"]);
+        let pi = pure_ip
+            .compile_tailscale(&Selected::new(), &root, &[])
+            .render_with_prefix(&geo, "ts_ip_");
+        assert_eq!(pi.rules, ["ip daddr @ts_ip_0 goto to_core", "return"]);
+        assert_eq!(pi.returns, 1);
+
+        // 7. Source-qualified `RULE-SET,office,DIRECT,src` MUST match source
+        //    address (`ip saddr`), NEVER destination (`ip daddr`), and a
+        //    source-qualified classical rule set must stay in the core.
+        let src_rs = Routes::from(&serde_yaml_ng::from_str(
+            "rule-providers:\n  office: {type: inline, behavior: ipcidr, payload: ['100.64.10.0/24']}\n  cls: {type: inline, behavior: classical, payload: ['IP-CIDR,1.2.3.0/24']}\nrules:\n  - RULE-SET,office,DIRECT,src\n  - RULE-SET,cls,DIRECT,src\n  - DOMAIN-SUFFIX,blocked.example,P\n  - MATCH,DIRECT\n",
+        ).unwrap());
+        let compiled_src = src_rs
+            .compile_tailscale(&Selected::new(), &root, &[])
+            .render_with_prefix(&geo, "ts_ip_");
+        assert_eq!(compiled_src.rules, ["ip saddr 100.64.10.0/24 return"]);
+        assert!(
+            compiled_src.rules.iter().all(|r| !r.contains("ip daddr") && !r.contains("1.2.3.0")),
+            "source-qualified rule sets must never emit a destination DIRECT return: {:?}",
+            compiled_src.rules
+        );
+
+        // 8. `lost_from` excludes chains equal to the final target so a
+        //    replacement's own port/source DIRECT rule never triggers a whole-LAN
+        //    or Tailscale reset when nothing previously bypassed.
+        assert!(
+            matches!(
+                lost_from(&[compiled_src.clone()], &compiled_src),
+                crate::netfx::conntrack::Scope::Destinations(ref d) if d.is_empty()
+            ),
+            "comparing a port/source chain against itself must reset nothing"
+        );
+        let plain_old = with_rules(&["IP-CIDR,1.2.3.0/24,DIRECT", "MATCH,P"])
+            .compile_tailscale(&Selected::new(), &root, &[])
+            .render_with_prefix(&geo, "ts_ip_");
+        assert_eq!(
+            lost_from(&[plain_old.clone(), compiled_src.clone()], &compiled_src),
+            crate::netfx::conntrack::Scope::Destinations(vec!["1.2.3.0/24".parse().unwrap()]),
+            "other prior chains still compute their lost destinations"
+        );
+
+        // 9. Skip CIDR loss helpers detect removed/shrunk prefixes for IPv4 & IPv6.
+        assert!(!lost_cidrs_v4(&[], &["198.51.100.0/24".into()]));
+        assert!(lost_cidrs_v4(&["198.51.100.0/24".into()], &[]));
+        assert!(lost_cidrs_v4(&["198.51.100.0/24".into()], &["198.51.100.0/25".into()]));
+        assert!(!lost_cidrs_v4(
+            &["198.51.100.0/25".into(), "198.51.100.128/25".into()],
+            &["198.51.100.0/24".into()]
+        ));
+        assert!(!lost_cidrs_v6(&[], &["2001:db8::/32".into()]));
+        assert!(lost_cidrs_v6(&["2001:db8::/32".into()], &[]));
+        assert!(lost_cidrs_v6(&["2001:db8::/32".into()], &["2001:db8::/48".into()]));
+        assert!(!lost_cidrs_v6(&["2001:db8:0::/32".into()], &["2001:db8::/32".into()]));
     }
 }

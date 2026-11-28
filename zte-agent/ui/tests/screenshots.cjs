@@ -67,7 +67,9 @@ const tailscale={
  tailscale_ips:['100.64.0.10','fd7a:115c:a1e0::10'],dns_name:'u60-pro.tail1234.ts.net.',relay:'hkg',direct:true,
  key_expiry:'0001-01-01T00:00:00Z',expired:false,client_version:'1.86.2',login_url:null,wakelock_held:true,updating:false,
  last_update:{version:'1.86.2',ok:true,finished_at:nowSec-1800},
- hostname:'u60-pro',advertise_routes:['192.168.0.0/24'],tailscale_ssh:false,hold_wakelock:true,pinned_version:'1.86.2'
+ hostname:'u60-pro',advertise_routes:['192.168.0.0/24'],advertise_exit_node:true,exit_via_mihomo:true,tailscale_ssh:false,hold_wakelock:true,pinned_version:'1.86.2',
+ routing:{sync:'applied',tun:{mode:'kernel',active:true,netfilter_mode:'off'},lan_subnets:['192.168.0.0/24','fd00:12::/64'],
+  routes:[{prefix:'192.168.0.0/24',state:'approved'}],exit:{advertised:true,state:'approved',state_v4:'approved',state_v6:'pending',via_mihomo:true}}
 };
 const tailscaleVersions={
  latest:'1.104.7',
@@ -83,6 +85,7 @@ const apiFixtures={
  '/api/esim/profiles':inventory,
  '/api/wifi-relay/status':relay,
  '/api/mihomo/status':mihomo,
+ '/api/doh/status':{running:true,config:{enabled:true,transport:'doh'}},
  '/api/mihomo/profiles':mihomoProfiles,
  '/api/mihomo/extensions':mihomoExtensions,
  '/api/mihomo/proxies':mihomoProxies,

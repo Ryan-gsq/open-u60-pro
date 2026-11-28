@@ -27,6 +27,8 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     last_update: null,
     hostname: 'u60-pro',
     advertise_routes: [],
+    advertise_exit_node: false,
+    exit_via_mihomo: false,
     tailscale_ssh: false,
     hold_wakelock: true,
     pinned_version: ''
@@ -45,6 +47,32 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     fetched_at: Math.floor(Date.now() / 1000)
   };
   let versionsFail = false;
+  let configError = null;
+  let mihomo = {running: true};
+  const dns = {running: true, config: {enabled: true, transport: 'doh'}};
+
+  function updateRouting() {
+    const running = status.backend_state === 'Running';
+    const prior = status.routing?.routes ?? [];
+    const approval = status.advertise_exit_node ? (running ? 'pending' : 'unknown') : 'off';
+    status.routing = {
+      sync: running ? 'applied' : 'pending_daemon',
+      tun: {mode: running ? 'kernel' : 'unknown', active: running, netfilter_mode: running ? 'off' : 'unknown'},
+      lan_subnets: ['192.168.0.0/24', 'fd00:12::/64'],
+      routes: status.advertise_routes.map(prefix => ({
+        prefix,
+        state: running ? (prior.find(route => route.prefix === prefix)?.state ?? 'pending') : 'unknown'
+      })),
+      exit: {
+        advertised: status.advertise_exit_node,
+        via_mihomo: status.exit_via_mihomo,
+        state: approval,
+        state_v4: approval,
+        state_v6: approval
+      }
+    };
+  }
+  updateRouting();
 
   const fixture = await start(({method, url, body}, reply, fail) => {
     if (method === 'POST' && url === '/api/auth/login') {
@@ -53,6 +81,14 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     }
     if (method === 'GET' && url === '/api/tailscale/status') {
       reply(status);
+      return true;
+    }
+    if (method === 'GET' && url === '/api/mihomo/status') {
+      reply(mihomo);
+      return true;
+    }
+    if (method === 'GET' && url === '/api/doh/status') {
+      reply(dns);
       return true;
     }
     if (method === 'GET' && url === '/api/tailscale/versions') {
@@ -114,12 +150,19 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
         login_url: null,
         wakelock_held: status.hold_wakelock
       };
+      updateRouting();
       reply(status);
       return true;
     }
     if (method === 'PUT' && url === '/api/tailscale/config') {
+      if (configError) {
+        fail(configError.message, configError.status);
+        return true;
+      }
       if (Object.hasOwn(body, 'hostname')) status.hostname = body.hostname;
       if (Object.hasOwn(body, 'advertise_routes')) status.advertise_routes = body.advertise_routes;
+      if (Object.hasOwn(body, 'advertise_exit_node')) status.advertise_exit_node = body.advertise_exit_node;
+      if (Object.hasOwn(body, 'exit_via_mihomo')) status.exit_via_mihomo = body.exit_via_mihomo;
       if (Object.hasOwn(body, 'tailscale_ssh')) status.tailscale_ssh = body.tailscale_ssh;
       if (Object.hasOwn(body, 'hold_wakelock')) {
         status.hold_wakelock = body.hold_wakelock;
@@ -128,6 +171,7 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
       if (status.backend_state === 'Running') {
         status.dns_name = `${status.hostname}.tail1234.ts.net.`;
       }
+      updateRouting();
       reply(status);
       return true;
     }
@@ -141,6 +185,7 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
         healthy: false,
         wakelock_held: false
       };
+      updateRouting();
       reply({status: 'disabled'});
       return true;
     }
@@ -160,6 +205,7 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
         login_url: null,
         wakelock_held: false
       };
+      updateRouting();
       reply({status: 'logged_out', warning: 'daemon unavailable — remove this machine in the admin console'});
       return true;
     }
@@ -181,7 +227,12 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     ([sel, wanted]) => document.querySelector(sel)?.textContent.includes(wanted),
     [selector, needle]
   );
-  const last = () => fixture.requests.at(-1);
+  const lastConfig = () => fixture.requests.filter(item => item.method === 'PUT' && item.url === '/api/tailscale/config').at(-1).body;
+  const routing = page.locator('#tailscale-routing');
+  const routeInput = routing.getByRole('textbox', {name: 'IPv4 or IPv6 CIDR'});
+  const routeRow = prefix => routing.getByRole('listitem').filter({has: page.getByText(prefix, {exact: true})});
+  const exit = routing.getByRole('switch', {name: /Advertise Exit Node/});
+  const viaMihomo = routing.getByRole('switch', {name: /Route Exit Node via Mihomo/});
 
   try {
     // 1. Not installed: enrollment & enable are unavailable; install form validates inputs first.
@@ -363,50 +414,287 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     assert.match(await text('#tailscale-status .tailscale-facts'), /Direct · DERP hkg/);
     assert.match(await text('#tailscale-status .tailscale-facts'), /Never expires/);
 
-    // 5. Preferences validation, dirty-draft preservation across SSE patches, and partial PUT diff.
-    await page.locator('#tailscale-routes').fill('192.168.0.0/33');
-    await button('Save preferences').click();
-    await said('#tailscale-config .action-status', 'Invalid IPv4 CIDR');
-    assert.equal(fixture.count('PUT', '/api/tailscale/config'), 0);
-
+    // 5. Basic preferences remain independent of routing.
+    assert.equal(await page.locator('#tailscale-config').getByRole('textbox', {name: /CIDR|subnet/i}).count(), 0);
     await page.locator('#tailscale-hostname').fill('u60-home');
-    await page.locator('#tailscale-routes').fill('192.168.0.0/24, 10.10.0.0/24');
     await page.locator('#tailscale-ssh').check();
     await page.locator('#tailscale-wakelock').uncheck();
     // Live SSE update must preserve unsaved config edits.
     fixture.patch({tailscale_status: envelope({...status, relay: 'sin'})});
     await said('#tailscale-status .tailscale-facts', 'DERP sin');
     assert.equal(await page.locator('#tailscale-hostname').inputValue(), 'u60-home');
-    assert.equal(await page.locator('#tailscale-routes').inputValue(), '192.168.0.0/24, 10.10.0.0/24');
 
     await page.clock.runFor(1200);
     status = {...status, relay: 'fra'};
     await refreshOn(page,fixture,'focus','/api/tailscale/status');
     await said('#tailscale-status .tailscale-facts', 'DERP fra');
     assert.equal(await page.locator('#tailscale-hostname').inputValue(), 'u60-home');
-    assert.equal(await page.locator('#tailscale-routes').inputValue(), '192.168.0.0/24, 10.10.0.0/24');
 
     await button('Save preferences').click();
     assert.match(await text('.confirm-dialog'), /Tailscale SSH will be enabled/);
     await confirm('Save preferences');
     await said('#tailscale-config .action-status', 'Tailscale preferences saved');
-    assert.deepEqual(
-      fixture.requests.find(item => item.method === 'PUT' && item.url === '/api/tailscale/config').body,
-      {hostname: 'u60-home', advertise_routes: ['192.168.0.0/24', '10.10.0.0/24'], tailscale_ssh: true, hold_wakelock: false}
-    );
+    assert.deepEqual(lastConfig(), {hostname: 'u60-home', tailscale_ssh: true, hold_wakelock: false});
     assert.match(await text('#tailscale-status .tailscale-facts'), /u60-home\.tail1234\.ts\.net/);
-    assert.match(await text('#tailscale-status .tailscale-facts'), /192\.168\.0\.0\/24, 10\.10\.0\.0\/24/);
     assert.match(await text('#tailscale-status .tailscale-facts'), /Enabled/);
+
+    // 5a. Validate and normalize manual input and add a LAN subnet.
+    const savedPrefix = '10.10.0.0/24';
+    const longPrefix = '2001:db8:abcd:1234:5678:9abc:def0:1234/128';
+    status.advertise_routes = [savedPrefix];
+    updateRouting();
+    fixture.patch({tailscale_status: envelope(status)});
+    await routeRow(savedPrefix).getByText('Pending').waitFor();
+    const admin = routing.getByRole('link', {name: /Approve in Tailscale/});
+    assert.equal(await admin.getAttribute('href'), 'https://login.tailscale.com/admin/machines');
+    assert.equal(await admin.getAttribute('target'), '_blank');
+    assert.equal(await admin.getAttribute('rel'), 'noopener noreferrer');
+    await said('#tailscale-routing .tailscale-routing-bar', 'Kernel TUN');
+    await said('#tailscale-routing .tailscale-routing-bar', 'Applied');
+    await said('#tailscale-routing .tailscale-exit-context', 'Exit Node Clean DNS · Unknown');
+    status.routing.clean_dns = {running: false};
+    fixture.patch({tailscale_status: envelope(status)});
+    await said('#tailscale-routing .tailscale-exit-context', 'Exit Node Clean DNS · Inactive');
+    status.routing.clean_dns = {state: 'active'};
+    fixture.patch({tailscale_status: envelope(status)});
+    await said('#tailscale-routing .tailscale-exit-context', 'Exit Node Clean DNS · Active');
+    assert.equal(fixture.requests.some(request => request.url === '/api/doh/status'), false);
+
+    await routeInput.fill('192.168.0.0/33');
+    await said('#tailscale-route-hint', 'Enter a valid IPv4 or IPv6 CIDR');
+    assert.equal(await button('Add route').isDisabled(), true);
+    await routeInput.fill('::/0');
+    await said('#tailscale-route-hint', 'Use the Advertise Exit Node switch');
+    await routeInput.fill('10.10.0.42/24');
+    await said('#tailscale-route-hint', '10.10.0.0/24 is already in the list');
+    assert.equal(await button('Add route').isDisabled(), true);
+    await routeInput.fill('2001:DB8::1/64');
+    await said('#tailscale-route-hint', 'Will normalize to 2001:db8::/64');
+    await routeInput.press('Enter');
+    await routeRow('2001:db8::/64').getByText('New').waitFor();
+    await button('+ Add LAN 192.168.0.0/24').click();
+    await routeRow('192.168.0.0/24').getByText('New').waitFor();
+    assert.equal(await button('+ Add LAN 192.168.0.0/24').count(), 0);
+    assert.equal(await button('+ Add LAN fd00:12::/64').isVisible(), true);
+    await routeInput.fill(longPrefix);
+    await button('Add route').click();
+
+    // 5b. Approval status changes through SSE and focus refresh while route drafts persist.
+    status.routing.routes[0].state = 'approved';
+    fixture.patch({tailscale_status: envelope(status)});
+    await routeRow(savedPrefix).getByText('Approved').waitFor();
+    await routeRow('2001:db8::/64').getByText('New').waitFor();
+    assert.equal(await routing.getAttribute('data-dirty'), 'true');
+    assert.equal(await routing.locator('.tailscale-routing-conflict').isHidden(), true);
+    status.routing.routes[0].state = 'standby';
+    status.routing.sync = 'drift';
+    await page.clock.runFor(1200);
+    await refreshOn(page, fixture, 'focus', '/api/tailscale/status');
+    await routeRow(savedPrefix).getByText('Standby').waitFor();
+    await said('#tailscale-routing .tailscale-routing-bar', 'Drift');
+    await routeRow('192.168.0.0/24').getByText('New').waitFor();
+    mihomo = {running: false};
+    status.routing.clean_dns = {state: 'disabled'};
+    fixture.patch({tailscale_status: envelope(status)});
+    await page.clock.runFor(5500);
+    await said('#tailscale-routing .tailscale-exit-context', 'Mihomo · Stopped');
+    await said('#tailscale-routing .tailscale-exit-context', 'Exit Node Clean DNS · Off');
+
+    // 5c. Validation, contention and daemon errors retain changes for retry.
+    const routesPatch = {advertise_routes: [savedPrefix, '2001:db8::/64', '192.168.0.0/24', longPrefix]};
+    for (const [errorStatus, message] of [[400, 'invalid routing settings'], [409, 'preferences are busy'], [502, 'tailscale set failed']]) {
+      configError = {status: errorStatus, message};
+      await button('Save routing').click();
+      await said('#tailscale-routing .action-status', message);
+      await said('#tailscale-routing .action-status', 'Your draft is kept');
+      assert.deepEqual(lastConfig(), routesPatch);
+      assert.equal(await routing.getAttribute('data-dirty'), 'true');
+      await routeRow(longPrefix).getByText('New').waitFor();
+    }
+    configError = null;
+    await button('Save routing').click();
+    await said('#tailscale-routing .action-status', 'Tailscale routing saved');
+    assert.deepEqual(lastConfig(), routesPatch);
+    await routeRow(longPrefix).getByText('Pending').waitFor();
+
+    // 5d. Discard after a remote change loads the latest configuration.
+    await button(`Remove ${savedPrefix}`).click();
+    status.advertise_routes = [...status.advertise_routes, '10.11.0.0/24'];
+    updateRouting();
+    fixture.patch({tailscale_status: envelope(status)});
+    await routing.locator('.tailscale-routing-conflict').waitFor({state: 'visible'});
+    assert.match(await text('.tailscale-routing-conflict'), /Review your draft before saving/);
+    assert.equal(await routeRow(savedPrefix).count(), 0);
+    await routeRow('10.11.0.0/24').getByText('Pending').waitFor();
+    await button('Discard routing edits').click();
+    await routeRow(savedPrefix).waitFor();
+    await routeRow('10.11.0.0/24').waitFor();
+    assert.equal(await routing.locator('.tailscale-routing-conflict').isHidden(), true);
+
+    // 5e. Exit Node confirmation, linked Mihomo control and dual-stack status.
+    assert.equal(await viaMihomo.isDisabled(), true);
+    await exit.click();
+    assert.match(await text('.confirm-dialog'), /Peer traffic may consume your router’s cellular data/);
+    await confirm('Cancel');
+    await page.locator('.confirm-dialog').waitFor({state: 'hidden'});
+    assert.equal(await exit.isChecked(), false);
+    await exit.click();
+    await confirm('Advertise Exit Node');
+    await page.waitForFunction(() => document.querySelector('#tailscale-advertise-exit-node').checked);
+    assert.equal(await viaMihomo.isEnabled(), true);
+    await viaMihomo.check();
+    await button('Save routing').click();
+    await said('#tailscale-routing .action-status', 'Tailscale routing saved');
+    assert.deepEqual(lastConfig(), {advertise_exit_node: true, exit_via_mihomo: true});
+    status.routing.exit.state = status.routing.exit.state_v4 = 'approved';
+    fixture.patch({tailscale_status: envelope(status)});
+    await said('#tailscale-routing [data-family=state]', 'Approved');
+    await said('#tailscale-routing [data-family=state_v4]', 'Approved');
+    await said('#tailscale-routing [data-family=state_v6]', 'Pending');
+    await exit.uncheck();
+    assert.equal(await viaMihomo.isDisabled(), true);
+    await button('Save routing').click();
+    await said('#tailscale-routing .action-status', 'Tailscale routing saved');
+    assert.deepEqual(lastConfig(), {advertise_exit_node: false});
+
+    const earlierRoutes = status.advertise_routes;
+    const localPrefix = '10.12.0.0/24', remotePrefix = '10.13.0.0/24';
+    status.advertise_routes = [savedPrefix];
+    updateRouting();
+    fixture.patch({tailscale_status: envelope(status)});
+    await routeRow(longPrefix).waitFor({state: 'detached'});
+    await routeInput.fill(localPrefix);
+    await button('Add route').click();
+    status.advertise_routes = [savedPrefix, remotePrefix];
+    updateRouting();
+    status.routing.routes[1].state = 'approved';
+    fixture.patch({tailscale_status: envelope(status)});
+    await routeRow(remotePrefix).getByText('Approved').waitFor();
+    await routeRow(localPrefix).getByText('New').waitFor();
+    assert.deepEqual(await routing.locator('.tailscale-route-row code').allTextContents(), [savedPrefix, remotePrefix, localPrefix]);
+    await said('.tailscale-routing-conflict', '1 saved subnet route was added.');
+    assert.equal(await routing.locator('.tailscale-routing-conflict').isVisible(), true);
+    await button('Save routing').click();
+    await said('#tailscale-routing .action-status', 'Tailscale routing saved');
+    assert.deepEqual(lastConfig(), {advertise_routes: [savedPrefix, remotePrefix, localPrefix]});
+
+    // 5f. A 409 during Save rebases SSE updates received while busy before enabling retry.
+    const retryLocal = '10.14.0.0/24', retryRemote = '10.15.0.0/24', retryRemoteDuringGet = '10.18.0.0/24';
+    status.advertise_routes = [savedPrefix];
+    updateRouting();
+    fixture.patch({tailscale_status: envelope(status)});
+    await routeRow(localPrefix).waitFor({state: 'detached'});
+    await routeInput.fill(retryLocal);
+    await button('Add route').click();
+    const [heldPut] = await Promise.all([
+      fixture.holdRequest('PUT', '/api/tailscale/config'),
+      button('Save routing').click(),
+    ]);
+    assert.deepEqual(heldPut.body, {advertise_routes: [savedPrefix, retryLocal]});
+    status.advertise_routes = [savedPrefix, retryRemote];
+    updateRouting();
+    status.routing.routes[1].state = 'approved';
+    fixture.patch({tailscale_status: envelope(status)});
+    // Give EventSource a turn to deliver the SSE update while PUT is still in flight.
+    await page.waitForTimeout(100);
+    // Hold the recovery GET so a second SSE arrives while the GET is in flight, then fail the GET.
+    const [heldRecoveryGet] = await Promise.all([
+      fixture.holdRequest('GET', '/api/tailscale/status'),
+      releaseResponse(page, heldPut, 'preferences are busy', 409),
+    ]);
+    await routeRow(retryRemote).getByText('Approved').waitFor();
+    status.advertise_routes = [savedPrefix, retryRemote, retryRemoteDuringGet];
+    updateRouting();
+    status.routing.routes[1].state = 'approved';
+    status.routing.routes[2].state = 'approved';
+    fixture.patch({tailscale_status: envelope(status)});
+    await page.waitForTimeout(100);
+    await releaseResponse(page, heldRecoveryGet, 'status unavailable', 503);
+    await said('#tailscale-routing .action-status', 'preferences are busy');
+    await said('#tailscale-routing .action-status', 'Your draft is kept');
+    await routeRow(retryRemote).getByText('Approved').waitFor();
+    await routeRow(retryRemoteDuringGet).getByText('Approved').waitFor();
+    await routeRow(retryLocal).getByText('New').waitFor();
+    assert.deepEqual(
+      await routing.locator('.tailscale-route-row code').allTextContents(),
+      [savedPrefix, retryRemote, retryRemoteDuringGet, retryLocal]
+    );
+    await said('.tailscale-routing-conflict', '1 saved subnet route was added.');
+    await button('Save routing').click();
+    await said('#tailscale-routing .action-status', 'Tailscale routing saved');
+    assert.deepEqual(lastConfig(), {advertise_routes: [savedPrefix, retryRemote, retryRemoteDuringGet, retryLocal]});
+
+    // Also verify 409 without SSE refreshes latest status before retry.
+    const retryLocal2 = '10.16.0.0/24', retryRemote2 = '10.17.0.0/24';
+    status.advertise_routes = [savedPrefix];
+    updateRouting();
+    fixture.patch({tailscale_status: envelope(status)});
+    await routeRow(retryLocal).waitFor({state: 'detached'});
+    await routeInput.fill(retryLocal2);
+    await button('Add route').click();
+    const [heldPut2] = await Promise.all([
+      fixture.holdRequest('PUT', '/api/tailscale/config'),
+      button('Save routing').click(),
+    ]);
+    status.advertise_routes = [savedPrefix, retryRemote2];
+    updateRouting();
+    await releaseResponse(page, heldPut2, 'preferences are busy', 409);
+    await routeRow(retryRemote2).getByText('Pending').waitFor();
+    await routeRow(retryLocal2).getByText('New').waitFor();
+    await button('Save routing').click();
+    await said('#tailscale-routing .action-status', 'Tailscale routing saved');
+    assert.deepEqual(lastConfig(), {advertise_routes: [savedPrefix, retryRemote2, retryLocal2]});
+
+    status.advertise_routes = [];
+    updateRouting();
+    fixture.patch({tailscale_status: envelope(status)});
+    await routeRow(savedPrefix).waitFor({state: 'detached'});
+    await routeInput.fill(savedPrefix);
+    await button('Add route').click();
+    await routeRow(savedPrefix).getByText('New').waitFor();
+    assert.equal(await routing.getAttribute('data-dirty'), 'true');
+    status.advertise_routes = [savedPrefix];
+    updateRouting();
+    status.routing.routes[0].state = 'approved';
+    fixture.patch({tailscale_status: envelope(status)});
+    await routeRow(savedPrefix).getByText('Approved').waitFor();
+    assert.equal(await routing.getAttribute('data-dirty'), 'false');
+    assert.equal(await button('Save routing').isDisabled(), true);
+    assert.equal(await routing.locator('.tailscale-routing-conflict').isHidden(), true);
+
+    const fullRoutes = Array.from({length: 16}, (_, index) => `10.20.${index}.0/24`);
+    await routeInput.fill(localPrefix);
+    await button('Add route').click();
+    status.advertise_routes = fullRoutes;
+    updateRouting();
+    fixture.patch({tailscale_status: envelope(status)});
+    await said('#tailscale-route-hint', 'Remove subnet routes to stay within the 16-route limit.');
+    await routeRow(localPrefix).getByText('New').waitFor();
+    assert.equal(await button('Save routing').isDisabled(), true);
+    await button(`Remove ${fullRoutes[0]}`).click();
+    assert.equal(await button('Save routing').isEnabled(), true);
+    await button('Discard routing edits').click();
+    status.advertise_routes = earlierRoutes;
+    updateRouting();
+    fixture.patch({tailscale_status: envelope(status)});
+    await routeRow(longPrefix).waitFor();
 
     // 6. Responsive & theme checks at 320, 390, 820 and 1440 in light & dark modes.
     for (const width of [320, 390, 820, 1440]) {
       for (const theme of ['light', 'dark']) {
-        await page.setViewportSize({width, height: 1000});
+        await page.setViewportSize({width, height: width === 390 ? 844 : 1000});
         await page.evaluate(value => {
           document.documentElement.dataset.theme = value;
         }, theme);
         const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
         assert.equal(overflow, false, `horizontal overflow at ${width}px (${theme})`);
+        if (width === 390) {
+          const row = routeRow(longPrefix);
+          const prefix = await row.locator('code').boundingBox();
+          const remove = await row.getByRole('button').boundingBox();
+          assert.ok(remove.y >= prefix.y + prefix.height, 'route actions appear below the prefix');
+          assert.ok(remove.width >= 44 && remove.height >= 44, 'route delete supports touch');
+        }
       }
     }
     await page.setViewportSize({width: 1440, height: 1200});
@@ -420,7 +708,7 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     await button('Log out & reset').click();
     await confirm('Log out & reset');
     await said('#tailscale-status .tailscale-alerts', 'remove this machine in the admin console');
-    assert.equal(last().url, '/api/tailscale/status');
+    assert.equal(fixture.requests.filter(request => request.url.startsWith('/api/tailscale/')).at(-1).url, '/api/tailscale/status');
 
     // 8. Lock clears drafts & private status, and a delayed status response cannot repopulate after Lock.
     await page.locator('#tailscale-auth-key').fill('tskey-auth-unsaved-secret');
@@ -428,6 +716,8 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
       await page.locator('#tailscale-manual summary').click();
     }
     await page.locator('#tailscale-version').fill('1.90.0');
+    await button('+ Add LAN fd00:12::/64').click();
+    await routeInput.fill('2001:db8:12::1/64');
     const [lateStatus] = await Promise.all([
       fixture.holdRequest('GET','/api/tailscale/status'),
       button('Read current status').click(),
@@ -439,6 +729,9 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     assert.equal(await page.locator('#tailscale-version').inputValue(), '');
     assert.equal(await page.locator('#tailscale-version-select').inputValue(), '');
     assert.equal(await page.locator('#tailscale-manual').evaluate(node => node.open), false);
+    assert.equal(await routeInput.inputValue(), '');
+    assert.equal(await routing.getAttribute('data-dirty'), 'false');
+    assert.equal(await routeRow('fd00:12::/64').count(), 0);
     assert.doesNotMatch(await text('#tailscale-status'), /100\.99\.99\.99|leaked\.ts\.net/);
 
     // 9. When version lookup fails on unlock, manual entry opens automatically and Refresh versions recovers.
@@ -454,8 +747,18 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     await page.waitForFunction(() => document.querySelector('#tailscale-version-select')?.value === '1.104.8');
     await said('#tailscale-update .action-status', 'Loaded 4 official releases');
 
+    // 10. A real stream outage discards staged routes and text.
+    await button('+ Add LAN fd00:12::/64').click();
+    await routeInput.fill('2001:db8:12::1/64');
+    await page.context().setOffline(true);
+    await page.clock.fastForward(31000);
+    await page.waitForFunction(() => !OpenU60Console.connected);
+    assert.equal(await routeInput.inputValue(), '');
+    assert.equal(await routing.getAttribute('data-dirty'), 'false');
+    assert.equal(await routeRow('fd00:12::/64').count(), 0);
+
     assert.deepEqual(errors, []);
-    console.log('Passed: Tailscale install/upgrade via SSE, enable, safe HTTPS login URL, auth key enrollment & redaction, preferences diff & draft preservation, responsive light/dark layout, disable/logout warning, and Lock cleanup.');
+    console.log('Passed: Tailscale install/upgrade, enrollment and lifecycle, routing validation and approval, split PUT diffs, draft preservation and cleanup, Exit Node confirmation, and responsive layout.');
   } finally {
     await browser.close();
     await fixture.close();

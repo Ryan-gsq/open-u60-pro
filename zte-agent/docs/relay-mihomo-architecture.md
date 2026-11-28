@@ -6,7 +6,7 @@
 
 | 编号 | 实现与验收共同遵守的约束 | 代码现状 |
 | --- | --- | --- |
-| I1 | 中继和 Mihomo 的 nft、iptables-legacy、地址、路由、策略规则、sysctl、conntrack 写入只经 `netfx`，可撤销资源归 `netfx::effect::EffectSet`；一项资源只有一个 owner。agent 不写 IPACM 的配置文件（`wifi_relay::offload` 只读它）；核心进程、托管配置及影响路由的核心 API 写操作由 Mihomo 控制器排序。ZTE 是外部写入者；WireGuard 和 TTL 的 legacy 链同样经 EffectSet。 | 随 `cargo test` 的源码扫描（`netfx::boundary`）识别资源和步骤，5 项例外见 §4。agent 既不写 IPACM 的配置，也不写它的 HW/SW 模式（§7）。 |
+| I1 | 中继、Mihomo 和 Tailscale 的 nft、iptables-legacy、地址、路由、策略规则、sysctl、conntrack 写入只经 `netfx`，可撤销资源归 `netfx::effect::EffectSet`（全局 RPS/backlog/pacing 归共享协调器 `netfx::perf`）；一项资源只有一个 owner。agent 不写 IPACM 的配置文件（`wifi_relay::offload` 只读它）；核心进程、托管配置及影响路由的核心 API 写操作由 Mihomo 控制器排序。ZTE 是外部写入者；WireGuard 和 TTL 的 legacy 链同样经 EffectSet。 | 随 `cargo test` 的源码扫描（`netfx::boundary`）识别资源和步骤，5 项例外见 §4。agent 既不写 IPACM 的配置，也不写它的 HW/SW 模式（§7）。 |
 | I2 | 不持跨功能锁做设备 I/O。HTTP 读状态只取快照；在单线程 Tokio 上不得阻塞等待控制器、运行命令或调用阻塞 HTTP。中继的关联、CAC、撤销或核对不能挡住 Mihomo 的退出处理、重试或 brnf 修复。 | `relay` 与 `mihomo` 各自串行执行设备操作。中继会话由控制器独占，状态和扫描列表经短锁发布，`active()`、`owns_network()` 读原子值和准入登记（§3）。 |
 | I3 | 对可撤销的自有效果，先持久记录本次开机的撤销依据，再生效；只能撤自己的东西。部分执行、执行前被杀、重复撤销都可恢复。conntrack 删除不可逆，按已生效的策略代次记录结果，不伪造 undo。 | `EffectSet` 在批量生效前一次持久写入撤销，日志为 `{boot, undo: Vec<Cmd>}`，撤销遇错保留剩余项（§4.1）。 |
 | I4 | 控制器主导的计划内重启、重载和规则切换，必须先收紧受影响的内核绕过，核心不可接包时阻断本应拦截的流量，核验后才扩大 DIRECT。provider 自主刷新也不允许误直连；用旧 DNS 真实 A 新建的连接必须遵守新策略，无法证明可直连的流量不得绕过。agent 仍在且确认核心意外退出，或计划内重启最终失败时，按 D3 撤常规拦截、显示正在直连并重试。单次 nft 写失败、PUT 超时或读回失败本身不授权直连。 | 由 Mihomo 控制器按 §5.4 的顺序做。 |
@@ -63,7 +63,7 @@ nft 撤销由所属 set 记账，Mihomo 为 `@u60-mihomo-nft remove`，中继为
 
 | 资源 | 取得后如何维护 |
 | --- | --- |
-| nft 表（族、表名） | 一个表一个 owner。用 `nft -f` 整表原子替换，过期集合随之消失；两族放入同一 nft 批处理。分别保留目标代次和最后一次读回确认的代次。写失败时目标仍待重试；读回失败是“未确认”。内容与已确认目标相同、且读回仍在内核里时不再载入。核对用一次 `nft -t list ruleset` 读两族（ZTE 不写 nft，里面只有 agent 的表），比对代次标记和每条链的**规则条数**；集合元素被清空或规则被等量替换查不出来（内容核验未实现，§8；没有别的写入者碰 nft）。 |
+| nft 表（族、表名） | 一个表一个 owner。用 `nft -f` 整表原子替换，过期集合随之消失；两族放入同一 nft 批处理。分别保留目标代次和最后一次读回确认的代次。写失败时目标仍待重试；读回失败或表带 `flags dormant` 均为“未确认”。内容与已确认目标相同、且读回仍在内核里且非 dormant 时不再载入。核对用一次 `nft -t list ruleset` 读两族（ZTE 不写 nft，里面只有 agent 的表），比对代次标记、非 dormant 状态和每条链的**规则条数**（`u60_tail` 的 `chain dns_out` 另作逐条精确规则核对）。 |
 | `LegacyChain` | 描述一条自有 `U60_*` 链及有序规则。首次用 `-N` 创建，替换/修复时将 `:NAME - [0:0]` 和全部规则放进同一 restore 事务，核对内容和顺序，undo 为 `-X`。B31 两族均测得该声明清空再填充自有链，见[批次 5](archive/2026-11-12-relay-mihomo-implementation.md#batch-5)。 |
 | `LegacyHook` | 描述厂商链里跳向自有链或带 `zte-agent*` 注释的一条规则，核对恰有一份，重复时修复。`InsertFirst` 在添加/补回时插第一条，之后保留厂商在其前面插入的规则（INPUT、FORWARD）。`BeforeVendor` 每次检查位置，将排在厂商 DNAT 后的门户 RETURN 在同一 restore 事务里删除并插到第一条。目标链就位后才应用钩子，undo 为精确 `-D`。 |
 | `Route`、`Rule`、`Addr`、`Sysctl` | 从族、接口、表、优先级等描述生成 `ip … add`/`del` 及核验。sysctl 首次记原值，向 guard 登记采样，undo 为 `@u60-sysctl key original`。IPv6 寿命、DAD 和冲突由会话根据活租约核验（§6.2）。 |
@@ -90,8 +90,8 @@ Mihomo 在自己的目录持有 `network.json`，仍写同样的九条 undo，�
 | 方向 | nft 自有规则 | 必要的 legacy 例外 |
 | --- | --- | --- |
 | 上游 INPUT v4/v6，`filter - 1` | 只约束 `iifname ath20`。v4 允许 established/related 和 DHCP 67→68 后 drop。未请求 IPv6 或尚未启用发现时保持上游 v6 关闭；发现开始前才允许 established/related、RA（链路本地源、跳数 255）、NS/NA（跳数 255）、ICMPv6 错误 1–4、DHCPv6 547→546，拒绝其余。 | v6 需要 `U60_R6_IN` 在 ZTE reject 前放行。v4 在证明首租、单播续租、广播重绑定和已建立回程都能穿过厂商 INPUT 前保留相应放行；仅看到 ESTABLISHED 规则不够。 |
-| IPv4 FORWARD，`filter - 1` | 先返回 `br-lan → ath20`，再返回 `ath20 → br-lan` 的 established/related；然后 drop 其余从/向 `ath20` 的流量。其他接口保持原路径。 | `U60_RELAY_FWD` 放行同样的合法流量，共两条（去程、已建立/相关的回程）。 |
-| IPv6 FORWARD / OUTPUT | 从 `br-lan` 向 `rmnet*` **先 reject**，不让后面的本地/组播例外覆盖它。NAT66 有效时返回经认可 LAN 源到 `ath20` 的去程、从该接口到 LAN 的 established/related 回程，再拒绝其他涉及该上游的转发。基线对其余 LAN 转发保留 `fc00::/7`、`fe80::/10`、`ff00::/8` 的本地例外，拒绝其他外部 v6；与中继无关的转发不受影响。OUTPUT 只需一条向 `rmnet*` 的拒绝。 | 合法 NAT66 流仍经 `U60_R6_FWD` 穿过厂商过滤。OUTPUT 拒绝归**中继基线**，覆盖 IPv6 未开启、租约丢失、NAT66 撤销后仍有 IPv4 中继的时段。 |
+| IPv4 FORWARD，`filter - 1` | 先 reject 指向 `rmnet*` 的流量，再依次返回 `br-lan → ath20`、`tailscale0 → ath20` 以及 `ath20 → br-lan`/`tailscale0` 的 established/related 回程；然后 drop 其余从/向 `ath20` 的流量。其他接口保持原路径。 | `U60_RELAY_FWD` 放行 LAN 合法流量（去程、已建立/相关的回程）；Tailscale 内核 TUN 另经 `U60_TS_FWD` 穿过厂商过滤。 |
+| IPv6 FORWARD / OUTPUT | 从 `br-lan` 与 `tailscale0` 向 `rmnet*` **先 reject**（严格零蜂窝模式下对全部接口 reject），不让后面的本地/组播例外覆盖它。NAT66 有效时返回经认可 LAN 源到 `ath20` 的去程、`tailscale0` 源自 `fd7a:115c:a1e0::/48` 到 `ath20` 的去程，以及从 `ath20` 到 `br-lan`/`tailscale0` 的 established/related 回程，再拒绝其他涉及该上游的转发。基线对其余 LAN 转发保留 `fc00::/7`、`fe80::/10`、`ff00::/8` 的本地例外，拒绝其他外部 v6；与中继无关的转发不受影响。OUTPUT 只需一条向 `rmnet*` 的拒绝。 | 合法 NAT66 流仍经 `U60_R6_FWD`（Tailscale 内核 TUN 侧另经 `U60_TS_FWD`）穿过厂商过滤。OUTPUT 拒绝归**中继基线**，覆盖 IPv6 未开启、租约丢失、NAT66 撤销后仍有 IPv4 中继的时段。 |
 | DNS、门户和地址转换 | `u60_mihomo` LAN DNS 优先于 `u60_relay`。两族 `dns_out` 首先检查本机核心的 `0x01000000` 标记，命中即保留 DNS 目的地址。B31 门户的整字 `--set-mark 8880` 会覆写途经该规则的标记。两族的 masquerade 均仅匹配活动中继的 `ath20` 出口。 | 两族门户 `redirect_chain` RETURN。 |
 | 自有 legacy 规则的身份 | — | 在 `U60_*` 链里、跳到 `U60_*` 链，或带 `zte-agent*` 注释（`netfx::effect::legacy::owned_rule`）。站点名不算身份：厂商的 IPACM 文件也列着 `ath20`。 |
 
@@ -109,7 +109,7 @@ guard 修复日志列应用命令或资源描述，例如 `iptables -t nat hook 
 
 ### 4.5 conntrack：删除范围、代次、结果
 
-只有 `netfx::conntrack` 删除条目，直接执行 `conntrack`，不经 shell。范围为 `Lan { v4, v6 }` 或 `Destinations(IPv4 前缀)`；后者也必须限定 LAN 来源，不能删路由器或其他接口的连接。每个请求带原因、范围及相应路径改变的代次/时刻。
+只有 `netfx::conntrack` 删除条目，直接执行 `conntrack`，不经 shell。范围为 `Lan { v4, v6 }`、`Destinations(IPv4 前缀)` 或 `Mark { mark, mask, v4, v6 }`（如 Tailscale 的 `0x02000000` 来源标记流），并单独提供 `flush_clean_dns_dnat()` 清理回环 `127.0.0.54:53` UDP/TCP NAT 条目；`Destinations` 也限定 LAN 来源，不能删路由器或其他接口的连接。每个请求带原因、范围及相应路径改变的代次/时刻。
 
 - 同时考虑新旧计划的**首条命中结果**。将可能已放行的旧 DIRECT 范围取并集，再扣除新表可证明的 DIRECT 目的 IPv4 范围。旧表无法表达时回退到 LAN IPv4，新表无法表达时按空放行集合计算。例如在原 DIRECT /24 前加 `DST-PORT,443,PROXY`，虽然 DIRECT 条文本身没变，已有 443 硬件流也必须退出。旧表中的来源、端口、协议、复合条件或全域兜底无法按目的地址表达时，退回 LAN IPv4。结果超过 64 段时也回退（D10）。纯目的集合没有失去放行时，不为了重编同一张表清连接。UDP 不享受已有 TCP 的 socket 固定；需改路径时也纳入相应范围。
 - 收集 200 ms 内到达的请求，合并范围，按最晚的策略变化时间发起删除。已完成的一次删除只有在**它开始于本次路径变化之后**、成功并覆盖全部请求范围时才可抵账；失败待重试的请求与下一个请求取并集，一次删除了结两者。删除在状态锁内依次进行。保留有界诊断，区分“成功删除、有证据的零匹配、操作失败”：conntrack-tools 1.4.8 的退出码 1 也可能是 netlink 错误，不能单凭返回码判断。部分失败记录待重试，不报告“已重置”。[conntrack-tools 1.4.8 源码包](https://www.netfilter.org/projects/conntrack-tools/files/conntrack-tools-1.4.8.tar.xz) 中的 `print_stats`（零匹配）和 `OTHER_PROBLEM`（操作失败）是两个不同分支。
@@ -127,9 +127,9 @@ guard 修复日志列应用命令或资源描述，例如 `iptables -t nat hook 
 
 | 范围 | 保留值与用途 |
 | --- | --- |
-| 策略路由 | Mihomo `pref 18620`、`fwmark 0x700/0xff00` → 表 60625 的本地路由；中继 `pref 18640` → 表 60631；IPA 的 main 默认路由和 unreachable 用 metric 60631。核心出站标志不能碰 TPROXY 或 ZTE 已用位。 |
-| 表、接口、端口 | `ip`/`ip6 u60_relay` 归中继，`ip`/`ip6 u60_mihomo` 归代理。STA 为 `ath20`（B31 原厂 IPACM 配置列着它）；2026-11-12 之前的版本用的名字（`u60sta0`、`u60mh0`）不再识别。1053：DNS；17894：TPROXY；127.0.0.1:17893：认证下载；127.0.0.1:19090：核心控制；9090/9443：agent。 |
-| 地址、其他 owner | `198.18.0.0/16` 是 fake-ip。统一登记地址常量，但代理私网例外、中继 DNS 例外、策略表 throw 和 IPA main 防护分别取其所需子集；不能把所有酒店私网都 throw。WireGuard 和 TTL 的自有链在这里登记，两者均纳入写入扫描。 |
+| 策略路由 | 5 档优先于 `tailscaled`（`5210–5270`）：`pref 5100` Mihomo TPROXY（`fwmark 0x700/0xff00` → 表 `60625`，同开机接管时退役旧 `18620`）；`pref 5110` Tailscale 已验证 Tailnet 目的（`fwmark 0x0/0x80000` → 表 `52`）；`pref 5120` 活动中继兜底（→ 表 `60631`，退役旧 `18640`）；`pref 5130/5131` IPv4 CGNAT `100.64.0.0/10` → `main` 与 `unreachable` 防护。IPA 的 main 默认路由和 unreachable 用 metric `60631`。核心出站标志 `0x01000000` 与 Tailscale conntrack 来源标志 `0x02000000` 均避开 TPROXY 与 ZTE 已用位。 |
+| 表、接口、端口 | `ip`/`ip6 u60_relay` 归中继，`ip`/`ip6 u60_mihomo` 归代理，`ip`/`ip6 u60_tail` 与 legacy `U60_TS_IN`/`U60_TS_FWD` 归 Tailscale 内核 TUN（`tailscale0`）。STA 为 `ath20`（B31 原厂 IPACM 配置列着它）；2026-11-12 之前的版本用的名字（`u60sta0`、`u60mh0`）不再识别。1053：Mihomo DNS；`127.0.0.54:53`（仅内核 TUN 模式下占用时回退 `:1054` + `u60_tail` `dns_out` DNAT；userspace 模式要求独占 `:53`，冲突时停止解析器并退避）：Tailscale 清洁 DNS；17894：TPROXY；127.0.0.1:17893：认证下载；127.0.0.1:19090：核心控制；9090/9443：agent。 |
+| 地址、其他 owner | `198.18.0.0/16` 是 fake-ip。统一登记地址常量，但代理私网例外、中继 DNS 例外、策略表 throw 和 IPA main 防护分别取其所需子集；不能把所有酒店私网都 throw。全局性能协调器 `netfx::perf` 跨中继、Mihomo 与已激活的 Tailscale 内核 TUN 维护 `wlan0`/`wlan2`（以及中继活跃时的 `ath20`）RPS（保留 `ecm0` 既有掩码不做改写）、`netdev_max_backlog >= 5000` 与 `tcp_pacing_*_ratio=1000`。WireGuard 和 TTL 的自有链在这里登记，两者均纳入写入扫描。 |
 
 ## 5. Mihomo
 
@@ -158,9 +158,11 @@ guard 修复日志列应用命令或资源描述，例如 `iptables -t nat hook 
 
 ### 5.3 拦截表
 
-保持独立的 `ip`/`ip6` 表、同一 owner。prerouting 只处理来自 `br-lan` 的包：先让**已有核心透明 TCP 会话**继续本地交付（保留其他标志位，再设 `0x700`）；排除 DNS 和本机目的，v4 fake-ip 强制 `goto to_core`，之后才处理私网例外、编译的 IPv4 规则和最终 `goto to_core`。LAN 53 用优先于中继 DNS 的 nat prerouting 重定向到 1053。IPv6 没有内核 DIRECT 规则段。ICMP 不进 TPROXY。
+保持独立的 `ip`/`ip6` 表、同一 owner。prerouting 在 Tailscale Strategy B Exit Node 对该地址族启用时先分发 `iifname "tailscale0" goto ts_pre`，其余流量仅处理来自 `br-lan` 的包：先让**已有核心透明 TCP 会话**继续本地交付（保留其他标志位，再设 `0x700`）；排除 DNS 和本机目的，v4 fake-ip 强制 `goto to_core`，之后才处理私网例外、编译的 IPv4 规则和最终 `goto to_core`。LAN 53 用优先于中继 DNS 的 nat prerouting 重定向到 1053（绝不劫持 `tailscale0`）。IPv6 没有内核 DIRECT 规则段。ICMP 不进 TPROXY。
 
 在 `to_core` 中，TPROXY、打标与 accept 同属一条规则。内核找不到可用的透明连接或监听时返回 `NFT_BREAK`，**仅跳过本规则余下部分**；因此计划内切换必须另有末尾 TCP/UDP drop，不能靠保留表名来阻止直连。计划内停旧核心前必须先装好阻断；agent 死亡后由独立恢复机制接管，不能把残留 drop 或无人监听的 DNS 重定向留给车主手动处理。已有 TCP 的匹配要在 DIRECT return 前；它不适用于 UDP、核心已重启的旧连接，也不能把通配监听误当成已建立会话。需用新 SYN（含目的端口 17894）和既有 TCP 验证匹配条件。[Linux TPROXY](https://github.com/gregkh/linux/blob/v5.15.194/net/netfilter/nft_tproxy.c#L49-L80) · [nft 规则执行](https://github.com/gregkh/linux/blob/v5.15.194/net/netfilter/nf_tables_core.c#L244-L247)
+
+当 Tailscale Exit Node 启用 `exit_via_mihomo` 且控制平面已批准对应地址族时，Mihomo 托管配置自动开启 `sniffer`（强制 `override-destination: false` 并由热重载读回 `configs["sniffing"]`），`u60_mihomo` 增设 `ts_pre` 链仅接管 `tailscale0` 透明代理与已打标本机交付（绝不暴露未授权 `:1053`/`:17894`），`:53` 重定向仍严格限于 `br-lan`，`forward` 链直接拒绝来自 `tailscale0` 的 `198.18.0.0/16` fake-ip 目的。`ts_pre` 跳过私网及已批准子网前缀（`skip_v4`/`skip_v6`，移除前缀或启用/撤销反转时按族清理 `0x02000000` 标记流），随后按 `routing::compile_tailscale()` 编译的显式 IP/GeoIP/端口链做单跳内核直连——遇到任意非 DIRECT 域名规则即截断后续内核 `return`，防止黑名单/GFWList 订阅的海外域名绕过核心嗅探。Mihomo 停止或进入 Backoff 时撤除 `tailscale0` 透明代理，Exit 流量无缝回落至 `u60_tail` 内核转发与直连 DoH；核心停机未确认（`CleanupPending`）期间保留 `StoppingTs` 撤回与 skip 历史，绝不复开已尝试撤回的族。
 
 ### 5.4 规则切换与 DNS
 
@@ -188,7 +190,7 @@ rule 模式按订阅顺序编译，select 的实际选择最终到 DIRECT 才可
 
 ### 6.1 会话与取消
 
-会话发布 `phase`：`idle`、`scanning`、`connecting`、`active`、`recovering`、`disconnecting`、`recovery_pending`。`recovering` 包括等待关联恢复和 agent 启动后的恢复；恢复任务中的实际扫描/连接仍显示对应阶段。`connected` 仍是“有选中的网络且有租约”，不能代替阶段。`recovery_required` 只有在日志尚存、阶段为 `idle` 或 `recovery_pending` 且没有待断开时才为真，操作中不显示“需要恢复”。无读者的恒定顶层字段 `experimental`、`cellular_fallback`、`internet` 已删除，`ipv6.internet` 保留。活动会话上的扫描保留其路由。掉关联由 `Association` 计时：12 s 内（`ASSOCIATION_GRACE`）回来且旧租约及助手仍有效则续约，否则拆除。车主断开、有效地址变更、热点关闭或连接取消走同一拆除路径；撤销失败时日志保留。运行中不后台重连；开机只恢复最近一次符合条件的成功连接，不轮询全部已保存网络。
+会话发布 `phase`：`idle`、`scanning`、`connecting`、`active`、`recovering`、`disconnecting`、`recovery_pending`。`recovering` 包括等待关联恢复和 agent 启动后的恢复；恢复任务中的实际扫描/连接仍显示对应阶段。`connected` 仍是“有选中的网络且有租约”，不能代替阶段。`recovery_required` 只有在日志尚存、阶段为 `idle` 或 `recovery_pending` 且没有待断开时才为真，操作中不显示“需要恢复”。无读者的恒定顶层字段 `experimental`、`cellular_fallback`、`internet` 已删除，`ipv6.internet` 保留。可选严格零蜂窝模式（`wifi_relay::cellular`，`POST /api/wifi-relay/strict-zero-cellular`）在中继就绪期间暂停蜂窝数据呼叫并驱逐存量蜂窝长流，经 `cellular-pause` 日志在退出或恢复时还原原始状态，绝不误开原本关闭的蜂窝。活动会话上的扫描保留其路由。掉关联由 `Association` 计时：12 s 内（`ASSOCIATION_GRACE`）回来且旧租约及助手仍有效则续约，否则拆除。车主断开、有效地址变更、热点关闭或连接取消走同一拆除路径；撤销失败时日志保留。运行中不后台重连；开机只恢复最近一次符合条件的成功连接，不轮询全部已保存网络。
 
 Disconnect 先更新取消代次和待断开标志，发布 `disconnecting`，走 General lane。控制器工作中立即回 HTTP 200，控制器在处理下一条消息和发布被取消操作的结果之前拆除。控制器空闲时调用方等待拆除回复，可能等热点返回原信道，批次 5 真机为 65.17 s。拆除中的额外断开合并。页面异步接受后写“Disconnect requested”，拆完才写“Relay disconnected”，测量范围见[批次 5](archive/2026-11-12-relay-mihomo-implementation.md#batch-5)。
 

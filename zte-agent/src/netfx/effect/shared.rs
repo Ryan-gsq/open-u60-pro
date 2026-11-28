@@ -135,8 +135,191 @@ pub(crate) fn sysctl_path(key: &str) -> Option<&'static str> {
         "bridge-nf-call-iptables" => "/proc/sys/net/bridge/bridge-nf-call-iptables",
         "bridge-nf-call-ip6tables" => "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
         "httpredirect_cmd" => "/sys/zte_genl/httpredirect_cmd",
+        "ip_forward" => "/proc/sys/net/ipv4/ip_forward",
+        "ipv6_forwarding" => "/proc/sys/net/ipv6/conf/all/forwarding",
+        "all_rp_filter" => "/proc/sys/net/ipv4/conf/all/rp_filter",
+        "tailscale0_rp_filter" => "/proc/sys/net/ipv4/conf/tailscale0/rp_filter",
         _ => return None,
     })
+}
+
+pub(crate) fn sysctl_interface(key: &str) -> Option<&'static str> {
+    match key {
+        "tailscale0_rp_filter" => Some(crate::netfx::ids::TAILSCALE_IFACE),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ParsedRule {
+    pub priority: u32,
+    pub to: Option<String>,
+    pub mark: Option<(u32, u32)>,
+    pub lookup: Option<String>,
+    pub unreachable: bool,
+}
+
+pub(crate) fn parse_fwmark(text: &str) -> Option<(u32, u32)> {
+    let parse_num = |part: &str| {
+        if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            part.parse::<u32>().ok()
+        }
+    };
+    match text.split_once('/') {
+        Some((mark, mask)) => Some((parse_num(mark)?, parse_num(mask)?)),
+        None => Some((parse_num(text)?, u32::MAX)),
+    }
+}
+
+/// Parse one line from `ip -4/-6 rule show` into our supported rule subset.
+/// Returns `None` for any rule carrying selectors or actions outside our schema
+/// (such as `not`, `iif`, `oif`, non-`all` source, etc.).
+pub(crate) fn parse_rule_line(line: &str) -> Option<ParsedRule> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let priority: u32 = words.first()?.strip_suffix(':')?.parse().ok()?;
+    if words.get(1) != Some(&"from") || words.get(2) != Some(&"all") {
+        return None;
+    }
+    let mut index = 3;
+    let mut to = None;
+    let mut mark = None;
+    let mut lookup = None;
+    let mut unreachable = false;
+    while index < words.len() {
+        match words[index] {
+            "to" if to.is_none() && index + 1 < words.len() => {
+                to = Some(route_destination(words[index + 1]));
+                index += 2;
+            }
+            "fwmark" if mark.is_none() && index + 1 < words.len() => {
+                mark = Some(parse_fwmark(words[index + 1])?);
+                index += 2;
+            }
+            "lookup" if lookup.is_none() && !unreachable && index + 2 == words.len() => {
+                lookup = Some(route_table(words[index + 1]).to_owned());
+                index += 2;
+            }
+            "unreachable" if lookup.is_none() && !unreachable && index + 1 == words.len() => {
+                unreachable = true;
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    if lookup.is_none() && !unreachable {
+        return None;
+    }
+    Some(ParsedRule { priority, to, mark, lookup, unreachable })
+}
+
+/// Parse an `ip -4/-6 rule del ...` argument vector into our supported rule subset.
+pub(crate) fn parse_rule_del_args(args: &[String]) -> Option<ParsedRule> {
+    if args.get(1).map(String::as_str) != Some("rule")
+        || args.get(2).map(String::as_str) != Some("del")
+    {
+        return None;
+    }
+    let mut index = 3;
+    let mut priority = None;
+    let mut to = None;
+    let mut mark = None;
+    let mut lookup = None;
+    let mut unreachable = false;
+    while index < args.len() {
+        match args[index].as_str() {
+            "pref" if priority.is_none() && index + 1 < args.len() => {
+                priority = args[index + 1].parse::<u32>().ok();
+                priority?;
+                index += 2;
+            }
+            "to" if to.is_none() && index + 1 < args.len() => {
+                to = Some(route_destination(&args[index + 1]));
+                index += 2;
+            }
+            "fwmark" if mark.is_none() && index + 1 < args.len() => {
+                mark = Some(parse_fwmark(&args[index + 1])?);
+                index += 2;
+            }
+            "lookup" if lookup.is_none() && !unreachable && index + 1 < args.len() => {
+                lookup = Some(route_table(&args[index + 1]).to_owned());
+                index += 2;
+            }
+            "unreachable" if lookup.is_none() && !unreachable => {
+                unreachable = true;
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    let priority = priority?;
+    if lookup.is_none() && !unreachable {
+        return None;
+    }
+    Some(ParsedRule { priority, to, mark, lookup, unreachable })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuleDelCheck {
+    Missing,
+    SafeSingleMatch,
+    Ambiguous,
+}
+
+/// Inspect `ip rule show` before running `ip rule del`. Linux 5.15 `fib_rules.c`
+/// treats `mark == 0` (e.g. `fwmark 0x0/0x80000`) and omitted selectors as
+/// wildcards when deleting, so refuse deletion if any row at `priority` is
+/// unparseable, duplicated, or could be matched ambiguously by `del`.
+pub(crate) fn rule_del_check(rules: &str, args: &[String]) -> RuleDelCheck {
+    let Some(expected) = parse_rule_del_args(args) else {
+        return RuleDelCheck::Ambiguous;
+    };
+    let prefix = format!("{}:", expected.priority);
+    let mut exact = 0usize;
+    let mut ambiguous = false;
+    let mut seen = std::collections::HashSet::new();
+    for line in rules.lines().filter(|line| line.trim_start().starts_with(&prefix)) {
+        let Some(parsed) = parse_rule_line(line) else {
+            return RuleDelCheck::Ambiguous;
+        };
+        if !seen.insert(parsed.clone()) {
+            return RuleDelCheck::Ambiguous;
+        }
+        if parsed == expected {
+            exact += 1;
+            continue;
+        }
+        // Check Linux fib_rule_match_del semantics: same action/table/to and
+        // wildcard-compatible mark could let `ip rule del` remove `parsed`.
+        let same_action = parsed.unreachable == expected.unreachable && parsed.lookup == expected.lookup;
+        let same_to = expected.to.is_none() || parsed.to == expected.to;
+        let mark_compatible = match (expected.mark, parsed.mark) {
+            (None, _) => true,
+            (Some((0, mask)), Some((_, parsed_mask))) => mask == 0 || parsed_mask == mask,
+            (Some((0, 0)), None) => true,
+            (Some((val, mask)), Some((pval, pmask))) => val == pval && (mask == 0 || pmask == mask),
+            _ => false,
+        };
+        if same_action && same_to && mark_compatible {
+            ambiguous = true;
+        }
+    }
+    if ambiguous || exact > 1 {
+        RuleDelCheck::Ambiguous
+    } else if exact == 0 {
+        RuleDelCheck::Missing
+    } else {
+        RuleDelCheck::SafeSingleMatch
+    }
+}
+
+/// Whether an `ip -4/-6 rule del ...` command matches any line in `ip rule show`.
+pub(crate) fn rule_del_listed(rules: &str, args: &[String]) -> bool {
+    let Some(expected) = parse_rule_del_args(args) else {
+        return true;
+    };
+    rules.lines().any(|line| parse_rule_line(line).as_ref() == Some(&expected))
 }
 
 pub fn sysctl_read(key: &str) -> Result<String, String> {

@@ -213,23 +213,41 @@ database or subscription is embedded in the Rust binary.
   private/multicast ranges and then what the core's mode and rules send DIRECT
   by address (the DIRECT bypass, below); the rest goes to the `to_core` chain,
   which marks established transparent sockets and TPROXYs the rest with mark
-  `0x700/0xff00`. Rule pref `18620` sends that mark to table
-  `60625` (`local default dev lo`, both families). A `dns` chain at `dstnat - 1`
-  redirects LAN TCP/UDP 53 to 1053, and an `input` chain drops 1053/17894 from
-  anything but `br-lan`/`lo`. The kernel has no `NFT_FIB_INET`, so the tables
-  are per family, not `inet`.
+  `0x700/0xff00`. Rule pref `5100` (retiring legacy `18620` on same-boot
+  adoption) sends that mark to table `60625` (`local default dev lo`, both
+  families). A `dns` chain at `dstnat - 2` redirects LAN (`br-lan` only)
+  TCP/UDP 53 to 1053, and an `input` chain drops 1053/17894 from anything but
+  `br-lan`/`lo` (plus transparently-marked `tailscale0` TPROXY sockets when
+  Tailscale Exit Node routing via Mihomo is active). The kernel has no
+  `NFT_FIB_INET`, so the tables are per family, not `inet`.
 - TPROXY needs `bridge-nf-call-iptables=0` and `bridge-nf-call-ip6tables=0`:
   with the bridge-netfilter path on, B31 loses the early socket association
   (rule counters rose while TCP stalled and UDP got no answer; a veth only named
   `br-lan` missed this). While the core runs these are 0 and restored to their
   old values on stop; LAN-to-LAN filtering such as guest isolation pauses
-  meanwhile. `tcp_pacing_ss_ratio`/`tcp_pacing_ca_ratio` are 1000 while it runs
-  (200/120 restored): qcacld leaves TSQ at about 1 ms of data, which held one
-  core-to-LAN TCP connection at about 60-70 Mbit/s. The settings are `Sysctl`
-  resources in Mihomo's `EffectSet`, with `@u60-sysctl` undo commands. ZTE resets brnf after relay connects and on
-  `fw3 reload`, and `net_guard` sets it back (read every 0.5 s for 3 s after
-  each ZTE trigger; see the relay's firewall layout). See
+  meanwhile. `tcp_pacing_ss_ratio`/`tcp_pacing_ca_ratio` (1000 while active,
+  restored on stop), `netdev_max_backlog >= 5000`, and Wi-Fi RPS (`wlan0` and
+  `wlan2`, plus `ath20` only while Wi-Fi Relay is active; `ecm0` is left
+  untouched, preserving its existing mask) are managed by the shared
+  `netfx::perf` coordinator across Relay, Mihomo and Tailscale (Tailscale
+  activates it only after kernel-TUN activation succeeds; owner lock and
+  journaled restoration retire legacy per-feature pacing undo entries on
+  adoption).
+  ZTE resets brnf after relay connects and on `fw3 reload`, and `net_guard`
+  sets it back (read every 0.5 s for 3 s after each ZTE trigger; see the
+  relay's firewall layout). See
   `docs/research/2026-11-08-mihomo-tproxy-single-flow.md`.
+- **Tailscale Strategy B Exit Node (`exit_via_mihomo`)**: when enabled and
+  approved by the Tailscale control plane for a family, Mihomo enables
+  `sniffer` (`override-destination: false`, read back via `configs["sniffing"]`)
+  and adds `ts_pre` in `u60_mihomo` for `tailscale0`: fake-IP destinations
+  (`198.18.0.0/16`) are rejected in `forward`, `:53` redirection remains
+  strictly `br-lan`-only, approved LAN subnet prefixes (`skip_v4`/`skip_v6`)
+  return unconditionally, and `routing::compile_tailscale()` emits single-hop
+  IPv4 DIRECT rules while cutting before the first non-DIRECT domain rule so
+  blacklist/GFWList subscriptions never bypass sniffing. Stopping Mihomo or
+  entering Backoff withdraws `tailscale0` TPROXY so Exit traffic falls back
+  seamlessly to kernel forwarding (`u60_tail`) and direct DoH.
 - Port 17894 (17893 is the private download proxy), table, priority and the
   absence of both nft tables are checked before use; a taken port fails the
   start instead of failing silently in the core. Main default routes are not
@@ -432,7 +450,9 @@ The uploaded YAML is parsed, then the agent overrides controller, ports, DNS
 binding and IPv6. It disables subscription-provided listeners, TUN, iptables,
 NTP service, alternate controllers and server listeners; a subscription's
 `sniffer` section is kept as written (it cannot bind an interface or open a
-port). Configuration checks
+port) unless Tailscale Strategy B (`exit_via_mihomo`) is active, in which case
+the agent enables `sniffer` (with TLS/HTTP/QUIC defaults) and forces
+`override-destination: false`. Configuration checks
 run `mihomo -t`; rejected YAML does not replace the selected profile. A start whose
 generated configuration, referenced geodata contents and installed core identity
 match one of the last four that passed and started this boot (with the
@@ -629,7 +649,8 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   from an old udhcpc cannot overwrite or delete a newer connection's lease.
   Leases are checked for host/gateway validity and LAN/tailnet/link-local
   conflicts before routes/NAT are applied. The long-lived udhcpc renews leases.
-- IPv4 policy table `60631`, priority `18640`; NAT and guarded forwarding
+- IPv4 policy table `60631`, priority `5120` (retiring legacy `18640` on
+  same-boot adoption); NAT and guarded forwarding
   exist before the final route rule is installed (firewall layout below).
   Existing cellular main defaults remain untouched. Own LAN, tailnet and
   link-local management routes fall through; other private subnets may belong
@@ -691,7 +712,8 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
 - `odhcp6c` receives RA/SLAAC and optional IA_NA, but calls the Rust executable,
   never the vendor netifd script. Kernel RA/autoconf on the owned STA stay off;
   validated addresses/default-router lifetimes become owned /128 addresses and
-  routes in IPv6 table `60631`, priority `18640`. DAD completes before source
+  routes in IPv6 table `60631`, priority `5120` (retiring legacy `18640` on
+  same-boot adoption). DAD completes before source
   route installation. Explicit RA on-link routes retain their lifetimes and
   advertised MTU; an address-generation prefix alone never creates an on-link
   route. No learned default is added to the cellular main table. Each discovery
@@ -703,7 +725,7 @@ earlier B31 association observations, not a translation of enhanced's GPL code.
   masquerade an old selected source if needed. The masquerade is an nft rule
   (`ip6 u60_relay`, postrouting `srcnat - 1`, only `oifname ath20`; B31 has
   `CONFIG_NFT_MASQ=y`). Mihomo's marked rule (pref
-  `18620`) precedes Relay's table, so LAN TCP/UDP interception still wins.
+  `5100`, retiring legacy `18620`) precedes Relay's table, so LAN TCP/UDP interception still wins.
   LAN address/prefix changes are reconciled even when the upstream lease is
   unchanged. Owned br-lan routes retain previously observed client prefixes
   only for their observed valid lifetime, capped at two hours; they never
@@ -847,8 +869,8 @@ a return only leaves these chains, and ZTE's rules still apply after them.
 | --- | --- | --- |
 | Guard | From before `ath20` is raised (a scan too) until the station is deleted | Upstream INPUT: established/related and DHCP 67→68 return, the rest dropped; IPv6 dropped. All forwarding from or to `ath20` dropped. |
 | IPv6 discovery | IPv6 requested, before `odhcp6c` starts | Upstream IPv6 INPUT: established/related, RA (link-local source, hop limit 255), NS/NA (hop limit 255), ICMPv6 errors 1–4, DHCPv6 547→546; the rest dropped. |
-| Routes | From before the policy rule until the routes are released (the tables shrink back to the guard first) | IPv4 FORWARD: `br-lan → ath20` and established replies return before the drops. IPv6 FORWARD from `br-lan`: `rmnet*` rejected first, then `fc00::/7`, `fe80::/10`, `ff00::/8` return, the rest rejected. One IPv6 OUTPUT reject to `rmnet*`, covering IPv6 off, a lost lease and a withdrawn NAT66. IPv4 masquerade in `ip u60_relay/nat4` (`oifname "ath20"`) and IPv4 DNS chains. |
-| NAT66 | A valid IPv6 lease, from before its policy rule | Approved LAN sources to `ath20` and established replies return (ahead of the upstream drops); the masquerade; IPv6 DNS chains. |
+| Routes | From before the policy rule until the routes are released (the tables shrink back to the guard first) | IPv4 FORWARD: reject egress to `rmnet*`, then return `br-lan → ath20`, `tailscale0 → ath20`, and established/related replies from `ath20` to `br-lan` and `tailscale0` before the `ath20` drops. IPv6 FORWARD from `br-lan` and `tailscale0`: `rmnet*` rejected first (all interfaces in strict zero-cellular mode), then `br-lan` local exceptions `fc00::/7`, `fe80::/10`, `ff00::/8` return and remaining `br-lan` egress is rejected. One IPv6 OUTPUT reject to `rmnet*`, covering IPv6 off, a lost lease and a withdrawn NAT66. IPv4 masquerade in `ip u60_relay/nat4` (`oifname "ath20"`) and IPv4 DNS chains. |
+| NAT66 | A valid IPv6 lease, from before its policy rule | Approved LAN sources to `ath20`, `tailscale0` sources in `fd7a:115c:a1e0::/48` to `ath20`, and established/related replies from `ath20` to `br-lan` and `tailscale0` return (ahead of the upstream drops); the masquerade; IPv6 DNS chains. |
 
 Legacy iptables keeps the accepts needed to pass ZTE's DROP/REJECT. IPv4 has
 `U60_RELAY_IN` for established replies and DHCP offers, and `U60_RELAY_FWD`
@@ -1138,6 +1160,7 @@ bodies. A console login can obtain the dedicated Zashboard bridge pass cookie.
 | POST | `/api/wifi-relay/clock` | Explicit fresh HTTPS time check; requires an active relay, never reconnects it; bounded admission/operation wait (409) |
 | POST | `/api/wifi-relay/offload` | `{"enabled":true/false}`: the hardware forwarding switch; a connected relay follows at once; status `offload.config` (`listed`/`not_listed`/`unavailable`, read from IPACM's file), `offload.enabled`, `offload.state`, `offload.route` |
 | POST | `/api/wifi-relay/power-save` | `{"auto_off":true/false}`: turn the upstream Wi-Fi power save off at each connection (default) or keep the driver's; a connected relay follows at once; status `power_save.auto_off`, `power_save.off`, `power_save.error` |
+| POST | `/api/wifi-relay/strict-zero-cellular` | `{"enabled":true/false}`: pause cellular data calls and evict surviving cellular flows while the relay is connected, restoring the saved pre-pause cellular state on disconnect or recovery without enabling a previously disabled modem |
 | GET | `/api/mihomo/profiles` | Profile library status, no URLs or YAML |
 | GET | `/api/mihomo/profiles/{id}` | Explicit private editor read (metadata and URL, never saved YAML) for one profile |
 | POST | `/api/mihomo/profiles` | Add, edit, select, refresh and delete profiles; set Merge and Script. Selected-subscription refresh hot-reloads when possible; identical source skips compile/validation |
@@ -1178,13 +1201,73 @@ boot restoration.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/tailscale/status` | Read Tailscale status |
+| GET | `/api/tailscale/status` | Read saved settings and live TUN, sync, route and Exit Node status |
 | GET | `/api/tailscale/versions` | Discover versions using the release cache |
 | POST | `/api/tailscale/versions/refresh` | Refresh version discovery |
 | POST | `/api/tailscale/setup` | Set up Tailscale |
 | POST | `/api/tailscale/login-url` | Request an interactive sign-in link |
 | POST | `/api/tailscale/enable` | Enable Tailscale |
 | POST | `/api/tailscale/disable` | Disable Tailscale |
-| PUT | `/api/tailscale/config` | Save managed settings |
+| PUT | `/api/tailscale/config` | Apply a partial update to managed settings and return refreshed status |
 | POST | `/api/tailscale/logout` | Log out of Tailscale |
 | POST | `/api/tailscale/update` | Update to the selected version with SHA-256 verification |
+
+Send the managed fields you want to change with `PUT /api/tailscale/config`.
+Omitted fields keep their saved values. The managed fields are `hostname`,
+`tailscale_ssh`, `hold_wakelock`, `advertise_routes`, `advertise_exit_node`
+and `exit_via_mihomo`. A supplied `advertise_routes` array replaces the whole
+subnet list. Send `[]` to clear it. The agent normalizes and deduplicates CIDRs
+and accepts up to 16 distinct subnet routes. `advertise_exit_node` controls
+advertising both default routes. `exit_via_mihomo` stores the routing preference
+for Exit Node traffic and keeps that preference when advertising is turned off.
+
+The `routing` block includes the reported `tun` mode and netfilter mode,
+`lan_subnets` for quick-add, and `routes` with each saved prefix's live approval
+state. `routing.exit` shows `advertised`, `via_mihomo`, and approval states in
+`state`, `state_v4` and `state_v6`. `routing.sync` is `applied` when daemon
+preferences match, `pending_daemon` when saved changes are waiting to apply,
+`drift` when the running daemon differs, or `unknown` when the comparison is
+unavailable.
+
+### Tailscale kernel-TUN and Clean DNS
+
+When `/dev/net/tun` is available, `tailscale::supervisor` applies
+`netfilter-mode=off` through `tailscale set` during preflight and spawns
+`tailscaled` with `--tun=tailscale0` behind an `EffectSet` data plane
+(`tailscale::netplane`, journal `/data/tailscale/network.json`):
+
+- **Firewall & policy routing**: dual-family `ip`/`ip6 u60_tail` owns anti-spoof
+  `input` protection for management ports, `0x02000000` conntrack origin marking
+  in `prerouting`, bidirectional `rt mtu` SYN MSS clamping and control-plane
+  approved `forward` allowlists (approved LAN subnet traffic exits through
+  `br-lan` in both IPv4 and IPv6, while Exit Node internet traffic is bound
+  strictly to the active physical uplink `ath20` or `rmnet*`), and conditional
+  `postrouting` masquerade (for `rmnet*` Exit Node traffic when cellular is
+  active and `br-lan` approved subnets, never duplicating the Wi-Fi relay's
+  `ath20` masquerade). Legacy
+  `U60_TS_IN` and `U60_TS_FWD` provide accept-only passes through vendor
+  filters. RPDB priorities `5110` (verified Tailnet destinations -> table `52`),
+  `5130` (CGNAT -> `main`), and `5131` (CGNAT `unreachable` guard) cooperate
+  with Mihomo (`5100`), Wi-Fi relay (`5120`), and `tailscaled` (`5210–5270`).
+  Management privilege checks use `IP_PKTINFO` / `IPV6_RECVPKTINFO` so only true
+  local loopback or verified `tailscale0` peers reach Tailnet/local routes.
+- **Clean DNS isolation**: both kernel-TUN and userspace daemons spawn inside a
+  private mount namespace (`CLONE_NEWNS` + `MS_REC|MS_SLAVE`) with a read-only
+  bind mount over `/tmp/resolv.conf.d` pointing solely at `127.0.0.54`, backed
+  by a dual-protocol UDP/TCP DoH resolver (`tailscale::clean_dns`) bound to
+  `127.0.0.54:53`. In kernel-TUN mode only, port-53 contention falls back to
+  `:1054` with an exact-verified `chain dns_out` DNAT rule in `ip u60_tail` and
+  a loopback conntrack flush; userspace mode requires direct `127.0.0.54:53` and
+  backs off if it cannot bind there. Clean DNS queries through Mihomo's private
+  proxy (`127.0.0.1:17893`) only when `exit_via_mihomo` is enabled, Mihomo is
+  running, and Mihomo is not in `Direct` mode; when Mihomo is stopped, in
+  Backoff, in `Direct` mode, or `exit_via_mihomo` is off, it uses direct
+  IP-literal DoH with no bootstrap DNS deadlock. Userspace fallback runs a
+  two-pass `CLONE_NEWNET` cold-load scrub to ensure persisted exit routes are
+  cleared on disk.
+- **OTA rollback guard**: before any OTA slot change or fallback,
+  `tailscale::netplane` persists a same-boot `clean-dns-dnat-flush-pending`
+  marker before removing the journal, and both `tailscale::supervisor` and
+  `zte-agent-supervisor.sh` verify that no same-boot Tailscale journal or flush
+  marker remains active (completing any pending same-boot Clean DNS DNAT
+  conntrack flush first) before handing off to an older slot.

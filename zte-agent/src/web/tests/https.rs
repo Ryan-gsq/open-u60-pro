@@ -32,12 +32,12 @@ fn ctx_with(w: &World, password: Option<&str>) -> Ctx {
 }
 
 /// A GET as the HTTPS listener hands it on (`Secure`).
-async fn get_secure(c: &Ctx, uri: &str, p: Peer, cookie: &str) -> Reply {
+async fn get_secure(c: &Ctx, uri: &str, p: FixturePeer, cookie: &str) -> Reply {
     send(c, req("GET", uri, p).header("cookie", cookie).extension(Secure).body(Body::empty()).unwrap()).await
 }
 
 /// The question's form posted: CSRF, its single-use token, `confirm=1`.
-async fn confirm(c: &Ctx, uri: &str, p: Peer, cookie: &str) -> (Reply, String) {
+async fn confirm(c: &Ctx, uri: &str, p: FixturePeer, cookie: &str) -> (Reply, String) {
     let q = get_with(c, uri, p, cookie).await;
     q.assert_secure_html(200);
     let body = format!("csrf={}&once={}&confirm=1", q.input("csrf"), q.input("once"));
@@ -45,7 +45,7 @@ async fn confirm(c: &Ctx, uri: &str, p: Peer, cookie: &str) -> (Reply, String) {
 }
 
 /// The line a 303 to Settings carries.
-async fn line(c: &Ctx, r: &Reply, p: Peer, cookie: &str) -> String {
+async fn line(c: &Ctx, r: &Reply, p: FixturePeer, cookie: &str) -> String {
     let to = r.header("location").unwrap().to_owned();
     assert!(to.starts_with("/ui/settings?r="), "{to}");
     get_with(c, &to, p, cookie).await.text()
@@ -111,7 +111,7 @@ async fn turn_on_from_settings_once() {
     // Over HTTPS: no hint; over Tailscale (loopback): no hint either.
     let html = get_secure(&c, SETTINGS, p, &cookie).await.text();
     assert!(html.contains("You are using HTTPS.") && !html.contains("This page is plain http"));
-    let html = get_with(&c, SETTINGS, Peer(SocketAddr::from(([127, 0, 0, 1], 40100))), &cookie).await.text();
+    let html = get_with(&c, SETTINGS, tailnet(40100), &cookie).await.text();
     assert!(!html.contains("This page is plain http") && !html.contains("You are using HTTPS."));
     // On but not listening (a bind that failed): the question offers to
     // listen again, and its post tells the listener.
@@ -280,7 +280,7 @@ async fn downloads_are_public_with_their_types() {
         assert!(r.text().contains("<string>com.apple.security.root</string>"));
         let r = send(&c, req("HEAD", DOWNLOAD_CRT, peer(233, 4)).body(Body::empty()).unwrap()).await;
         assert_eq!(r.status, 200);
-        let evil = axum::http::Request::builder().uri(DOWNLOAD_CRT).header("host", "evil.example").extension(peer(233, 5)).body(Body::empty()).unwrap();
+        let evil = peer(233, 5).request(axum::http::Request::builder().uri(DOWNLOAD_CRT).header("host", "evil.example")).body(Body::empty()).unwrap();
         assert_eq!(send(&c, evil).await.status, 403);
         // Posts are not downloads.
         let r = send(&c, form(DOWNLOAD_CRT, peer(233, 6), "", "").body(Body::empty()).unwrap()).await;
@@ -302,11 +302,11 @@ async fn login_page_hint() {
     r.assert_secure_html(200);
     assert!(r.text().contains(hint), "{}", r.text());
     assert!(!get_secure(&c, "/ui/login", peer(234, 3), "").await.text().contains("To install"));
-    assert!(!get(&c, "/ui/login", Peer(SocketAddr::from(([127, 0, 0, 1], 40101)))).await.text().contains("To install"));
+    assert!(!get(&c, "/ui/login", tailnet(40101)).await.text().contains("To install"));
     // The local name answers only over HTTPS (another network's DNS can
     // answer for it over http).
     let by_name = |secure: bool| {
-        let b = axum::http::Request::builder().uri("/ui/login").header("host", "u60.home.arpa:9443").extension(peer(234, 5));
+        let b = peer(234, 5).request(axum::http::Request::builder().uri("/ui/login").header("host", "u60.home.arpa:9443"));
         if secure { b.extension(Secure) } else { b }.body(Body::empty()).unwrap()
     };
     let r = send(&c, by_name(false)).await;

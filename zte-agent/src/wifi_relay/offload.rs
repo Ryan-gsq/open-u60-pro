@@ -37,14 +37,7 @@ const CONFIG: &str = "/etc/data/ipa/IPACM_cfg.xml";
 /// Present while the owner has hardware forwarding turned off (survives
 /// reboots and updates).
 const OFF: &str = "/data/zte-agent-relay/ipacm/off";
-/// Metric of the relay's `main` default and its unreachable guards. Not 0:
-/// netifd installs the cellular default with metric 0 and NLM_F_REPLACE, so
-/// an equal metric would let either route replace the other.
-pub(super) const METRIC: &str = crate::netfx::ids::RELAY_METRIC;
-/// Ranges the relay table throws to `main` for their specific routes. With a
-/// relay default in `main` they would otherwise leave through the hotel.
-/// The LAN subnet always has its connected route there.
-pub(super) const GUARDED: [&str; 3] = crate::netfx::ids::LOCAL_ROUTES_V4;
+const METRIC: &str = crate::netfx::ids::RELAY_METRIC;
 
 /// What IPACM's configuration says about the station interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -206,8 +199,8 @@ pub(super) struct Runtime {
     /// Undo commands of the `main` route steps added to the session's plan,
     /// for `release`.
     applied: Vec<Key>,
-    /// The session's gateway and subnet, to add the route again later.
-    uplink: Option<(Ipv4Addr, String)>,
+    /// The session's gateway, to add the route again later.
+    uplink: Option<Ipv4Addr>,
 }
 
 impl Runtime {
@@ -216,13 +209,22 @@ impl Runtime {
     }
 
     /// Called with the session's network plan applied.
-    pub(super) fn start(tx: &mut EffectSet, gateway: Ipv4Addr, subnet: String) -> Self {
-        Self::start_with(&mut Device, tx, gateway, subnet)
+    pub(super) fn start(tx: &mut EffectSet, gateway: Ipv4Addr) -> Self {
+        Self::start_with(&mut Device, tx, gateway)
     }
 
-    fn start_with(port: &mut impl IpacmPort, tx: &mut EffectSet, gateway: Ipv4Addr, subnet: String) -> Self {
+    pub(super) fn adopt(tx: &mut EffectSet, gateway: Ipv4Addr) -> Result<Self, String> {
+        let runtime = Self::start(tx, gateway);
+        if runtime.state == State::Off {
+            let undo = route(gateway).undo(|_| unreachable!())?;
+            tx.retire_legacy_commands(|command| *command == undo)?;
+        }
+        Ok(runtime)
+    }
+
+    fn start_with(port: &mut impl IpacmPort, tx: &mut EffectSet, gateway: Ipv4Addr) -> Self {
         let mut runtime = Self::off();
-        runtime.uplink = Some((gateway, subnet));
+        runtime.uplink = Some(gateway);
         if let Err(e) = runtime.sync_with(port, tx) {
             runtime.reason = Some(e);
         }
@@ -266,8 +268,8 @@ impl Runtime {
             self.reason = Some(why);
             return Ok(false);
         }
-        let Some((gateway, subnet)) = self.uplink.clone() else { return Ok(false) };
-        let plan = route_plan(&gateway.to_string(), &subnet);
+        let Some(gateway) = self.uplink else { return Ok(false) };
+        let plan = vec![route(gateway)];
         self.applied.extend(plan.iter().map(Resource::key));
         if let Err(e) = port.declare(tx, plan) {
             self.release(port, tx)?;
@@ -306,24 +308,12 @@ impl Runtime {
     }
 }
 
-/// `main` default through the relay plus its unreachable guards, for a plan
-/// that already has the relay table. Only with the station listed.
-pub(super) fn route_plan(gateway: &str, subnet: &str) -> Vec<Resource> {
-    let mut plan: Vec<Resource> = GUARDED
-        .iter()
-        .filter(|dest| **dest != subnet)
-        .map(|dest| {
-            let mut route = Route::new(Family::V4, RouteType::Unreachable, dest, "main");
-            route.metric = Some(METRIC.parse().unwrap());
-            Resource::Route(route)
-        })
-        .collect();
+pub(super) fn route(gateway: Ipv4Addr) -> Resource {
     let mut route = Route::new(Family::V4, RouteType::Unicast, "default", "main");
-    route.gateway = Some(gateway.into());
+    route.gateway = Some(gateway.to_string());
     route.device = Some(IFACE.into());
     route.metric = Some(METRIC.parse().unwrap());
-    plan.push(Resource::Route(route));
-    plan
+    Resource::Route(route)
 }
 
 #[cfg(test)]
@@ -331,8 +321,8 @@ mod tests {
     use super::*;
     use crate::net_tools::Step;
 
-    fn route_plan(gateway: &str, subnet: &str) -> Vec<Step> {
-        crate::netfx::effect::test_plan(super::route_plan(gateway, subnet))
+    fn route_plan(gateway: Ipv4Addr) -> Vec<Step> {
+        crate::netfx::effect::test_plan(vec![route(gateway)])
     }
 
     /// B31's factory configuration around the station's entry, as it is
@@ -354,17 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn the_main_route_never_shares_the_cellular_metric_and_guards_thrown_ranges() {
-        let plan = route_plan("192.168.2.1", "192.168.2.0/24");
-        let last = plan.last().unwrap();
-        assert_eq!(last.apply.args.join(" "), format!("-4 route add default via 192.168.2.1 dev {IFACE} metric {METRIC} table main"));
+    fn the_main_default_route_never_shares_the_cellular_metric() {
+        let plan = route_plan(GATEWAY);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].apply.args.join(" "), format!("-4 route add default via 192.168.2.1 dev {IFACE} metric {METRIC} table main"));
         assert_ne!(METRIC, "0");
-        for dest in GUARDED {
-            assert!(plan.iter().any(|s| s.apply.args.windows(2).any(|w| w == ["unreachable", dest])));
-        }
-        assert!(plan.iter().all(|s| s.undo.args.windows(2).any(|w| w == ["table", "main"])));
-        // An upstream inside a guarded range keeps its own connected route.
-        assert_eq!(route_plan("100.64.0.1", "100.64.0.0/10").len(), GUARDED.len());
+        assert!(plan[0].undo.args.windows(2).any(|w| w == ["table", "main"]));
     }
 
     /// A fake IPACM and journal: what was added, released and started.
@@ -417,7 +402,7 @@ mod tests {
 
     fn session(fake: &mut Fake) -> (Runtime, EffectSet) {
         let mut tx = EffectSet::new("relay", std::env::temp_dir().join("u60-ipa-fake-never-written.json"));
-        let runtime = Runtime::start_with(fake, &mut tx, GATEWAY, "192.168.2.0/24".into());
+        let runtime = Runtime::start_with(fake, &mut tx, GATEWAY);
         (runtime, tx)
     }
 
@@ -426,7 +411,7 @@ mod tests {
         let mut fake = Fake::default();
         let (mut runtime, mut tx) = session(&mut fake);
         assert_eq!(runtime.state, State::Routed);
-        assert_eq!(fake.log, ["routes 4", "monitors"]);
+        assert_eq!(fake.log, ["routes 1", "monitors"]);
         assert_eq!(runtime.status(), json!({"state": "routed", "route": true, "reason": null}));
         fake.log.clear();
         assert!(!runtime.sync_with(&mut fake, &mut tx).unwrap(), "nothing changed");
@@ -434,13 +419,12 @@ mod tests {
         fake.enabled = false;
         assert!(runtime.sync_with(&mut fake, &mut tx).unwrap(), "the path changed");
         assert_eq!(runtime.state, State::Off);
-        assert_eq!(fake.log.len(), 4);
-        assert!(fake.log.iter().all(|l| l.starts_with("undo ip -4")), "the route and its guards, nothing else: {:?}", fake.log);
+        assert_eq!(fake.log, ["undo ip -4"]);
         assert_eq!(runtime.status(), json!({"state": "off", "route": false, "reason": "Hardware forwarding is turned off"}));
         fake.enabled = true;
         fake.log.clear();
         assert!(runtime.sync_with(&mut fake, &mut tx).unwrap());
-        assert_eq!((runtime.state, fake.log.as_slice()), (State::Routed, &["routes 4".to_owned(), "monitors".to_owned()][..]));
+        assert_eq!((runtime.state, fake.log.as_slice()), (State::Routed, &["routes 1".to_owned(), "monitors".to_owned()][..]));
     }
 
     /// Another firmware's IPACM configuration without the station: the file
@@ -475,7 +459,7 @@ mod tests {
         let (runtime, _) = session(&mut fake);
         assert_eq!(runtime.state, State::Off);
         assert!(runtime.reason.as_deref().unwrap().contains("route was not added"));
-        assert_eq!(fake.log.iter().filter(|l| l.starts_with("undo ip -4")).count(), 4, "what this attempt journaled is undone: {:?}", fake.log);
+        assert_eq!(fake.log.iter().filter(|l| l.starts_with("undo ip -4")).count(), 1, "what this attempt journaled is undone: {:?}", fake.log);
         assert!(!fake.log.contains(&"monitors".to_owned()));
         let mut fake = Fake::default();
         let (mut runtime, mut tx) = session(&mut fake);
@@ -491,9 +475,8 @@ mod tests {
         fake.log.clear();
         assert!(runtime.sync_with(&mut fake, &mut tx).unwrap());
         assert_eq!(runtime.state, State::Routed);
-        assert_eq!(fake.log[..4].iter().filter(|l| l.starts_with("undo ip -4")).count(), 4, "{:?}", fake.log);
-        assert_eq!(fake.log[4..], ["routes 4", "monitors"]);
-        assert_eq!(runtime.applied.len(), 4, "only the new route's undos");
+        assert_eq!(fake.log, ["undo ip -4", "routes 1", "monitors"]);
+        assert_eq!(runtime.applied.len(), 1, "only the new route's undo");
     }
 
     #[test]

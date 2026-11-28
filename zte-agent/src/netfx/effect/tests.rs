@@ -14,9 +14,9 @@ pub(crate) struct Kernel {
     pub tables: BTreeMap<(String, String), Vec<String>>,
     pub writes: Vec<(String, String)>,
     pub reads: Vec<Cmd>,
-    commands: Vec<Cmd>,
+    pub commands: Vec<Cmd>,
     effects: Vec<EffectCall>,
-    apply_error: Option<Cmd>,
+    pub apply_error: Option<Cmd>,
     checks: Vec<Cmd>,
     routes: Vec<Cmd>,
     undos: Vec<Cmd>,
@@ -24,8 +24,8 @@ pub(crate) struct Kernel {
     check_error: Option<(i32, String)>,
     stop_before_effect: Option<PathBuf>,
     pub settings: BTreeMap<String, String>,
-    ip: BTreeMap<String, String>,
-    undo_error: bool,
+    pub ip: BTreeMap<String, String>,
+    pub undo_error: bool,
     blocked_undo: Option<Cmd>,
     normalize: bool,
     fail_after_commit: bool,
@@ -386,7 +386,7 @@ fn every_typed_resource_writes_only_the_previous_builds_undo_vocabulary() {
         chain(), hook(),
         Resource::NftTable(NftTable { owner: "mihomo", name: "u60_mihomo", file: PathBuf::from("tables.nft"), families: None }),
         Resource::Route(Route::new(Family::V4, RouteType::Throw, "192.0.2.0/24", "60631")),
-        Resource::Rule(Rule { family: Family::V6, priority: 18640, table: "60631".into(), mark: None }),
+        Resource::Rule(Rule::lookup(Family::V6, 5120, "60631")),
         Resource::Addr(Addr { family: Family::V6, device: "ath20".into(), address: "2001:db8::2/64".into(), broadcast: None, valid_lft: Some(30), preferred_lft: Some(20), noprefixroute: true }),
         Resource::Sysctl(Sysctl { key: "bridge-nf-call-iptables".into(), value: "0".into() }),
         Resource::Internal(Internal::new("@u60-relay-steer", vec!["backlog".into(), "5000".into()], vec!["backlog".into(), "1000".into()])),
@@ -396,7 +396,7 @@ fn every_typed_resource_writes_only_the_previous_builds_undo_vocabulary() {
         Cmd::new("iptables", &["-w", "2", "-t", "filter", "-D", "INPUT", "-j", "U60_TEST"]),
         Cmd::new("@u60-mihomo-nft", &["remove"]),
         Cmd::new("ip", &["-4", "route", "del", "throw", "192.0.2.0/24", "table", "60631"]),
-        Cmd::new("ip", &["-6", "rule", "del", "pref", "18640", "lookup", "60631"]),
+        Cmd::new("ip", &["-6", "rule", "del", "pref", "5120", "lookup", "60631"]),
         Cmd::new("ip", &["-6", "addr", "del", "2001:db8::2/64", "dev", "ath20"]),
         Cmd::new("@u60-sysctl", &["bridge-nf-call-iptables", "1"]),
         Cmd::new("@u60-relay-steer", &["backlog", "1000"]),
@@ -442,15 +442,15 @@ fn routes_use_metric_gateway_and_device_and_rules_refuse_a_foreign_priority() {
     route.device = Some("ath20".into());
     route.gateway = Some("192.0.2.1".into());
     route.metric = Some(60631);
-    let rule = Rule { family: Family::V4, priority: 18640, table: "60631".into(), mark: None };
+    let rule = Rule::lookup(Family::V4, 5120, "60631");
     let address = Addr { family: Family::V4, device: "ath20".into(), address: "192.0.2.2/24".into(), broadcast: Some("192.0.2.255".into()), valid_lft: None, preferred_lft: None, noprefixroute: false };
     set.declare_with(vec![Resource::Route(route), Resource::Rule(rule), Resource::Addr(address)], &mut kernel, &mut nft).unwrap();
     kernel.ip.insert("-4 route show table all".into(), "default via 192.0.2.1 dev ath20 metric 60631".into());
-    kernel.ip.insert("-4 rule show".into(), "18640: from all lookup 60631".into());
+    kernel.ip.insert("-4 rule show".into(), "5120: from all lookup 60631".into());
     kernel.ip.insert("-o -4 addr show".into(), "33: ath20 inet 192.0.2.2/24 scope global".into());
     assert!(set.reconcile_with(&mut kernel, &mut nft).restored.is_empty());
     kernel.ip.insert("-4 route show table all".into(), "default via 192.0.2.1 dev ath20 metric 100".into());
-    kernel.ip.insert("-4 rule show".into(), "18640: from all lookup main".into());
+    kernel.ip.insert("-4 rule show".into(), "5120: from all lookup main".into());
     let result = set.reconcile_with(&mut kernel, &mut nft);
     assert_eq!(result.restored.len(), 1);
     assert_eq!(result.failed.len(), 1);
@@ -496,6 +496,47 @@ fn imperative_steps_are_journaled_and_recovery_discards_another_boot() {
     net::write_private(&set.path, br#"{"boot":"previous-boot","undo":[{"program":"false","args":[]}]}"#).unwrap();
     EffectSet::recover(&set.path).unwrap();
     assert!(!set.path.exists());
+
+    // An unknown/empty current boot ID must NEVER discard a journal without running its undos.
+    let mut kernel = Kernel::default();
+    net::write_private(&set.path, br#"{"boot":"live-boot","undo":[{"program":"ip","args":["-4","rule","del","pref","5131","to","100.64.0.0/10","unreachable"]}]}"#).unwrap();
+    EffectSet::recover_for_boot(&set.path, "", &mut kernel).unwrap();
+    assert_eq!(kernel.undos.len(), 1, "unknown boot_id must execute undos rather than discarding journal");
+    assert!(!set.path.exists());
+
+    // An empty or malformed journal boot ID (internal/leading whitespace,
+    // control char, NUL) must NEVER be classified as another boot or discard
+    // a nonempty undo list without executing it!
+    net::write_private(&set.path, br#"{"boot":"","undo":[]}"#).unwrap();
+    assert!(!EffectSet::is_other_boot(&set.path));
+    for bad_boot in [
+        "previous boot",
+        " previous-boot",
+        "previous\tboot",
+        "previous\x0cboot",
+        "previous\0boot",
+    ] {
+        let mut kernel = Kernel::default();
+        let payload = serde_json::json!({
+            "boot": bad_boot,
+            "undo": [{"program": "ip", "args": ["-4", "rule", "del", "pref", "5131", "to", "100.64.0.0/10", "unreachable"]}]
+        });
+        net::write_private(&set.path, &serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert!(
+            !EffectSet::is_other_boot(&set.path),
+            "malformed journal boot {bad_boot:?} must fail closed as same-boot"
+        );
+        EffectSet::recover_for_boot(&set.path, "host-boot", &mut kernel).unwrap();
+        assert_eq!(
+            kernel.undos.len(),
+            1,
+            "malformed journal boot {bad_boot:?} must execute nonempty undo list instead of discarding"
+        );
+        assert!(!set.path.exists());
+    }
+    net::write_private(&set.path, br#"{"boot":"previous-boot","undo":[]}"#).unwrap();
+    assert!(EffectSet::is_other_boot(&set.path));
+    let _ = fs::remove_file(&set.path);
 }
 
 #[test]
@@ -1059,4 +1100,157 @@ fn a_failed_table_listing_does_not_stop_a_different_tables_repair() {
     let result = set.reconcile_with(&mut kernel, &mut nft);
     assert_eq!(result.restored, ["iptables -t filter chain U60_TEST"]);
     assert_eq!(result.failed.len(), 1);
+}
+
+#[test]
+fn retire_legacy_commands_removes_only_matching_entries_and_preserves_other_undos() {
+    let mut set = set("retire-legacy-commands");
+    let mut kernel = Kernel::empty_router();
+    let mut nft = FakeNft::default();
+    set.declare_with(vec![chain()], &mut kernel, &mut nft).unwrap();
+    let legacy_pacing = Cmd::new("@u60-sysctl", &["tcp_pacing_ss_ratio", "200"]);
+    set.undo.push(legacy_pacing.clone());
+    set.save().unwrap();
+
+    let mut loaded = EffectSet::load("test", &set.path).unwrap();
+    loaded
+        .retire_legacy_commands_with(
+            &mut |undo| {
+                undo.program == "@u60-sysctl"
+                    && undo.args.first().is_some_and(|k| k == "tcp_pacing_ss_ratio")
+            },
+            &mut kernel,
+        )
+        .unwrap();
+    assert!(!loaded.undo.contains(&legacy_pacing));
+    assert_eq!(loaded.undo.len(), 1);
+    assert_eq!(kernel.undos, vec![legacy_pacing]);
+    loaded.release_with(&mut kernel).unwrap();
+}
+
+#[test]
+fn multi_destination_rules_and_unreachable_rules_reconcile_and_refuse_foreign_entries() {
+    let mut set = set("ts-rpdb");
+    let mut kernel = Kernel::default();
+    let mut nft = FakeNft::default();
+    let r1 = Resource::Rule(Rule {
+        family: Family::V4,
+        priority: 5110,
+        to: Some("100.75.1.1/32".into()),
+        mark: Some("0x0/0x80000".into()),
+        action: RuleAction::Lookup("52".into()),
+    });
+    let r2 = Resource::Rule(Rule {
+        family: Family::V4,
+        priority: 5110,
+        to: Some("100.100.100.100/32".into()),
+        mark: Some("0x0/0x80000".into()),
+        action: RuleAction::Lookup("52".into()),
+    });
+    let r_main = Resource::Rule(Rule {
+        family: Family::V4,
+        priority: 5130,
+        to: Some("100.64.0.0/10".into()),
+        mark: None,
+        action: RuleAction::Lookup("main".into()),
+    });
+    let r_guard = Resource::Rule(Rule::unreachable(Family::V4, 5131, "100.64.0.0/10"));
+    set.declare_with(vec![r_guard, r_main, r1, r2], &mut kernel, &mut nft).unwrap();
+
+    // Exact match (including omitted /32 on ip -4 rule show) reconciles with zero repairs.
+    kernel.ip.insert(
+        "-4 rule show".into(),
+        concat!(
+            "5110:\tfrom all to 100.75.1.1 fwmark 0x0/0x80000 lookup 52\n",
+            "5110:\tfrom all to 100.100.100.100 fwmark 0x0/0x80000 lookup 52\n",
+            "5130:\tfrom all to 100.64.0.0/10 lookup main\n",
+            "5131:\tfrom all to 100.64.0.0/10 unreachable\n",
+        )
+        .into(),
+    );
+    let ok = set.reconcile_with(&mut kernel, &mut nft);
+    assert!(ok.restored.is_empty() && ok.failed.is_empty(), "{ok:?}");
+
+    // Foreign writer sharing 5110 with another table is flagged as a conflict.
+    kernel.ip.insert(
+        "-4 rule show".into(),
+        concat!(
+            "5110:\tfrom all to 100.75.1.1 fwmark 0x0/0x80000 lookup 52\n",
+            "5110:\tfrom all to 100.100.100.100 fwmark 0x0/0x80000 lookup 99\n",
+            "5130:\tfrom all to 100.64.0.0/10 lookup main\n",
+            "5131:\tfrom all to 100.64.0.0/10 unreachable\n",
+        )
+        .into(),
+    );
+    let conflict = set.reconcile_with(&mut kernel, &mut nft);
+    assert!(!conflict.failed.is_empty());
+
+    // Foreign unjournaled broader rule at 5110 with the SAME mark and lookup
+    // must also be rejected by both reconcile and vacant (new declaration).
+    kernel.ip.insert(
+        "-4 rule show".into(),
+        concat!(
+            "5110:\tfrom all to 100.75.1.1 fwmark 0x0/0x80000 lookup 52\n",
+            "5110:\tfrom all to 100.100.100.100 fwmark 0x0/0x80000 lookup 52\n",
+            "5110:\tfrom all to 100.64.0.0/11 fwmark 0x0/0x80000 lookup 52\n",
+            "5130:\tfrom all to 100.64.0.0/10 lookup main\n",
+            "5131:\tfrom all to 100.64.0.0/10 unreachable\n",
+        )
+        .into(),
+    );
+    let broader = set.reconcile_with(&mut kernel, &mut nft);
+    assert!(!broader.failed.is_empty(), "unjournaled 5110 rule must fail reconcile");
+    let extra = Resource::Rule(Rule {
+        family: Family::V4,
+        priority: 5110,
+        to: Some("100.99.1.1/32".into()),
+        mark: Some("0x0/0x80000".into()),
+        action: RuleAction::Lookup("52".into()),
+    });
+    assert!(
+        set.declare_with(vec![extra], &mut kernel, &mut nft).is_err(),
+        "unjournaled 5110 rule must fail vacant check"
+    );
+
+    // Linux 5.15 fib_rules zero-mark deletion wildcard guard: deleting
+    // fwmark 0x0/0x80000 must be refused when another rule with same to/mask
+    // (e.g. 0x80000/0x80000) shares priority 5110.
+    let del_args: Vec<String> = ["-4", "rule", "del", "pref", "5110", "to", "100.75.1.1/32", "fwmark", "0x0/0x80000", "lookup", "52"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        shared::rule_del_check(
+            "5110:\tfrom all to 100.75.1.1 fwmark 0x0/0x80000 lookup 52\n",
+            &del_args
+        ),
+        shared::RuleDelCheck::SafeSingleMatch
+    );
+    assert_eq!(
+        shared::rule_del_check("", &del_args),
+        shared::RuleDelCheck::Missing
+    );
+    assert_eq!(
+        shared::rule_del_check(
+            concat!(
+                "5110:\tfrom all to 100.75.1.1 fwmark 0x0/0x80000 lookup 52\n",
+                "5110:\tfrom all to 100.75.1.1 fwmark 0x80000/0x80000 lookup 52\n",
+            ),
+            &del_args
+        ),
+        shared::RuleDelCheck::Ambiguous
+    );
+    // Duplicate sibling rows at the same priority must also refuse deletion.
+    assert_eq!(
+        shared::rule_del_check(
+            concat!(
+                "5110:\tfrom all to 100.75.1.1 fwmark 0x0/0x80000 lookup 52\n",
+                "5110:\tfrom all to 100.100.100.100 fwmark 0x0/0x80000 lookup 52\n",
+                "5110:\tfrom all to 100.100.100.100 fwmark 0x0/0x80000 lookup 52\n",
+            ),
+            &del_args
+        ),
+        shared::RuleDelCheck::Ambiguous
+    );
+    set.release_with(&mut kernel).unwrap();
 }

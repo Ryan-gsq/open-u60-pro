@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -116,7 +117,22 @@ impl EffectSet {
     }
 
     pub fn current(path: &Path) -> bool {
-        Self::read(path).is_ok_and(|journal| journal.boot == net::boot_id())
+        let current = net::boot_id();
+        Self::read(path).is_ok_and(|journal| {
+            journal.boot == current || (current.is_empty() && !journal.boot.is_empty())
+        })
+    }
+
+    /// True ONLY when both the journal's boot ID and the current boot ID are
+    /// valid single printable-ASCII tokens and unequal (proven reboot),
+    /// matching `tailscale_same_boot_journal_present` in `zte-agent-supervisor.sh`.
+    pub fn is_other_boot(path: &Path) -> bool {
+        let current = net::boot_id();
+        net::valid_boot_token(current.as_bytes()).is_some_and(|cur| {
+            Self::read(path).is_ok_and(|journal| {
+                net::is_valid_boot_token_str(&journal.boot) && journal.boot != cur
+            })
+        })
     }
 
     fn read(path: &Path) -> Result<Journal, String> {
@@ -137,12 +153,18 @@ impl EffectSet {
     }
 
     fn recover_with(path: &Path, probe: &mut impl Probe) -> Result<(), String> {
+        Self::recover_for_boot(path, &net::boot_id(), probe)
+    }
+
+    fn recover_for_boot(path: &Path, current_boot: &str, probe: &mut impl Probe) -> Result<(), String> {
         if !path.exists() {
             return Ok(());
         }
         let journal = Self::read(path)?;
-        if !journal.boot.is_empty() && journal.boot != net::boot_id() {
-            return fs::remove_file(path).map_err(|error| error.to_string());
+        if let Some(cur) = net::valid_boot_token(current_boot.as_bytes()) {
+            if net::is_valid_boot_token_str(&journal.boot) && journal.boot != cur {
+                return fs::remove_file(path).map_err(|error| error.to_string());
+            }
         }
         Self { owner: "recovery", path: path.into(), undo: journal.undo, held: Vec::new(), #[cfg(test)] journal_writes: std::cell::Cell::new(0) }.release_with(probe)
     }
@@ -180,6 +202,8 @@ impl EffectSet {
         nft: &mut (impl Nft + ?Sized),
     ) -> Result<Vec<PreparedResource>, String> {
         let mut prepared: Vec<PreparedResource> = Vec::new();
+        let mut owned_index = self.owned_rule_index();
+        let empty_owned = HashSet::new();
         for resource in resources {
             validate(&resource, self.owner)?;
             let key = resource.key();
@@ -196,11 +220,26 @@ impl EffectSet {
             let adopted = held.is_none() && undo.program != "true" && self.undo.contains(&undo);
             let owned = held.is_some() || adopted;
             if !owned {
-                let table_held = match &resource {
-                    Resource::Route(route) => self.held.iter().any(|held| matches!(&held.resource, Resource::Route(previous) if previous.family == route.family && shared::route_table(&previous.table) == shared::route_table(&route.table))),
+                let container_held = match &resource {
+                    Resource::Route(route) => self.held.iter().any(|held| matches!(&held.resource, Resource::Route(previous) if previous.family == route.family && shared::route_table(&previous.table) == shared::route_table(&route.table)))
+                        || prepared.iter().any(|previous| matches!(&previous.resource, Resource::Route(other) if other.family == route.family && shared::route_table(&other.table) == shared::route_table(&route.table))),
+                    Resource::Rule(rule) => rule.to.is_some()
+                        && (self.held.iter().any(|held| matches!(&held.resource, Resource::Rule(previous) if previous.family == rule.family && previous.priority == rule.priority && previous.to.is_some() && previous.mark == rule.mark && previous.action == rule.action))
+                            || prepared.iter().any(|previous| matches!(&previous.resource, Resource::Rule(other) if other.family == rule.family && other.priority == rule.priority && other.to.is_some() && other.mark == rule.mark && other.action == rule.action))),
                     _ => false,
                 };
-                vacant(&resource, table_held, listings, probe, nft)?;
+                let owned_rules = match &resource {
+                    Resource::Rule(rule) if container_held => {
+                        owned_index.get(&(rule.family, rule.priority)).unwrap_or(&empty_owned)
+                    }
+                    _ => &empty_owned,
+                };
+                vacant(&resource, container_held, owned_rules, listings, probe, nft)?;
+            }
+            if let Resource::Rule(rule) = &resource {
+                if let Ok(parsed) = expected_rule(rule) {
+                    owned_index.entry((rule.family, rule.priority)).or_default().insert(parsed);
+                }
             }
             if let Resource::LegacyHook(hook) = &resource {
                 if let Some(target) = hook.target() {
@@ -266,6 +305,8 @@ impl EffectSet {
             registered.push(RegisteredResource { index, owned, adopted });
         }
         let mut pending = Restore::default();
+        let owned_index = self.owned_rule_index();
+        let empty_owned = HashSet::new();
         for RegisteredResource { index, owned, adopted } in registered {
             if !self.held[index].obsolete.is_empty() {
                 pending.run(probe)?;
@@ -276,11 +317,15 @@ impl EffectSet {
                 pending.run(probe)?;
                 listings = Listings::default();
             }
+            let owned_rules = match &self.held[index].resource {
+                Resource::Rule(rule) => owned_index.get(&(rule.family, rule.priority)).unwrap_or(&empty_owned),
+                _ => &empty_owned,
+            };
             let held = &mut self.held[index];
             let imperative = matches!(&held.resource, Resource::Internal(internal) if super::internal::handler(internal.name).is_some_and(|handler| handler.check.is_none()));
             let pending_target = matches!(&held.resource, Resource::LegacyHook(hook) if hook.target().is_some_and(|target| pending.input.contains(&format!("-N {target}\n"))));
             let repair = if owned && (!imperative || adopted) && !pending_target {
-                repair(&held.resource, &mut listings, probe)?
+                repair(&held.resource, owned_rules, &mut listings, probe)?
             } else {
                 initial(&held.resource)?
             };
@@ -340,11 +385,41 @@ impl EffectSet {
         if self.undo.contains(&undo) { self.remove(&[undo], &mut net::Device) } else { Ok(()) }
     }
 
+    /// Retire matching legacy undo commands from a loaded journal under this
+    /// `EffectSet`'s exclusive ownership before adopting its replacement.
+    pub fn retire_legacy_commands(&mut self, mut matches: impl FnMut(&Cmd) -> bool) -> Result<(), String> {
+        self.retire_legacy_commands_with(&mut matches, &mut net::Device)
+    }
+
+    pub(crate) fn retire_legacy_commands_with(
+        &mut self,
+        matches: &mut dyn FnMut(&Cmd) -> bool,
+        probe: &mut impl Probe,
+    ) -> Result<(), String> {
+        let selected: Vec<Cmd> = self.undo.iter().filter(|cmd| matches(cmd)).cloned().collect();
+        if selected.is_empty() {
+            return Ok(());
+        }
+        self.remove(&selected, probe)
+    }
+
     pub fn withdraw(&mut self, keys: &[Key]) -> Result<(), String> {
         self.withdraw_with(keys, &mut net::Device)
     }
 
-    fn withdraw_with(&mut self, keys: &[Key], probe: &mut impl Probe) -> Result<(), String> {
+    pub(crate) fn holds_key(&self, key: &Key) -> bool {
+        self.held.iter().any(|held| held.resource.key() == *key)
+    }
+
+    pub(crate) fn withdrawing_keys(&self) -> Vec<Key> {
+        self.held
+            .iter()
+            .filter(|held| held.withdrawing)
+            .map(|held| held.resource.key())
+            .collect()
+    }
+
+    pub(crate) fn withdraw_with(&mut self, keys: &[Key], probe: &mut impl Probe) -> Result<(), String> {
         let mut selected = Vec::new();
         for held in &mut self.held {
             if keys.contains(&held.resource.key()) {
@@ -395,7 +470,7 @@ impl EffectSet {
         self.release_with(&mut net::Device)
     }
 
-    fn release_with(&mut self, probe: &mut impl Probe) -> Result<(), String> {
+    pub(crate) fn release_with(&mut self, probe: &mut impl Probe) -> Result<(), String> {
         self.held.iter_mut().for_each(|held| held.withdrawing = true);
         crate::net_guard::release(&self.path.to_string_lossy(), None);
         self.remove(&self.undo.clone(), probe)
@@ -417,6 +492,8 @@ impl EffectSet {
     pub(crate) fn reconcile_selected(&mut self, keep: impl Fn(&Resource) -> bool, probe: &mut impl Probe, nft: &mut (impl Nft + ?Sized)) -> Reconciled {
         net::with_listings(|listings| {
             let mut result = Reconciled::default();
+            let mut owned_index = self.owned_rule_index();
+            let empty_owned = HashSet::new();
             for index in 0..self.held.len() {
                 if self.held[index].withdrawing || !keep(&self.held[index].resource) {
                     continue;
@@ -424,11 +501,16 @@ impl EffectSet {
                 if !self.held[index].obsolete.is_empty() {
                     let cleaned = self.clear_obsolete(index, probe);
                     *listings = Listings::default();
+                    owned_index = self.owned_rule_index();
                     if let Err(error) = cleaned {
                         result.failed.push(format!("resource replacement: not checked: {error}"));
                         continue;
                     }
                 }
+                let owned_rules = match &self.held[index].resource {
+                    Resource::Rule(rule) => owned_index.get(&(rule.family, rule.priority)).unwrap_or(&empty_owned),
+                    _ => &empty_owned,
+                };
                 let held = &mut self.held[index];
                 let label = held.resource.label();
                 if let Some(tables) = held.tables.as_mut() {
@@ -448,7 +530,7 @@ impl EffectSet {
                         _ => {}
                     }
                 }
-                match repair(&held.resource, listings, probe) {
+                match repair(&held.resource, owned_rules, listings, probe) {
                     Ok(Repair::None) => {}
                     Ok(repair) => {
                         net::changed();
@@ -492,6 +574,56 @@ impl EffectSet {
     pub fn tables_confirmed(&self, name: &str) -> bool {
         self.held.iter().filter_map(|held| held.tables.as_ref()).find(|tables| tables.name == name).is_some_and(NftTables::confirmed)
     }
+
+    pub fn tables_target_generation(&self, name: &str) -> Option<u64> {
+        self.held
+            .iter()
+            .filter_map(|held| held.tables.as_ref())
+            .find(|tables| tables.name == name)
+            .and_then(NftTables::target_generation)
+    }
+
+    pub fn tables_confirmed_generation(&self, name: &str) -> Option<u64> {
+        self.held
+            .iter()
+            .filter_map(|held| held.tables.as_ref())
+            .find(|tables| tables.name == name)
+            .and_then(NftTables::confirmed_generation)
+    }
+
+    pub fn invalidate_tables(&mut self, name: &str) {
+        for held in &mut self.held {
+            if let Some(tables) = held.tables.as_mut().filter(|tables| tables.name == name) {
+                tables.invalidate();
+            }
+        }
+    }
+
+    /// Index every owned and journaled policy rule once per `(family, priority)`
+    /// so reconciliation and vacancy checks run in O(1) per rule even at 1,024 hosts.
+    fn owned_rule_index(&self) -> HashMap<(Family, u32), HashSet<shared::ParsedRule>> {
+        let mut index: HashMap<(Family, u32), HashSet<shared::ParsedRule>> = HashMap::new();
+        for held in &self.held {
+            if let Resource::Rule(rule) = &held.resource {
+                if let Ok(parsed) = expected_rule(rule) {
+                    index.entry((rule.family, rule.priority)).or_default().insert(parsed);
+                }
+            }
+        }
+        for undo in &self.undo {
+            if undo.program == "ip" {
+                let family = match undo.args.first().map(String::as_str) {
+                    Some("-4") => Family::V4,
+                    Some("-6") => Family::V6,
+                    _ => continue,
+                };
+                if let Some(parsed) = shared::parse_rule_del_args(&undo.args) {
+                    index.entry((family, parsed.priority)).or_default().insert(parsed);
+                }
+            }
+        }
+        index
+    }
 }
 
 fn validate(resource: &Resource, owner: &str) -> Result<(), String> {
@@ -526,7 +658,14 @@ fn legacy_listing(tool: LegacyTool, table: &str) -> Cmd {
     Cmd::new(tool.program(), &["-w", "2", "-t", table, "-S"])
 }
 
-fn vacant(resource: &Resource, table_held: bool, listings: &mut Listings, probe: &mut impl Probe, nft: &mut (impl Nft + ?Sized)) -> Result<(), String> {
+fn vacant(
+    resource: &Resource,
+    table_held: bool,
+    owned_rules: &HashSet<shared::ParsedRule>,
+    listings: &mut Listings,
+    probe: &mut impl Probe,
+    nft: &mut (impl Nft + ?Sized),
+) -> Result<(), String> {
     let occupied = match resource {
         Resource::NftTable(table) => {
             NftTables::new(table.owner, table.name, table.file.clone()).presence(nft)? != Presence::Absent
@@ -542,7 +681,21 @@ fn vacant(resource: &Resource, table_held: bool, listings: &mut Listings, probe:
         }
         Resource::Rule(rule) => {
             let text = listings.get(Cmd::new("ip", &[rule.family.flag(), "rule", "show"]), probe)?;
-            text.lines().any(|line| line.trim_start().starts_with(&format!("{}:", rule.priority)))
+            let prefix = format!("{}:", rule.priority);
+            let rows: Vec<_> = text.lines().filter(|line| line.trim_start().starts_with(&prefix)).collect();
+            if table_held {
+                let expected = expected_rule(rule)?;
+                rows.iter().any(|row| {
+                    match shared::parse_rule_line(row) {
+                        // Reject if the target already exists OR if any row at this priority
+                        // is not explicitly owned/journaled by this EffectSet.
+                        Some(parsed) => parsed == expected || !owned_rules.contains(&parsed),
+                        None => true,
+                    }
+                })
+            } else {
+                !rows.is_empty()
+            }
         }
         Resource::Addr(addr) => {
             let text = listings.get(Cmd::new("ip", &["-o", addr.family.flag(), "addr", "show"]), probe)?;
@@ -605,7 +758,12 @@ fn unexpected(label: &str) {
     }
 }
 
-fn repair(resource: &Resource, listings: &mut Listings, probe: &mut impl Probe) -> Result<Repair, String> {
+fn repair(
+    resource: &Resource,
+    owned_rules: &HashSet<shared::ParsedRule>,
+    listings: &mut Listings,
+    probe: &mut impl Probe,
+) -> Result<Repair, String> {
     let present = match resource {
         Resource::NftTable(_) => return Ok(Repair::None),
         Resource::LegacyChain(chain) => {
@@ -650,14 +808,25 @@ fn repair(resource: &Resource, listings: &mut Listings, probe: &mut impl Probe) 
             let text = listings.get(Cmd::new("ip", &[rule.family.flag(), "rule", "show"]), probe)?;
             let prefix = format!("{}:", rule.priority);
             let rows: Vec<_> = text.lines().filter(|line| line.trim_start().starts_with(&prefix)).collect();
-            if rows.is_empty() { false } else {
-                let mut expected = vec![prefix, "from".into(), "all".into()];
-                if let Some(mark) = &rule.mark { expected.extend(["fwmark".into(), mark.clone()]); }
-                expected.extend(["lookup".into(), rule.table.clone()]);
-                if rows.len() != 1 || rows[0].split_whitespace().collect::<Vec<_>>() != expected {
+            if rows.is_empty() {
+                false
+            } else {
+                let expected = expected_rule(rule)?;
+                let mut matched = 0usize;
+                for row in &rows {
+                    let Some(parsed) = shared::parse_rule_line(row) else {
+                        return Err("Policy priority is shared or belongs to another writer".into());
+                    };
+                    if parsed == expected {
+                        matched += 1;
+                    } else if rule.to.is_none() || !owned_rules.contains(&parsed) {
+                        return Err("Policy priority is shared or belongs to another writer".into());
+                    }
+                }
+                if matched > 1 {
                     return Err("Policy priority is shared or belongs to another writer".into());
                 }
-                true
+                matched == 1
             }
         }
         Resource::Addr(addr) => net::addr_listed(listings.get(Cmd::new("ip", &["-o", addr.family.flag(), "addr", "show"]), probe)?, &addr.device, &addr.address),
@@ -670,6 +839,24 @@ fn repair(resource: &Resource, listings: &mut Listings, probe: &mut impl Probe) 
 fn table_used(text: &str, table: &str) -> bool {
     let table = shared::route_table(table);
     net::listed_route_tables(text).any(|listed| shared::route_table(listed) == table)
+}
+
+fn expected_rule(rule: &Rule) -> Result<shared::ParsedRule, String> {
+    let mark = match &rule.mark {
+        Some(text) => Some(shared::parse_fwmark(text).ok_or("Invalid policy rule fwmark")?),
+        None => None,
+    };
+    let (lookup, unreachable) = match &rule.action {
+        RuleAction::Lookup(table) => (Some(shared::route_table(table).to_owned()), false),
+        RuleAction::Unreachable => (None, true),
+    };
+    Ok(shared::ParsedRule {
+        priority: rule.priority,
+        to: rule.to.as_deref().map(shared::route_destination),
+        mark,
+        lookup,
+        unreachable,
+    })
 }
 
 fn route_present(route: &Route, text: &str) -> bool {

@@ -32,7 +32,7 @@
     route,
     'tailscale-status',
     'Tailscale',
-    'Encrypted mesh access to this router from your Tailscale network. Runs in userspace networking mode without replacing default internet routes.'
+    'Encrypted access to this router from your Tailscale network.'
   );
   statusPanel.classList.add('tailscale-panel');
 
@@ -58,11 +58,7 @@
   const disableBtn = button('Disable Tailscale', () => toggleService(false), 'danger');
   const refreshBtn = button('Read current status', () => load(false));
   const logoutBtn = button('Log out & reset', logoutNode, 'danger');
-  const adminLink = el('a', 'button', 'Tailscale admin console ↗');
-  adminLink.href = M.ADMIN_CONSOLE_URL;
-  adminLink.target = '_blank';
-  adminLink.rel = 'noopener noreferrer';
-  statusActions.append(enableBtn, disableBtn, refreshBtn, logoutBtn, adminLink);
+  statusActions.append(enableBtn, disableBtn, refreshBtn, logoutBtn);
   const statusText = UI.status(statusPanel);
   statusPanel.append(hero, facts, alertsBox, statusActions, statusText);
 
@@ -125,12 +121,12 @@
   const authText = UI.status(authPanel);
   authPanel.append(authHint, loginRow, loginBox, authForm, authText);
 
-  // ── Preferences & Routing ───────────────────────────────────────────────
+  // ── Preferences ─────────────────────────────────────────────────────────
   const configPanel = UI.panel(
     route,
     'tailscale-config',
-    'Preferences & routing',
-    'Managed node settings re-applied on every daemon start. Advertised subnet routes must also be approved in the Tailscale admin console.'
+    'Preferences',
+    'Node settings applied whenever Tailscale starts.'
   );
   const configForm = el('form', 'settings-form');
   configForm.id = 'tailscale-config-form';
@@ -153,18 +149,6 @@
     '1–63 ASCII letters, digits or hyphens. Used for MagicDNS and the console Host allowlist.'
   );
 
-  const routesInput = el('input', 'mono');
-  routesInput.id = 'tailscale-routes';
-  routesInput.name = 'advertise_routes';
-  routesInput.type = 'text';
-  routesInput.spellcheck = false;
-  routesInput.placeholder = '192.168.0.0/24';
-  const routesField = field(
-    'Advertise subnet routes',
-    routesInput,
-    'Comma-separated IPv4 CIDRs (leave blank for none). Approve advertised routes in the Tailscale admin console.'
-  );
-
   const sshChoice = choiceField(
     'tailscale-ssh',
     'Enable Tailscale SSH',
@@ -175,7 +159,7 @@
     'Hold device wakelock while enabled',
     'Prevent deep sleep so remote Tailscale access stays reachable. Increases idle battery use.'
   );
-  configFields.append(hostnameField.wrapper, routesField.wrapper, sshChoice.label, wakelockChoice.label);
+  configFields.append(hostnameField.wrapper, sshChoice.label, wakelockChoice.label);
 
   const configActions = el('div', 'form-actions');
   const saveConfigBtn = button('Save preferences', null, 'primary');
@@ -185,6 +169,95 @@
   configForm.append(configFields, configActions);
   const configText = UI.status(configPanel);
   configPanel.append(configForm, configText);
+
+  // ── Subnet routes & Exit Node ───────────────────────────────────────────
+  const routingPanel = UI.panel(
+    route, 'tailscale-routing', 'Subnet routes & Exit Node',
+    'Share LAN subnets or this router’s internet connection with your tailnet.'
+  );
+  statusPanel.after(routingPanel);
+  const routingBar = el('div', 'tailscale-routing-bar');
+  const tunLabel = el('strong');
+  const syncChip = el('span', 'tailscale-routing-chip');
+  const adminLink = el('a', 'button', 'Approve in Tailscale admin ↗');
+  adminLink.href = M.ADMIN_CONSOLE_URL;
+  adminLink.target = '_blank';
+  adminLink.rel = 'noopener noreferrer';
+  for (const [label, value] of [['TUN mode', tunLabel], ['Config sync', syncChip]]) {
+    const fact = el('div', 'tailscale-routing-fact');
+    fact.append(el('small', 'field-help', label), value);
+    routingBar.append(fact);
+  }
+  routingBar.append(adminLink);
+
+  const routingForm = el('form', 'settings-form');
+  routingForm.autocomplete = 'off';
+  const routingFields = el('fieldset', 'tailscale-routing-fields');
+  routingFields.append(el('legend', 'sr-only', 'Tailscale routing settings'));
+  const routeList = el('ul', 'tailscale-route-list');
+  routeList.setAttribute('aria-label', 'Subnet routes');
+  const noRoutes = el('p', 'field-help', 'No subnet routes.');
+  const routeInput = el('input', 'mono');
+  routeInput.id = 'tailscale-route-cidr';
+  routeInput.spellcheck = false;
+  routeInput.autocapitalize = 'none';
+  routeInput.placeholder = '192.168.0.0/24';
+  const routeLabel = el('label', '', 'IPv4 or IPv6 CIDR');
+  routeLabel.htmlFor = routeInput.id;
+  const routeHint = el('small', 'field-help');
+  routeHint.id = 'tailscale-route-hint';
+  routeHint.setAttribute('aria-live', 'polite');
+  routeInput.setAttribute('aria-describedby', routeHint.id);
+  const addRouteBtn = button('Add route', () => {
+    if (addRoute(routeInput.value)) routeInput.focus();
+  });
+  const routeEntry = el('div', 'tailscale-route-entry');
+  routeEntry.append(routeLabel, routeInput, addRouteBtn, routeHint);
+  const lanButtons = el('div', 'tailscale-lan-routes');
+  const subnetSection = el('section', 'tailscale-routing-section');
+  subnetSection.append(el('h3', '', 'Subnet routes'), routeList, noRoutes, routeEntry, lanButtons);
+
+  const exitChoice = choiceField(
+    'tailscale-advertise-exit-node', 'Advertise Exit Node',
+    'Let approved tailnet peers use this router for internet access.'
+  );
+  const mihomoChoice = choiceField(
+    'tailscale-exit-via-mihomo', 'Route Exit Node via Mihomo',
+    'Use Mihomo for Exit Node traffic when Exit Node is enabled.'
+  );
+  exitChoice.input.setAttribute('role', 'switch');
+  mihomoChoice.input.setAttribute('role', 'switch');
+  const approval = el('dl', 'tailscale-exit-approval');
+  const exitChips = new Map();
+  for (const [key, label] of [['state', 'Overall'], ['state_v4', 'IPv4'], ['state_v6', 'IPv6']]) {
+    const entry = el('div');
+    const value = el('dd', 'tailscale-routing-chip');
+    value.dataset.family = key;
+    entry.append(el('dt', 'field-help', label), value);
+    approval.append(entry);
+    exitChips.set(key, value);
+  }
+  approval.setAttribute('aria-label', 'Saved Exit Node approval');
+  const context = el('p', 'field-help tailscale-exit-context');
+  const exitSection = el('section', 'tailscale-routing-section');
+  exitSection.append(el('h3', '', 'Exit Node'), exitChoice.label, approval, mihomoChoice.label, context);
+  routingFields.append(subnetSection, exitSection);
+
+  const routingConflict = el('p', 'relay-problem tailscale-routing-conflict');
+  routingConflict.setAttribute('role', 'status');
+  routingConflict.hidden = true;
+  const routingActions = el('div', 'form-actions');
+  const saveRoutingBtn = button('Save routing', null, 'primary');
+  saveRoutingBtn.type = 'submit';
+  const discardRoutingBtn = button('Discard routing edits', () => {
+    resetRoutingDraft();
+    drawRouting();
+    say(routingText, 'Routing draft discarded.');
+  });
+  routingActions.append(saveRoutingBtn, discardRoutingBtn);
+  routingForm.append(routingFields, routingConflict, routingActions);
+  const routingText = UI.status(routingPanel);
+  routingPanel.append(routingBar, routingForm, routingText);
 
   // ── Install & Upgrade ───────────────────────────────────────────────────
   const updatePanel = UI.panel(
@@ -267,30 +340,34 @@
 
   // ── State ───────────────────────────────────────────────────────────────
   let status = null, baseline = null, loading = false, attempted = false, busy = false, lastLoad = 0, loadId = 0;
+  let pendingStatus = null;
   let pendingLoginUrl = '', loginPending = false, logoutWarning = '';
   let versionCatalog = null, selectedVersion = '', versionsLoading = false, versionsAttempted = false, versionsError = '', versionsLoadId = 0;
   let versionSelectSignature = '';
+  let routingState = M.rebaseRouting(null), routingSession = 0;
+  let mihomoStatus = null, routingContextTimer, routingContextLoad = 0, routingContextLoading = false;
+  let routeRows = new Map(), lanSuggestionSignature = '';
   const READING_STATUS_MESSAGE = 'Reading Tailscale status…';
   const onRoute = () => OpenU60Navigation.current.key === route;
 
   function currentConfigDraft() {
     return {
       hostname: hostnameInput.value,
-      routesText: routesInput.value,
       tailscale_ssh: sshChoice.input.checked,
       hold_wakelock: wakelockChoice.input.checked
     };
   }
   const configDirty = () => !!baseline && Object.keys(M.configDiff(baseline, currentConfigDraft())).length > 0;
+  const routingDirty = () => routingState.dirty || routeInput.value.trim().length > 0;
+  const routingEditable = () => routingState.baseline && !busy && API.connected && !API.locked && M.view(status).canConfig;
   const authDirty = () => authKeyInput.value.trim().length > 0;
   const updateDirty = () => versionInput.value.trim().length > 0 || sha256Input.value.trim().length > 0;
-  const dirty = () => configDirty() || authDirty() || updateDirty();
+  const dirty = () => configDirty() || routingDirty() || authDirty() || updateDirty();
   const effectiveUpdateVersion = () => versionInput.value.trim() || selectedVersion;
 
   function populateConfig(data) {
     baseline = M.configBaseline(data);
     hostnameInput.value = baseline.hostname;
-    routesInput.value = baseline.advertise_routes.join(', ');
     sshChoice.input.checked = baseline.tailscale_ssh;
     wakelockChoice.input.checked = baseline.hold_wakelock;
   }
@@ -298,7 +375,6 @@
   function discardConfig() {
     if (!baseline) return;
     hostnameInput.value = baseline.hostname;
-    routesInput.value = baseline.advertise_routes.join(', ');
     sshChoice.input.checked = baseline.tailscale_ssh;
     wakelockChoice.input.checked = baseline.hold_wakelock;
     drawConfig();
@@ -310,6 +386,12 @@
     sha256Input.value = '';
     drawUpdate();
     say(updateText, '');
+  }
+
+  function resetRoutingDraft(baseline = routingState.baseline) {
+    routingState = M.rebaseRouting(baseline);
+    routeInput.value = '';
+    say(routingText, '');
   }
 
   function applyStatus(data, {forceConfig = false} = {}) {
@@ -334,6 +416,11 @@
     if (view.running || view.enabled) logoutWarning = '';
     if (data && (forceConfig || !baseline || !configDirty())) {
       populateConfig(data);
+    }
+    if (data) {
+      const next = M.rebaseRouting(M.routingBaseline(data), routingState);
+      if (routingState.dirty && !next.dirty) say(routingText, '');
+      routingState = next;
     }
     draw();
   }
@@ -398,6 +485,130 @@
     saveConfigBtn.disabled = inactive || !view.canConfig || !isDirty;
     discardConfigBtn.disabled = inactive || !isDirty;
     configPanel.dataset.dirty = String(isDirty);
+  }
+
+  function setRoutingChip(chip, state, label) {
+    chip.dataset.state = state;
+    if (chip.textContent !== label) chip.textContent = label;
+  }
+
+  function reviewRoutingChanges(before, after) {
+    const added = after.advertise_routes.filter(prefix => !before.advertise_routes.includes(prefix)).length;
+    const removed = before.advertise_routes.filter(prefix => !after.advertise_routes.includes(prefix)).length;
+    const changes = [];
+    if (added) changes.push(`${added} saved subnet ${added === 1 ? 'route was' : 'routes were'} added.`);
+    if (removed) changes.push(`${removed} saved subnet ${removed === 1 ? 'route was' : 'routes were'} removed.`);
+    if (before.advertise_exit_node !== after.advertise_exit_node) {
+      changes.push(`Exit Node advertising was turned ${after.advertise_exit_node ? 'on' : 'off'}.`);
+    }
+    if (before.exit_via_mihomo !== after.exit_via_mihomo) {
+      changes.push(`The Mihomo preference was turned ${after.exit_via_mihomo ? 'on' : 'off'}.`);
+    }
+    return `Saved routing settings changed elsewhere. ${changes.join(' ')} Review your draft before saving, or discard your edits.`;
+  }
+
+  function drawRouting() {
+    const editable = routingEditable();
+    const {baseline, draft, dirty, reviewBaseline, overLimit} = routingState;
+    const savedRoutes = baseline?.advertise_routes ?? [], routes = draft.advertise_routes;
+    const live = API.connected ? status?.routing : null;
+    const routing = M.routingStatus(live);
+    tunLabel.textContent = routing.modeLabel;
+    setRoutingChip(syncChip, routing.sync, routing.syncLabel);
+    routingFields.disabled = !editable;
+
+    const renderedRoutes = [...routeRows.keys()];
+    if (routes.length !== renderedRoutes.length || routes.some((prefix, index) => prefix !== renderedRoutes[index])) {
+      const nextRows = new Map();
+      for (const prefix of routes) {
+        let row = routeRows.get(prefix);
+        if (!row) {
+          const item = el('li', 'tailscale-route-row');
+          const state = el('span', 'tailscale-routing-chip');
+          const remove = button('Remove', () => {
+            if (!routingEditable()) return;
+            editRoute(prefix, false);
+            (routeRows.values().next().value?.item.querySelector('button') ?? routeInput).focus();
+          });
+          remove.setAttribute('aria-label', `Remove ${prefix}`);
+          item.append(el('code', 'mono', prefix), state, remove);
+          row = {item, state};
+        }
+        nextRows.set(prefix, row);
+      }
+      routeRows = nextRows;
+      routeList.replaceChildren(...Array.from(routeRows.values(), row => row.item));
+    }
+    noRoutes.hidden = routes.length > 0;
+    routeList.hidden = routes.length === 0;
+    for (const [prefix, row] of routeRows) {
+      const state = M.routeState(prefix, savedRoutes, live?.routes);
+      setRoutingChip(row.state, state, M.ROUTE_STATES[state]);
+    }
+
+    const input = routeInput.value.trim();
+    const candidate = input ? M.routeCandidate(input, routes) : null;
+    const hint = (overLimit ? `Remove subnet routes to stay within the ${M.MAX_ADVERTISE_ROUTES}-route limit.` : candidate?.error) ||
+      (candidate?.hasHostBits ? `Will normalize to ${candidate.prefix}` : '') ||
+      `${routes.length} of ${M.MAX_ADVERTISE_ROUTES} routes`;
+    if (hint !== routeHint.textContent) routeHint.textContent = hint;
+    routeHint.dataset.error = String(overLimit || !!candidate?.error);
+    routeInput.setAttribute('aria-invalid', String(!!candidate?.error));
+    addRouteBtn.disabled = !editable || !candidate?.prefix;
+    const suggestions = M.lanRouteSuggestions(live?.lan_subnets, routes);
+    const signature = `${routes.length >= M.MAX_ADVERTISE_ROUTES}|${suggestions.join(',')}`;
+    if (signature !== lanSuggestionSignature) {
+      lanSuggestionSignature = signature;
+      lanButtons.replaceChildren(...suggestions.map(prefix => {
+        const add = button(`+ Add LAN ${prefix}`, () => {
+          if (addRoute(prefix)) routeInput.focus();
+        }, 'mono');
+        add.disabled = routes.length >= M.MAX_ADVERTISE_ROUTES;
+        return add;
+      }));
+    }
+
+    exitChoice.input.checked = draft.advertise_exit_node;
+    mihomoChoice.input.checked = draft.exit_via_mihomo;
+    mihomoChoice.input.disabled = !draft.advertise_exit_node;
+    for (const [key, chip] of exitChips) {
+      const approval = M.exitApproval(live?.exit?.[key]);
+      setRoutingChip(chip, approval.state, approval.label);
+    }
+    const exitContext = M.exitContext(mihomoStatus, live);
+    context.textContent = `Mihomo · ${exitContext.mihomoLabel}   |   Exit Node Clean DNS · ${exitContext.dnsLabel}`;
+    const notice = reviewBaseline ? reviewRoutingChanges(reviewBaseline, baseline) : '';
+    if (routingConflict.textContent !== notice) routingConflict.textContent = notice;
+    routingConflict.hidden = !notice;
+    saveRoutingBtn.disabled = !editable || !!input || !dirty || overLimit;
+    discardRoutingBtn.disabled = !editable || (!dirty && !input);
+    routingPanel.dataset.dirty = String(dirty);
+  }
+
+  function editRouting(edits) {
+    routingState = M.rebaseRouting(routingState.baseline, {
+      ...routingState,
+      edits: {...routingState.edits, ...edits}
+    });
+    say(routingText, '');
+    drawRouting();
+  }
+
+  function editRoute(prefix, adding) {
+    const {addedRoutes, removedRoutes} = routingState.edits;
+    editRouting({
+      addedRoutes: adding ? [...addedRoutes, prefix] : addedRoutes.filter(route => route !== prefix),
+      removedRoutes: adding ? removedRoutes.filter(route => route !== prefix) : [...removedRoutes, prefix]
+    });
+  }
+
+  function addRoute(raw) {
+    if (!routingEditable()) return false;
+    const candidate = M.routeCandidate(raw, routingState.draft.advertise_routes);
+    if (!candidate.prefix) return false;
+    if (raw === routeInput.value) routeInput.value = '';
+    editRoute(candidate.prefix, true);
+    return true;
   }
 
   function drawUpdate(view = M.view(status)) {
@@ -502,7 +713,32 @@
     drawStatus(view);
     drawAuth(view);
     drawConfig(view);
+    drawRouting();
     drawUpdate(view);
+  }
+
+  function stopRoutingContext() {
+    clearTimeout(routingContextTimer);
+    routingContextTimer = undefined;
+    routingContextLoad++;
+    routingContextLoading = false;
+    mihomoStatus = null;
+  }
+
+  async function loadRoutingContext() {
+    if (routingContextLoading || document.hidden || !onRoute() || !API.connected) return;
+    const id = ++routingContextLoad;
+    routingContextLoading = true;
+    const mihomo = await request('/api/mihomo/status').catch(() => null);
+    if (id !== routingContextLoad) return;
+    routingContextLoading = false;
+    if (document.hidden || !onRoute() || !API.connected) return;
+    mihomoStatus = mihomo;
+    drawRouting();
+    routingContextTimer = setTimeout(() => {
+      routingContextTimer = undefined;
+      loadRoutingContext();
+    }, 5000);
   }
 
   async function load(quiet = false) {
@@ -512,6 +748,7 @@
     loading = true;
     attempted = true;
     lastLoad = Date.now();
+    if (!routingContextTimer) loadRoutingContext();
     if (!versionsAttempted && !versionsLoading) loadVersions({force: false});
     draw();
     if (!quiet) say(statusText, READING_STATUS_MESSAGE);
@@ -536,10 +773,27 @@
   async function refreshAfterMutation(live) {
     try {
       const data = await request('/api/tailscale/status', {timeoutMs: 15000});
-      if (live()) applyStatus(data);
+      if (!live()) return false;
+      pendingStatus = null;
+      applyStatus(data);
+      return true;
     } catch {
       /* SSE or manual refresh will follow. */
+      return false;
     }
+  }
+
+  function flushPendingStatus(live) {
+    const queued = pendingStatus;
+    pendingStatus = null;
+    if (!live() || !queued) return false;
+    applyStatus(queued);
+    return true;
+  }
+
+  function finishBusy(live) {
+    busy = false;
+    if (!flushPendingStatus(live) && live()) draw();
   }
 
   async function loadVersions({force = false} = {}) {
@@ -587,6 +841,7 @@
     if (!await confirm(heading, copy, {label: enable ? 'Enable Tailscale' : 'Disable Tailscale', destructive: !enable})) return;
     await mutate(statusText, async live => {
       busy = true;
+      pendingStatus = null;
       draw();
       say(statusText, enable ? 'Starting Tailscale…' : 'Stopping Tailscale…');
       try {
@@ -600,8 +855,7 @@
       } catch (error) {
         if (live()) say(statusText, error.message, true);
       } finally {
-        busy = false;
-        if (live()) draw();
+        finishBusy(live);
       }
     });
   }
@@ -612,6 +866,7 @@
     if (!await confirm('Log out & reset Tailscale?', copy, {label: 'Log out & reset', destructive: true})) return;
     await mutate(statusText, async live => {
       busy = true;
+      pendingStatus = null;
       draw();
       say(statusText, 'Logging out of Tailscale…');
       try {
@@ -627,8 +882,7 @@
       } catch (error) {
         if (live()) say(statusText, error.message, true);
       } finally {
-        busy = false;
-        if (live()) draw();
+        finishBusy(live);
       }
     });
   }
@@ -637,6 +891,7 @@
     if (!status || busy) return;
     await mutate(authText, async live => {
       busy = true;
+      pendingStatus = null;
       draw();
       say(authText, 'Requesting browser login link from tailscaled…');
       try {
@@ -660,8 +915,7 @@
       } catch (error) {
         if (live()) say(authText, error.message, true);
       } finally {
-        busy = false;
-        if (live()) draw();
+        finishBusy(live);
       }
     });
   }
@@ -709,6 +963,7 @@
     await mutate(authText, async live => {
       authKeyInput.value = '';
       busy = true;
+      pendingStatus = null;
       draw();
       say(authText, 'Enrolling with Tailscale (this can take up to 90 seconds)…');
       try {
@@ -717,13 +972,13 @@
         pendingLoginUrl = '';
         loginPending = false;
         logoutWarning = '';
+        pendingStatus = null;
         applyStatus(data);
         say(authText, 'Router enrolled and connected to Tailscale.');
       } catch (error) {
         if (live()) say(authText, error.message, true);
       } finally {
-        busy = false;
-        if (live()) draw();
+        finishBusy(live);
       }
     });
   });
@@ -739,7 +994,7 @@
     event.preventDefault();
     if (!status || !baseline || busy) return;
     const draft = currentConfigDraft();
-    const issue = M.configProblem(draft);
+    const issue = M.hostnameProblem(draft.hostname);
     if (issue) { say(configText, issue, true); return; }
     const patch = M.configDiff(baseline, draft);
     if (!Object.keys(patch).length) { say(configText, 'No changes to save.'); return; }
@@ -747,18 +1002,88 @@
     if (!await confirm('Save Tailscale preferences?', summary, {label: 'Save preferences'})) return;
     await mutate(configText, async live => {
       busy = true;
+      pendingStatus = null;
       draw();
       say(configText, 'Applying Tailscale preferences…');
       try {
         const data = await request('/api/tailscale/config', {...json('PUT', patch), timeoutMs: 30000});
         if (!live()) return;
+        pendingStatus = null;
         applyStatus(data, {forceConfig: true});
         say(configText, 'Tailscale preferences saved.');
       } catch (error) {
         if (live()) say(configText, error.message, true);
       } finally {
-        busy = false;
-        if (live()) draw();
+        finishBusy(live);
+      }
+    });
+  });
+
+  routeInput.addEventListener('input', () => {
+    say(routingText, '');
+    drawRouting();
+  });
+  routeInput.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' || event.isComposing) return;
+    event.preventDefault();
+    if (addRoute(routeInput.value)) routeInput.focus();
+  });
+  exitChoice.input.addEventListener('change', async () => {
+    if (!routingEditable()) return;
+    const next = exitChoice.input.checked;
+    const confirmation = M.exitEnableConfirmation(routingState.baseline.advertise_exit_node, next);
+    if (confirmation) {
+      const session = routingSession;
+      drawRouting();
+      if (!await confirm('Advertise Exit Node?', confirmation, {label: 'Advertise Exit Node'})) return;
+      if (session !== routingSession || !routingEditable()) return;
+    }
+    editRouting({advertiseExitNode: next});
+  });
+  mihomoChoice.input.addEventListener('change', () => {
+    if (routingEditable() && routingState.draft.advertise_exit_node) {
+      editRouting({exitViaMihomo: mihomoChoice.input.checked});
+    }
+  });
+  routingForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!routingEditable() || !routingState.dirty || routeInput.value.trim()) return;
+    const {baseline, draft, overLimit} = routingState;
+    if (overLimit) {
+      say(routingText, `Remove subnet routes to stay within the ${M.MAX_ADVERTISE_ROUTES}-route limit.`, true);
+      return;
+    }
+    const patch = M.routingDiff(baseline, draft);
+    const session = routingSession;
+    await mutate(routingText, async live => {
+      const current = () => live() && session === routingSession;
+      busy = true;
+      pendingStatus = null;
+      loadId++;
+      loading = false;
+      if (statusText.textContent === READING_STATUS_MESSAGE) say(statusText, '');
+      draw();
+      say(routingText, 'Saving Tailscale routing…');
+      try {
+        const data = await request('/api/tailscale/config', {...json('PUT', patch), timeoutMs: 30000});
+        if (!current()) return;
+        pendingStatus = null;
+        resetRoutingDraft();
+        applyStatus(data);
+        say(routingText, 'Tailscale routing saved.');
+      } catch (error) {
+        if (!current()) return;
+        flushPendingStatus(current);
+        await refreshAfterMutation(current);
+        if (!current()) return;
+        flushPendingStatus(current);
+        if (routingState.dirty) {
+          say(routingText, `Could not save routing. Your draft is kept. ${error.message}`, true);
+        } else {
+          say(routingText, 'Saved routing already matches your changes.');
+        }
+      } finally {
+        finishBusy(live);
       }
     });
   });
@@ -804,6 +1129,7 @@
     if (!await confirm(`${actionLabel}?`, copy, {label: actionLabel})) return;
     await mutate(updateText, async live => {
       busy = true;
+      pendingStatus = null;
       draw();
       say(updateText, `Starting download for Tailscale v${req.version}…`);
       try {
@@ -818,23 +1144,46 @@
       } catch (error) {
         if (live()) say(updateText, error.message, true);
       } finally {
-        busy = false;
-        if (live()) draw();
+        finishBusy(live);
       }
     });
   });
 
   function refreshVisible() {
-    if (document.hidden || loading || busy || API.locked || !API.connected || !onRoute() || Date.now() - lastLoad < 1000) return;
+    if (document.hidden || API.locked || !API.connected || !onRoute()) return;
+    if (!routingContextTimer) loadRoutingContext();
+    if (loading || busy || Date.now() - lastLoad < 1000) return;
     load(true);
   }
   UI.listenForVisibility(refreshVisible);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) stopRoutingContext();
+  });
+  window.addEventListener('dashboard:navigate', () => {
+    if (!onRoute()) stopRoutingContext();
+  });
+  window.addEventListener('dashboard:connection', event => {
+    if (event.detail.state !== 'retrying' || API.connected) return;
+    routingSession++;
+    loadId++;
+    loading = false;
+    pendingStatus = null;
+    if (statusText.textContent === READING_STATUS_MESSAGE) say(statusText, '');
+    stopRoutingContext();
+    resetRoutingDraft();
+    drawRouting();
+  });
 
   UI.track({
     route,
     sync(readings) {
       const sample = readings.tailscale_status;
-      if (!onRoute() || API.locked || busy || !sample?.ok) return;
+      if (!onRoute() || API.locked || !sample?.ok) return;
+      if (busy) {
+        pendingStatus = sample.data;
+        return;
+      }
+      pendingStatus = null;
       if (loading) {
         loadId++;
         loading = false;
@@ -850,13 +1199,15 @@
     clear() {
       loadId++;
       versionsLoadId++;
-      status = null; baseline = null; loading = false; attempted = false; busy = false;
+      routingSession++;
+      stopRoutingContext();
+      resetRoutingDraft(null);
+      status = null; baseline = null; loading = false; attempted = false; busy = false; pendingStatus = null;
       pendingLoginUrl = ''; loginPending = false; logoutWarning = '';
       versionCatalog = null; selectedVersion = ''; versionsLoading = false; versionsAttempted = false; versionsError = ''; versionSelectSignature = '';
       manualDetails.open = false;
       authKeyInput.value = '';
       hostnameInput.value = '';
-      routesInput.value = '';
       sshChoice.input.checked = false;
       wakelockChoice.input.checked = false;
       versionInput.value = '';

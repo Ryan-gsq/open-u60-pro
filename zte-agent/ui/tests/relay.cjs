@@ -1,6 +1,7 @@
 const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs'),{start,assertQuiet,visibilityEvent,refreshOn}=require('./fixture.cjs');
 (async()=>{
-  const off={connected:false,network_id:null,saved_network_id:null,width_mode:null,ssid:null,frequency:null,width:null,width_state:null,address:null,gateway:null,networks:[],internet:'not_verified',ipv6_relay:false,ipv6:{requested:false,state:'off',upstream:false,nat66:false,internet:'not_verified'},cellular_fallback:true,restoring:null,experimental:true,error:null,clock_error:null,recovery_required:false,autostart:false,saved_networks:[]};
+  const idleCellular={state:'idle',original_enabled:null,error:null};
+  const off={connected:false,network_id:null,saved_network_id:null,width_mode:null,ssid:null,frequency:null,width:null,width_state:null,address:null,gateway:null,networks:[],internet:'not_verified',ipv6_relay:false,ipv6:{requested:false,state:'off',upstream:false,nat66:false,internet:'not_verified'},cellular_fallback:true,strict_zero_cellular:false,cellular_pause:idleCellular,restoring:null,experimental:true,error:null,clock_error:null,recovery_required:false,autostart:false,saved_networks:[]};
   let status={...off};
   const scan=[
     {id:'hotel5',ssid:'Hotel Guest',frequency:5180,signal:-48,security:'wpa2',supported:true,remembered:true,width_mode:'auto'},
@@ -9,7 +10,8 @@ const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs
     {id:'wpa3',ssid:'Modern',frequency:5220,signal:-50,security:'unsupported',supported:false,remembered:false,width_mode:'off'}
   ];
   const saved=[{id:'k-hotel',ssid:'Hotel Guest',security:'wpa2',width_mode:'auto',remembered:true},{id:'k-cafe',ssid:'Cafe <b>Open</b>',security:'open',width_mode:'off',remembered:true}];
-  let refuse=null,hang=false,restoringPolls=0;
+  let refuse=null,hang=false,restoringPolls=0,cellularFailure=null,cellularWasOn=true;
+  const pausedCellular=()=>({state:cellularWasOn?'paused':'already_off',original_enabled:cellularWasOn,error:null});
   const fixture=await start(({method,url,body,res},reply,fail)=>{
     if(!url.startsWith('/api/wifi-relay/'))return false;
     if(method==='GET'&&url==='/api/wifi-relay/status'){if(status.restoring)restoringPolls++;reply(status);return true;}
@@ -20,9 +22,21 @@ const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs
       if(refuse){fail(refuse,503);return true;}
       const net=scan.find(n=>n.id===body.network);
       status={...status,connected:true,ssid:net.ssid,address:'192.168.8.23',gateway:'192.168.8.1',frequency:net.frequency,width:80,width_state:'stable',width_mode:body.width_mode||net.width_mode,saved_network_id:'k-hotel',autostart:true,networks:scan,saved_networks:saved,clock_error:net.id==='home5'?'The router clock could not be verified over this uplink.':null,ipv6:{...off.ipv6,state:body.ipv6?'configured':'off',upstream:!!body.ipv6,address:'2001:db8::2',lan_prefix:'fd00:1::/64'}};
+      if(status.strict_zero_cellular)status.cellular_pause=pausedCellular();
       reply(status);return true;
     }
-    if(url==='/api/wifi-relay/disconnect'){status={...off,networks:scan,saved_networks:saved};reply(status);return true;}
+    if(url==='/api/wifi-relay/strict-zero-cellular'){
+      status={...status,strict_zero_cellular:body.enabled};
+      if(cellularFailure){
+        status.cellular_pause={state:'error',original_enabled:cellularWasOn,error:cellularFailure};
+        fail(cellularFailure,503);
+      }else{
+        status.cellular_pause=status.connected&&body.enabled?pausedCellular():idleCellular;
+        reply(status);
+      }
+      return true;
+    }
+    if(url==='/api/wifi-relay/disconnect'){status={...off,strict_zero_cellular:status.strict_zero_cellular,networks:scan,saved_networks:saved};reply(status);return true;}
     if(url==='/api/wifi-relay/clock'){status={...status,clock_error:null};reply(status);return true;}
     if(url==='/api/wifi-relay/forget'){const i=saved.findIndex(s=>s.id===body.id);if(i>=0)saved.splice(i,1);status={...status,saved_networks:saved};reply(status);return true;}
     return false;
@@ -34,6 +48,7 @@ const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs
   const said=(sel,words)=>page.waitForFunction(([sel,words])=>document.querySelector(sel)?.textContent.includes(words),[sel,words]);
   const confirm=label=>page.locator('.confirm-dialog').getByRole('button',{name:label,exact:true}).click();
   const pick=name=>page.locator('.relay-network',{hasText:name}).click();
+  const strictCellular=page.getByRole('checkbox',{name:'Strict zero-cellular during relay'});
   try{
     // Opening the page reads state and never starts work.
     await page.goto(`${fixture.url}/#network/relay`);await said('#relay-status .relay-state','RELAY OFF');
@@ -80,9 +95,36 @@ const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs
     assert.equal(await page.getByRole('button',{name:'Disconnect relay'}).isVisible(),true);assert.match(await text('#relay-networks .action-status'),/Internet is not verified/);
     assert.match(await text('#relay-saved .relay-saved-item:has-text("Hotel Guest")'),/Connected/);
 
+    assert.equal(await strictCellular.isChecked(),false);
+    assert.match(await text('#relay-cellular-help'),/resumes afterward if it was on/);
+    await strictCellular.check();
+    await said('#relay-status .relay-facts','Cellular data paused');
+    assert.equal(last().url,'/api/wifi-relay/strict-zero-cellular');
+    assert.deepEqual(last().body,{enabled:true});
+    assert.equal(await strictCellular.isChecked(),true);
+    cellularFailure='Cannot restore cellular data: modem did not respond';
+    await strictCellular.uncheck();
+    await said('#relay-status .relay-problem',cellularFailure);
+    assert.deepEqual(last().body,{enabled:false});
+    cellularFailure=null;
+    await page.getByRole('button',{name:'Retry cellular change'}).click();
+    await said('#relay-status .relay-facts','Strict mode off');
+    assert.deepEqual(last().body,{enabled:false});
+    await page.locator('#relay-status .relay-problem').waitFor({state:'hidden'});
+
+    cellularWasOn=false;
+    cellularFailure='Cannot pause cellular data: modem did not respond';
+    await strictCellular.check();
+    await said('#relay-status .relay-problem',cellularFailure);
+    cellularFailure=null;
+    await page.getByRole('button',{name:'Retry cellular change'}).click();
+    await said('#relay-status .relay-facts','Cellular data was already off');
+    assert.deepEqual(last().body,{enabled:true});
+
     // Disconnect is confirmed; the page returns to the off state.
     await page.getByRole('button',{name:'Disconnect relay'}).click();assert.match(await text('.confirm-dialog'),/restored/);await confirm('Disconnect relay');
     await said('#relay-status .relay-state','RELAY OFF');assert.equal(last().url,'/api/wifi-relay/disconnect');assert.equal(await page.locator('#relay-status .relay-scope').isHidden(),true,'the scope note is for a connected relay');
+    assert.equal(await strictCellular.isChecked(),true);
 
     // Open networks never send a password; options map onto the request.
     await pick('Cafe');assert.equal(await page.locator('#relay-password').isDisabled(),true);assert.equal(await page.locator('input[name=remember]').isDisabled(),true);
@@ -90,6 +132,7 @@ const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs
     await page.getByRole('button',{name:'Connect to Wi-Fi'}).click();await confirm('Connect');await said('#relay-status .relay-state','WI-FI LINKED');
     assert.deepEqual(last().body,{network:'cafe24',password:'',confirmed:true,ipv6:false,remember:false});
     assert.match(await text('#relay-status .relay-facts'),/Off/);assert.equal(await page.locator('#relay-status .relay-scope').isVisible(),true);
+    assert.match(await text('#relay-status .relay-facts'),/Cellular data was already off/);
 
     // Saved networks: forgetting is an explicit, confirmed change; there is no bandwidth choice.
     const item=page.locator('#relay-saved .relay-saved-item:has-text("Hotel Guest")');
@@ -123,6 +166,6 @@ const assert=require('node:assert/strict'),{launchChrome}=require('./browser.cjs
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth),true,`${theme} ${width}px has no horizontal overflow`);
     }
     assert.deepEqual(errors,[]);
-    console.log('Passed: relay states, scan list, password checks, connect/disconnect, saved networks, restore SSE, uncertain requests and responsive themes.');
+    console.log('Passed: relay states, scan list, password checks, connect/disconnect, strict cellular controls and error recovery, saved networks, restore SSE, uncertain requests and responsive themes.');
   }finally{await browser.close();await fixture.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

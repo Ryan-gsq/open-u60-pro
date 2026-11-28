@@ -28,9 +28,17 @@
   const actions = el('div', 'form-actions'), refresh = button('Read current status', () => load()), stop = button('Disconnect relay', stopRelay, 'danger');
   stop.hidden = true;
   actions.append(refresh, stop);
-  const caution = el('p', 'field-help relay-caution', 'Hotspots may briefly reconnect. If Wi-Fi drops, SIM data may be used only if cellular data is already on. Relay never turns it on. Hotel login is completed in a browser on a connected device, never by ignoring certificate warnings.');
+  const caution = el('p', 'field-help relay-caution', 'Hotspots may briefly reconnect. When the relay stops, cellular data can resume if it was already on. Use a connected device’s browser for hotel login and stop if you see a certificate warning.');
   const statusText = UI.status(statusPanel);
-  statusPanel.append(hero, path, facts, scope, problem, clockBox, actions, caution, statusText);
+  const strictCellular = choice('strict-zero-cellular', 'Strict zero-cellular during relay', false);
+  const cellularHelp = el('p', 'field-help', 'Pauses the cellular data call while Wi-Fi relay is connected. Cellular data resumes afterward if it was on before the pause.');
+  cellularHelp.id = 'relay-cellular-help';
+  strictCellular.input.setAttribute('aria-describedby', cellularHelp.id);
+  strictCellular.input.addEventListener('change', () => changeStrictCellular(strictCellular.input.checked));
+  const cellularRetry = button('Retry cellular change', () => changeStrictCellular(R.cellular(current).enabled));
+  cellularRetry.hidden = true;
+  actions.append(cellularRetry);
+  statusPanel.append(hero, path, facts, scope, problem, clockBox, strictCellular.label, cellularHelp, actions, caution, statusText);
 
   // ── Networks ────────────────────────────────────────────────────────────
   const netPanel = UI.panel(route, 'relay-networks', 'Upstream networks', 'Find nearby Wi-Fi and choose the one the U60 should use. Open and WPA2 networks are supported; WPA3-only, enterprise and hidden networks are not.');
@@ -78,7 +86,7 @@
 
   // ── State ───────────────────────────────────────────────────────────────
   let current = null, loading = false, attempted = false, busy = false, selectedId = '', lastLoad = 0, settleTimer = 0;
-  let loadId = 0, settleId = 0;
+  let loadId = 0, settleId = 0, pendingStrictCellular = null;
   const onRoute = () => OpenU60Navigation.current.key === route;
   const dirty = () => password.value !== '';
 
@@ -98,7 +106,12 @@
       return pair;
     }));
     scope.hidden = !view.connected;
-    const messages = [current?.error, current?.ipv6?.error].filter(Boolean);
+    const cellular = R.cellular(current);
+    strictCellular.input.checked = pendingStrictCellular ?? cellular.enabled;
+    strictCellular.input.disabled = typeof current?.strict_zero_cellular !== 'boolean' || busy || !API.connected;
+    cellularRetry.hidden = !view.connected || !cellular.error;
+    cellularRetry.disabled = busy || !API.connected;
+    const messages = [...new Set([current?.error, current?.ipv6?.error, cellular.error].filter(Boolean))];
     problem.hidden = messages.length === 0;
     problem.textContent = messages.join(' ');
     clockBox.hidden = !(view.connected && current?.clock_error);
@@ -192,7 +205,7 @@
 
   // One place for every state-changing call: definite refusals show the router’s
   // reason; a request that never answered is reported as uncertain.
-  async function act(node, pathName, body, {timeoutMs, working, done}) {
+  async function act(node, pathName, body, {timeoutMs, working, done, onDone}) {
     await mutate(node, async live => {
       busy = true; draw(); say(node, working);
       try {
@@ -210,6 +223,7 @@
         }
       } finally {
         busy = false;
+        onDone?.();
         if (live()) { draw(); }
       }
     });
@@ -220,6 +234,22 @@
   }
   async function recheckTime() {
     await act(statusText, '/api/wifi-relay/clock', {}, {timeoutMs: MINUTE, working: 'Verifying time over Wi-Fi…', done: 'Time verified over the relay.'});
+  }
+  async function changeStrictCellular(enabled) {
+    pendingStrictCellular = enabled;
+    try {
+      await act(statusText, '/api/wifi-relay/strict-zero-cellular', {enabled}, {
+        timeoutMs: MINUTE,
+        working: 'Applying the cellular data setting…',
+        done: enabled ? 'Strict zero-cellular is enabled.' : 'Strict zero-cellular is off.',
+        onDone: () => { pendingStrictCellular = null; }
+      });
+    } finally {
+      if (pendingStrictCellular !== null) {
+        pendingStrictCellular = null;
+        draw();
+      }
+    }
   }
   async function stopRelay() {
     const view = R.view(current);
@@ -266,7 +296,7 @@
     clear() {
       clearTimeout(settleTimer);
       loadId++; settleId++;
-      current = null; attempted = false; loading = false; busy = false; selectedId = '';
+      current = null; attempted = false; loading = false; busy = false; selectedId = ''; pendingStrictCellular = null;
       password.value = ''; remember.input.checked = ipv6.input.checked = true;
       for (const node of [statusText, netText, savedText]) say(node, '');
       draw();

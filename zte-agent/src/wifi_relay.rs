@@ -6,6 +6,7 @@
 pub(crate) mod ipv6;
 pub(crate) mod adopt;
 mod bss;
+mod cellular;
 mod dhcp;
 mod controller;
 pub(crate) mod dns;
@@ -43,7 +44,9 @@ use serde_json::{json, Value};
 
 use crate::boottime::{BootClock, BootInstant, Clock};
 use crate::net_tools::{self as net, Cmd, NetworkLock, Step};
+use crate::netfx::conntrack::{self, Scope};
 use crate::netfx::effect::{EffectSet, Resource, Addr, Family, Internal, Key, LegacyChain, LegacyHook, LegacyTool, Position, Route, RouteType, Rule};
+use crate::netfx::perf::{Perf, PerfFeature};
 
 const IFACE: &str = crate::netfx::ids::RELAY_IFACE;
 mod saved;
@@ -52,6 +55,11 @@ const JOURNAL: &str = "/data/zte-agent-relay";
 const HOSTAPD: &str = "/data/vendor/wifi/hostapd";
 const TABLE: &str = crate::netfx::ids::RELAY_TABLE;
 const PREF: &str = crate::netfx::ids::RELAY_PREF;
+
+#[cfg(not(test))]
+pub(crate) fn network_journal() -> std::path::PathBuf {
+    Path::new(JOURNAL).join(journals::NETWORK)
+}
 
 #[derive(Clone, Serialize)]
 pub struct Network {
@@ -213,22 +221,43 @@ struct Snapshot {
 }
 
 struct Shared {
+    perf: Arc<Perf>,
     cancel: Mutex<Cancel>,
     snapshot: Mutex<Snapshot>,
     active: AtomicBool,
     owned: AtomicBool,
     tick_pending: AtomicBool,
+    slot_change_paused: AtomicBool,
+    #[cfg(test)]
+    test_ota_trial_pending: AtomicBool,
 }
 
 impl Shared {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_perf(Perf::router())
+    }
+
+    fn with_perf(perf: Arc<Perf>) -> Self {
         Self {
+            perf,
             cancel: Mutex::new(Cancel::default()),
             snapshot: Mutex::new(Snapshot { value: Arc::new(snapshot(&State::default(), BootClock.now())), scans: Vec::new() }),
             active: AtomicBool::new(false),
             owned: AtomicBool::new(false),
             tick_pending: AtomicBool::new(false),
+            slot_change_paused: AtomicBool::new(false),
+            #[cfg(test)]
+            test_ota_trial_pending: AtomicBool::new(false),
         }
+    }
+
+    fn slot_change_blocked(&self) -> bool {
+        #[cfg(test)]
+        if self.test_ota_trial_pending.load(Ordering::Acquire) {
+            return true;
+        }
+        self.slot_change_paused.load(Ordering::Acquire) || crate::ota::slot_change_pending()
     }
 
     fn generation_matches(&self, generation: u64) -> bool {
@@ -320,8 +349,12 @@ pub struct WifiRelay {
 
 impl WifiRelay {
     pub fn new(lock: NetworkLock) -> Self {
-        let relay = Self { lock, shared: Arc::new(Shared::new()), commands: OnceLock::new(), mihomo: None, tailscale: None };
-        let mut port = DevicePort { control: None, settings: None, shared: Arc::clone(&relay.shared), mihomo: None, tailscale: None };
+        Self::with_perf(lock, Perf::router())
+    }
+
+    fn with_perf(lock: NetworkLock, perf: Arc<Perf>) -> Self {
+        let relay = Self { lock, shared: Arc::new(Shared::with_perf(perf)), commands: OnceLock::new(), mihomo: None, tailscale: None };
+        let mut port = DevicePort { control: None, settings: None, cellular_pause: cellular::Pause::default(), cellular_deferred_by_trial: false, shared: Arc::clone(&relay.shared), mihomo: None, tailscale: None };
         let mut state = State::default();
         if recovery_pending(Path::new(JOURNAL)) { state.phase = Phase::RecoveryPending; }
         port.publish(&state);
@@ -329,7 +362,8 @@ impl WifiRelay {
     }
 
     pub fn with_core(lock: NetworkLock, core: Arc<crate::mihomo::Mihomo>) -> Self {
-        Self { mihomo: Some(core), ..Self::new(lock) }
+        let perf = Arc::clone(core.perf());
+        Self { mihomo: Some(core), ..Self::with_perf(lock, perf) }
     }
 
     pub fn with_tailscale(mut self, tailscale: Arc<crate::tailscale::TailscaleManager>) -> Self {
@@ -342,7 +376,7 @@ impl WifiRelay {
         let (reply, _) = std::sync::mpsc::sync_channel(1);
         controller::boot(&sender, reply);
         if self.commands.set(sender.clone()).is_err() { return; }
-        let port = DevicePort { control: None, settings: None, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone(), tailscale: self.tailscale.clone() };
+        let port = DevicePort { control: None, settings: None, cellular_pause: cellular::Pause::default(), cellular_deferred_by_trial: false, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone(), tailscale: self.tailscale.clone() };
         let controller = controller::Controller::new(port, receiver, sender.clone(), Arc::clone(&self.shared), Arc::clone(&self.lock), controller::Timings::default());
         crate::system::spawn_named("relay", move || controller.supervised(|_| {
             crate::netlog!("[relay] the controller thread panicked; ending the agent so that its guard starts it again and it adopts the connection");
@@ -395,8 +429,19 @@ impl WifiRelay {
     }
 
     pub fn recover(&self) -> Result<(), String> {
-        DevicePort { control: None, settings: None, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone(), tailscale: self.tailscale.clone() }.recover()
+        DevicePort { control: None, settings: None, cellular_pause: cellular::Pause::default(), cellular_deferred_by_trial: false, shared: Arc::clone(&self.shared), mihomo: self.mihomo.clone(), tailscale: self.tailscale.clone() }.recover()
     }
+}
+
+pub(crate) fn cellular_pause_journal_path() -> std::path::PathBuf {
+    Path::new(JOURNAL).join(cellular::JOURNAL)
+}
+
+pub(crate) fn restore_cellular_pause() -> Result<(), String> {
+    cellular::Pause::default().set(Path::new(JOURNAL), false)
+}
+
+impl WifiRelay {
 
     pub fn recover_idle(&self) { let _ = controller::request(self, RelayCommand::Boot, None); }
     pub fn wants_restore(&self) -> bool { resume::load(Path::new(JOURNAL)).is_some() }
@@ -438,6 +483,7 @@ impl WifiRelay {
     }
 
     fn set_power_save(&self, enabled: bool) -> Result<(), String> { self.call(RelayCommand::PowerSave(enabled)).map(|_| ()) }
+    fn set_strict_zero_cellular(&self, enabled: bool) -> Result<(), String> { self.call(RelayCommand::StrictZeroCellular(enabled)).map(|_| ()) }
     fn set_offload_enabled(&self, enabled: bool) -> Result<Option<Value>, String> { self.call(RelayCommand::Offload(enabled)) }
     fn forget(&self, id: &str) -> Result<(), String> { self.call(RelayCommand::Forget(id.into())).map(|_| ()) }
     fn recheck_clock(&self) -> Result<(), String> {
@@ -445,6 +491,53 @@ impl WifiRelay {
             return Err("Connect Wi-Fi relay before checking time".into());
         }
         self.call(RelayCommand::Clock).map(|_| ())
+    }
+
+    /// Restore any active strict-zero-cellular pause (`cellular-pause` journal)
+    /// and block re-pausing before an OTA slot change so an older slot without
+    /// a `cellular-pause` reader can never inherit a stranded disabled modem.
+    pub(crate) fn before_slot_change<T>(&self, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        if self
+            .shared
+            .slot_change_paused
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("OTA slot change is already in progress".into());
+        }
+        let prepared = if self.commands.get().is_some() {
+            self.call(RelayCommand::PrepareSlotChange).map(|_| ())
+        } else {
+            let root = Path::new(JOURNAL);
+            cellular::Pause::default().set(root, false).and_then(|()| {
+                if root
+                    .join(cellular::JOURNAL)
+                    .try_exists()
+                    .map_err(|e| format!("inspect cellular pause journal: {e}"))?
+                {
+                    Err("cellular pause journal still present after cleanup".into())
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        if let Err(error) = prepared {
+            self.shared.slot_change_paused.store(false, Ordering::SeqCst);
+            if self.commands.get().is_some() {
+                let _ = self.send(Message::ResumeSlotChange);
+            }
+            return Err(format!("relay slot-change cleanup failed: {error}"));
+        }
+        match action() {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.shared.slot_change_paused.store(false, Ordering::SeqCst);
+                if self.commands.get().is_some() {
+                    let _ = self.send(Message::ResumeSlotChange);
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -471,13 +564,25 @@ fn snapshot(i: &State, now: BootInstant) -> Value {
 struct DevicePort {
     control: Option<scan::Ctrl>,
     settings: Option<Value>,
+    cellular_pause: cellular::Pause,
+    cellular_deferred_by_trial: bool,
     shared: Arc<Shared>,
     mihomo: Option<Arc<crate::mihomo::Mihomo>>,
     tailscale: Option<Arc<crate::tailscale::TailscaleManager>>,
 }
 
 impl DevicePort {
-    pub fn recover(&self) -> Result<(), String> {
+    fn set_perf_active(&self) {
+        let perf = &self.shared.perf;
+        perf.report(perf.set_active(PerfFeature::Relay, true));
+    }
+
+    pub fn recover(&mut self) -> Result<(), String> {
+        Self::recover_network()?;
+        self.cellular_pause.set(Path::new(JOURNAL), false)
+    }
+
+    fn recover_network() -> Result<(), String> {
         stop_strays(&[])?;
         let ipv6 = ipv6::recover();
         let ipv4 = EffectSet::recover(&Path::new(JOURNAL).join(journals::NETWORK));
@@ -498,7 +603,7 @@ impl DevicePort {
         wireless.and(dns)
     }
 
-    fn adopt_previous(&self) -> Option<Session> {
+    fn adopt_previous(&mut self, allow_cellular_pause: bool) -> Option<Session> {
         let target = resume::load(Path::new(JOURNAL))?;
         if !routes_journaled(Path::new(JOURNAL)) || hotspot::owner_off("wlan2") {
             return None;
@@ -508,6 +613,16 @@ impl DevicePort {
         let started = Instant::now();
         match adopt::adopt(&target, lan_ip, lan_mask) {
             Ok(session) => {
+                let root = Path::new(JOURNAL);
+                if allow_cellular_pause && !self.shared.slot_change_blocked() {
+                    if let Err(error) = self.cellular_pause.reconcile(root) {
+                        crate::netlog!("[relay] cellular reconciliation during takeover failed: {error}");
+                    }
+                    self.cellular_deferred_by_trial = false;
+                } else if cellular::enabled(root) {
+                    self.cellular_deferred_by_trial = true;
+                }
+                self.set_perf_active();
                 crate::netlog!("[relay] took over the previous agent's connection in {} ms", started.elapsed().as_millis());
                 Some(session)
             }
@@ -518,7 +633,7 @@ impl DevicePort {
         }
     }
 
-    fn prepare(&self, cancel: &Cancellation) -> Result<Session, String> {
+    fn prepare(&mut self, cancel: &Cancellation) -> Result<Session, String> {
         // A Wi-Fi reload the agent started is still reconfiguring the radio.
         if crate::netfx::admission::held(crate::netfx::admission::VENDOR_WIFI_RELOAD) {
             return Err("Wi-Fi is still applying its new settings; retry in a moment".into());
@@ -596,7 +711,7 @@ impl DevicePort {
             Ok(())
         })();
         if let Err(e) = result {
-            return Err(cleanup(&mut session, || self.uplink_changed()).err().unwrap_or(e));
+            return Err(self.cleanup_session(&mut session).err().unwrap_or(e));
         }
         Ok(session)
     }
@@ -605,8 +720,20 @@ impl DevicePort {
 
 impl DevicePort {
     fn uplink_changed(&self) {
-        if let Some(core) = &self.mihomo { core.uplink_changed(); }
-        if let Some(tailscale) = &self.tailscale { tailscale.relay_uplink_changed(); }
+        notify_uplink(self.mihomo.as_deref(), self.tailscale.as_deref());
+    }
+
+    fn apply_cellular(&mut self, session: &Session, enabled: bool) -> Result<(), String> {
+        session.uplink.update(|layout| layout.strict_zero_cellular = enabled)
+            .map_err(|error| self.cellular_pause.failed(format!("Cannot update the strict zero-cellular firewall: {error}")))?;
+        self.cellular_pause.set(Path::new(JOURNAL), enabled)
+    }
+
+    fn cleanup_session(&mut self, session: &mut Session) -> Result<(), String> {
+        self.control = None;
+        let cellular_pause = &mut self.cellular_pause;
+        let (mihomo, tailscale) = (self.mihomo.as_deref(), self.tailscale.as_deref());
+        cleanup(session, &self.shared.perf, || cellular_pause.set(Path::new(JOURNAL), false), || notify_uplink(mihomo, tailscale))
     }
 
     fn check(&self, cancel: &Cancellation) -> Result<(), String> {
@@ -625,7 +752,7 @@ impl DevicePort {
             state, selected, ipv6, cancel, root, channels,
             Self::publish,
             |port, old, keep_ipv6| handover(old, channels, keep_ipv6, || port.uplink_changed()),
-            |port, old| cleanup(old, || port.uplink_changed()),
+            Self::cleanup_session,
             |port| port.prepare(cancel),
         )
     }
@@ -672,7 +799,7 @@ impl DevicePort {
         lease.ok_or_else(|| "No usable DHCP lease received".into())
     }
 
-    fn install_ipv4(session: &mut Session, lease: &Lease) -> Result<u32, String> {
+    fn install_ipv4(session: &mut Session, lease: &Lease, strict_zero_cellular: bool) -> Result<(), String> {
         let lan_ip: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.ipaddr"]).run()?.parse().map_err(|_| "Invalid LAN address")?;
         let lan_mask: Ipv4Addr = Cmd::new("uci", &["-q", "get", "network.lan.netmask"]).run()?.parse().map_err(|_| "Invalid LAN mask")?;
         let prefix = validate_lease(lease, lan_ip, lan_mask)?;
@@ -691,13 +818,16 @@ impl DevicePort {
             session.dns.declare(vec![step])?;
         }
         session.dns.declare(portal::web_redirect(&session.dns))?;
-        session.uplink.update(|l| l.relay = Some(relay_layout(lease, lan_ip, lan_mask)))?;
+        session.uplink.update(|layout| {
+            layout.relay = Some(relay_layout(lease, lan_ip, lan_mask));
+            layout.strict_zero_cellular = strict_zero_cellular;
+        })?;
         session.network.declare(vec![rule])?;
         session.routed = true;
         if !crate::mihomo::egress::relay_route(false) {
             return Err("Firmware policy routing did not select the Wi-Fi upstream".into());
         }
-        Ok(prefix)
+        Ok(())
     }
 
     fn begin_join_with(
@@ -705,7 +835,7 @@ impl DevicePort {
         root: &Path, channels: &scan::Channels,
         publish: impl FnOnce(&mut Self, &State),
         transfer: impl FnOnce(&Self, &mut Session, bool) -> Result<(), String>,
-        teardown: impl FnOnce(&Self, &mut Session) -> Result<(), String>,
+        teardown: impl FnOnce(&mut Self, &mut Session) -> Result<(), String>,
         prepare: impl FnOnce(&mut Self) -> Result<Session, String>,
     ) -> Result<(Session, bool, bool), String> {
         if !channels.contains(selected.frequency) {
@@ -744,6 +874,17 @@ impl DevicePort {
     }
 }
 
+fn notify_uplink(mihomo: Option<&crate::mihomo::Mihomo>, tailscale: Option<&crate::tailscale::TailscaleManager>) {
+    if let Some(core) = mihomo { core.uplink_changed(); }
+    if let Some(tailscale) = tailscale { tailscale.relay_uplink_changed(); }
+}
+
+fn reset_link_connections(reset: impl FnOnce(&'static str, Scope, Instant) -> Result<conntrack::Report, String>) {
+    if let Err(error) = reset("relay connected", Scope::Lan { v4: true, v6: false }, Instant::now()) {
+        crate::netlog!("[relay] connection reset after link-up failed: {error}");
+    }
+}
+
 fn finish_join_hotspot_failure(
     shared: &Shared,
     by_owner: bool,
@@ -758,17 +899,18 @@ fn finish_join_hotspot_failure(
 }
 
 fn scan_session_with(
-    connected: bool, mut check: impl FnMut() -> Result<(), String>,
-    prepare: impl FnOnce() -> Result<Session, String>, scan: impl FnOnce() -> Result<Vec<Network>, String>,
-    cleanup: impl FnOnce(&mut Session) -> Result<(), String>,
+    port: &mut DevicePort, connected: bool, mut check: impl FnMut(&DevicePort) -> Result<(), String>,
+    prepare: impl FnOnce(&mut DevicePort) -> Result<Session, String>,
+    scan: impl FnOnce(&DevicePort) -> Result<Vec<Network>, String>,
+    cleanup: impl FnOnce(&mut DevicePort, &mut Session) -> Result<(), String>,
 ) -> Result<Vec<Network>, String> {
-    check()?;
-    let mut temporary = if !connected { Some(prepare()?) } else { None };
-    let result = check().and_then(|()| scan());
+    check(port)?;
+    let mut temporary = if !connected { Some(prepare(port)?) } else { None };
+    let result = check(port).and_then(|()| scan(port));
     if let Some(session) = &mut temporary {
-        cleanup(session)?;
+        cleanup(port, session)?;
     }
-    check()?;
+    check(port)?;
     result
 }
 
@@ -796,7 +938,7 @@ impl controller::Port for DevicePort {
     fn snapshot(&mut self, state: &State) -> Value {
         let mut value = snapshot(state, BootClock.now());
         let settings = self.settings.get_or_insert_with(|| {
-            let mut settings = json!({"autostart":resume::load(Path::new(JOURNAL)).is_some(), "enabled":offload::enabled(), "auto_off":power_save::auto_off(Path::new(JOURNAL))});
+            let mut settings = json!({"autostart":resume::load(Path::new(JOURNAL)).is_some(), "enabled":offload::enabled(), "auto_off":power_save::auto_off(Path::new(JOURNAL)), "strict_zero_cellular":cellular::enabled(Path::new(JOURNAL))});
             saved::annotate(&mut settings);
             settings
         });
@@ -806,6 +948,8 @@ impl controller::Port for DevicePort {
         value["offload"]["enabled"] = settings["enabled"].clone();
         if !value["power_save"].is_object() { value["power_save"] = json!({}); }
         value["power_save"]["auto_off"] = settings["auto_off"].clone();
+        value["strict_zero_cellular"] = settings["strict_zero_cellular"].clone();
+        value["cellular_pause"] = json!(self.cellular_pause);
         if let Some(saved) = settings["saved_networks"].as_array() {
             if let Some(networks) = value["networks"].as_array_mut() {
                 for network in networks {
@@ -828,22 +972,24 @@ impl controller::Port for DevicePort {
         if routed && !routes_journaled(Path::new(JOURNAL)) { self.uplink_changed(); }
         recovered
     }
-    fn adopt(&mut self) -> Option<Session> { self.adopt_previous() }
+    fn adopt(&mut self, allow_cellular_pause: bool) -> Option<Session> {
+        self.adopt_previous(allow_cellular_pause)
+    }
 
     fn scan(&mut self, state: &mut State, cancel: &Cancellation) -> Result<Vec<Network>, String> {
-        scan_session_with(state.session.is_some(), || self.check(cancel), || self.prepare(cancel), || {
+        scan_session_with(self, state.session.is_some(), |port| port.check(cancel), |port| port.prepare(cancel), |port| {
             let channels = scan::Channels::parse(&Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?);
             let plan = channels.plan();
             let mut ctrl = scan::Ctrl::attach(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT))?;
-            let (table, took) = scan::run(&mut ctrl, &plan, || self.check(cancel))?;
+            let (table, took) = scan::run(&mut ctrl, &plan, || port.check(cancel))?;
             Ok(parse_bss_on_channels(&table, took.as_secs() + 1, &channels))
-        }, |session| {
-            self.set_phase(Phase::Disconnecting);
-            cleanup(session, || ())
+        }, |port, session| {
+            port.set_phase(Phase::Disconnecting);
+            port.cleanup_session(session)
         })
     }
 
-    fn join(&mut self, state: &mut State, selection: Selection, ipv6: bool, cancel: &Cancellation) -> Result<Session, String> {
+    fn join(&mut self, state: &mut State, selection: Selection, ipv6: bool, cancel: &Cancellation, allow_cellular_pause: bool) -> Result<Session, String> {
         self.check(cancel)?;
         let root = Path::new(JOURNAL);
         let selected = selection.network;
@@ -851,20 +997,15 @@ impl controller::Port for DevicePort {
         // Country/driver restrictions may have changed since the last scan.
         let channels = scan::Channels::parse(&Cmd::new("iw", &["phy", &radio_phy()?, "channels"]).run()?);
         let (mut session, kept, ipv6_kept) = self.begin_join(state, &selected, ipv6, cancel, root, &channels)?;
-        let check = || self.check(cancel);
+        let strict = cellular::enabled(root);
         let result = (|| {
             let lease = self.associate_and_lease(&mut session, &selected, &network_config, &channels, kept, cancel)?;
-            let prefix = Self::install_ipv4(&mut session, &lease)?;
-            // CPU-path help and hardware forwarding are optional: the relay
-            // works without them.
-            if let Err(e) = session.network.declare(steering::plan()) {
-                crate::netlog!("[relay] receive steering not applied: {e}");
-            }
+            Self::install_ipv4(&mut session, &lease, strict)?;
+            self.set_perf_active();
             if power_save::auto_off(Path::new(JOURNAL)) {
                 let _ = session.power_save.set(&mut session.network, true);
             }
-            let subnet = format!("{}/{prefix}", Ipv4Addr::from(u32::from(lease.ip) & u32::from(lease.subnet)));
-            session.offload = offload::Runtime::start(&mut session.network, lease.gateway, subnet);
+            session.offload = offload::Runtime::start(&mut session.network, lease.gateway);
             session.dns.declare(vec![resolver(&lease)])?;
             // After a handover the switch already reads 0 (held): no step,
             // no dnsmasq restart.
@@ -876,9 +1017,20 @@ impl controller::Port for DevicePort {
             if !ipv6_kept {
                 session.ipv6.start(ipv6)?;
             }
-            check()?;
+            self.check(cancel)?;
             if hotspot::owner_off("wlan2") || (selected.frequency < 3000 && hotspot::owner_off("wlan0")) {
                 return Err("Hotspot was turned off while connecting relay".into());
+            }
+            if strict {
+                if self.shared.slot_change_paused.load(Ordering::Acquire) {
+                    return Err("OTA slot change is in progress; retry after restart".into());
+                }
+                if allow_cellular_pause && !self.shared.slot_change_blocked() {
+                    self.cellular_pause.set(root, true)?;
+                    self.cellular_deferred_by_trial = false;
+                } else {
+                    self.cellular_deferred_by_trial = true;
+                }
             }
             session.lease = Some(lease);
             session.selected = Some(selected.clone());
@@ -888,13 +1040,14 @@ impl controller::Port for DevicePort {
             let (_off, by_owner) = hotspot::status(selected.frequency < 3000);
             let clear_error = finish_join_hotspot_failure(&self.shared, by_owner, || resume::clear(root));
             self.set_phase(Phase::Disconnecting);
-            let e = cleanup(&mut session, || self.uplink_changed()).err().unwrap_or(e);
+            let e = self.cleanup_session(&mut session).err().unwrap_or(e);
             state.error = clear_error.or_else(|| (e != RESTORE_CANCELLED).then(|| e.clone()));
             return Err(e);
         }
+        reset_link_connections(conntrack::reset_since);
         if !cancel.shared.generation_matches(cancel.generation) {
             self.set_phase(Phase::Disconnecting);
-            let cleaned = cleanup(&mut session, || self.uplink_changed());
+            let cleaned = self.cleanup_session(&mut session);
             return cleaned.and(Err(RESTORE_CANCELLED.into()));
         }
         Ok(session)
@@ -910,7 +1063,7 @@ impl controller::Port for DevicePort {
         error
     }
 
-    fn cleanup(&mut self, session: &mut Session) -> Result<(), String> { self.control = None; cleanup(session, || self.uplink_changed()) }
+    fn cleanup(&mut self, session: &mut Session) -> Result<(), String> { self.cleanup_session(session) }
     fn observe_link(&mut self) -> (Option<String>, u128) {
         let started = Instant::now();
         if self.control.is_none() { self.control = scan::Ctrl::attach(&Path::new(ROOT).join("ctrl").join(IFACE), Path::new(ROOT)).ok(); }
@@ -928,31 +1081,93 @@ impl controller::Port for DevicePort {
         Observation { #[cfg(test)] link: None, lease, helpers, resolvers_valid, hotspot_off, by_owner }
     }
     fn renew(&mut self, session: &mut Session) { session.renew_lease(); }
-    fn maintain(&mut self, session: &mut Session) -> Result<bool, String> {
+    fn maintain(&mut self, session: &mut Session, allow_cellular_pause: bool) -> Result<bool, String> {
         let lease = session.lease.as_ref().unwrap();
         let resolvers = if lease.dns.is_empty() { vec![lease.gateway] } else { lease.dns.clone() };
         let dns = dns::reconcile(&resolvers);
         if let Some(Err(error)) = crate::netfx::conntrack::retry() { crate::netlog!("[relay] connection reset retry failed: {error}"); }
+        let root = Path::new(JOURNAL);
+        if !allow_cellular_pause && cellular::enabled(root) {
+            self.cellular_deferred_by_trial = true;
+        }
         let guard_due = session.guard.due();
+        let mut cellular_reconciled = false;
         let guarded = if guard_due {
-            let _pass = net::Pass::open();
-            let mut result = session.uplink.reconcile();
-            result.extend(session.wireless.lock().unwrap().reconcile_only(firewall_resource));
-            result.extend(session.network.reconcile());
-            result.extend(session.dns.reconcile());
-            result.extend(session.ipv6.reconcile());
+            let (result, firewall_ready) = {
+                let _pass = net::Pass::open();
+                let mut result = session.uplink.reconcile();
+                let firewall_ready = result.failed.is_empty();
+                result.extend(session.wireless.lock().unwrap().reconcile_only(firewall_resource));
+                result.extend(session.network.reconcile());
+                result.extend(session.dns.reconcile());
+                result.extend(session.ipv6.reconcile());
+                (result, firewall_ready)
+            };
             session.guard.after(&result);
+            if allow_cellular_pause && (firewall_ready || cellular::enabled(root)) {
+                cellular_reconciled = true;
+                self.cellular_deferred_by_trial = false;
+                if let Err(error) = self.cellular_pause.reconcile(root) {
+                    crate::netlog!("[relay] cellular reconciliation failed: {error}");
+                }
+            }
             crate::net_guard::report("relay", result)
         } else { Ok(()) };
+        if allow_cellular_pause && !cellular_reconciled && self.cellular_deferred_by_trial {
+            self.cellular_deferred_by_trial = false;
+            if let Err(error) = self.cellular_pause.reconcile(root) {
+                crate::netlog!("[relay] post-trial cellular reconciliation failed: {error}");
+            }
+        }
         session.dns_error = dns.and(guarded).err();
         let before = session.ipv6.revision();
         session.ipv6.tick(guard_due)?;
         Ok(before != session.ipv6.revision())
     }
+    fn prepare_slot_change(&mut self, state: &mut State) -> Result<(), String> {
+        self.cellular_deferred_by_trial = false;
+        if self.cellular_pause.error().is_some_and(|error| state.error.as_deref() == Some(error)) {
+            state.error = None;
+        }
+        let root = Path::new(JOURNAL);
+        self.cellular_pause.set(root, false)?;
+        if root
+            .join(cellular::JOURNAL)
+            .try_exists()
+            .map_err(|e| format!("inspect cellular pause journal: {e}"))?
+        {
+            return Err("cellular pause journal still present after cleanup".into());
+        }
+        Ok(())
+    }
+    fn resume_slot_change(&mut self, state: &mut State) {
+        if state.session.is_some() && !self.shared.slot_change_blocked() {
+            let root = Path::new(JOURNAL);
+            if cellular::enabled(root) {
+                self.cellular_deferred_by_trial = false;
+                if let Err(error) = self.cellular_pause.reconcile(root) {
+                    crate::netlog!("[relay] cellular reconciliation after aborted slot change failed: {error}");
+                }
+            }
+        }
+    }
     fn uplink_changed(&self) { DevicePort::uplink_changed(self); }
     fn power_save(&mut self, state: &mut State, auto_off: bool) -> Result<(), String> {
         self.settings = None; power_save::save(Path::new(JOURNAL), auto_off)?;
         let result = state.session.as_mut().map_or(Ok(()), |session| session.power_save.set(&mut session.network, auto_off));
+        result.map_err(|error| format!("Setting saved. {error}"))
+    }
+    fn strict_zero_cellular(&mut self, state: &mut State, enabled: bool) -> Result<(), String> {
+        self.settings = None;
+        cellular::save(Path::new(JOURNAL), enabled)?;
+        if self.cellular_pause.error().is_some_and(|error| state.error.as_deref() == Some(error)) {
+            state.error = None;
+        }
+        let result = match state.session.as_ref() {
+            Some(session) => self.apply_cellular(session, enabled),
+            None if !enabled => self.cellular_pause.set(Path::new(JOURNAL), false),
+            None => Ok(()),
+        };
         result.map_err(|error| format!("Setting saved. {error}"))
     }
     fn offload(&mut self, state: &mut State, enabled: bool) -> Result<Option<Value>, String> {
@@ -963,8 +1178,8 @@ impl controller::Port for DevicePort {
         let changed = session.offload.sync(&mut session.network);
         self.publish(state);
         match changed {
-            Ok(true) => Ok(Some(match crate::netfx::conntrack::reset_since("relay forwarding path changed", crate::netfx::conntrack::Scope::Lan { v4: true, v6: false }, changed_at) {
-                Ok(report) => report.json(), Err(error) => crate::netfx::conntrack::failed_json(&error),
+            Ok(true) => Ok(Some(match conntrack::reset_since("relay forwarding path changed", Scope::Lan { v4: true, v6: false }, changed_at) {
+                Ok(report) => report.json(), Err(error) => conntrack::failed_json(&error),
             })),
             Ok(false) => Ok(None),
             Err(error) => Err(error),
@@ -1111,7 +1326,7 @@ fn routes_journaled(root: &Path) -> bool {
 }
 
 fn recovery_pending(root: &Path) -> bool {
-    [journals::NETWORK, journals::WIRELESS, journals::DNS, journals::V6_SETUP, journals::V6_NETWORK, journals::RA].iter().any(|name| root.join(name).exists())
+    [journals::NETWORK, journals::WIRELESS, journals::DNS, journals::V6_SETUP, journals::V6_NETWORK, journals::RA, cellular::JOURNAL].iter().any(|name| root.join(name).exists())
 }
 
 /// Where a monitor of `offload` records its process id (`stop_strays`).
@@ -1393,15 +1608,20 @@ fn successor(old: Session, keep_ipv6: bool) -> Session {
 
 /// Tears the session down. `uplink_changed` runs only when the session had
 /// installed its routes: a failed connection or a scan changes no uplink.
-fn cleanup(s: &mut Session, uplink_changed: impl FnOnce()) -> Result<(), String> {
+fn cleanup(s: &mut Session, perf: &Perf, restore_cellular: impl FnOnce() -> Result<(), String>, uplink_changed: impl FnOnce()) -> Result<(), String> {
     s.offload.stop();
     let ipv6 = s.ipv6.stop();
     // Back to the guard before the routes go; the station is still up.
-    if let Err(e) = s.uplink.update(|l| l.relay = None) {
+    if let Err(e) = s.uplink.update(|layout| {
+        layout.relay = None;
+        layout.strict_zero_cellular = false;
+    }) {
         crate::netlog!("[relay] relay tables not narrowed before releasing routes (the journal removes them): {e}");
     }
     let routes = s.network.release();
     let dns = s.dns.release();
+    let cellular = restore_cellular();
+    perf.report(perf.set_active(PerfFeature::Relay, false));
     // Rebind the proxy as soon as routes/DNS are released, before hotspot CAC.
     if std::mem::take(&mut s.routed) {
         uplink_changed();
@@ -1409,7 +1629,7 @@ fn cleanup(s: &mut Session, uplink_changed: impl FnOnce()) -> Result<(), String>
     if let Err(e) = ipv6 {
         net::stop_child(&mut s.dhcp);
         stop_helper(&mut s.supplicant);
-        return routes.and(dns).and(Err(e));
+        return routes.and(dns).and(cellular).and(Err(e));
     }
     net::stop_child(&mut s.dhcp);
     if s.supplicant.is_some() && wpa("disconnect", &[]).and_then(expect_ok).is_err() {
@@ -1426,7 +1646,7 @@ fn cleanup(s: &mut Session, uplink_changed: impl FnOnce()) -> Result<(), String>
         let _ = fs::remove_file(path);
     }
     let _ = fs::remove_file(Path::new(ROOT).join("wpa.conf"));
-    routes.and(wireless).and(dns)
+    routes.and(wireless).and(dns).and(cellular)
 }
 
 /// The `wireless` plan's firewall steps (the upstream INPUT accepts), which
@@ -1488,6 +1708,13 @@ pub(crate) fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) 
             p.push(Resource::Route(Route::new(Family::V4, RouteType::Throw, dest, TABLE)));
         }
     }
+    for dest in crate::netfx::ids::LOCAL_ROUTES_V4 {
+        if dest != subnet {
+            let mut guard = Route::new(Family::V4, RouteType::Unreachable, dest, "main");
+            guard.metric = Some(crate::netfx::ids::RELAY_METRIC.parse().unwrap());
+            p.push(Resource::Route(guard));
+        }
+    }
     let mut default = Route::new(Family::V4, RouteType::Unicast, "default", TABLE);
     default.gateway = Some(l.gateway.to_string());
     default.device = Some(IFACE.into());
@@ -1499,7 +1726,7 @@ pub(crate) fn relay_plan(l: &Lease, prefix: u32, lan: Ipv4Addr, mask: Ipv4Addr) 
     ] }));
     p.push(Resource::LegacyHook(LegacyHook { tool: LegacyTool::V4, table: "filter".into(), chain: "FORWARD".into(), rule: words(&["-j", "U60_RELAY_FWD"]), position: Position::InsertFirst }));
     // Installed last: no downstream traffic switches until NAT/guards exist.
-    p.push(Resource::Rule(Rule { family: Family::V4, priority: PREF.parse().unwrap(), table: TABLE.into(), mark: None }));
+    p.push(Resource::Rule(Rule::lookup(Family::V4, PREF.parse().unwrap(), TABLE)));
     p
 }
 
@@ -1535,6 +1762,11 @@ pub fn change(state: &crate::handlers::AppState, action: &str, body: &[u8]) -> (
             .and_then(|v| v["auto_off"].as_bool())
             .ok_or_else(|| "auto_off must be a boolean".to_owned())
             .and_then(|auto_off| state.wifi_relay.set_power_save(auto_off)),
+        "strict-zero-cellular" => serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| value["enabled"].as_bool())
+            .ok_or_else(|| "Send enabled as a boolean".to_owned())
+            .and_then(|enabled| state.wifi_relay.set_strict_zero_cellular(enabled)),
         "forget" => serde_json::from_slice::<Value>(body).map_err(|_| "Invalid request".to_owned())
             .and_then(|v| state.wifi_relay.forget(v["id"].as_str().unwrap_or(""))),
         "connect" => match serde_json::from_slice::<Value>(body) {
@@ -1569,12 +1801,12 @@ mod tests {
             (true, true, "cleanup failed"),
         ] {
             let dir = test_dir::TestDir::new("temporary-scan");
-            let (port, _, _, cancel) = join_fixture(dir.path());
+            let (mut port, _, _, cancel) = join_fixture(dir.path());
             let calls = RefCell::new(Vec::new());
-            let result = scan_session_with(false, || { calls.borrow_mut().push("check"); port.check(&cancel) },
-                || { calls.borrow_mut().push("prepare"); Ok(Session::new(dir.path())) },
-                || { calls.borrow_mut().push("scan"); if cancelled { port.shared.cancel_restore(); } Err("scan failed".into()) },
-                |_| { calls.borrow_mut().push("cleanup"); if cleanup_fails { Err("cleanup failed".into()) } else { Ok(()) } },
+            let result = scan_session_with(&mut port, false, |port| { calls.borrow_mut().push("check"); port.check(&cancel) },
+                |_| { calls.borrow_mut().push("prepare"); Ok(Session::new(dir.path())) },
+                |port| { calls.borrow_mut().push("scan"); if cancelled { port.shared.cancel_restore(); } Err("scan failed".into()) },
+                |_, _| { calls.borrow_mut().push("cleanup"); if cleanup_fails { Err("cleanup failed".into()) } else { Ok(()) } },
             );
             assert_eq!(result.err().as_deref(), Some(expected));
             let mut trace = vec!["check", "prepare", "check", "scan", "cleanup"];
@@ -1636,7 +1868,7 @@ mod tests {
 
     fn join_fixture(dir: &Path) -> (DevicePort, State, Network, Cancellation) {
         let shared = Arc::new(Shared::new());
-        let port = DevicePort { shared: shared.clone(), control: None, settings: Some(json!({})), mihomo: None, tailscale: None };
+        let port = DevicePort { shared: shared.clone(), control: None, settings: Some(json!({})), cellular_pause: cellular::Pause::default(), cellular_deferred_by_trial: false, mihomo: None, tailscale: None };
         let cancel = Cancellation { shared, generation: 0, target: None };
         let selected = Network { id: "test".into(), ssid: "upstream".into(), frequency: 5500, signal: -50, security: "open", supported: true, bssid: "00:11:22:33:44:55".into() };
         let mut session = Session::new(dir);
@@ -2107,7 +2339,7 @@ mod tests {
         // Absent upstream IPv6 never uses cellular: the baseline's rejects.
         let [_, ip6] = uplink::tables(&uplink::Layout { relay: Some(relay_layout(&l, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap())), ..Default::default() }, None).unwrap();
         assert_eq!(uplink::tests::chain(&ip6, "output"), ["oifname \"rmnet*\" reject"]);
-        assert_eq!(uplink::tests::chain(&ip6, "forward")[0], "iifname \"br-lan\" oifname \"rmnet*\" reject");
+        assert_eq!(uplink::tests::chain(&ip6, "forward")[0], "iifname { \"br-lan\", \"tailscale0\" } oifname \"rmnet*\" reject");
     }
 
     #[test]
@@ -2146,14 +2378,15 @@ mod tests {
     fn only_a_session_that_installed_routes_tells_mihomo_its_uplink_changed() {
         let temp = crate::wifi_relay::test_dir::TestDir::new("u60-relay-routed");
         let dir = temp.path();
+        let perf = Perf::for_test(&dir.join("perf"));
         let mut told = 0;
         let mut scan = Session::new(dir);
-        cleanup(&mut scan, || told += 1).unwrap();
+        cleanup(&mut scan, &perf, || Ok(()), || told += 1).unwrap();
         assert_eq!(told, 0, "a scan or a join that failed before routing");
         let mut routed = Session::new(dir);
         routed.routed = true;
-        cleanup(&mut routed, || told += 1).unwrap();
-        cleanup(&mut routed, || told += 1).unwrap();
+        cleanup(&mut routed, &perf, || Ok(()), || told += 1).unwrap();
+        cleanup(&mut routed, &perf, || Ok(()), || told += 1).unwrap();
         assert_eq!(told, 1, "once, not again for a repeated teardown");
     }
 
@@ -2169,6 +2402,7 @@ mod tests {
             "ipv6-network.json",
             "ipv6-setup.json",
             "ra-runtime.json",
+            cellular::JOURNAL,
         ] {
             fs::write(dir.join(name), b"retained recovery evidence").unwrap();
             assert!(recovery_pending(dir), "{name}");
@@ -2194,6 +2428,32 @@ mod tests {
         let [ip, _] = uplink::tables(&uplink::Layout { relay: Some(relay_layout(&l, lan.0, lan.1)), ..Default::default() }, None).unwrap();
         assert_eq!(uplink::tests::chain(&ip, "nat4"), ["oifname \"ath20\" masquerade"]);
         assert_eq!(relay_layout(&Lease { dns: vec![], ..l }, lan.0, lan.1).dns, "10.20.0.1".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn the_base_relay_plan_guards_main_table_throws_without_the_ipa_default() {
+        let lease = lease_with(&[]);
+        let plan = relay_plan(&lease, 24, "192.168.8.1".parse().unwrap(), "255.255.255.0".parse().unwrap());
+        for destination in crate::netfx::ids::LOCAL_ROUTES_V4 {
+            let guard = plan.iter().find(|step| step.apply.args.windows(2).any(|pair| pair == ["unreachable", destination])).unwrap();
+            assert_eq!(guard.apply.args, ["-4", "route", "add", "unreachable", destination, "metric", crate::netfx::ids::RELAY_METRIC, "table", "main"]);
+        }
+        assert!(!plan.iter().any(|step| step.apply.args.contains(&"default".into()) && step.apply.args.ends_with(&words(&["table", "main"]))));
+        assert_eq!(plan.last().unwrap().apply.args, ["-4", "rule", "add", "pref", PREF, "lookup", TABLE]);
+    }
+
+    #[test]
+    fn link_up_resets_existing_lan_ipv4_connections_through_netfx() {
+        let after_routes = Instant::now();
+        let mut called = false;
+        reset_link_connections(|reason, scope, changed| {
+            called = true;
+            assert_eq!(reason, "relay connected");
+            assert_eq!(scope, Scope::Lan { v4: true, v6: false });
+            assert!(changed >= after_routes);
+            Ok(conntrack::Report { scope, merged: false, deleted: 2 })
+        });
+        assert!(called);
     }
 
     fn lease_with(dns: &[&str]) -> Lease {

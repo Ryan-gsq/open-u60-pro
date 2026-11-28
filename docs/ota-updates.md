@@ -53,15 +53,101 @@ read-only API calls.
 | Truncated, oversized or wrong-hash payload | The inactive-slot download is rejected before staging. |
 | Staged binary or metadata changes after download | Install preflight fails before writing a pending marker or stopping the agent. |
 | Update-helper cannot start or confirm its handoff | The helper is stopped, the pending marker is cleared and the current agent keeps running. |
-| Candidate cannot start, listen, or remain healthy | It is quarantined and the verified previous slot is restarted. |
-| Reboot or power loss during the trial | The unproven candidate is excluded and the verified previous slot is selected. |
-| Active slot is damaged at a later boot | The supervisor selects the other verified, non-quarantined slot. |
-| Neither A/B slot is safe | The separately retained, verified last Stable copy is started without marking a broken A/B slot active. |
+| Candidate cannot start, listen, or remain healthy | Once same-boot network cleanup (Tailscale kernel-TUN journal, pending Clean DNS DNAT flush, live `tailscaled`, performance tuning journal) and any strict `cellular-pause` restoration succeed and verify, the candidate is quarantined and the verified previous slot is restarted. If cleanup fails or cannot be verified, the supervisor stops with exit code `8` and retains `pending` rather than handing off to an older slot over live state it cannot undo. |
+| Reboot or power loss during the trial | The unproven candidate is excluded and the verified previous slot is selected (still enforcing any surviving cross-boot `cellular-pause` restoration first). |
+| Active slot is damaged at a later boot | The supervisor selects the other verified, non-quarantined slot once same-boot network cleanup and any `cellular-pause` restoration verify; if cleanup fails or cannot be verified, it stops with exit code `8` and keeps the recorded `active` slot. |
+| Neither A/B slot is safe | The separately retained, verified last Stable copy is started without marking a broken A/B slot active (subject to the same cleanup verification gate before switching slots). |
 
-There is one deliberate recovery boundary: if both A/B binaries and the last
-Stable rescue copy are all missing or corrupted, no on-device updater can run.
-Recovery then requires SSH/USB and `setup.sh`. Validation must not deliberately
-destroy all three copies on a production router.
+There are two deliberate recovery boundaries:
+
+1. **Failed or incomplete pre-handoff cleanup (exit code `8`)**: if the
+   supervisor or OTA helper cannot finish and verify `network-recover` (for
+   example, a surviving same-boot Tailscale journal `/data/tailscale/network.json`,
+   pending Clean DNS flush marker `/data/tailscale/clean-dns-dnat-flush-pending`,
+   running `tailscaled`, `/tmp/zte-agent-perf/network.json`, strict-relay
+   `/data/zte-agent-relay/cellular-pause`, or an interrupted
+   `/data/open-u60/update/network-recover-pending`), it deliberately exits `8`
+   and keeps `pending` / `active` intact instead of starting an older binary
+   that does not understand those journals. Over SSH or USB ADB:
+   - Before running recovery, if `/data/zte-agent-relay/cellular-pause` exists,
+     read and note its recorded original modem `enable` value (`0` or `1`),
+     since `network-recover` removes that file once restoration succeeds.
+   - Identify the binary that owns cleanup by checking
+     `/data/open-u60/update/network-recover-pending`, `/data/open-u60/update/pending`
+     (line 1 = candidate slot, line 2 = previous slot), and
+     `/data/open-u60/update/active`:
+     - First check line 1 of `network-recover-pending` against
+       `/proc/sys/kernel/random/boot_id`. Only treat line 2 (`candidate`,
+       `previous`, `stable`, `a`, or `b`) as an active cleanup owner when line 1
+       matches the current boot (if the file is malformed/unreadable, fail closed
+       and verify every journal, process, and Tailscale policy rule before
+       continuing). Ignore a well-formed marker whose line 1 names a previous
+       boot.
+     - When `network-recover-pending` is active for the current boot and line 2
+       names `a` or `b`, verify and run `/data/open-u60/update/slot-<a|b>/zte-agent network-recover`
+       (both during a pending rollback and when `pending` is absent).
+     - When `network-recover-pending` is active for the current boot with line 2
+       `stable`, or `active` is `rescue` with the previous slot disarmed or
+       unavailable, verify `/data/open-u60/update/last-stable/zte-agent` against
+       `/data/open-u60/update/last-stable/release.json` (confirming
+       `"channel": "stable"`) and run
+       `/data/open-u60/update/last-stable/zte-agent network-recover` — do **not**
+       invoke the quarantined candidate binary.
+     - When `network-recover-pending` is active with line 2 `previous` (or
+       same-boot `rollback-blocked` exists alongside `pending`), verify the slot
+       named on `pending` line 2 against its `release.json` or `bootstrap.sha256`
+       and run `/data/open-u60/update/slot-<a|b>/zte-agent network-recover`.
+     - When `network-recover-pending` is active with line 2 `candidate` (or is
+       absent / stale / single-line legacy while an ordinary trial `pending`
+       exists), verify the slot named on `pending` line 1 and run
+       `/data/open-u60/update/slot-<a|b>/zte-agent network-recover`.
+     - When `pending` is absent and no active `network-recover-pending` names a
+       slot, verify and run the slot named by `active` (`slot-<a|b>` or
+       `last-stable` for `rescue`).
+     - Only if the responsible binary itself is damaged, unverified, or predates
+       Tailscale policy-rule cleanup, run another verified binary that supports
+       full `network-recover` (or clear same-boot state manually / reboot after
+       restoring cellular state).
+   - Confirm `/data/tailscale/network.json`,
+     `/data/tailscale/clean-dns-dnat-flush-pending`,
+     `/tmp/zte-agent-perf/network.json`, `/data/zte-agent-relay/cellular-pause`,
+     any live `tailscaled` process, and any residual Tailscale policy rules
+     (`5110`, `5130`, `5131`, `5210`, `5230`, `5250`, `5270` in `ip -4/-6 rule show`)
+     are gone. If `cellular-pause` was present, verify
+     `ubus call zwrt_data get_wwaniface '{"cid":1}'` reports the `enable` value
+     you recorded before running recovery.
+   - If `/data/open-u60/update/network-recover-pending` is well-formed
+     (`<boot_id>\n<owner>` or legacy single-token `<boot_id>`), leave it in
+     place so the supervisor verifies cleanup and removes it automatically. If
+     `network-recover-pending` itself is empty, corrupted, or malformed (so the
+     fail-closed check keeps exiting `8` with an unknown owner even after
+     cleanup or reboot), only after independently confirming that every
+     same-boot journal/marker, `tailscaled`, Tailscale policy rule, and
+     `cellular-pause` state is clean (or after a clean reboot with cellular
+     restored), remove the malformed `/data/open-u60/update/network-recover-pending`
+     file before restarting.
+   - Check whether `/data/open-u60/update/rollback-blocked` exists **without**
+     `/data/open-u60/update/pending`:
+     - If `rollback-blocked` contains a valid single-token boot ID matching
+       `/proc/sys/kernel/random/boot_id`, the supervisor exits `8`
+       unconditionally for the rest of the current boot (even after
+       `network-recover` succeeds); once cellular restoration is verified,
+       **reboot** the router so kernel-only same-boot state clears and the
+       marker becomes stale on the next boot.
+     - If `rollback-blocked` is empty, corrupted, or malformed (not a valid
+       single printable-ASCII boot token), the fail-closed supervisor check
+       keeps exiting `8` **even across reboots**; only after verifying that all
+       same-boot journals/markers are gone (or after a clean reboot) and that
+       cellular state matches the recorded original value, remove the malformed
+       `/data/open-u60/update/rollback-blocked` file before restarting.
+     - Otherwise, restart the service through `/data/local/tmp/start_zte_agent.sh`
+       (which sets the configured password, bind address, OTA environment
+       variables, and start lock), or reboot after ensuring `cellular-pause`
+       has been restored.
+2. **All three copies unavailable**: if both A/B binaries and the last Stable
+   rescue copy are all missing or corrupted, no on-device updater can run.
+   Recovery then requires SSH/USB and `setup.sh`. Validation must not
+   deliberately destroy all three copies on a production router.
 
 ## Release lanes
 

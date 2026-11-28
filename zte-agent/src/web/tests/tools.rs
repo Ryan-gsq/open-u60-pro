@@ -228,7 +228,7 @@ async fn automations_empty_and_new_form() {
     }
     assert!(!html.contains("Custom:") && !html.contains("/ui/a/datastar-") && !html.contains("connected remotely"));
     // A remote browser is told what cuts its connection when it runs.
-    let tailnet = Peer(std::net::SocketAddr::from(([127, 0, 0, 1], 40104)));
+    let tailnet = tailnet(40104);
     let html = get_with(&c, "/ui/tools/automations/new", tailnet, &cookie).await.text();
     assert!(html.contains("<p class=\"foot\">You are connected remotely: Airplane Mode ON and Mobile Data OFF cut this connection when they run."), "{html}");
 }

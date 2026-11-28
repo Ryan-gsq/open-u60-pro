@@ -192,9 +192,10 @@ impl NftTables {
         if let Some(marker) = self.marker(&listings) {
             if let Some(number) = marker.strip_prefix(&self.marker_prefix()).and_then(|rest| rest.split_whitespace().next()).and_then(|number| number.parse::<u64>().ok()) {
                 let (expected, text) = batch(self.owner, self.name, number, families.clone())?;
-                if marker == expected && holds_rules(&text, &listings) {
+                let candidate = Generation { number, marker, text, digest: Sha256::digest(families.concat()).into() };
+                if candidate.marker == expected && self.intact(&candidate, &listings) {
                     self.generation = number;
-                    self.target = Some(Generation { number, marker, text, digest: Sha256::digest(families.concat()).into() });
+                    self.target = Some(candidate);
                     self.confirmed = Some(number);
                     self.error = None;
                     return Ok(number);
@@ -250,18 +251,19 @@ impl NftTables {
     fn load(&mut self, nft: &mut (impl Nft + ?Sized)) -> Result<u64, String> {
         let target = self.target.as_ref().ok_or("Nothing to load")?;
         let loaded = net::write_private(&self.file, target.text.as_bytes()).and_then(|()| nft.load(&self.file));
-        // A tool that failed or timed out may still have committed: the
-        // marker decides, never the exit code alone.
-        let readback = nft.list_both(self.name).map(|listings| self.marker(&listings));
+        // A tool that failed or timed out may still have committed: require
+        // BOTH the generation marker AND intact chains/rule counts on readback
+        // so a failed repair never reconfirms a table with a missing chain/rule.
+        let readback = nft.list_both(self.name).map(|listings| self.intact(target, &listings));
         match (&loaded, readback) {
-            (_, Ok(Some(marker))) if marker == target.marker => {
+            (_, Ok(true)) => {
                 self.confirmed = Some(target.number);
                 self.error = None;
                 Ok(target.number)
             }
             (Err(e), _) => self.failed(format!("nftables did not load generation {}: {e}", target.number)),
             (Ok(()), Err(e)) => self.failed(format!("generation {} is not confirmed: {e}", target.number)),
-            (Ok(()), Ok(_)) => self.failed(format!("generation {} did not read back", target.number)),
+            (Ok(()), Ok(false)) => self.failed(format!("generation {} did not read back intact", target.number)),
         }
     }
 
@@ -283,10 +285,14 @@ impl NftTables {
         seen
     }
 
-    /// The listings hold `target`: its marker in both families and every
-    /// chain's rule count.
+    /// The listings hold `target`: neither family is dormant, both carry its
+    /// marker, and every chain's rule count matches.
     fn intact(&self, target: &Generation, listings: &[Option<String>; 2]) -> bool {
-        self.marker(listings).as_ref() == Some(&target.marker) && holds_rules(&target.text, listings)
+        listings
+            .iter()
+            .all(|l| l.as_deref().is_some_and(|text| !nft_table_is_dormant(text)))
+            && self.marker(listings).as_ref() == Some(&target.marker)
+            && holds_rules(&target.text, listings)
     }
 
     /// After another writer may have acted (`net_guard`), or after a failed
@@ -298,12 +304,29 @@ impl NftTables {
         if self.confirmed == Some(target.number) && self.intact(target, &nft.list_both(self.name).map_err(|error| format!("not checked: {error}"))?) {
             return Ok(false);
         }
+        self.confirmed = None;
         self.load(nft).map(|_| true)
     }
 
     /// Whether the target is what the kernel was last read to hold.
     pub fn confirmed(&self) -> bool {
         self.target.as_ref().is_some_and(|t| self.confirmed == Some(t.number))
+    }
+
+    /// Generation number last accepted as `NftTables`' target, if any.
+    pub fn target_generation(&self) -> Option<u64> {
+        self.target.as_ref().map(|t| t.number)
+    }
+
+    /// Generation number last confirmed active in the kernel, if any.
+    pub fn confirmed_generation(&self) -> Option<u64> {
+        self.confirmed
+    }
+
+    /// Clears the confirmed generation so the next `declare` or `reconcile`
+    /// reloads the table even if marker and rule counts appear unchanged.
+    pub fn invalidate(&mut self) {
+        self.confirmed = None;
     }
 
     #[cfg(test)]
@@ -314,6 +337,31 @@ impl NftTables {
     pub fn status(&self) -> Value {
         json!({"target": self.target.as_ref().map(|t| t.number), "confirmed": self.confirmed, "error": self.error})
     }
+}
+
+/// Returns `true` when an `nft list table` output marks the table `dormant`
+/// (`flags dormant` at table brace depth 1), which unregisters all base chains
+/// while preserving markers, hooks, and rule counts.
+pub(crate) fn nft_table_is_dormant(listing: &str) -> bool {
+    let mut depth: i32 = 0;
+    for raw in listing.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let opens = line.chars().filter(|&c| c == '{').count() as i32;
+        let closes = line.chars().filter(|&c| c == '}').count() as i32;
+        if depth == 1 && opens == 0 {
+            let mut tokens = line
+                .split(|c: char| c.is_whitespace() || matches!(c, ';' | ','))
+                .filter(|t| !t.is_empty());
+            if tokens.next() == Some("flags") && tokens.any(|t| t == "dormant") {
+                return true;
+            }
+        }
+        depth += opens - closes;
+    }
+    false
 }
 
 /// Rules per family and chain, over each family's definition or listing.
@@ -499,6 +547,39 @@ mod tests {
         nft.tables.remove(&key);
         assert!(t.reconcile(&mut nft).unwrap(), "a deleted family");
         assert!(!t.reconcile(&mut nft).unwrap());
+
+        // Deleting a chain's rules while preserving the generation marker AND
+        // failing nft reload MUST leave `confirmed() == false` (never
+        // reconfirming the surviving marker alone).
+        let damaged = nft.tables[&key].replace("\t\taccept\n\t\tdrop\n", "");
+        nft.tables.insert(key.clone(), damaged);
+        nft.fail.push(("nft reload failed".into(), false));
+        assert!(t.reconcile(&mut nft).is_err());
+        assert!(!t.confirmed(), "failed repair with surviving marker must not reconfirm damaged table");
+        assert!(t.reconcile(&mut nft).unwrap());
+        assert!(t.confirmed());
+
+        // A dormant table keeps exact marker, chains, and rule counts, but
+        // Netfilter unregisters its base chains -> MUST NOT pass intact()!
+        let dormant = nft.tables[&key].replacen("{\n", "{\n\tflags dormant\n", 1);
+        assert!(nft_table_is_dormant(&dormant));
+        nft.tables.insert(key.clone(), dormant.clone());
+        nft.fail.push(("nft reload failed".into(), false));
+        assert!(t.reconcile(&mut nft).is_err());
+        assert!(!t.confirmed(), "dormant table must not reconfirm on failed reload");
+        assert!(t.reconcile(&mut nft).unwrap());
+        assert!(t.confirmed());
+
+        // `adopt()` must also reject a dormant table and replace it with a
+        // fresh active generation instead of confirming inactive hooks.
+        let dormant_for_adopt = nft.tables[&key].replacen("{\n", "{\n\tflags dormant\n", 1);
+        nft.tables.insert(key.clone(), dormant_for_adopt);
+        let mut adopter = tables("guard");
+        let loads_before = nft.loads;
+        adopter.adopt(definition(&["accept", "drop"]), &mut nft).unwrap();
+        assert!(nft.loads > loads_before, "adopt() must reload a dormant table");
+        assert!(!nft_table_is_dormant(&nft.tables[&key]));
+        assert!(adopter.confirmed());
         let _ = std::fs::remove_dir_all(t.file.parent().unwrap());
     }
 

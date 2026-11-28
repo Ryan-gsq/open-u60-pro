@@ -2481,11 +2481,20 @@ mod tests {
 
     #[test]
     fn busy_guard_is_exclusive_and_released_on_drop() {
-        let e = Esim::with_lock_path(temp_lock("busy"));
+        let path = temp_lock("busy");
+        let e = Esim::with_lock_path(path.clone());
         let g = e.acquire().expect("first");
         assert!(e.acquire().is_none());
         drop(g);
-        assert!(e.acquire().is_some());
+        // Same as `the_file_lock_keeps_a_second_holder_out`: a child being
+        // spawned by another test thread holds a copy of the descriptor until
+        // its exec on macOS, so the flock can take a moment to come free.
+        let freed = (0..200).any(|_| e.acquire().is_some() || {
+            std::thread::sleep(Duration::from_millis(5));
+            false
+        });
+        assert!(freed);
+        let _ = std::fs::remove_file(path);
     }
 
     /// The card commands' data and errors go through the views' parsers.

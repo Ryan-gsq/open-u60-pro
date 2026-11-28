@@ -40,7 +40,7 @@ use crate::auth::{Principal, SessionId};
 use crate::events::Topic;
 use crate::handlers::AppState;
 use crate::httpd::gate::{self, Lane};
-use crate::httpd::{Ctx, Peer};
+use crate::httpd::{Ctx, Via};
 use crate::server::Method;
 use crate::web::action::{self, Ask};
 use crate::web::bands::{LOCK_LTE, LOCK_NR};
@@ -436,7 +436,7 @@ async fn refused(ctx: &Ctx, p: Principal, mut r: Req, kind: Kind, fs: FormState)
 /// the scan's results, in a gate task.
 pub async fn get(ctx: &Ctx, p: Principal, req: Request, kind: Kind) -> Response {
     let nonce = CspNonce::of(&req);
-    let remote = session::is_remote(req.extensions().get::<Peer>());
+    let remote = session::is_remote(Via::of(req.extensions()));
     let input = match parse(kind, Form::parse(req.uri().query().unwrap_or("").as_bytes()).pairs()) {
         Ok(input) => input,
         Err(Bad::Request) => return render::bad_request(&nonce),
@@ -594,7 +594,7 @@ fn asks(kind: Kind, input: &Input, remote: bool) -> bool {
 /// `POST <path>`.
 pub async fn post(ctx: Ctx, req: Request, kind: Kind) -> Response {
     let nonce = CspNonce::of(&req);
-    let remote = session::is_remote(req.extensions().get::<Peer>());
+    let remote = session::is_remote(Via::of(req.extensions()));
     let r = Req { query: None, ..Req::of(&ctx, &req) };
     let s = kind.screen();
     let (parts, body) = req.into_parts();

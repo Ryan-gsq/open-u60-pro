@@ -1,8 +1,9 @@
 //! The core's egress (`relay-mihomo-architecture.md` section 5.6): what
 //! interface and addresses its connections leave by, and which changes
 //! restart it. The relay announces changes of its own routes at once; outside
-//! the relay (cellular) the controller audits the egress every 15 s and only
-//! an egress that strands the core's connections restarts it. A relay
+//! such notifications the controller audits the egress every 15 s, including
+//! the relay's interface and gateway. It restarts on a settled change that
+//! strands the core's connections. A relay
 //! announcement restarts the core at once when IPv4 moved (another interface,
 //! a recreated one, or a lost source address) or first became available; an
 //! IPv6-only move must hold for 5 s, and such restarts are at least 60 s
@@ -10,11 +11,9 @@
 //! relay switch restarts the core once, when the new uplink is up, and an
 //! IPv6 address added to the same interface later restarts nothing.
 //!
-//! An observation spawns nothing but, for a route through the relay that
-//! the relay announced, one `iw` (which access point it is on): routes come
-//! from the kernel's own lookup over rtnetlink (what `ip route get` asks)
-//! and addresses from `getifaddrs`. The 15 s audit used to start four tools
-//! each time, and skips `iw` (an audit ignores the relay's routes).
+//! Routes come from the kernel's own lookup over rtnetlink (what
+//! `ip route get` asks) and addresses from `getifaddrs`. For a route
+//! through the relay, one `iw` reads the associated access point.
 
 use std::time::{Duration, Instant};
 
@@ -37,6 +36,28 @@ pub(super) const EGRESS_RESTART_GAP: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Uplink {
     pub(super) paths: [Option<Egress>; 2],
+    relay_v4: bool,
+}
+
+/// The observation used to bind a candidate and the relay's change generation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Binding {
+    pub(super) uplink: Uplink,
+    pub(super) generation: u64,
+}
+
+impl Binding {
+    pub(super) fn interface(&self) -> Option<&'static str> {
+        self.uplink.binding_interface()
+    }
+
+    pub(super) fn change(&self, core: &Uplink, observed: &Uplink) -> Change {
+        if observed.paths.iter().any(Option::is_some) && self.interface() != observed.binding_interface() {
+            Change::Rebind
+        } else {
+            change(core, observed)
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Egress {
@@ -113,7 +134,8 @@ impl Uplink {
             Some(Egress { route, source: SourceIdentity { ifindex, addresses: found } })
         };
         let [v4, v6] = routes;
-        Self { paths: [path(v4, true), path(v6, false)] }
+        let relay_v4 = v4.as_ref().is_some_and(|(route, _)| route.device == RELAY_IFACE);
+        Self { paths: [path(v4, true), path(v6, false)], relay_v4 }
     }
 
     /// What the core's connections leave by now. `upstream`: also which
@@ -131,8 +153,9 @@ impl Uplink {
     }
     /// Connections opened on `earlier` cannot leave through this egress any
     /// more: a readable family moved to another interface (name or index) or
-    /// lost a source address it had. Added addresses, gateway or preferred
-    /// source changes and a newly available family keep them usable; an
+    /// lost a source address it had, or the relay's gateway changed. Added
+    /// addresses, cellular gateway or preferred source changes and a newly
+    /// available family keep them usable; an
     /// unreadable family is no evidence (a failed read, or a lost uplink).
     pub(super) fn strands(&self, earlier: &Self) -> bool {
         self.paths
@@ -146,30 +169,60 @@ impl Uplink {
     /// Takes readable families as the new reference. An unreadable family
     /// keeps the last one, so its return on another address still strands.
     pub(super) fn adopt(&mut self, observed: &Self) {
+        if observed.paths[0].is_some() {
+            self.relay_v4 = observed.relay_v4;
+        }
         for (kept, now) in self.paths.iter_mut().zip(&observed.paths) {
-            if now.is_some() {
-                kept.clone_from(now);
+            if let Some(now) = now {
+                let mut next = now.clone();
+                if next.route.upstream.is_none() {
+                    next.route.upstream = kept.as_ref()
+                        .filter(|earlier| earlier.on_same_interface(now))
+                        .and_then(|earlier| earlier.route.upstream.clone());
+                }
+                *kept = Some(next);
             }
         }
     }
     pub(super) fn relayed(&self) -> bool {
-        self.paths
+        self.relay_v4 || self.paths
             .iter()
             .flatten()
             .any(|path| path.route.device == RELAY_IFACE)
+    }
+
+    fn binding_interface(&self) -> Option<&'static str> {
+        self.paths.iter().flatten().next()
+            .map_or(self.relay_v4, |path| path.route.device == RELAY_IFACE)
+            .then_some(RELAY_IFACE)
     }
 
     /// An egress through `dev` (index `ifindex`) with an IPv4 and an optional
     /// IPv6 source address, for tests elsewhere in the module.
     #[cfg(test)]
     pub(super) fn sample(dev: &str, ifindex: u64, v4: &str, v6: Option<&str>) -> Self {
+        Self::sample_with_gateway(dev, ifindex, v4, v6, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn sample_with_gateway(dev: &str, ifindex: u64, v4: &str, v6: Option<&str>, gateway: Option<&str>) -> Self {
         let mut info = vec![serde_json::json!({"family": "inet", "local": v4, "prefixlen": 24})];
         if let Some(v6) = v6 {
             info.push(serde_json::json!({"family": "inet6", "local": v6, "prefixlen": 64}));
         }
         let links = serde_json::json!([{"ifindex": ifindex, "ifname": dev, "addr_info": info}]).to_string();
-        let route = |src: Option<&str>| src.and_then(|src| Self::route(&format!(r#"[{{"dev":"{dev}","prefsrc":"{src}"}}]"#)));
+        let route = |src: Option<&str>| src.and_then(|src| Self::route(
+            &serde_json::json!([{"dev": dev, "prefsrc": src, "gateway": gateway}]).to_string()
+        ));
         Self::read([route(Some(v4)), route(v6)], &links)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_upstream(mut self, upstream: Option<&str>) -> Self {
+        for path in self.paths.iter_mut().flatten().filter(|path| path.route.device == RELAY_IFACE) {
+            path.route.upstream = upstream.map(str::to_owned);
+        }
+        self
     }
 }
 
@@ -179,17 +232,19 @@ impl Uplink {
 /// interface after the relay left is stranded as soon as another egress
 /// (cellular) appears; while there is none it keeps its reference.
 pub(super) fn settle_egress(
+    binding: &Binding,
     uplink: &mut Uplink,
     stranding: &mut Option<(Uplink, Instant)>,
     observed: Uplink,
     last_restart: Option<Instant>,
     now: Instant,
 ) -> bool {
-    if observed.relayed() {
-        *stranding = None;
-        return false;
-    }
-    if !observed.strands(uplink) {
+    let moved = match binding.change(uplink, &observed) {
+        Change::Rebind => true,
+        Change::V4 | Change::V6 if uplink.relayed() || observed.relayed() => true,
+        _ => observed.strands(uplink),
+    };
+    if !moved {
         uplink.adopt(&observed);
         *stranding = None;
         return false;
@@ -215,7 +270,7 @@ pub(super) enum Change {
     /// The same egress: a duplicate notification.
     None,
     /// Nothing the core's connections use moved (an added address or
-    /// family, another gateway, a withdrawn family): take it as the new
+    /// family, another cellular gateway, a withdrawn family): take it as the new
     /// reference without a restart.
     Adopt,
     /// No readable egress at all: nothing to restart onto. The core keeps
@@ -226,6 +281,8 @@ pub(super) enum Change {
     V6,
     /// IPv4 moved or first became available: restart now.
     V4,
+    /// The usable egress requires a different global interface binding.
+    Rebind,
 }
 
 pub(super) fn change(core: &Uplink, observed: &Uplink) -> Change {
@@ -252,12 +309,16 @@ pub(super) fn change(core: &Uplink, observed: &Uplink) -> Change {
 }
 
 impl Egress {
+    fn on_same_interface(&self, other: &Self) -> bool {
+        self.route.device == other.route.device && self.source.ifindex == other.source.ifindex
+    }
+
     /// Connections opened on `then` cannot leave through this path: another
-    /// interface (name or index), another access point behind the relay, or
-    /// a source address `then` had is gone.
+    /// interface (name or index), another access point or gateway behind the
+    /// relay, or a source address `then` had is gone.
     fn strands_from(&self, then: &Self) -> bool {
-        self.route.device != then.route.device
-            || self.source.ifindex != then.source.ifindex
+        !self.on_same_interface(then)
+            || (self.route.device == RELAY_IFACE && self.route.gateway != then.route.gateway)
             || matches!((&self.route.upstream, &then.route.upstream), (Some(now), Some(before)) if now != before)
             || then.source.addresses.iter().any(|(ip, _)| !self.source.addresses.iter().any(|(kept, _)| kept == ip))
     }
@@ -619,9 +680,11 @@ mod tests {
         let cell = |addr: &str| cellular("rmnet_data0", 3, "10.1.0.1", &[addr, "2001:db8::2"]);
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let binding = Binding::default();
         let mut uplink = cell("10.1.0.2");
         let mut stranding = None;
         assert!(!settle_egress(
+            &binding,
             &mut uplink,
             &mut stranding,
             cell("10.1.0.6"),
@@ -634,6 +697,7 @@ mod tests {
             "only starts settling"
         );
         assert!(!settle_egress(
+            &binding,
             &mut uplink,
             &mut stranding,
             cell("10.1.0.6"),
@@ -641,10 +705,11 @@ mod tests {
             at(4)
         ));
         assert!(
-            !settle_egress(&mut uplink, &mut stranding, cell("10.1.0.10"), None, at(4)),
+            !settle_egress(&binding, &mut uplink, &mut stranding, cell("10.1.0.10"), None, at(4)),
             "a flapping uplink starts settling again"
         );
         assert!(!settle_egress(
+            &binding,
             &mut uplink,
             &mut stranding,
             cell("10.1.0.10"),
@@ -652,6 +717,7 @@ mod tests {
             at(8)
         ));
         assert!(settle_egress(
+            &binding,
             &mut uplink,
             &mut stranding,
             cell("10.1.0.10"),
@@ -666,7 +732,7 @@ mod tests {
 
         let mut stranding = Some((cell("10.1.0.6"), at(0)));
         assert!(
-            !settle_egress(&mut uplink, &mut stranding, cell("10.1.0.2"), None, at(10)),
+            !settle_egress(&binding, &mut uplink, &mut stranding, cell("10.1.0.2"), None, at(10)),
             "the old address came back before the change settled"
         );
         assert_eq!(stranding, None);
@@ -676,6 +742,7 @@ mod tests {
         assert_eq!(restart_due(at(70), last), at(75));
         let mut stranding = None;
         assert!(!settle_egress(
+            &binding,
             &mut uplink,
             &mut stranding,
             cell("10.1.0.6"),
@@ -683,10 +750,11 @@ mod tests {
             at(10)
         ));
         assert!(
-            !settle_egress(&mut uplink, &mut stranding, cell("10.1.0.6"), last, at(59)),
+            !settle_egress(&binding, &mut uplink, &mut stranding, cell("10.1.0.6"), last, at(59)),
             "settled, but the last watchdog restart was under a minute ago"
         );
         assert!(settle_egress(
+            &binding,
             &mut uplink,
             &mut stranding,
             cell("10.1.0.6"),
@@ -702,18 +770,11 @@ mod tests {
             &["10.1.0.2", "10.1.0.3", "2001:db8::2"],
         );
         assert!(
-            !settle_egress(&mut uplink, &mut stranding, dual.clone(), None, at(10)),
+            !settle_egress(&binding, &mut uplink, &mut stranding, dual.clone(), None, at(10)),
             "added addresses and a new gateway only update the reference"
         );
         assert_eq!((uplink.clone(), stranding), (dual, None));
 
-        let relay = cellular(RELAY_IFACE, 7, "192.0.2.1", &["192.0.2.2", "2001:db8::2"]);
-        let mut stranding = Some((cell("10.1.0.6"), at(0)));
-        assert!(
-            !settle_egress(&mut uplink, &mut stranding, relay, None, at(10)),
-            "the relay announces its own path changes"
-        );
-        assert_eq!(stranding, None);
     }
 
 
@@ -739,7 +800,7 @@ mod tests {
             Change::V4
         );
         let regateway = cellular("ath20", 9, "192.168.2.254", &["192.168.2.124", "2409:8a00::5"]);
-        assert_eq!(change(&core, &regateway), Change::Adopt, "another gateway keeps connections usable");
+        assert_eq!(change(&core, &regateway), Change::V4, "a different relay gateway moves the egress");
         let mut v6 = core.clone();
         v6.paths[1] = cellular("ath20", 9, "192.168.2.1", &["192.168.2.124", "2409:8b00::7"]).paths[1].clone();
         assert_eq!(change(&core, &v6), Change::V6, "IPv6 renumbered: held, then one restart");
@@ -753,19 +814,28 @@ mod tests {
 
     #[test]
     fn a_core_left_on_the_relays_interface_follows_cellular_once_it_appears() {
-        let relay = cellular(RELAY_IFACE, 7, "192.0.2.1", &["192.0.2.2", "2001:db8::2"]);
+        let relay = cellular(RELAY_IFACE, 7, "192.0.2.1", &["192.0.2.2"]);
+        let binding = Binding { uplink: relay.clone(), generation: 0 };
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
+        assert_eq!(binding.interface(), Some(RELAY_IFACE));
+        assert_eq!(binding.change(&relay, &Uplink::default()), Change::Gone);
         let mut uplink = relay.clone();
         let mut stranding = None;
         assert!(
-            !settle_egress(&mut uplink, &mut stranding, Uplink::default(), None, at(0)),
+            !settle_egress(&binding, &mut uplink, &mut stranding, Uplink::default(), None, at(0)),
             "no egress: nothing to follow"
         );
-        assert_eq!((uplink.clone(), stranding.clone()), (relay.clone(), None));
-        let cell = cellular("rmnet_data0", 3, "10.1.0.1", &["10.1.0.2"]);
-        assert!(!settle_egress(&mut uplink, &mut stranding, cell.clone(), None, at(15)));
-        assert!(settle_egress(&mut uplink, &mut stranding, cell, None, at(20)), "cellular held 5 s");
+        assert_eq!((uplink.clone(), stranding.clone()), (relay, None));
+        for cell in [
+            cellular("rmnet_data0", 3, "10.1.0.1", &["10.1.0.2"]),
+            cellular("rmnet_data0", 3, "2001:db8::1", &["2001:db8::2"]),
+        ] {
+            assert_eq!(binding.change(&uplink, &cell), Change::Rebind);
+            assert_eq!(Binding { uplink: cell.clone(), generation: 0 }.interface(), None);
+            assert!(!settle_egress(&binding, &mut uplink, &mut stranding, cell.clone(), None, at(15)));
+            assert!(settle_egress(&binding, &mut uplink, &mut stranding, cell, None, at(20)), "cellular held 5 s");
+        }
     }
 
     /// A relay switch hands the station over: the interface and possibly the
@@ -773,11 +843,7 @@ mod tests {
     #[test]
     fn another_access_point_behind_the_relay_moves_the_egress() {
         let behind = |bss: Option<&str>| {
-            let mut uplink = cellular(RELAY_IFACE, 9, "192.168.2.1", &["192.168.2.124", "2409:8a00::5"]);
-            for path in uplink.paths.iter_mut().flatten() {
-                path.route.upstream = bss.map(str::to_owned);
-            }
-            uplink
+            cellular(RELAY_IFACE, 9, "192.168.2.1", &["192.168.2.124", "2409:8a00::5"]).with_upstream(bss)
         };
         let first = behind(Some("c0:a4:76:b1:f0:e4"));
         assert_eq!(change(&first, &behind(Some("c0:a4:76:b1:f0:e4"))), Change::None, "the same access point again");

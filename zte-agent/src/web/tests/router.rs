@@ -21,10 +21,6 @@ fn calls(c: &Ctx) -> Vec<(String, Value)> {
     device::calls(&c.app)
 }
 
-fn tailnet(port: u16) -> Peer {
-    Peer(SocketAddr::from(([127, 0, 0, 1], port)))
-}
-
 /// A device whose page-load reads answer with these values.
 fn reads(gets: Vec<(&'static str, Result<Value, String>)>) -> device::Device {
     device::Device { gets, ..Default::default() }

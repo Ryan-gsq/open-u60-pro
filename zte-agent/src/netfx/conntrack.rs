@@ -26,6 +26,8 @@ pub enum Scope {
     Lan { v4: bool, v6: bool },
     /// LAN IPv4 connections to these destinations.
     Destinations(Vec<Ipv4Net>),
+    /// Connections carrying a specific conntrack mark/mask (e.g. Tailscale origin).
+    Mark { mark: u32, mask: u32, v4: bool, v6: bool },
 }
 
 impl Scope {
@@ -34,7 +36,10 @@ impl Scope {
             (Scope::Lan { v4, v6 }, Scope::Lan { v4: v4b, v6: v6b }) => (*v4 || !v4b) && (*v6 || !v6b),
             (Scope::Lan { v4, .. }, Scope::Destinations(_)) => *v4,
             (Scope::Destinations(have), Scope::Destinations(want)) => want.iter().all(|w| have.iter().any(|h| h.contains(w))),
-            (Scope::Destinations(_), Scope::Lan { .. }) => false,
+            (Scope::Mark { mark, mask, v4, v6 }, Scope::Mark { mark: mb, mask: maskb, v4: v4b, v6: v6b }) => {
+                *mark == *mb && *mask == *maskb && (*v4 || !v4b) && (*v6 || !v6b)
+            }
+            _ => false,
         }
     }
 
@@ -50,7 +55,7 @@ impl Scope {
 
     fn empty(&self) -> bool {
         match self {
-            Scope::Lan { v4, v6 } => !v4 && !v6,
+            Scope::Lan { v4, v6 } | Scope::Mark { v4, v6, .. } => !v4 && !v6,
             Scope::Destinations(ranges) => ranges.is_empty(),
         }
     }
@@ -65,6 +70,10 @@ impl Scope {
                 Scope::Destinations(all).bounded()
             }
             (Scope::Lan { v6, .. }, Scope::Destinations(_)) | (Scope::Destinations(_), Scope::Lan { v6, .. }) => Scope::Lan { v4: true, v6: *v6 },
+            (Scope::Mark { mark, mask, v4, v6 }, Scope::Mark { mark: mb, mask: maskb, v4: v4b, v6: v6b }) if mark == mb && mask == maskb => {
+                Scope::Mark { mark: *mark, mask: *mask, v4: *v4 || *v4b, v6: *v6 || *v6b }
+            }
+            _ => other.clone(),
         }
     }
 
@@ -73,8 +82,11 @@ impl Scope {
             Scope::Lan { v4: true, v6: true } => "LAN IPv4 and IPv6".into(),
             Scope::Lan { v4: true, .. } => "LAN IPv4".into(),
             Scope::Lan { v6: true, .. } => "LAN IPv6".into(),
-            Scope::Lan { .. } => "nothing".into(),
+            Scope::Lan { .. } | Scope::Mark { v4: false, v6: false, .. } => "nothing".into(),
             Scope::Destinations(ranges) => format!("LAN IPv4 to {} range(s)", ranges.len()),
+            Scope::Mark { mark, mask, v4: true, v6: true } => format!("mark 0x{mark:x}/0x{mask:x} IPv4 and IPv6"),
+            Scope::Mark { mark, mask, v4: true, .. } => format!("mark 0x{mark:x}/0x{mask:x} IPv4"),
+            Scope::Mark { mark, mask, v6: true, .. } => format!("mark 0x{mark:x}/0x{mask:x} IPv6"),
         }
     }
 }
@@ -153,10 +165,26 @@ struct Pending {
     changed: Instant,
 }
 
+struct PendingMark {
+    reason: &'static str,
+    mark: u32,
+    mask: u32,
+    v4: bool,
+    v6: bool,
+}
+
 struct State {
     last: Option<Done>,
     /// A request whose deletion failed: tried again by `retry`.
     pending: Option<Pending>,
+    /// A marked-conntrack reset whose deletion failed: retried independently
+    /// of LAN coalescing batches until every failed family succeeds.
+    pending_mark: Option<PendingMark>,
+    /// Start instant of the latest completed IPv4 marked-conntrack deletion
+    /// (`(mark, mask, started)`), recorded before `conntrack -D` runs so callers
+    /// can order completions against table retirements even when another
+    /// subsystem drives the retry.
+    mark_v4_completed_at: Option<(u32, u32, Instant)>,
 }
 
 /// Results kept for the status pages.
@@ -187,6 +215,31 @@ pub fn reset_since(reason: &'static str, scope: Scope, changed: Instant) -> Resu
         #[cfg(test)]
         || {},
     )
+}
+
+/// Deletes conntrack entries carrying `mark/mask` directly under the tracker lock
+/// without mixing them into LAN coalescing batches or overwriting LAN retry state.
+pub fn reset_mark(reason: &'static str, mark: u32, mask: u32, v4: bool, v6: bool) -> Result<Report, String> {
+    TRACKER.reset_mark_with(reason, mark, mask, v4, v6, &mut Device)
+}
+
+/// Reports which families (`(v4, v6)`) are still pending a retry for `mark/mask`.
+pub fn pending_mark_families(mark: u32, mask: u32) -> (bool, bool) {
+    TRACKER.pending_mark_families(mark, mask)
+}
+
+/// Start instant of the latest completed IPv4 marked-conntrack deletion for
+/// `mark/mask`, so callers (e.g. Mihomo) can order completions performed by
+/// other subsystems (e.g. Wi-Fi relay) against table changes.
+pub fn mark_v4_completed_at(mark: u32, mask: u32) -> Option<Instant> {
+    TRACKER.mark_v4_completed_at(mark, mask)
+}
+
+/// Flushes loopback IPv4 UDP/TCP conntrack entries targeting Clean DNS
+/// (`127.0.0.54:53`) after withdrawing `chain dns_out`, so reused UDP tuples
+/// cannot keep hitting the old fallback DNAT mapping.
+pub fn flush_clean_dns_dnat() -> Result<(), String> {
+    TRACKER.flush_clean_dns_dnat_with(&mut Device)
 }
 
 /// Tries a failed request again; `None` when nothing is pending.
@@ -259,7 +312,7 @@ impl Tracker {
     const fn new() -> Self {
         Self {
             collect: Mutex::new(None),
-            state: Mutex::new(State { last: None, pending: None }),
+            state: Mutex::new(State { last: None, pending: None, pending_mark: None, mark_v4_completed_at: None }),
             results: Mutex::new(VecDeque::new()),
         }
     }
@@ -333,8 +386,140 @@ impl Tracker {
 
     fn retry_with(&self, tables: &mut impl Tables) -> Option<Result<Report, String>> {
         let mut state = self.lock();
-        let pending = state.pending.take()?;
-        Some(self.run(&mut state, pending.reason, pending.scope, pending.changed, tables))
+        let lan_result = state
+            .pending
+            .take()
+            .map(|pending| self.run(&mut state, pending.reason, pending.scope, pending.changed, tables));
+        let mark_result = state.pending_mark.take().map(|pm| {
+            self.run_mark_locked(&mut state, pm.reason, pm.mark, pm.mask, pm.v4, pm.v6, tables)
+        });
+        match (lan_result, mark_result) {
+            (Some(Err(e)), _) => Some(Err(e)),
+            (_, Some(Err(e))) => Some(Err(e)),
+            (Some(ok), _) => Some(ok),
+            (None, Some(ok)) => Some(ok),
+            (None, None) => None,
+        }
+    }
+
+    fn pending_mark_families(&self, mark: u32, mask: u32) -> (bool, bool) {
+        let state = self.lock();
+        match state.pending_mark.as_ref() {
+            Some(pm) if pm.mark == mark && pm.mask == mask => (pm.v4, pm.v6),
+            _ => (false, false),
+        }
+    }
+
+    fn mark_v4_completed_at(&self, mark: u32, mask: u32) -> Option<Instant> {
+        self.lock()
+            .mark_v4_completed_at
+            .filter(|(m, k, _)| *m == mark && *k == mask)
+            .map(|(_, _, started)| started)
+    }
+
+    fn flush_clean_dns_dnat_with(&self, tables: &mut impl Tables) -> Result<(), String> {
+        let _state = self.lock();
+        let port = super::ids::CLEAN_DNS_PORT.to_string();
+        let mut failures = Vec::new();
+        for proto in ["udp", "tcp"] {
+            match tables.delete("ipv4", &["-d", super::ids::CLEAN_DNS_ADDR, "-p", proto, "--dport", &port]) {
+                Found::Deleted(_) | Found::NoMatch => {}
+                Found::Failed(why) => failures.push(format!("{proto}: {why}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn reset_mark_with(
+        &self,
+        reason: &'static str,
+        mark: u32,
+        mask: u32,
+        v4: bool,
+        v6: bool,
+        tables: &mut impl Tables,
+    ) -> Result<Report, String> {
+        let mut state = self.lock();
+        let (v4, v6) = match state.pending_mark.take() {
+            Some(pm) if pm.mark == mark && pm.mask == mask => (v4 || pm.v4, v6 || pm.v6),
+            Some(other) => {
+                state.pending_mark = Some(other);
+                (v4, v6)
+            }
+            None => (v4, v6),
+        };
+        self.run_mark_locked(&mut state, reason, mark, mask, v4, v6, tables)
+    }
+
+    fn run_mark_locked(
+        &self,
+        state: &mut State,
+        reason: &'static str,
+        mark: u32,
+        mask: u32,
+        v4: bool,
+        v6: bool,
+        tables: &mut impl Tables,
+    ) -> Result<Report, String> {
+        let scope = Scope::Mark { mark, mask, v4, v6 };
+        if scope.empty() {
+            return Ok(Report { scope, merged: false, deleted: 0 });
+        }
+        let started = Instant::now();
+        let spec = format!("0x{mark:08x}/0x{mask:08x}");
+        let mut deleted = 0;
+        let mut failures = Vec::new();
+        let mut failed_v4 = false;
+        let mut failed_v6 = false;
+        for (is_v4, enabled, family) in [(true, v4, "ipv4"), (false, v6, "ipv6")] {
+            if !enabled {
+                continue;
+            }
+            match tables.delete(family, &["-m", &spec]) {
+                Found::Deleted(n) => deleted += n,
+                Found::NoMatch => {}
+                Found::Failed(why) => {
+                    if is_v4 {
+                        failed_v4 = true;
+                    } else {
+                        failed_v6 = true;
+                    }
+                    failures.push(why);
+                }
+            }
+        }
+        if v4 && !failed_v4 {
+            state.mark_v4_completed_at = Some((mark, mask, started));
+        }
+        if failures.is_empty() {
+            crate::netlog!("[net] conntrack reset {} for {reason}: {deleted} deleted", scope.describe());
+            self.record(reason, &scope, &format!("{deleted} deleted"));
+            return Ok(Report { scope, merged: false, deleted });
+        }
+        state.pending_mark = Some(match state.pending_mark.take() {
+            Some(existing) if existing.mark == mark && existing.mask == mask => PendingMark {
+                reason,
+                mark,
+                mask,
+                v4: existing.v4 || failed_v4,
+                v6: existing.v6 || failed_v6,
+            },
+            _ => PendingMark {
+                reason,
+                mark,
+                mask,
+                v4: failed_v4,
+                v6: failed_v6,
+            },
+        });
+        let error = format!("{deleted} deleted, then failed: {}", failures.join("; "));
+        crate::netlog!("[net] conntrack reset {} for {reason}: {error}", scope.describe());
+        self.record(reason, &scope, &format!("failed ({error})"));
+        Err(format!("Existing connections were not all reset ({error})"))
     }
 
     /// Runs the deletion for `scope`; the state lock orders resets.
@@ -359,6 +544,15 @@ impl Tracker {
                     let lan = tables.lan_v4()?.to_string();
                     for range in ranges {
                         commands.push(("ipv4", vec!["-s".into(), lan.clone(), "-d".into(), range.to_string()]));
+                    }
+                }
+                Scope::Mark { mark, mask, v4, v6 } => {
+                    let spec = format!("0x{mark:08x}/0x{mask:08x}");
+                    if *v4 {
+                        commands.push(("ipv4", vec!["-m".into(), spec.clone()]));
+                    }
+                    if *v6 {
+                        commands.push(("ipv6", vec!["-m".into(), spec]));
                     }
                 }
             }
@@ -576,5 +770,88 @@ mod tests {
             assert!(result.is_ok(), "a reset must not block either memory snapshot");
             worker.join().unwrap();
         });
+    }
+
+    #[test]
+    fn reset_mark_targets_only_matching_mark_without_touching_lan_pending() {
+        let tracker = Tracker::new();
+        let mut failing_lan = Fake { answers: [Found::Failed("busy".into())].into(), ..Fake::default() };
+        assert!(tracker.reset_with("lan", Scope::Lan { v4: true, v6: false }, Instant::now(), &mut failing_lan).is_err());
+        assert!(tracker.lock().pending.is_some());
+
+        let mut fake = Fake { answers: [Found::Deleted(4), Found::NoMatch].into(), ..Fake::default() };
+        let report = tracker
+            .reset_mark_with("tailscale switch", 0x0200_0000, 0x0200_0000, true, true, &mut fake)
+            .unwrap();
+        assert_eq!(report.deleted, 4);
+        assert_eq!(
+            fake.deleted,
+            [
+                "ipv4 -m 0x02000000/0x02000000",
+                "ipv6 -m 0x02000000/0x02000000",
+            ]
+        );
+        assert!(tracker.lock().pending.is_some(), "LAN pending retry state stays intact");
+
+        // A failed marked-conntrack family MUST remain pending and be retried
+        // by `retry_with` until deletion succeeds.
+        let mut partial_fail = Fake {
+            answers: [Found::Deleted(2), Found::Failed("v6 busy".into())].into(),
+            ..Fake::default()
+        };
+        assert!(tracker
+            .reset_mark_with("tailscale retry test", 0x0200_0000, 0x0200_0000, true, true, &mut partial_fail)
+            .is_err());
+        {
+            let state = tracker.lock();
+            let pm = state.pending_mark.as_ref().expect("failed v6 family must remain pending");
+            assert!(!pm.v4 && pm.v6, "only the failed family stays pending");
+        }
+        let mut recover = Fake {
+            answers: [Found::NoMatch, Found::Deleted(3)].into(),
+            ..Fake::default()
+        };
+        assert!(tracker.retry_with(&mut recover).unwrap().is_ok());
+        assert!(tracker.lock().pending.is_none());
+        assert!(tracker.lock().pending_mark.is_none());
+        assert_eq!(tracker.pending_mark_families(0x0200_0000, 0x0200_0000), (false, false));
+        let completed1 = tracker
+            .mark_v4_completed_at(0x0200_0000, 0x0200_0000)
+            .expect("completed IPv4 marked reset must record start instant");
+        assert!(recover.deleted.iter().any(|cmd| cmd == "ipv6 -m 0x02000000/0x02000000"));
+        assert!(
+            !recover.deleted.iter().any(|cmd| cmd == "ipv4 -m 0x02000000/0x02000000"),
+            "retry after v4-ok/v6-fail must NOT reset healthy IPv4 flows: {:?}",
+            recover.deleted
+        );
+
+        // When IPv4 fails and another caller completes `retry_with`, the shared
+        // `mark_v4_completed_at` advances to an instant >= the failure time.
+        let mut fail_v4 = Fake { answers: [Found::Failed("v4 busy".into())].into(), ..Fake::default() };
+        assert!(tracker
+            .reset_mark_with("v4 fail", 0x0200_0000, 0x0200_0000, true, false, &mut fail_v4)
+            .is_err());
+        assert_eq!(tracker.mark_v4_completed_at(0x0200_0000, 0x0200_0000), Some(completed1));
+        let retired_at = Instant::now();
+        let mut other_caller_retry = Fake { answers: [Found::Deleted(1)].into(), ..Fake::default() };
+        assert!(tracker.retry_with(&mut other_caller_retry).unwrap().is_ok());
+        let completed2 = tracker
+            .mark_v4_completed_at(0x0200_0000, 0x0200_0000)
+            .unwrap();
+        assert!(completed2 >= retired_at);
+
+        // Flushing loopback Clean DNS NAT mappings deletes both UDP and TCP
+        // entries targeting `127.0.0.54:53` and surfaces any deletion error.
+        let mut flush_ok = Fake { answers: [Found::Deleted(1), Found::NoMatch].into(), ..Fake::default() };
+        tracker.flush_clean_dns_dnat_with(&mut flush_ok).unwrap();
+        assert_eq!(
+            flush_ok.deleted,
+            [
+                "ipv4 -d 127.0.0.54 -p udp --dport 53",
+                "ipv4 -d 127.0.0.54 -p tcp --dport 53",
+            ]
+        );
+        let mut flush_err = Fake { answers: [Found::Failed("conntrack busy".into()), Found::NoMatch].into(), ..Fake::default() };
+        assert!(tracker.flush_clean_dns_dnat_with(&mut flush_err).is_err());
     }
 }

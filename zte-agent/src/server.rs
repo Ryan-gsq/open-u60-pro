@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -11,6 +12,7 @@ use crate::device_ext;
 use crate::esim;
 use crate::httpd::gate::Lane;
 use crate::httpd::guard::{self, HostPolicy, ReqHeaders};
+use crate::httpd::{is_canonical_loopback, Via};
 use crate::lan_test;
 use crate::scheduler;
 use crate::handlers::{self, AppState};
@@ -68,8 +70,8 @@ pub struct ReqInfo<'a> {
     /// The value after `Bearer ` (case-sensitive) of the first Authorization header.
     pub bearer: Option<&'a str>,
     pub headers: ReqHeaders<'a>,
-    /// The peer is this device: Tailscale clients (userspace networking).
-    pub loopback: bool,
+    pub via: Via,
+    pub peer_ip: Option<IpAddr>,
     /// Over the LAN HTTPS listener (`httpd::tls`).
     pub secure: bool,
 }
@@ -110,14 +112,19 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
     if req.path != "/api/auth/login" && has_password {
         // The local token works only from this device (root reads its file).
         principal = req.bearer.and_then(|t| {
-            env.auth.authenticate(Kind::Bearer, t).or_else(|| req.loopback.then(|| env.auth.authenticate_local(t)).flatten())
+            env.auth.authenticate(Kind::Bearer, t).or_else(|| {
+                if req.via == Via::Loopback && req.peer_ip.is_some_and(is_canonical_loopback) {
+                    env.auth.authenticate_local(t)
+                } else {
+                    None
+                }
+            })
         });
         if principal.is_none() {
             return refuse(401, "unauthorized");
         }
     }
-    // Refuse names a rebinding attack would use (any IP literal and the
-    // device's own names pass): without a password for every request (the
+    // Refuse hosts outside the ingress allowlist: without a password for every request (the
     // API is open), with one for browser requests (`Origin` or
     // `Sec-Fetch-Site`; the apps send neither), so a rebound page cannot
     // try passwords at the login route or use up its rate limit.
@@ -125,7 +132,7 @@ pub fn precheck(req: &ReqInfo, env: &PreEnv) -> Pre {
         let Some(host) = req.headers.host else {
             return refuse(400, "missing host");
         };
-        if !env.hosts.allows_via(host, req.loopback, req.secure, env.ts_names) {
+        if !env.hosts.allows_via(host, req.via, req.secure, env.ts_names) {
             return refuse(403, "host not allowed");
         }
     }
@@ -523,6 +530,7 @@ fn route_inner(method: &Method, path: &str, state: &AppState, body: &[u8]) -> (u
         (&Method::Post, "/api/wifi-relay/forget") => crate::wifi_relay::change(state, "forget", body),
         (&Method::Post, "/api/wifi-relay/offload") => crate::wifi_relay::change(state, "offload", body),
         (&Method::Post, "/api/wifi-relay/power-save") => crate::wifi_relay::change(state, "power-save", body),
+        (&Method::Post, "/api/wifi-relay/strict-zero-cellular") => crate::wifi_relay::change(state, "strict-zero-cellular", body),
         (&Method::Get, "/api/tailscale/status") => tailscale::status(state),
         (&Method::Get, "/api/tailscale/versions") => tailscale::versions(state),
         (&Method::Post, "/api/tailscale/versions/refresh") => tailscale::versions_refresh(state),
@@ -639,7 +647,7 @@ fn https_change(state: &AppState, path: &str, body: &[u8]) -> (u16, Value) {
 mod tests {
     use super::*;
     use crate::auth::Kind;
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
     const PW: &str = "test-password";
 
@@ -657,13 +665,13 @@ mod tests {
         vec!["u60-pro".into()]
     }
 
-    /// A request from a Tailscale client (loopback); `lan` for one from the LAN.
+    /// A request from loopback; `lan` for one from the LAN.
     fn info<'a>(method: Method, path: &'a str, query: Option<&'a str>, bearer: Option<&'a str>, headers: ReqHeaders<'a>) -> ReqInfo<'a> {
-        ReqInfo { method, path, query, bearer, headers, loopback: true, secure: false }
+        ReqInfo { method, path, query, bearer, headers, via: Via::Loopback, peer_ip: Some(Ipv4Addr::LOCALHOST.into()), secure: false }
     }
 
     fn lan(req: ReqInfo<'_>) -> ReqInfo<'_> {
-        ReqInfo { loopback: false, ..req }
+        ReqInfo { via: Via::Local, peer_ip: Some(IpAddr::from([192, 168, 0, 2])), ..req }
     }
 
     fn host(h: &str) -> ReqHeaders<'_> {
@@ -737,6 +745,17 @@ mod tests {
         let h = host("127.0.0.1:9090");
         assert_eq!(run(&auth, &info(Method::Post, "/api/wifi-relay/connect", None, t, h)), DISPATCH);
         assert_eq!(run(&auth, &lan(info(Method::Get, "/api/device", None, t, h))), reply(401, "unauthorized"));
+        for (peer, iface, userspace) in [
+            ("127.0.0.1", "lo", true),
+            ("127.0.0.1", "br-lan", false),
+            ("127.0.0.2", "lo", false),
+            ("::ffff:127.0.0.2", "lo", false),
+        ] {
+            let ip = peer.parse().unwrap();
+            let via = crate::httpd::classify_via(ip, Some(iface), userspace);
+            let request = ReqInfo { via, peer_ip: Some(ip), ..info(Method::Get, "/api/device", None, t, h) };
+            assert_eq!(run(&auth, &request), reply(401, "unauthorized"), "{peer} on {iface}");
+        }
         assert_eq!(
             run(&auth, &info(Method::Get, "/api/events", None, t, h)),
             reply(403, "event streams need a login token")
@@ -774,9 +793,11 @@ mod tests {
         // A browser on an allowed name still gets the same-origin rules.
         let same = ReqHeaders { host: Some("192.168.0.1:9090"), origin: Some("http://192.168.0.1:9090"), ..rebound };
         assert_eq!(run(&auth, &lan(info(Method::Post, "/api/auth/login", None, None, same))), Pre::Login);
-        // Tailscale names count only for Tailscale (loopback) peers.
+        // Tailscale names count for loopback and Tailnet.
         let ts = ReqHeaders { host: Some("u60-pro:9090"), origin: Some("http://u60-pro:9090"), ..rebound };
         assert_eq!(run(&auth, &info(Method::Post, "/api/auth/login", None, None, ts)), Pre::Login);
+        let tailnet = ReqInfo { via: Via::Tailnet, ..info(Method::Post, "/api/auth/login", None, None, ts) };
+        assert_eq!(run(&auth, &tailnet), Pre::Login);
         assert_eq!(run(&auth, &lan(info(Method::Post, "/api/auth/login", None, None, ts))), reply(403, "host not allowed"));
     }
 
@@ -792,7 +813,7 @@ mod tests {
         assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, h)), DISPATCH);
         assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, host("u60-pro:9090"))), DISPATCH);
         assert_eq!(run(&auth, &info(Method::Get, "/api/device", None, None, host("localhost"))), DISPATCH);
-        // The device's own names only from loopback (Tailscale) peers.
+        // LAN peers cannot use loopback or Tailscale names.
         assert_eq!(run(&auth, &lan(info(Method::Get, "/api/device", None, None, host("u60-pro:9090")))), reply(403, "host not allowed"));
         assert_eq!(run(&auth, &lan(info(Method::Get, "/api/device", None, None, host("localhost")))), reply(403, "host not allowed"));
         assert_eq!(run(&auth, &lan(info(Method::Get, "/api/device", None, None, h))), DISPATCH);

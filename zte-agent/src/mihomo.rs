@@ -11,9 +11,9 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::net_tools::{self as net, Cmd};
 use crate::netfx::effect::{self, EffectSet, Family, NftTable, NftTables, Presence, Resource, Route, RouteType, Rule, Sysctl};
 use crate::netfx::ids;
+use crate::netfx::perf::{Perf, PerfFeature};
 
 pub mod control;
 mod controller;
@@ -77,9 +78,26 @@ const NFT_FILE: &str = "nft-tables.nft";
 pub const MAX_CONFIG: usize = 512 * 1024;
 /// How long an owner command waits for the controller.
 const COMMAND_WAIT: Duration = Duration::from_secs(150);
+const QOS_MODE_TTL: Duration = Duration::from_secs(5);
+
+/// Tailscale Strategy B Exit Node coordination state supplied by `TailscaleManager`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TailscaleExitConfig {
+    /// Auto-enable Mihomo's `sniffer` (TLS/HTTP/QUIC + `parse-pure-ip`) for real-IP Exit traffic.
+    pub sniffer: bool,
+    /// Intercept IPv4 `tailscale0` Exit Node traffic (only when Exit Node IPv4 is approved).
+    pub tproxy_v4: bool,
+    /// Intercept IPv6 `tailscale0` Exit Node traffic (only when Exit Node IPv6 is approved).
+    pub tproxy_v6: bool,
+    /// Approved LAN IPv4 subnets on `tailscale0` that stay direct (never TPROXY'd).
+    pub skip_v4: Vec<String>,
+    /// Approved LAN IPv6 subnets on `tailscale0` that stay direct (never TPROXY'd).
+    pub skip_v6: Vec<String>,
+}
 
 pub struct Mihomo {
     root: PathBuf,
+    perf: Arc<Perf>,
     /// Excludes installation, configuration and owner starts.
     operation: Mutex<()>,
     profile_operation: Mutex<()>,
@@ -88,6 +106,7 @@ pub struct Mihomo {
     profile_revision: Mutex<u64>,
     library_revision: AtomicU64,
     status_cache: Mutex<Option<(profiles::LibraryStamp, Value)>>,
+    qos_mode_cache: Mutex<Option<(Instant, Option<String>)>>,
     /// Fingerprints (secret and egress interface masked) of the last
     /// configurations that passed `mihomo -t`, newest first; a start with
     /// one of them skips the check (a relay/cellular switch, a fallback to
@@ -101,19 +120,23 @@ pub struct Mihomo {
     /// What the controller last published (pages never wait for it).
     shared: Arc<Mutex<Snapshot>>,
     commands: Mutex<Option<Sender<Message>>>,
+    egress_generation: AtomicU64,
+    tailscale_exit: Mutex<TailscaleExitConfig>,
+    tailscale: OnceLock<Weak<crate::tailscale::TailscaleManager>>,
     #[cfg(test)]
     bridge_addr: Option<String>,
 }
 
 impl Mihomo {
     pub fn new() -> Self {
-        Self::at(PathBuf::from(ROOT))
+        Self::with_perf(PathBuf::from(ROOT), Perf::router())
     }
 
-    fn at(root: PathBuf) -> Self {
+    fn with_perf(root: PathBuf, perf: Arc<Perf>) -> Self {
         let validated = remembered_validation(&root);
         Self {
             root,
+            perf,
             operation: Mutex::new(()),
             profile_operation: Mutex::new(()),
             profile_storage: Mutex::new(()),
@@ -121,6 +144,7 @@ impl Mihomo {
             profile_revision: Mutex::new(0),
             library_revision: AtomicU64::new(0),
             status_cache: Mutex::new(None),
+            qos_mode_cache: Mutex::new(None),
             validated_config: Mutex::new(validated),
             digests: geodata::Digests::default(),
             subscription_dns: Mutex::new(Vec::new()),
@@ -128,6 +152,9 @@ impl Mihomo {
             geoip: geoip::Cache::default(),
             shared: Arc::new(Mutex::new(Snapshot::default())),
             commands: Mutex::new(None),
+            egress_generation: AtomicU64::new(0),
+            tailscale_exit: Mutex::new(TailscaleExitConfig::default()),
+            tailscale: OnceLock::new(),
             #[cfg(test)]
             bridge_addr: None,
         }
@@ -138,6 +165,20 @@ impl Mihomo {
         Self::at(root)
     }
 
+    #[cfg(test)]
+    fn at(root: PathBuf) -> Self {
+        let perf = Arc::new(Perf::for_test(&root.join("perf")));
+        Self::with_perf(root, perf)
+    }
+
+    pub(crate) fn perf(&self) -> &Arc<Perf> {
+        &self.perf
+    }
+
+    fn set_perf_active(&self, active: bool) {
+        self.perf.report(self.perf.set_active(PerfFeature::Mihomo, active));
+    }
+
     /// A running core with this secret, for the bridge's tests.
     #[cfg(test)]
     pub(crate) fn for_bridge(root: PathBuf, secret: String) -> Self {
@@ -146,7 +187,7 @@ impl Mihomo {
 
     #[cfg(test)]
     pub(crate) fn for_bridge_at(root: PathBuf, secret: String, addr: std::net::SocketAddr) -> Self {
-        let mut this = Self::at(root);
+        let mut this = Self::for_test(root);
         this.bridge_addr = Some(addr.to_string());
         let mut snapshot = this.snapshot();
         snapshot.phase = Phase::Running;
@@ -176,10 +217,20 @@ impl Mihomo {
     }
 
     pub fn status(&self) -> Value {
-        self.status_with(|| self.profile_status())
+        self.status_with(|| self.profile_status(), || self.cached_qos_mode(crate::router::read_smart_qos_mode))
     }
 
-    fn status_with(&self, profiles: impl FnOnce() -> Result<Value, String>) -> Value {
+    fn cached_qos_mode(&self, read: impl FnOnce() -> Option<String>) -> Option<String> {
+        let mut cache = self.qos_mode_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, mode)) = cache.as_ref().filter(|(at, _)| at.elapsed() < QOS_MODE_TTL) {
+            return mode.clone();
+        }
+        let mode = read();
+        *cache = Some((Instant::now(), mode.clone()));
+        mode
+    }
+
+    fn status_with(&self, profiles: impl FnOnce() -> Result<Value, String>, qos_mode: impl FnOnce() -> Option<String>) -> Value {
         let installed = self.root.join("mihomo").is_file();
         let configured = profiles().ok().is_some_and(|p| p["selected"].is_string());
         let journal = self.journal().exists();
@@ -188,7 +239,8 @@ impl Mihomo {
         let kernel = s.bypass.as_ref().filter(|_| running).map(|bypass| {
             json!({"mode": s.mode.map(routing::Mode::name), "bypass": bypass.label(),
                 "returns": match bypass { controller::Bypass::Rules { returns, .. } => Some(*returns), _ => None },
-                "reason": match bypass { controller::Bypass::None(reason) | controller::Bypass::Rules { cut: Some(reason), .. } => Some(reason), _ => None }})
+                "reason": match bypass { controller::Bypass::None(reason) | controller::Bypass::Rules { cut: Some(reason), .. } => Some(reason), _ => None },
+                "compilation": s.compilation})
         });
         json!({"installed": installed, "configured": configured,
             "running": running, "state": s.phase.name(), "version": VERSION, "dashboard_version": DASHBOARD_VERSION,
@@ -203,6 +255,7 @@ impl Mihomo {
             "direct_bypass": self.direct_bypass_enabled(),
             "direct_bypass_active": running && s.bypass.as_ref().is_some_and(|b| !matches!(b, controller::Bypass::None(_))),
             "kernel": kernel, "tables": s.tables, "generation": s.generation,
+            "vendor_qos_mode": qos_mode(), "fake_ip_filter": s.dns_filter,
             "autostart": self.wants_restore(), "recovery_required": s.phase == Phase::CleanupPending || (s.phase == Phase::Off && journal),
             "connections_reset": s.last_reset, "connection_resets": crate::netfx::conntrack::history()})
     }
@@ -234,13 +287,72 @@ impl Mihomo {
         if s.running() { s.secret.clone() } else { None }
     }
 
+    pub(crate) fn set_tailscale(&self, ts: &Arc<crate::tailscale::TailscaleManager>) {
+        let _ = self.tailscale.set(Arc::downgrade(ts));
+    }
+
+    pub(crate) fn tailscale_exit(&self) -> TailscaleExitConfig {
+        self.tailscale_exit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_tailscale_exit(&self, next: TailscaleExitConfig) {
+        let changed = {
+            let mut guard = self
+                .tailscale_exit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *guard == next {
+                false
+            } else {
+                *guard = next;
+                true
+            }
+        };
+        if changed {
+            if let Some(tx) = self
+                .commands
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                let _ = tx.send(Message::TailscaleExit);
+            }
+        }
+    }
+
+    /// Loopback authenticated HTTP proxy credentials for Tailscale Clean DNS.
+    /// Returns `None` whenever Mihomo is off, in D3 backoff, restarting, or in
+    /// `Direct` mode so Clean DNS falls back immediately to direct IP-literal DoH.
+    pub(crate) fn clean_dns_proxy(&self) -> Option<(String, String, String)> {
+        let s = self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(s.phase, Phase::Running | Phase::Reloading) {
+            return None;
+        }
+        if s.mode == Some(routing::Mode::Direct) {
+            return None;
+        }
+        let secret = s.secret.clone()?;
+        Some((download::PROXY.to_string(), download::USER.to_string(), secret))
+    }
+
+    fn notify_tailscale(&self) {
+        if let Some(ts) = self.tailscale.get().and_then(Weak::upgrade) {
+            ts.mihomo_state_changed();
+        }
+    }
+
     pub fn dashboard_root(&self) -> PathBuf {
         self.root.join("ui")
     }
 
     /// `network-recover`: rolls back what a previous process left.
     pub fn recover(&self) -> Result<(), String> {
-        EffectSet::recover(&self.journal())
+        let result = EffectSet::recover(&self.journal());
+        self.set_perf_active(false);
+        result
     }
 
     /// Starts the controller and tells it the agent started (it adopts this
@@ -262,10 +374,7 @@ impl Mihomo {
             });
         });
         let _ = tx.send(Message::Boot);
-        let guard = std::sync::Mutex::new(tx.clone());
-        crate::net_guard::on_settled(move || {
-            let _ = guard.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(Message::Guard);
-        });
+        watch_guard(tx.clone());
         *self.commands.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
     }
 
@@ -416,25 +525,8 @@ impl Mihomo {
     /// forwarding: one Go execution slot, a soft memory limit for the Go
     /// runtime, and a lower scheduling priority.
     fn check_with(&self, name: &str, background: bool) -> Result<(), String> {
-        let mut c = Command::new(self.root.join("mihomo"));
-        c.env("SKIP_SYSTEM_IPV6_CHECK", "true");
-        if background {
-            use std::os::unix::process::CommandExt;
-            c.env("GOMAXPROCS", "1").env("GOMEMLIMIT", "128MiB");
-            // SAFETY: only the async-signal-safe setpriority(2) runs before exec.
-            unsafe {
-                c.pre_exec(|| {
-                    libc::setpriority(libc::PRIO_PROCESS as _, 0, 10);
-                    Ok(())
-                });
-            }
-        }
-        c.args(["-t", "-d"])
-            .arg(&self.root)
-            .arg("-f")
-            .arg(self.root.join(name));
         let started = Instant::now();
-        let result = net::run(c, Duration::from_secs(30));
+        let result = net::run(self.validation_command(name, background), Duration::from_secs(30));
         let outcome = match &result {
             Ok(_) => "ok",
             Err(error) if error == "Device tool timed out" => "timeout",
@@ -452,6 +544,35 @@ impl Mihomo {
                     "Mihomo could not validate the configuration; check YAML, nodes, providers and rule databases".into()
                 }
             })
+    }
+
+    fn validation_command(&self, name: &str, background: bool) -> Command {
+        let mut c = Command::new(self.root.join("mihomo"));
+        c.env("SKIP_SYSTEM_IPV6_CHECK", "true");
+        if background {
+            use std::os::unix::process::CommandExt;
+            c.env("GOMAXPROCS", "1").env("GOMEMLIMIT", "128MiB");
+            // SAFETY: only the async-signal-safe setpriority(2) runs before exec.
+            unsafe {
+                c.pre_exec(|| {
+                    libc::setpriority(libc::PRIO_PROCESS as _, 0, 10);
+                    Ok(())
+                });
+            }
+        }
+        c.args(["-t", "-d"])
+            .arg(&self.root)
+            .arg("-f")
+            .arg(self.root.join(name));
+        c
+    }
+
+    fn core_command(&self) -> Command {
+        let mut command = Command::new(self.root.join("mihomo"));
+        // The core listens on IPv6 even if only link-local addresses exist.
+        command.env("SKIP_SYSTEM_IPV6_CHECK", "true").env("GOMEMLIMIT", "256MiB");
+        command.arg("-d").arg(&self.root).arg("-f").arg(self.root.join("config.yaml"));
+        command
     }
 
     /// The owner turns Mihomo on.
@@ -559,8 +680,16 @@ impl Mihomo {
 
     /// The relay changed its routes. Never blocks the relay (I2).
     pub(crate) fn uplink_changed(&self) {
+        self.egress_generation.fetch_add(1, Ordering::Release);
         let _ = self.send(Message::Egress);
     }
+}
+
+fn watch_guard(sender: Sender<Message>) {
+    let guard = Mutex::new(sender);
+    crate::net_guard::on_settled(move || {
+        let _ = guard.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(Message::Guard);
+    });
 }
 
 /// The controller's device side: the core's files and process, the network
@@ -571,13 +700,35 @@ struct DevicePort {
     lan: Option<std::net::Ipv4Addr>,
     effects: Option<EffectSet>,
     guard: crate::net_guard::Cursor,
-    /// Rule-set files the last plan read.
+    /// Rule-set files the current LAN and Tailscale plans read.
+    lan_sources: Vec<routing::Source>,
+    ts_sources: Vec<routing::Source>,
     sources: Vec<routing::Source>,
+    /// True when LAN and Tailscale compiled from different content digests for
+    /// the same provider path within one planning pass (forcing a consistent
+    /// recompile of both chains on the next check).
+    sources_diverged: bool,
 }
 
 impl DevicePort {
     fn new(m: Arc<Mihomo>, local: String) -> Self {
-        Self { m, local, lan: None, effects: None, guard: crate::net_guard::Cursor::default(), sources: Vec::new() }
+        Self {
+            m,
+            local,
+            lan: None,
+            effects: None,
+            guard: crate::net_guard::Cursor::default(),
+            lan_sources: Vec::new(),
+            ts_sources: Vec::new(),
+            sources: Vec::new(),
+            sources_diverged: false,
+        }
+    }
+
+    fn rebuild_sources(&mut self) {
+        let (merged, diverged) = merge_sources(&self.lan_sources, &self.ts_sources);
+        self.sources = merged;
+        self.sources_diverged = diverged;
     }
 
     fn owned_tables(&self) -> NftTables {
@@ -586,6 +737,17 @@ impl DevicePort {
 
     fn table(&self, families: Option<[String; 2]>) -> Resource {
         Resource::NftTable(NftTable { owner: "mihomo", name: NFT_TABLE, file: self.m.root.join(NFT_FILE), families })
+    }
+
+    fn reconcile_effects(&mut self, reconcile: impl FnOnce(&mut EffectSet) -> net::Reconciled) -> controller::Guarded {
+        let Some(effects) = self.effects.as_mut() else {
+            return controller::Guarded { result: Ok(()), confirmed: false, confirmed_generation: None };
+        };
+        let result = reconcile(effects);
+        let confirmed = effects.tables_confirmed(NFT_TABLE);
+        let confirmed_generation = effects.tables_confirmed_generation(NFT_TABLE);
+        self.guard.after(&result);
+        controller::Guarded { result: crate::net_guard::report("mihomo", result), confirmed, confirmed_generation }
     }
 }
 
@@ -603,17 +765,28 @@ impl controller::Port for DevicePort {
         self.m.operation.try_lock().is_err().then(|| "A Mihomo operation is in progress".into())
     }
 
-    fn prepare(&mut self, source: &Source, _serving: bool) -> Result<Prepared, String> {
+    fn prepare(&mut self, source: &Source, _serving: bool, egress: egress::Binding) -> Result<Prepared, String> {
         let m = &self.m;
         let prepared = match source {
-            Source::Previous(previous) => (**previous).clone(),
+            Source::Previous(previous) => {
+                let mut prepared = (**previous).clone();
+                if prepared.egress.interface() != egress.interface() {
+                    let mut config: Yaml = serde_yaml_ng::from_str(&prepared.config).map_err(|_| "Invalid managed configuration")?;
+                    bind_egress(&mut config, &egress);
+                    prepared.facts = reload::Facts::from(&config);
+                    prepared.config = serde_yaml_ng::to_string(&config).map_err(|_| "Cannot encode managed configuration")?;
+                }
+                prepared.egress = egress;
+                prepared
+            }
             Source::Reload(previous) | Source::Refresh(previous) => {
                 let lan = lan_address()?;
                 self.lan = Some(lan);
                 let refresh = matches!(source, Source::Refresh(_));
                 let bypass = if refresh { previous.bypass } else { m.direct_bypass_enabled() };
+                let tailscale_sniffer = m.tailscale_exit().sniffer;
                 let source = if refresh { m.selected_source()? } else { previous.source.clone() };
-                let (mut config, routes) = managed_mapping(&source, &previous.secret, Some((&previous.local, lan)), bypass)?;
+                let (mut config, (routes, dns)) = managed_mapping(&source, &previous.secret, Some((&previous.local, lan)), bypass, tailscale_sniffer)?;
                 let running = &previous.facts.runtime;
                 let map = config.as_mapping_mut().ok_or("Mihomo YAML must be a mapping")?;
                 for key in ["interface-name", "mode", "log-level"] {
@@ -627,11 +800,10 @@ impl controller::Port for DevicePort {
                         map.insert(Yaml::from(key), Yaml::from(value));
                     }
                 }
-                let dns = routes.dns(bypass);
                 let facts = reload::Facts::from(&config);
                 let config = serde_yaml_ng::to_string(&config).map_err(|_| "Cannot encode managed configuration")?;
                 let notice = geodata::notice(&facts.assets, bypass);
-                Prepared { secret: previous.secret.clone(), local: previous.local.clone(), runtime: previous.runtime.clone(), routes, dns, bypass, notice, source, config, facts }
+                Prepared { secret: previous.secret.clone(), local: previous.local.clone(), runtime: previous.runtime.clone(), routes, dns, bypass, tailscale_sniffer, notice, source, config, facts, egress }
             }
             Source::Selected { local, runtime } => {
                 let local = if local.is_empty() { self.local.clone() } else { local.clone() };
@@ -642,14 +814,9 @@ impl controller::Port for DevicePort {
                 let lan = lan_address()?;
                 self.lan = Some(lan);
                 let bypass = m.direct_bypass_enabled();
-                let (mut config, routes) = managed_mapping(&source, &secret, Some((&local, lan)), bypass)?;
-                let dns = routes.dns(bypass);
-                // A user may have disabled cellular data while Wi-Fi is offline. Keep
-                // the core available without creating a route or enabling the modem.
-                if egress::relay_route(false) {
-                    check_clock();
-                    config.as_mapping_mut().unwrap().insert(Yaml::from("interface-name"), Yaml::from(ids::RELAY_IFACE));
-                }
+                let tailscale_sniffer = m.tailscale_exit().sniffer;
+                let (mut config, (routes, dns)) = managed_mapping(&source, &secret, Some((&local, lan)), bypass, tailscale_sniffer)?;
+                bind_egress(&mut config, &egress);
                 // Always written, so a first start and a restart with the same
                 // settings give the same text (the validation is reused).
                 for (key, default) in [("mode", "rule"), ("log-level", "info")] {
@@ -660,7 +827,7 @@ impl controller::Port for DevicePort {
                 let facts = reload::Facts::from(&config);
                 let config = serde_yaml_ng::to_string(&config).map_err(|_| "Cannot encode managed configuration")?;
                 let notice = geodata::notice(&facts.assets, bypass);
-                Prepared { secret, local, runtime, routes, dns, bypass, notice, source, config, facts }
+                Prepared { secret, local, runtime, routes, dns, bypass, tailscale_sniffer, notice, source, config, facts, egress }
             }
         };
         if self.lan.is_none() {
@@ -717,23 +884,43 @@ impl controller::Port for DevicePort {
                     return Err(error);
                 }
                 self.effects = Some(effects);
+                self.m.set_perf_active(true);
                 Ok(())
             }
             Engage::FromBackoff => {
                 let effects = self.effects.as_mut().ok_or("Mihomo owns nothing to start from")?;
-                effects.declare(proxy_resources())
+                effects.declare(proxy_resources())?;
+                self.m.set_perf_active(true);
+                Ok(())
             }
             Engage::Adopt => {
                 let mut resources = proxy_resources();
                 resources.push(self.table(None));
-                self.effects = Some(EffectSet::load("mihomo", &self.m.journal())?);
-                self.effects.as_mut().unwrap().declare(resources)
+                let mut effects = EffectSet::load("mihomo", &self.m.journal())?;
+                effects.retire_legacy_commands(|undo| {
+                    undo.program == "@u60-sysctl"
+                        && undo.args.first().is_some_and(|key| {
+                            matches!(key.as_str(), "tcp_pacing_ss_ratio" | "tcp_pacing_ca_ratio")
+                        })
+                })?;
+                effects.declare(resources)?;
+                effects.retire_legacy_commands(|undo| {
+                    undo.program == "ip"
+                        && undo.args.windows(2).any(|w| w == ["pref", ids::LEGACY_MIHOMO_PREF])
+                })?;
+                self.effects = Some(effects);
+                self.m.set_perf_active(true);
+                Ok(())
             }
         }
     }
 
     fn tables(&mut self, shape: intercept::Shape) -> Result<(), String> {
-        let table = self.table(Some(intercept::tables(shape)));
+        self.tables_with_tailscale(shape, intercept::TailscaleExit::default())
+    }
+
+    fn tables_with_tailscale(&mut self, shape: intercept::Shape, ts: intercept::TailscaleExit) -> Result<(), String> {
+        let table = self.table(Some(intercept::tables_with_tailscale(shape, ts)));
         let effects = self.effects.as_mut().ok_or("Mihomo owns no tables")?;
         effects.declare(vec![table])
     }
@@ -742,19 +929,29 @@ impl controller::Port for DevicePort {
         self.effects.as_ref().map_or(Value::Null, |effects| effects.tables_status(NFT_TABLE))
     }
 
+    fn tables_target_generation(&mut self) -> Option<u64> {
+        self.effects.as_ref().and_then(|effects| effects.tables_target_generation(NFT_TABLE))
+    }
+
     fn direct(&mut self) -> Result<(), String> {
         let table = self.table(Some(intercept::tables(intercept::Shape::FakeReject)));
-        let Some(effects) = self.effects.as_mut() else { return Ok(()) };
-        effects.declare(vec![table])?;
-        effects.withdraw(&proxy_resources().iter().map(Resource::key).collect::<Vec<_>>())
+        let result = self.effects.as_mut().map_or(Ok(()), |effects| {
+            effects.declare(vec![table])?;
+            effects.withdraw(&proxy_resources().iter().map(Resource::key).collect::<Vec<_>>())
+        });
+        self.m.set_perf_active(false);
+        result
     }
 
     fn release_all(&mut self) -> Result<(), String> {
         match self.effects.as_mut() {
             Some(effects) => {
-                effects.release()?;
-                self.effects = None;
-                Ok(())
+                let result = effects.release();
+                if result.is_ok() {
+                    self.effects = None;
+                }
+                self.m.set_perf_active(false);
+                result
             }
             None => self.m.recover(),
         }
@@ -762,12 +959,7 @@ impl controller::Port for DevicePort {
 
     fn spawn(&mut self, generation: u64, prepared: &Prepared, exits: Sender<Message>) -> Result<Box<dyn controller::CoreHandle>, String> {
         net::write_private(&self.m.root.join("config.yaml"), prepared.config.as_bytes())?;
-        let mut cmd = Command::new(self.m.root.join("mihomo"));
-        // With cellular off and Relay disconnected B31 has only link-local
-        // IPv6; the core must still listen on IPv6 to use the next uplink.
-        cmd.env("SKIP_SYSTEM_IPV6_CHECK", "true");
-        cmd.arg("-d").arg(&self.m.root).arg("-f").arg(self.m.root.join("config.yaml"));
-        let core = core::Core::spawn(cmd, generation, move |generation, how| {
+        let core = core::Core::spawn(self.m.core_command(), generation, move |generation, how| {
             let _ = exits.send(Message::Exited { generation, how });
         })?;
         Ok(Box::new(core))
@@ -797,13 +989,27 @@ impl controller::Port for DevicePort {
 
     fn plan(&mut self, routes: &routing::Routes, bypass: bool, mode: routing::Mode, selected: &routing::Selected, unsettled: &[String]) -> (controller::Bypass, routing::Chain) {
         use controller::Bypass;
+        // Every caller invokes `plan()` before an optional `plan_tailscale()`.
+        // Reset Tailscale sources here so disabling Tailscale or switching modes
+        // drops stale provider observations cleanly.
+        self.ts_sources.clear();
         let none = |why: String| (Bypass::None(why), routing::Chain::default());
         if !bypass {
+            self.lan_sources.clear();
+            self.rebuild_sources();
             return none("Bypass for DIRECT rules is off".into());
         }
         match mode {
-            routing::Mode::Global => none("Global mode sends everything through the proxy".into()),
-            routing::Mode::Direct => (Bypass::All, routing::Chain::all()),
+            routing::Mode::Global => {
+                self.lan_sources.clear();
+                self.rebuild_sources();
+                none("Global mode sends everything through the proxy".into())
+            }
+            routing::Mode::Direct => {
+                self.lan_sources.clear();
+                self.rebuild_sources();
+                (Bypass::All, routing::Chain::all())
+            }
             routing::Mode::Rule => {
                 let compiled = routes.compile(selected, &self.m.root, unsettled);
                 let lists = self.m.geoip.get(&self.m.root, &compiled.geoip);
@@ -811,17 +1017,76 @@ impl controller::Port for DevicePort {
                     Ok(lists) => lists.get(code).map(Vec::as_slice).ok_or_else(|| "not in GeoIP.dat".to_owned()),
                     Err(e) => Err(e.clone()),
                 });
-                self.sources = compiled.sources;
+                self.lan_sources = compiled.sources;
+                self.rebuild_sources();
                 if chain.returns == 0 {
-                    return none(chain.cut.unwrap_or_else(|| "No rule sends IPv4 DIRECT by address".into()));
+                    let reason = chain.cut.clone().unwrap_or_else(|| "No rule sends IPv4 DIRECT by address".into());
+                    return (Bypass::None(reason), routing::Chain {
+                        cut: chain.cut,
+                        skipped_direct_alternatives: chain.skipped_direct_alternatives,
+                        ..routing::Chain::default()
+                    });
                 }
                 (Bypass::Rules { returns: chain.returns, cut: chain.cut.clone() }, chain)
             }
         }
     }
 
+    fn plan_tailscale(&mut self, routes: &routing::Routes, mode: routing::Mode, selected: &routing::Selected, unsettled: &[String]) -> routing::Chain {
+        match mode {
+            routing::Mode::Global => {
+                self.ts_sources.clear();
+                self.rebuild_sources();
+                routing::Chain::default()
+            }
+            routing::Mode::Direct => {
+                self.ts_sources.clear();
+                self.rebuild_sources();
+                routing::Chain::all()
+            }
+            routing::Mode::Rule => {
+                let compiled = routes.compile_tailscale(selected, &self.m.root, unsettled);
+                let lists = self.m.geoip.get(&self.m.root, &compiled.geoip);
+                let chain = compiled.render_with_prefix(&|code| match &lists {
+                    Ok(lists) => lists.get(code).map(Vec::as_slice).ok_or_else(|| "not in GeoIP.dat".to_owned()),
+                    Err(e) => Err(e.clone()),
+                }, "ts_ip_");
+                self.ts_sources = compiled.sources;
+                self.rebuild_sources();
+                if chain.returns == 0 {
+                    return routing::Chain {
+                        cut: chain.cut,
+                        skipped_direct_alternatives: chain.skipped_direct_alternatives,
+                        ..routing::Chain::default()
+                    };
+                }
+                chain
+            }
+        }
+    }
+
+    fn tailscale_exit(&mut self) -> TailscaleExitConfig {
+        self.m.tailscale_exit()
+    }
+
     fn reset(&mut self, reason: &'static str, scope: crate::netfx::conntrack::Scope, changed: Instant) -> Result<crate::netfx::conntrack::Report, String> {
         crate::netfx::conntrack::reset_since(reason, scope, changed)
+    }
+
+    fn reset_tailscale(&mut self, reason: &'static str, v4: bool, v6: bool) -> Result<(), String> {
+        crate::netfx::conntrack::reset_mark(reason, ids::TAILSCALE_CT_MARK, ids::TAILSCALE_CT_MARK, v4, v6).map(|_| ())
+    }
+
+    fn tailscale_reset_pending(&mut self) -> (bool, bool) {
+        crate::netfx::conntrack::pending_mark_families(ids::TAILSCALE_CT_MARK, ids::TAILSCALE_CT_MARK)
+    }
+
+    fn tailscale_v4_reset_started(&mut self) -> Option<Instant> {
+        crate::netfx::conntrack::mark_v4_completed_at(ids::TAILSCALE_CT_MARK, ids::TAILSCALE_CT_MARK)
+    }
+
+    fn on_state_change(&mut self) {
+        self.m.notify_tailscale();
     }
 
     fn write(&mut self, secret: &str, write: &controller::Write) -> Answered {
@@ -861,12 +1126,12 @@ impl controller::Port for DevicePort {
         egress::Uplink::observe(upstream)
     }
 
+    fn egress_generation(&self) -> u64 {
+        self.m.egress_generation.load(Ordering::Acquire)
+    }
+
     fn reconcile(&mut self) -> controller::Guarded {
-        let Some(effects) = self.effects.as_mut() else { return controller::Guarded { result: Ok(()), confirmed: false } };
-        let result = effects.reconcile();
-        let confirmed = effects.tables_confirmed(NFT_TABLE);
-        self.guard.after(&result);
-        controller::Guarded { result: crate::net_guard::report("mihomo", result), confirmed }
+        self.reconcile_effects(EffectSet::reconcile)
     }
 
     fn wanted(&mut self) -> bool {
@@ -878,7 +1143,8 @@ impl controller::Port for DevicePort {
     }
 
     fn sources_changed(&mut self) -> bool {
-        self.sources.iter_mut().any(routing::Source::changed)
+        let disk_changed = self.sources.iter_mut().any(routing::Source::changed);
+        self.sources_diverged || disk_changed
     }
 
     fn guard_due(&mut self) -> bool {
@@ -890,6 +1156,22 @@ impl controller::Port for DevicePort {
             crate::netlog!("[mihomo] connection reset retry failed: {e}");
         }
     }
+}
+
+fn merge_sources(lan: &[routing::Source], ts: &[routing::Source]) -> (Vec<routing::Source>, bool) {
+    let mut merged: Vec<routing::Source> = Vec::with_capacity(lan.len() + ts.len());
+    let mut diverged = false;
+    for src in lan.iter().chain(ts.iter()) {
+        if let Some(existing) = merged.iter_mut().find(|item| item.path() == src.path()) {
+            if !existing.same_content(src) {
+                diverged = true;
+            }
+            *existing = src.clone();
+        } else {
+            merged.push(src.clone());
+        }
+    }
+    (merged, diverged)
 }
 
 impl controller::CoreHandle for core::Core {
@@ -914,6 +1196,15 @@ fn reload_findings(prepared: &Prepared, configs: Option<&Value>, proxies: Option
     }
     if configs["interface-name"].as_str().unwrap_or("") != facts.runtime["interface-name"].as_str().unwrap_or("") {
         return Err("the egress interface changed".into());
+    }
+    if prepared.tailscale_sniffer {
+        if configs["sniffing"].as_bool() != Some(true) {
+            return Err("Mihomo did not enable sniffer".into());
+        }
+    } else if let Some(sniffing) = configs.get("sniffing").and_then(Value::as_bool) {
+        if sniffing != facts.sniffing {
+            return Err("Mihomo sniffer state did not match configuration".into());
+        }
     }
     let selected = proxies.and_then(routing::selected_from).ok_or("Mihomo did not report its groups")?;
     if selected.iter().any(|(group, now)| now == "COMPATIBLE" && before.get(group).is_none_or(|old| old != "COMPATIBLE")) {
@@ -1092,9 +1383,15 @@ pub fn managed_config(source: &str, secret: &str) -> Result<String, String> {
     config_with_lan_host(source, secret, None, true).map(|(config, _)| config)
 }
 
+#[cfg(test)]
+pub fn managed_config_with_tailscale(source: &str, secret: &str, tailscale_sniffer: bool) -> Result<String, String> {
+    let (mapping, _) = managed_mapping(source, secret, None, true, tailscale_sniffer)?;
+    serde_yaml_ng::to_string(&mapping).map_err(|_| "Cannot encode Mihomo configuration".into())
+}
+
 /// The managed configuration and its routing (`routing::Routes`, read
 /// before DNS is rewritten), with the DNS filter for the DIRECT bypass
-/// setting (`routing::Routes::dns`).
+/// setting (`routing::Routes::dns_filter`).
 #[cfg(test)]
 fn config_with_lan_host(
     source: &str,
@@ -1102,17 +1399,18 @@ fn config_with_lan_host(
     local: Option<(&str, std::net::Ipv4Addr)>,
     bypass: bool,
 ) -> Result<(String, routing::Routes), String> {
-    let (mapping, routes) = managed_mapping(source, secret, local, bypass)?;
+    let (mapping, (routes, _)) = managed_mapping(source, secret, local, bypass, false)?;
     let text = serde_yaml_ng::to_string(&mapping).map_err(|_| "Cannot encode Mihomo configuration")?;
     Ok((text, routes))
 }
 
-fn managed_mapping(source: &str, secret: &str, local: Option<(&str, std::net::Ipv4Addr)>, bypass: bool) -> Result<(Yaml, routing::Routes), String> {
+fn managed_mapping(source: &str, secret: &str, local: Option<(&str, std::net::Ipv4Addr)>, bypass: bool, tailscale_sniffer: bool) -> Result<(Yaml, (routing::Routes, routing::DnsFilter)), String> {
     if source.len() > MAX_CONFIG {
         return Err("Configuration exceeds 512 KiB".into());
     }
     let mut root: Yaml = serde_yaml_ng::from_str(source).map_err(|_| "Invalid Mihomo YAML")?;
     let routes = routing::Routes::from(&root);
+    let filter = routes.dns_filter(bypass);
     let m = root
         .as_mapping_mut()
         .ok_or("Mihomo YAML must be a mapping")?;
@@ -1268,7 +1566,7 @@ fn managed_mapping(source: &str, secret: &str, local: Option<(&str, std::net::Ip
     dns.remove(Yaml::from("fake-ip-range6"));
     set(dns, "fake-ip-ttl", Yaml::from(1));
     set(dns, "fake-ip-filter-mode", Yaml::from("rule"));
-    set(dns, "fake-ip-filter", serde_yaml_ng::to_value(routes.dns(bypass)).map_err(|_| "Cannot encode the DNS filter")?);
+    set(dns, "fake-ip-filter", serde_yaml_ng::to_value(&filter.rules).map_err(|_| "Cannot encode the DNS filter")?);
     if !dns.contains_key(Yaml::from("nameserver")) {
         set(
             dns,
@@ -1276,8 +1574,81 @@ fn managed_mapping(source: &str, secret: &str, local: Option<(&str, std::net::Ip
             serde_yaml_ng::to_value(["1.1.1.1", "8.8.8.8"]).unwrap(),
         );
     }
+    if tailscale_sniffer {
+        enable_tailscale_sniffer(m)?;
+    }
     validate_dns_routes(&root)?;
-    Ok((root, routes))
+    Ok((root, (routes, filter)))
+}
+
+/// Auto-enable TLS/HTTP/QUIC pure-IP domain sniffing for Tailscale Strategy B
+/// Exit Node traffic while preserving any user-defined sniffer skip lists or
+/// protocol port overrides. Crucially forces `override-destination: false` both
+/// globally and per-protocol so Mihomo populates `SniffHost` for rule matching
+/// WITHOUT clearing `DstIP` (preventing plaintext DNS re-resolution on DIRECT
+/// connections after Clean DNS has already resolved the real destination IP).
+fn enable_tailscale_sniffer(m: &mut Mapping) -> Result<(), String> {
+    let sniffer = m
+        .entry(Yaml::from("sniffer"))
+        .or_insert_with(|| Yaml::Mapping(Mapping::new()));
+    if sniffer.is_null() {
+        *sniffer = Yaml::Mapping(Mapping::new());
+    }
+    let sniffer = sniffer
+        .as_mapping_mut()
+        .ok_or("sniffer must be a mapping")?;
+    sniffer.insert(Yaml::from("enable"), Yaml::from(true));
+    sniffer.insert(Yaml::from("force-dns-mapping"), Yaml::from(true));
+    sniffer.insert(Yaml::from("parse-pure-ip"), Yaml::from(true));
+    sniffer.insert(Yaml::from("override-destination"), Yaml::from(false));
+    let sniff = sniffer
+        .entry(Yaml::from("sniff"))
+        .or_insert_with(|| Yaml::Mapping(Mapping::new()));
+    if sniff.is_null() {
+        *sniff = Yaml::Mapping(Mapping::new());
+    }
+    let sniff = sniff
+        .as_mapping_mut()
+        .ok_or("sniffer.sniff must be a mapping")?;
+    for (proto, default_ports) in [
+        ("HTTP", json!([80, "8080-8880"])),
+        ("TLS", json!([443, 8443])),
+        ("QUIC", json!([443, 8443])),
+    ] {
+        // Mihomo folds `sniffer.sniff` keys case-insensitively into the same
+        // protocol slot when iterating a Go map; reuse any existing mixed-case
+        // key instead of inserting a colliding uppercase sibling.
+        let key = sniff
+            .keys()
+            .find(|k| k.as_str().is_some_and(|s| s.eq_ignore_ascii_case(proto)))
+            .cloned()
+            .unwrap_or_else(|| Yaml::from(proto));
+        let entry = sniff
+            .entry(key)
+            .or_insert_with(|| serde_yaml_ng::to_value(json!({"ports": default_ports})).unwrap());
+        if entry.is_null() {
+            *entry = serde_yaml_ng::to_value(json!({"ports": default_ports})).unwrap();
+        }
+        let proto_map = entry
+            .as_mapping_mut()
+            .ok_or_else(|| format!("sniffer.sniff.{proto} must be a mapping"))?;
+        if proto_map
+            .get(&Yaml::from("ports"))
+            .is_none_or(Yaml::is_null)
+        {
+            proto_map.insert(
+                Yaml::from("ports"),
+                serde_yaml_ng::to_value(default_ports).unwrap(),
+            );
+        }
+        proto_map.insert(Yaml::from("override-destination"), Yaml::from(false));
+    }
+    for (_, value) in sniff.iter_mut() {
+        if let Some(proto_map) = value.as_mapping_mut() {
+            proto_map.insert(Yaml::from("override-destination"), Yaml::from(false));
+        }
+    }
+    Ok(())
 }
 
 // Mihomo interprets an unknown bare DNS URL fragment as SO_BINDTODEVICE,
@@ -1355,6 +1726,17 @@ fn validate_dns_routes(root: &Yaml) -> Result<(), String> {
     Ok(())
 }
 
+fn bind_egress(config: &mut Yaml, egress: &egress::Binding) {
+    let mapping = config.as_mapping_mut().unwrap();
+    let key = Yaml::from("interface-name");
+    if let Some(interface) = egress.interface() {
+        check_clock();
+        mapping.insert(key, Yaml::from(interface));
+    } else {
+        mapping.remove(key);
+    }
+}
+
 fn clear_egress_overrides(value: &mut Yaml) {
     match value {
         Yaml::Mapping(map) => {
@@ -1377,11 +1759,6 @@ fn clear_egress_overrides(value: &mut Yaml) {
 /// order. EffectSet captures each setting's original value on first hold.
 fn proxy_resources() -> Vec<Resource> {
     let mut resources = Vec::new();
-    // The core's TCP towards the LAN leaves through qcacld, which leaves TSQ
-    // at ~1 ms of data: one connection ran at ~60 instead of ~230 Mbit/s.
-    for key in ["tcp_pacing_ss_ratio", "tcp_pacing_ca_ratio"] {
-        resources.push(Resource::Sysctl(Sysctl { key: key.into(), value: "1000".into() }));
-    }
     // TPROXY loses its socket on the bridge-netfilter path (iptables and nft
     // alike); LAN-to-LAN filtering such as guest isolation pauses meanwhile.
     for key in ["bridge-nf-call-iptables", "bridge-nf-call-ip6tables"] {
@@ -1391,7 +1768,9 @@ fn proxy_resources() -> Vec<Resource> {
         let mut route = Route::new(family, RouteType::Local, all, TABLE);
         route.device = Some("lo".into());
         resources.push(Resource::Route(route));
-        resources.push(Resource::Rule(Rule { family, priority: PREF.parse().unwrap(), table: TABLE.into(), mark: Some(MARK.into()) }));
+        let mut rule = Rule::lookup(family, PREF.parse().unwrap(), TABLE);
+        rule.mark = Some(MARK.into());
+        resources.push(Resource::Rule(rule));
     }
     resources
 }
@@ -1476,8 +1855,75 @@ pub fn change(state: &crate::handlers::AppState, action: &str, body: &[u8]) -> (
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn assert_ra_firewall_guard(set_data: impl FnOnce()) {
+        use controller::Port;
+        use std::collections::BTreeMap;
+
+        struct Bridge(BTreeMap<String, String>);
+        impl net::Probe for Bridge {
+            fn list(&mut self, _: &Cmd) -> Result<String, String> {
+                unreachable!()
+            }
+
+            fn status(&mut self, _: &Cmd) -> Result<(i32, String), String> {
+                unreachable!()
+            }
+
+            fn apply(&mut self, command: &Cmd) -> Result<(), String> {
+                assert_eq!(command.program, "@u60-sysctl");
+                self.0.insert(command.args[0].clone(), command.args[1].clone());
+                Ok(())
+            }
+
+            fn sysctl(&mut self, key: &str) -> Result<String, String> {
+                Ok(self.0[key].clone())
+            }
+        }
+
+        let temp = test_dir::TestDir::new("mihomo-ra-guard");
+        let mihomo = Arc::new(Mihomo::for_test(temp.path().to_owned()));
+        let mut port = DevicePort::new(mihomo, "u60.home.arpa".into());
+        let mut effects = EffectSet::new("mihomo", port.m.journal());
+        let settings: Vec<_> = proxy_resources()
+            .into_iter()
+            .filter(|resource| matches!(resource, Resource::Sysctl(_)))
+            .collect();
+        let keys = ["bridge-nf-call-iptables", "bridge-nf-call-ip6tables"];
+        let mut bridge = Bridge(keys.into_iter().map(|key| (key.into(), "1".into())).collect());
+        effects.assume(settings);
+        port.effects = Some(effects);
+        assert!(port.guard_due(), "the initial guard check is already accounted for");
+
+        let (sender, messages) = mpsc::channel();
+        watch_guard(sender);
+        crate::net_guard::start(&crate::event_bus::EventBus::new());
+        set_data();
+        assert!(matches!(
+            messages.recv_timeout(Duration::from_secs(10)),
+            Ok(Message::Guard)
+        ));
+        let check = |port: &mut DevicePort, bridge: &mut Bridge| {
+            port.reconcile_effects(|effects| {
+                effects.reconcile_selected(|_| true, bridge, &mut effect::Device)
+            }).result.unwrap();
+            for key in keys {
+                assert_eq!(bridge.0[key], "0");
+            }
+        };
+        assert!(port.guard_due(), "Mihomo checks at the guard's wakeup");
+        check(&mut port, &mut bridge);
+
+        bridge.0.values_mut().for_each(|value| *value = "1".into());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !port.guard_due() {
+            assert!(Instant::now() < deadline, "the bridge guard did not recheck");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        check(&mut port, &mut bridge);
+    }
 
     fn resource_steps(original: impl Fn(&str) -> Result<String, String>) -> Result<Vec<net::Step>, String> {
         let mut resources = proxy_resources();
@@ -1500,16 +1946,14 @@ mod tests {
     }
 
     #[test]
-    fn the_typed_start_journal_is_identical_to_ef58bd4() {
+    fn the_typed_start_journal_keeps_only_the_proxy_resources() {
         let expected = vec![
-            Cmd::new("@u60-sysctl", &["tcp_pacing_ss_ratio", "1"]),
-            Cmd::new("@u60-sysctl", &["tcp_pacing_ca_ratio", "1"]),
             Cmd::new("@u60-sysctl", &["bridge-nf-call-iptables", "1"]),
             Cmd::new("@u60-sysctl", &["bridge-nf-call-ip6tables", "1"]),
             Cmd::new("ip", &["-4", "route", "del", "local", "default", "dev", "lo", "table", "60625"]),
-            Cmd::new("ip", &["-4", "rule", "del", "pref", "18620", "fwmark", "0x700/0xff00", "lookup", "60625"]),
+            Cmd::new("ip", &["-4", "rule", "del", "pref", PREF, "fwmark", "0x700/0xff00", "lookup", "60625"]),
             Cmd::new("ip", &["-6", "route", "del", "local", "::/0", "dev", "lo", "table", "60625"]),
-            Cmd::new("ip", &["-6", "rule", "del", "pref", "18620", "fwmark", "0x700/0xff00", "lookup", "60625"]),
+            Cmd::new("ip", &["-6", "rule", "del", "pref", PREF, "fwmark", "0x700/0xff00", "lookup", "60625"]),
             Cmd::new("@u60-mihomo-nft", &["remove"]),
         ];
         let temp = test_dir::TestDir::new("start-journal");
@@ -1533,7 +1977,7 @@ mod tests {
         assert!(remembered_validation(&dir).is_empty(), "another boot's validation is not reused");
         remember_validation(&dir, &[]);
         assert!(!dir.join(VALIDATED).exists());
-        assert!(Mihomo::at(dir.clone()).validated_config.lock().unwrap().is_empty());
+        assert!(Mihomo::for_test(dir.clone()).validated_config.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1549,7 +1993,7 @@ mod tests {
                     entered_tx.send(()).unwrap();
                     release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
                     Ok(json!({"selected":"fixture"}))
-                })
+                }, || None)
             })
         };
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -1560,6 +2004,106 @@ mod tests {
             available,
             "async dashboard readers must not wait for profile I/O"
         );
+    }
+
+    #[test]
+    fn the_production_core_and_validators_use_separate_go_limits() {
+        fn env(command: &Command, key: &str) -> Option<String> {
+            command.get_envs().find(|(name, _)| *name == key)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        }
+
+        let temp = test_dir::TestDir::new("mihomo-core-command");
+        let mihomo = Mihomo::for_test(temp.path().to_owned());
+        let core = mihomo.core_command();
+        assert_eq!(env(&core, "GOMEMLIMIT").as_deref(), Some("256MiB"));
+        assert_eq!(env(&core, "GOMAXPROCS"), None);
+        assert!(!core.get_args().any(|arg| arg == "-t"));
+
+        let background = mihomo.validation_command("candidate.yaml", true);
+        assert_eq!(env(&background, "GOMEMLIMIT").as_deref(), Some("128MiB"));
+        assert_eq!(env(&background, "GOMAXPROCS").as_deref(), Some("1"));
+        assert_eq!(background.get_args().next().unwrap(), "-t");
+
+        let foreground = mihomo.validation_command("candidate.yaml", false);
+        assert_eq!(env(&foreground, "GOMEMLIMIT"), None);
+        assert_eq!(env(&foreground, "GOMAXPROCS"), None);
+        assert_eq!(foreground.get_args().next().unwrap(), "-t");
+    }
+
+    #[test]
+    fn status_reports_read_only_qos_and_bypass_compilation_details() {
+        use controller::Port;
+
+        let temp = test_dir::TestDir::new("mihomo-diagnostics");
+        let mihomo = Arc::new(Mihomo::for_test(temp.path().to_owned()));
+        let off = mihomo.status_with(|| Ok(json!({})), || None);
+        assert!(off["kernel"].is_null() && off["fake_ip_filter"].is_null());
+        assert!(off["vendor_qos_mode"].is_null());
+        let mut port = DevicePort::new(Arc::clone(&mihomo), "u60.home.arpa".into());
+        let source = "
+dns:
+  fake-ip-filter: ['+.example.test']
+rule-providers:
+  Dynamic: {type: http, behavior: domain, path: ./dynamic.yaml}
+rules:
+  - IP-CIDR,1.2.3.0/24,DIRECT
+  - IP-ASN,13334,DIRECT
+  - IP-ASN,13335,REJECT
+  - RULE-SET,Dynamic,REJECT
+  - MATCH,DIRECT
+";
+        let (_, (routes, dns)) = managed_mapping(source, "fixture", None, true, false).unwrap();
+        let mode = routing::Mode::Rule;
+        let selected = routing::Selected::new();
+        let (bypass, chain) = port.plan(&routes, true, mode, &selected, &[]);
+
+        {
+            let mut snapshot = mihomo.shared.lock().unwrap();
+            snapshot.phase = Phase::Running;
+            snapshot.mode = Some(mode);
+            snapshot.bypass = Some(bypass);
+            snapshot.compilation = Some(chain.compilation());
+            snapshot.dns_filter = Some(dns.diagnostics);
+        }
+        let status = mihomo.status_with(|| Ok(json!({"selected": "fixture"})), || Some("Game_mode".into()));
+        assert_eq!(status["vendor_qos_mode"], "Game_mode");
+        assert_eq!(status["configured"], true);
+        assert_eq!(status["running"], true);
+        assert_eq!(status["direct_bypass_active"], true);
+        assert_eq!(status["kernel"]["mode"], "rule");
+        assert_eq!(status["kernel"]["bypass"], "rules");
+        assert_eq!(status["kernel"]["returns"], 1);
+        assert_eq!(status["kernel"]["reason"], "Rule 3 (IP-ASN,13335,REJECT): IP-ASN rules need the core");
+        assert_eq!(status["kernel"]["compilation"], json!({
+            "truncation_reason": status["kernel"]["reason"],
+            "nft_rules": 1,
+            "direct_returns": 1,
+            "cidr_sets": 1,
+            "cidr_set_entries": 1,
+            "skipped_direct_alternatives": 1
+        }));
+        assert_eq!(status["fake_ip_filter"], json!({
+            "truncation_reason": "Rule 4: a rule set can gain new domain names",
+            "rules": dns.rules.len(),
+            "fake_ip_rules": 2,
+            "compatibility_rules_skipped": 1,
+            "default_action": "fake-ip"
+        }));
+    }
+
+    #[test]
+    fn qos_mode_lookup_caches_absence_and_refreshes_after_the_ttl() {
+        let temp = test_dir::TestDir::new("mihomo-qos-cache");
+        let mihomo = Mihomo::for_test(temp.path().to_owned());
+
+        assert_eq!(mihomo.cached_qos_mode(|| None), None);
+        assert_eq!(mihomo.cached_qos_mode(|| panic!("the missing mode is cached")), None);
+
+        mihomo.qos_mode_cache.lock().unwrap().as_mut().unwrap().0 -= QOS_MODE_TTL;
+        assert_eq!(mihomo.cached_qos_mode(|| Some("Game_mode".into())).as_deref(), Some("Game_mode"));
+        assert_eq!(mihomo.cached_qos_mode(|| panic!("the mode is cached")).as_deref(), Some("Game_mode"));
     }
 
     #[test]
@@ -1657,6 +2201,98 @@ mod tests {
         assert!(serde_yaml_ng::from_str::<Yaml>(&none).unwrap()["sniffer"].is_null());
     }
 
+    #[test]
+    fn tailscale_exit_auto_enables_sniffer_preserving_dst_ip_and_custom_skip_lists() {
+        // Subscription with no sniffer block gets TLS/HTTP/QUIC + parse-pure-ip enabled,
+        // with override-destination forced false globally and per-protocol so Mihomo
+        // uses SniffHost for rule matching without re-resolving via plaintext DNS.
+        let auto = managed_config_with_tailscale("rules: [MATCH,DIRECT]\n", "private", true).unwrap();
+        let v: Yaml = serde_yaml_ng::from_str(&auto).unwrap();
+        assert_eq!(v["sniffer"]["enable"].as_bool(), Some(true));
+        assert_eq!(v["sniffer"]["parse-pure-ip"].as_bool(), Some(true));
+        assert_eq!(v["sniffer"]["override-destination"].as_bool(), Some(false));
+        assert_eq!(v["sniffer"]["force-dns-mapping"].as_bool(), Some(true));
+        for proto in ["HTTP", "TLS", "QUIC"] {
+            assert!(v["sniffer"]["sniff"][proto].is_mapping(), "{proto}");
+            assert_eq!(
+                v["sniffer"]["sniff"][proto]["override-destination"].as_bool(),
+                Some(false),
+                "{proto} must preserve Clean DNS DstIP"
+            );
+        }
+
+        // User-supplied skip-domain and custom TLS ports are preserved while any
+        // user-supplied `override-destination: true` is overridden to false.
+        let custom = managed_config_with_tailscale(
+            "sniffer:\n  enable: false\n  override-destination: true\n  skip-domain: ['Mijia Cloud']\n  sniff:\n    HTTP: {ports: [80], override-destination: true}\n    TLS: {ports: [443]}\nrules: [MATCH,DIRECT]\n",
+            "private",
+            true,
+        )
+        .unwrap();
+        let c: Yaml = serde_yaml_ng::from_str(&custom).unwrap();
+        assert_eq!(c["sniffer"]["enable"].as_bool(), Some(true));
+        assert_eq!(c["sniffer"]["parse-pure-ip"].as_bool(), Some(true));
+        assert_eq!(c["sniffer"]["override-destination"].as_bool(), Some(false));
+        assert_eq!(c["sniffer"]["skip-domain"][0].as_str(), Some("Mijia Cloud"));
+        assert_eq!(c["sniffer"]["sniff"]["HTTP"]["override-destination"].as_bool(), Some(false));
+        assert_eq!(c["sniffer"]["sniff"]["TLS"]["ports"].as_sequence().unwrap().len(), 1);
+        assert_eq!(c["sniffer"]["sniff"]["TLS"]["override-destination"].as_bool(), Some(false));
+        assert_eq!(c["sniffer"]["sniff"]["QUIC"]["override-destination"].as_bool(), Some(false));
+
+        // Mixed-case user protocol keys (`tls`, `http`) MUST be matched
+        // case-insensitively without inserting colliding `TLS`/`HTTP` siblings.
+        let mixed = managed_config_with_tailscale(
+            "sniffer:\n  enable: true\n  sniff:\n    tls: {ports: [443, 2053], override-destination: true}\n    Http: {override-destination: true}\nrules: [MATCH,DIRECT]\n",
+            "private",
+            true,
+        )
+        .unwrap();
+        let m: Yaml = serde_yaml_ng::from_str(&mixed).unwrap();
+        let sniff_map = m["sniffer"]["sniff"].as_mapping().unwrap();
+        assert_eq!(sniff_map.len(), 3, "no colliding uppercase duplicates: {sniff_map:?}");
+        assert!(sniff_map.get(&Yaml::from("TLS")).is_none());
+        assert!(sniff_map.get(&Yaml::from("HTTP")).is_none());
+        assert_eq!(m["sniffer"]["sniff"]["tls"]["ports"].as_sequence().unwrap().len(), 2);
+        assert_eq!(m["sniffer"]["sniff"]["tls"]["override-destination"].as_bool(), Some(false));
+        assert!(m["sniffer"]["sniff"]["Http"]["ports"].is_sequence());
+        assert_eq!(m["sniffer"]["sniff"]["Http"]["override-destination"].as_bool(), Some(false));
+        assert_eq!(m["sniffer"]["sniff"]["QUIC"]["override-destination"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn clean_dns_proxy_gates_on_running_and_non_direct_mode() {
+        let dir = test_dir::TestDir::new("clean-dns-proxy-gate");
+        let m = Mihomo::for_test(dir.path().to_path_buf());
+        assert!(m.clean_dns_proxy().is_none());
+
+        {
+            let mut s = m.shared.lock().unwrap();
+            s.phase = Phase::Running;
+            s.mode = Some(routing::Mode::Rule);
+            s.secret = Some("s3cr3t".into());
+        }
+        assert_eq!(
+            m.clean_dns_proxy(),
+            Some((download::PROXY.to_string(), download::USER.to_string(), "s3cr3t".to_string()))
+        );
+
+        // Direct mode -> direct IP-literal DoH (no proxy hop)
+        m.shared.lock().unwrap().mode = Some(routing::Mode::Direct);
+        assert!(m.clean_dns_proxy().is_none());
+
+        // D3 Backoff -> direct IP-literal DoH
+        {
+            let mut s = m.shared.lock().unwrap();
+            s.mode = Some(routing::Mode::Rule);
+            s.phase = Phase::Backoff;
+        }
+        assert!(m.clean_dns_proxy().is_none());
+
+        // Recovery back to Running -> proxy mode re-engaged
+        m.shared.lock().unwrap().phase = Phase::Running;
+        assert!(m.clean_dns_proxy().is_some());
+    }
+
     /// v4 release blocker: while the relay holds the network lock (an
     /// association or a CAC of up to 80 s), Mihomo's owner commands, egress
     /// news and failure handling still run: the controller never takes it.
@@ -1665,7 +2301,7 @@ mod tests {
         let temp = test_dir::TestDir::new("core-cac");
         let dir = temp.path().to_path_buf();
         let lock = Arc::new(crate::netfx::admission::Gate::new());
-        let m = Arc::new(Mihomo::at(dir.clone()));
+        let m = Arc::new(Mihomo::for_test(dir.clone()));
         let controller = controller::tests::Harness::for_mihomo(&m);
         let held = crate::netfx::admission::enter(&lock, Duration::ZERO).unwrap();
         let started = Instant::now();
@@ -1682,7 +2318,7 @@ mod tests {
     fn direct_bypass_flag_status_and_legacy_fallback() {
         let temp = test_dir::TestDir::new("direct-bypass");
         let dir = temp.path().to_path_buf();
-        let m = Mihomo::at(dir.clone());
+        let m = Mihomo::for_test(dir.clone());
         assert_eq!(m.status()["direct_bypass"], Value::Bool(false));
         assert_eq!(m.status()["direct_bypass_active"], Value::Bool(false));
         net::write_private(&dir.join(LEGACY_BYPASS), b"1").unwrap();
@@ -1716,10 +2352,46 @@ mod tests {
         let routes: Vec<String> = undos.iter().filter(|u| u.program == "ip").map(|u| u.args.join(" ")).collect();
         assert_eq!(routes, [
             "-4 route del local default dev lo table 60625",
-            "-4 rule del pref 18620 fwmark 0x700/0xff00 lookup 60625",
+            &format!("-4 rule del pref {PREF} fwmark 0x700/0xff00 lookup 60625"),
             "-6 route del local ::/0 dev lo table 60625",
-            "-6 rule del pref 18620 fwmark 0x700/0xff00 lookup 60625",
+            &format!("-6 rule del pref {PREF} fwmark 0x700/0xff00 lookup 60625"),
         ]);
+    }
+
+    fn port_with_performance_claim(root: &Path) -> (DevicePort, PathBuf) {
+        let mihomo = Arc::new(Mihomo::for_test(root.to_owned()));
+        let backlog = root.join("perf/proc/sys/net/core/netdev_max_backlog");
+        fs::create_dir_all(backlog.parent().unwrap()).unwrap();
+        fs::write(&backlog, "1000").unwrap();
+        mihomo.perf.set_active(PerfFeature::Mihomo, true).unwrap();
+        assert_eq!(fs::read_to_string(&backlog).unwrap(), "5000");
+        (DevicePort::new(mihomo, "u60.home.arpa".into()), backlog)
+    }
+
+    #[test]
+    fn direct_releases_performance_when_the_firewall_refuses_the_direct_table() {
+        use controller::Port;
+        let temp = test_dir::TestDir::new("mihomo-direct-perf");
+        let (mut port, backlog) = port_with_performance_claim(temp.path());
+        port.effects = Some(EffectSet::new("foreign", port.m.journal()));
+
+        assert_eq!(port.direct().unwrap_err(), "The nftables table has another owner");
+        assert_eq!(fs::read_to_string(backlog).unwrap(), "1000");
+    }
+
+    #[test]
+    fn release_all_releases_performance_when_firewall_cleanup_pauses() {
+        use controller::Port;
+        let temp = test_dir::TestDir::new("mihomo-release-perf");
+        let (mut port, backlog) = port_with_performance_claim(temp.path());
+        let mut effects = EffectSet::new("mihomo", port.m.journal());
+        effects.assume(vec![Resource::Sysctl(Sysctl { key: "unavailable-test-setting".into(), value: "0".into() })]);
+        port.effects = Some(effects);
+
+        let error = port.release_all().unwrap_err();
+        assert!(error.starts_with("Network cleanup paused:"), "{error}");
+        assert!(port.effects.is_some());
+        assert_eq!(fs::read_to_string(backlog).unwrap(), "1000");
     }
 
     /// Writes the production table batches and the journal this version
@@ -1779,7 +2451,7 @@ mod tests {
         let run = |args: &[&str]| Cmd::new(args[0], &args[1..]).run();
         let root = PathBuf::from("/tmp/u60-mihomo-qa-root");
         fs::create_dir_all(&root).unwrap();
-        let m = Arc::new(Mihomo::at(root.clone()));
+        let m = Arc::new(Mihomo::for_test(root.clone()));
         let mut port = DevicePort::new(Arc::clone(&m), "qa.home.arpa".into());
         // Foreign names: a table without our marker, a route in our table,
         // a rule at our priority. Each is refused and left as it was.
@@ -1842,11 +2514,13 @@ mod tests {
             local: "u60.home.arpa".into(),
             runtime: json!({"mode": "rule", "log-level": "info"}),
             routes: routing::Routes::default(),
-            dns: Vec::new(),
+            dns: Default::default(),
             bypass: true,
+            tailscale_sniffer: false,
             notice: None,
             source: String::new(),
             config: config.into(), facts: reload::Facts::from(&serde_yaml_ng::from_str(config).unwrap()),
+            egress: Default::default(),
         };
         let before: routing::Selected = [("G".to_owned(), "DIRECT".to_owned())].into();
         let configs = json!({"mode": "rule", "interface-name": "ath20"});
@@ -1865,6 +2539,13 @@ mod tests {
         assert!(reload_findings(&prepared, Some(&configs), Some(&renamed), Some(&providers), &before).is_ok());
         let unchanged = json!({"proxies": {"G": {"type": "Selector", "now": "New", "all": ["New", "DIRECT"]}}});
         assert!(reload_findings(&prepared, Some(&configs), Some(&unchanged), Some(&providers), &before).is_err());
+
+        // When tailscale_sniffer is required, reload_findings MUST require `configs["sniffing"] == true`.
+        let mut sniff_prepared = prepared.clone();
+        sniff_prepared.tailscale_sniffer = true;
+        assert!(reload_findings(&sniff_prepared, Some(&configs), Some(&proxies("DIRECT")), Some(&providers), &before).is_err());
+        assert!(reload_findings(&sniff_prepared, Some(&json!({"mode": "rule", "interface-name": "ath20", "sniffing": false})), Some(&proxies("DIRECT")), Some(&providers), &before).is_err());
+        assert!(reload_findings(&sniff_prepared, Some(&json!({"mode": "rule", "interface-name": "ath20", "sniffing": true})), Some(&proxies("DIRECT")), Some(&providers), &before).is_ok());
     }
 
     /// Q2: the core never refreshes a rule set by itself; the controller
@@ -1886,19 +2567,25 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = test_dir::TestDir::new("reload-validation");
         let dir = temp.path().to_path_buf();
-        let mihomo = Arc::new(Mihomo::at(dir.clone()));
+        let mihomo = Arc::new(Mihomo::for_test(dir.clone()));
         net::write_private(&dir.join("mihomo"), b"#!/bin/sh\nprintf x >> \"$3/check-count\"\n").unwrap();
         fs::set_permissions(dir.join("mihomo"), fs::Permissions::from_mode(0o700)).unwrap();
         net::write_private(&dir.join("config.yaml"), b"serving config").unwrap();
+        let mapping: Yaml = serde_yaml_ng::from_str("interface-name: ath20\nrules: ['MATCH,DIRECT']\n").unwrap();
+        let config = serde_yaml_ng::to_string(&mapping).unwrap();
         let prepared = Prepared {
             secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode":"rule"}),
-            routes: routing::Routes::default(), dns: Vec::new(), bypass: false, notice: None,
-            facts: Default::default(), source: "rules: ['MATCH,DIRECT']".into(), config: "rules: ['MATCH,DIRECT']".into(),
+            routes: routing::Routes::default(), dns: Default::default(), bypass: false, tailscale_sniffer: false, notice: None,
+            facts: reload::Facts::from(&mapping),
+            source: "rules: ['MATCH,DIRECT']".into(), config,
+            egress: egress::Binding { uplink: egress::Uplink::sample("ath20", 9, "192.0.2.2", None), generation: 1 },
         };
         let mut port = DevicePort::new(Arc::clone(&mihomo), "u60.home.arpa".into());
         port.lan = Some(std::net::Ipv4Addr::LOCALHOST);
-        let first = port.prepare(&Source::Previous(Box::new(prepared)), true).unwrap();
-        port.validator(&first, true).unwrap()().unwrap();
+        port.validator(&prepared, true).unwrap()().unwrap();
+        let first = port.prepare(&Source::Previous(Box::new(prepared)), true, Default::default()).unwrap();
+        assert!(first.facts.runtime.get("interface-name").is_none());
+        assert!(serde_yaml_ng::from_str::<Yaml>(&first.config).unwrap().get("interface-name").is_none());
         port.validator(&first, false).unwrap()().unwrap();
         assert_eq!(fs::read(dir.join("check-count")).unwrap(), b"x");
         assert_eq!(fs::read(dir.join("config.yaml")).unwrap(), b"serving config");
@@ -2064,8 +2751,6 @@ if [ -f "$3/mihomo.next" ]; then mv "$3/mihomo.next" "$3/mihomo" || exit; fi
     fn transparent_plan_tunes_the_kernel_and_restores_the_values_it_found() {
         let steps = resource_steps(|key| Ok(format!("old-{key}"))).unwrap();
         for (key, value) in [
-            ("tcp_pacing_ss_ratio", "1000"),
-            ("tcp_pacing_ca_ratio", "1000"),
             ("bridge-nf-call-iptables", "0"),
             ("bridge-nf-call-ip6tables", "0"),
         ] {
@@ -2097,7 +2782,7 @@ if [ -f "$3/mihomo.next" ]; then mv "$3/mihomo.next" "$3/mihomo" || exit; fi
     fn off_status_has_no_dashboard_and_creates_nothing() {
         let temp = test_dir::TestDir::new("mihomo-no-side-effects");
         let dir = temp.path().join("mihomo");
-        let m = Mihomo::at(dir.clone());
+        let m = Mihomo::for_test(dir.clone());
         assert_eq!(m.status()["running"], false);
         assert!(m.status()["dashboard"].is_null());
         assert!(!dir.exists());
@@ -2153,7 +2838,7 @@ if [ -f "$3/mihomo.next" ]; then mv "$3/mihomo.next" "$3/mihomo" || exit; fi
         let temp = test_dir::TestDir::new("core-busy");
         let dir = temp.path().join("mihomo");
         let lock = Arc::new(crate::netfx::admission::Gate::new());
-        let m = Mihomo::at(dir.clone());
+        let m = Mihomo::for_test(dir.clone());
         let _operation = m.operation.lock().unwrap();
         assert!(
             crate::netfx::admission::enter(&lock, Duration::ZERO).is_some(),
@@ -2174,10 +2859,10 @@ if [ -f "$3/mihomo.next" ]; then mv "$3/mihomo.next" "$3/mihomo" || exit; fi
     fn owner_choice_outlives_restarts_until_turned_off_or_failing() {
         let temp = test_dir::TestDir::new("core-wanted");
         let dir = temp.path().to_path_buf();
-        let m = Arc::new(Mihomo::at(dir.clone()));
+        let m = Arc::new(Mihomo::for_test(dir.clone()));
         net::write_private(&dir.join(WANTED), b"1").unwrap();
         assert!(m.wants_restore());
-        assert_eq!(m.status_with(|| Err("none".into()))["autostart"], true);
+        assert_eq!(m.status_with(|| Err("none".into()), || None)["autostart"], true);
         let controller = controller::tests::Harness::for_mihomo(&m);
         // The owner saw it fail: a restart must not retry it.
         assert_eq!(m.enable("u60.home.arpa").unwrap_err(), "fixture rejected the start");
@@ -2196,7 +2881,7 @@ if [ -f "$3/mihomo.next" ]; then mv "$3/mihomo.next" "$3/mihomo" || exit; fi
     fn restore_marker_write_and_delete_failures_are_reported() {
         let temp = test_dir::TestDir::new("core-marker");
         let dir = temp.path().to_path_buf();
-        let m = Arc::new(Mihomo::at(dir.clone()));
+        let m = Arc::new(Mihomo::for_test(dir.clone()));
         std::fs::create_dir_all(dir.join(WANTED)).unwrap();
         assert!(net::write_private(&dir.join(WANTED), b"1").is_err());
         assert_eq!(m.set_wanted(false).unwrap_err(), "Cannot clear Mihomo's restart setting");
@@ -2243,5 +2928,79 @@ hosts: {interface-name: 192.0.2.1}
         assert!(v["proxy-providers"]["Hotel"]["override"]["override-expr"].is_null());
         assert_eq!(v["hosts"]["interface-name"].as_str(), Some("192.0.2.1"));
         assert_eq!(v["profile"]["store-selected"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn tailscale_only_rule_provider_revisions_do_not_accumulate() {
+        use controller::Port;
+        let temp = test_dir::TestDir::new("core-ts-sources");
+        let dir = temp.path().to_path_buf();
+        let provider_path = dir.join("ruleset/direct.yaml");
+        std::fs::create_dir_all(provider_path.parent().unwrap()).unwrap();
+        std::fs::write(&provider_path, "payload:\n  - '1.2.3.0/24'\n").unwrap();
+
+        let m = Arc::new(Mihomo::for_test(dir.clone()));
+        let mut port = DevicePort::new(m, "u60.home.arpa".into());
+        let doc: Yaml = serde_yaml_ng::from_str(
+            "rule-providers:\n  direct_ip:\n    type: http\n    behavior: ipcidr\n    path: ./ruleset/direct.yaml\nrules:\n  - RULE-SET,direct_ip,DIRECT\n  - MATCH,P\n",
+        )
+        .unwrap();
+        let routes = routing::Routes::from(&doc);
+        let selected = routing::Selected::new();
+
+        // Revision 1 with LAN bypass OFF and Tailscale Strategy B active.
+        port.plan(&routes, false, routing::Mode::Rule, &selected, &[]);
+        let chain1 = port.plan_tailscale(&routes, routing::Mode::Rule, &selected, &[]);
+        assert_eq!(chain1.returns, 1);
+        assert_eq!(port.sources.len(), 1);
+        assert!(!port.sources_changed());
+
+        // Rewrite provider content across multiple revisions: `sources` must
+        // keep exactly one current entry per path (never retaining obsolete digests).
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&provider_path, "payload:\n  - '4.5.6.0/24'\n").unwrap();
+        assert!(port.sources_changed());
+        port.plan(&routes, false, routing::Mode::Rule, &selected, &[]);
+        let chain2 = port.plan_tailscale(&routes, routing::Mode::Rule, &selected, &[]);
+        assert_eq!(chain2.returns, 1);
+        assert_eq!(port.sources.len(), 1, "revisions for the same provider path must replace, not accumulate");
+        assert!(!port.sources_changed(), "no obsolete source revision may trigger perpetual changes");
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&provider_path, "payload:\n  - '7.8.9.0/24'\n").unwrap();
+        port.plan(&routes, false, routing::Mode::Rule, &selected, &[]);
+        let _ = port.plan_tailscale(&routes, routing::Mode::Rule, &selected, &[]);
+        assert_eq!(port.sources.len(), 1);
+        assert!(!port.sources_changed());
+
+        // When LAN bypass is ALSO on and reads the same file, deduplicate by path.
+        port.plan(&routes, true, routing::Mode::Rule, &selected, &[]);
+        let _ = port.plan_tailscale(&routes, routing::Mode::Rule, &selected, &[]);
+        assert_eq!(port.sources.len(), 1);
+        assert!(!port.sources_changed());
+
+        // Mid-pass provider mutation between LAN `plan()` (rev A) and Tailscale
+        // `plan_tailscale()` (rev B) MUST mark sources diverged so the next
+        // `sources_changed()` forces recompiling both chains consistently even
+        // though disk already matches rev B!
+        port.plan(&routes, true, routing::Mode::Rule, &selected, &[]);
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&provider_path, "payload:\n  - '9.9.9.0/24'\n").unwrap();
+        let _ = port.plan_tailscale(&routes, routing::Mode::Rule, &selected, &[]);
+        assert_eq!(port.sources.len(), 1, "merged sources still keep one entry per path");
+        assert!(
+            port.sources_changed(),
+            "differing LAN/Tailscale observations for the same path must force a recompile"
+        );
+        // Once both chains recompile from the same rev B, divergence clears.
+        port.plan(&routes, true, routing::Mode::Rule, &selected, &[]);
+        let _ = port.plan_tailscale(&routes, routing::Mode::Rule, &selected, &[]);
+        assert_eq!(port.sources.len(), 1);
+        assert!(!port.sources_changed());
+
+        // When Tailscale planning stops and LAN bypass is off, stale sources clear.
+        port.plan(&routes, false, routing::Mode::Rule, &selected, &[]);
+        assert!(port.sources.is_empty());
+        assert!(!port.sources_changed());
     }
 }

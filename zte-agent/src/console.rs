@@ -1,5 +1,5 @@
 //! The sole browser UI, with safe redirects for retired /ui/ bookmarks.
-use crate::httpd::{api, Ctx, Peer};
+use crate::httpd::{api, Ctx, Via};
 use axum::http::{
     header::{HeaderValue, CACHE_CONTROL, CONTENT_TYPE},
     StatusCode,
@@ -26,17 +26,14 @@ pub fn router() -> Router<Ctx> {
 }
 
 pub(crate) fn host_allowed(ctx: &Ctx, req: &Request) -> bool {
-    let loopback = req
-        .extensions()
-        .get::<Peer>()
-        .is_some_and(|peer| peer.0.ip().to_canonical().is_loopback());
+    let via = Via::of(req.extensions());
     let secure = req
         .extensions()
         .get::<crate::httpd::tls::Secure>()
         .is_some();
     api::header(req.headers(), "host").is_some_and(|host| {
         ctx.hosts
-            .allows_via(host, loopback, secure, &|| ctx.ts.get())
+            .allows_via(host, via, secure, &|| ctx.ts.get())
     })
 }
 
@@ -497,6 +494,26 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn console_loopback_host_requires_ingress_extension() {
+        let router = crate::httpd::app(Ctx::new(Arc::new(AppState::new()), 2));
+        let peer = crate::httpd::Peer(std::net::SocketAddr::from(([127, 0, 0, 1], 5000)));
+        for (via, status) in [
+            (None, 403),
+            (Some(Via::Local), 403),
+            (Some(Via::Tailnet), 403),
+            (Some(Via::Loopback), 303),
+        ] {
+            let mut request = Request::builder().uri("/console/").header("host", "localhost").extension(peer);
+            if let Some(via) = via {
+                request = request.extension(via);
+            }
+            let response = router.clone().oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status().as_u16(), status, "{via:?}");
+        }
+    }
+
     #[tokio::test]
     async fn production_retires_old_pages_actions_assets_and_streams() {
         let state = Arc::new(AppState::new());

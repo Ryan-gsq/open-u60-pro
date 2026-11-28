@@ -324,7 +324,7 @@ async fn band_lock_grids_questions_and_bodies() {
         ]
     );
     // LTE and Unlock over Tailscale: the remote line.
-    let tailnet = Peer(SocketAddr::from(([127, 0, 0, 1], 40114)));
+    let tailnet = tailnet(40114);
     let q = get_with(&c, "/ui/tools/band-lock/lte?lte=3&lte=20", tailnet, &cookie).await;
     assert!(q.text().contains("these LTE bands: 3, 20.") && q.text().contains("You are connected remotely"), "{}", q.text());
     post(&c, "/ui/tools/band-lock/lte", tailnet, &cookie, &format!("csrf={csrf}&lte=3&lte=20&once={}&confirm=1", q.input("once"))).await;

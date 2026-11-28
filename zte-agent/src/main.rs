@@ -108,8 +108,16 @@ fn main() {
     }
     if let Some(result) = network_recover_cli(
         args.get(1).map(String::as_str),
-        || Arc::new(crate::netfx::admission::Gate::new()),
-        || mihomo::Mihomo::new().recover(),
+        || {
+            crate::netfx::perf::Perf::router().lock_owner()?;
+            Ok(Arc::new(crate::netfx::admission::Gate::new()))
+        },
+        || crate::netfx::perf::Perf::router().recover(),
+        || {
+            mihomo::Mihomo::new()
+                .recover()
+                .and_then(|()| tailscale::recover_network())
+        },
         |lock| wifi_relay::WifiRelay::new(lock).recover(),
     ) {
         if let Err(e) = result { eprintln!("{e}"); std::process::exit(1); }
@@ -130,6 +138,8 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("wireguard-smoke") {
         std::process::exit(wireguard::cli_smoke());
     }
+
+    ota::record_trial_parent();
 
     let bind = std::env::var("ZTE_AGENT_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let threads: usize = std::env::var("ZTE_AGENT_THREADS")
@@ -152,6 +162,12 @@ fn main() {
             std::process::exit(1);
         }
     }
+
+    if let Err(error) = state.perf.start() {
+        eprintln!("[perf] {error}");
+        std::process::exit(1);
+    }
+    state.perf.watch();
 
     // For scripts run as root on the router (`adb shell`); loopback only.
     if let Err(error) = auth::startup::write_local_token(&state.auth, std::path::Path::new(auth::startup::LOCAL_TOKEN)) {
@@ -221,6 +237,9 @@ fn main() {
         .charge_limit
         .start(charger_rx, Arc::clone(&state.cache));
     state.sms_forward.start(sms_rx, service_rx, wan_status_rx);
+    if let Err(error) = state.tailscale.recover_startup() {
+        eprintln!("[tailscale] startup recovery failed: {error}");
+    }
     state.tailscale.auto_start();
     state.mihomo.start(state.tls.name().to_owned());
     state.mihomo.start_profiles();
@@ -260,7 +279,26 @@ fn main() {
 /// a stale relay route would bind to the relay's station interface.
 fn restore_network(state: &Arc<AppState>) {
     if let Some(restore) = network_restore_work(state) {
-        system::spawn_named("net-restore", restore);
+        let tailscale = Arc::clone(&state.tailscale);
+        system::spawn_named("net-restore", move || {
+            struct ReadyOnDrop(Arc<tailscale::TailscaleManager>);
+            impl Drop for ReadyOnDrop {
+                fn drop(&mut self) {
+                    self.0.mark_network_restore_ready();
+                }
+            }
+            let _guard = ReadyOnDrop(tailscale);
+            restore();
+        });
+    } else {
+        // Even when neither relay nor Mihomo wants restore, ensure any idle
+        // legacy journals finish boot recovery before Tailscale promotes to
+        // kernel TUN.
+        let state = Arc::clone(state);
+        system::spawn_named("net-restore-gate", move || {
+            state.wifi_relay.recover_idle();
+            state.tailscale.mark_network_restore_ready();
+        });
     }
 }
 
@@ -296,12 +334,14 @@ fn network_restore_work(state: &impl NetworkRestore) -> Option<impl FnOnce()> {
 }
 
 fn network_recover_cli<L>(
-    action: Option<&str>, lock: impl FnOnce() -> L, recover_mihomo: impl FnOnce() -> Result<(), String>,
+    action: Option<&str>, lock: impl FnOnce() -> Result<L, String>, recover_perf: impl FnOnce() -> Result<(), String>,
+    recover_mihomo: impl FnOnce() -> Result<(), String>,
     recover_relay: impl FnOnce(L) -> Result<(), String>,
 ) -> Option<Result<(), String>> {
     (action == Some("network-recover")).then(|| {
-        let lock = lock();
-        recover_mihomo().and_then(|()| recover_relay(lock))
+        let lock = lock()?;
+        let perf = recover_perf();
+        recover_mihomo().and_then(|()| recover_relay(lock)).and(perf)
     })
 }
 
@@ -419,22 +459,26 @@ mod tests {
     #[test]
     fn network_recover_cli_recovers_synchronously_in_order_and_stops_on_failure() {
         use std::cell::RefCell;
-        for (action, core_ok, relay_ok, expected) in [
-            (Some("guard"), true, true, None),
-            (Some("network-recover"), false, true, Some(Err("core error".to_owned()))),
-            (Some("network-recover"), true, false, Some(Err("relay error".to_owned()))),
-            (Some("network-recover"), true, true, Some(Ok(()))),
+        for (action, lock_ok, perf_ok, core_ok, relay_ok, expected) in [
+            (Some("guard"), true, true, true, true, None),
+            (Some("network-recover"), false, true, true, true, Some(Err("owner error".to_owned()))),
+            (Some("network-recover"), true, false, true, true, Some(Err("perf error".to_owned()))),
+            (Some("network-recover"), true, true, false, true, Some(Err("core error".to_owned()))),
+            (Some("network-recover"), true, true, true, false, Some(Err("relay error".to_owned()))),
+            (Some("network-recover"), true, true, true, true, Some(Ok(()))),
         ] {
             let calls = RefCell::new(Vec::new());
-            let result = super::network_recover_cli(action, || { calls.borrow_mut().push("lock"); 42 },
+            let result = super::network_recover_cli(action, || { calls.borrow_mut().push("lock"); if lock_ok { Ok(42) } else { Err("owner error".into()) } },
+                || { calls.borrow_mut().push("perf.recover"); if perf_ok { Ok(()) } else { Err("perf error".into()) } },
                 || { calls.borrow_mut().push("mihomo.recover"); if core_ok { Ok(()) } else { Err("core error".into()) } },
                 |lock| { assert_eq!(lock, 42); calls.borrow_mut().push("wifi_relay.recover"); if relay_ok { Ok(()) } else { Err("relay error".into()) } },
             );
             assert_eq!(result, expected);
             let trace = calls.into_inner();
             if expected.is_none() { assert!(trace.is_empty()); }
-            else if !core_ok { assert_eq!(trace, ["lock", "mihomo.recover"]); }
-            else { assert_eq!(trace, ["lock", "mihomo.recover", "wifi_relay.recover"]); }
+            else if !lock_ok { assert_eq!(trace, ["lock"]); }
+            else if !core_ok { assert_eq!(trace, ["lock", "perf.recover", "mihomo.recover"]); }
+            else { assert_eq!(trace, ["lock", "perf.recover", "mihomo.recover", "wifi_relay.recover"]); }
         }
     }
 

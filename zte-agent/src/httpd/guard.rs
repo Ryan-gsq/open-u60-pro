@@ -2,8 +2,9 @@
 //! HTTP framework: a Host allowlist (DNS-rebinding defence) and exact
 //! Origin / Referer / `Sec-Fetch-Site` checks for state-changing requests.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use super::Via;
 use crate::server::Method;
 
 /// The headers the checks look at (first occurrence of each).
@@ -76,9 +77,7 @@ fn parse_port(p: &str) -> Option<u16> {
     p.parse().ok()
 }
 
-/// Host names the agent answers to besides IP literals (and, for loopback
-/// peers, `localhost` and the Tailscale names; over the HTTPS listener,
-/// the LAN HTTPS name).
+/// Host names the agent answers to for each ingress and listener.
 pub struct HostPolicy {
     extra: Vec<String>,
     /// The LAN HTTPS name (`tls`, `u60.home.arpa`).
@@ -99,8 +98,8 @@ impl HostPolicy {
     }
 
     /// Each entry is parsed like a Host header, so it matches exactly what
-    /// `allows` compares; a port is ignored there too. IP literals always
-    /// pass, and an entry that is no host name is reported and dropped.
+    /// `allows` compares; a port is ignored there too. IP literals are
+    /// handled separately. Invalid entries are reported and dropped.
     pub fn new(extra: Vec<String>) -> Self {
         let mut names = Vec::new();
         for raw in extra.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
@@ -115,26 +114,28 @@ impl HostPolicy {
 
     /// `allows`, and over the HTTPS listener (`secure`, which runs only
     /// while HTTPS is on) also the LAN HTTPS name.
-    pub fn allows_via(&self, host_header: &str, loopback: bool, secure: bool, ts_names: &dyn Fn() -> Vec<String>) -> bool {
-        self.allows(host_header, loopback, ts_names)
+    pub fn allows_via(&self, host_header: &str, via: Via, secure: bool, ts_names: &dyn Fn() -> Vec<String>) -> bool {
+        self.allows(host_header, via, ts_names)
             || (secure && matches!(parse_authority(host_header), Some((Authority::Name(n), _)) if Some(&n) == self.local.as_ref()))
     }
 
-    /// Any IP literal or a configured name; `localhost` and the Tailscale
-    /// names only from a `loopback` peer (Tailscale clients arrive as
-    /// 127.0.0.1, so a LAN browser asking for those single-label names was
-    /// sent there by DNS). The port is ignored. `ts_names` is only called
-    /// for a loopback peer's name that is neither `localhost` nor configured.
-    pub fn allows(&self, host_header: &str, loopback: bool, ts_names: &dyn Fn() -> Vec<String>) -> bool {
+    /// Loopback hosts require loopback ingress. Tailscale names require
+    /// loopback or Tailnet ingress. The port is ignored.
+    fn allows(&self, host_header: &str, via: Via, ts_names: &dyn Fn() -> Vec<String>) -> bool {
         match parse_authority(host_header) {
             None => false,
-            Some((Authority::V4(_) | Authority::V6(_), _)) => true,
+            Some((Authority::V4(addr), _)) => allows_ip(addr.into(), via),
+            Some((Authority::V6(addr), _)) => allows_ip(addr.into(), via),
+            Some((Authority::Name(name), _)) if name == "localhost" => via == Via::Loopback,
             Some((Authority::Name(name), _)) => {
-                self.extra.contains(&name)
-                    || (loopback && (name == "localhost" || ts_names().contains(&name)))
+                self.extra.contains(&name) || (via.allows_tailnet() && ts_names().contains(&name))
             }
         }
     }
+}
+
+fn allows_ip(ip: IpAddr, via: Via) -> bool {
+    !ip.to_canonical().is_loopback() || via == Via::Loopback
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -240,14 +241,32 @@ mod tests {
             "u60-pro-1.tailnet.ts.net:9090",
             "U60-PRO-1",
         ] {
-            assert!(p.allows(host, true, &ts_enabled), "refused {host}");
+            assert!(p.allows(host, Via::Loopback, &ts_enabled), "refused {host}");
         }
         // From the LAN: IP literals and configured names only.
         for host in ["192.168.0.1:9090", "[fe80::1]:9090", "router.lan"] {
-            assert!(p.allows(host, false, &ts_enabled), "refused {host} from the LAN");
+            assert!(p.allows(host, Via::Local, &ts_enabled), "refused {host} from the LAN");
         }
         for host in ["localhost:9090", "u60-pro", "u60-pro-1.tailnet.ts.net:9090", "U60-PRO-1"] {
-            assert!(!p.allows(host, false, &ts_enabled), "accepted {host} from the LAN");
+            assert!(!p.allows(host, Via::Local, &ts_enabled), "accepted {host} from the LAN");
+        }
+    }
+
+    #[test]
+    fn loopback_and_tailnet_hosts_require_their_ingress() {
+        let policy = HostPolicy::new(vec!["localhost".into()]);
+        for host in ["localhost:9090", "127.0.0.1:9090", "127.0.0.2:9090", "[::1]", "[::ffff:127.0.0.1]", "[::ffff:127.0.0.2]"] {
+            assert!(policy.allows(host, Via::Loopback, &ts_enabled), "{host}");
+            assert!(!policy.allows(host, Via::Tailnet, &ts_enabled), "{host}");
+            assert!(!policy.allows(host, Via::Local, &ts_enabled), "{host}");
+        }
+        for host in ["u60-pro", "u60-pro-1.tailnet.ts.net:9090"] {
+            assert!(policy.allows(host, Via::Loopback, &ts_enabled), "{host}");
+            assert!(policy.allows(host, Via::Tailnet, &ts_enabled), "{host}");
+            assert!(!policy.allows(host, Via::Local, &ts_enabled), "{host}");
+        }
+        for host in ["100.64.1.1:9090", "[fd7a:115c:a1e0::1]"] {
+            assert!(policy.allows(host, Via::Local, &ts_enabled), "{host}");
         }
     }
 
@@ -281,11 +300,11 @@ mod tests {
             "ho\\st",
             "ho%st",
         ] {
-            assert!(!p.allows(host, true, &ts_enabled), "accepted {host:?}");
+            assert!(!p.allows(host, Via::Loopback, &ts_enabled), "accepted {host:?}");
         }
         // Tailscale names only while Tailscale is enabled.
         for host in ["u60-pro", "u60-pro-1.tailnet.ts.net", "u60-pro-1"] {
-            assert!(!p.allows(host, true, &Vec::new), "accepted {host} with Tailscale disabled");
+            assert!(!p.allows(host, Via::Loopback, &Vec::new), "accepted {host} with Tailscale disabled");
         }
     }
 
@@ -298,12 +317,12 @@ mod tests {
             ts_enabled()
         };
         for host in ["192.168.0.1:9090", "[fe80::1]", "localhost", "router.lan", "127.1", "a b"] {
-            let _ = p.allows(host, true, &names);
+            let _ = p.allows(host, Via::Loopback, &names);
         }
-        assert!(!p.allows("u60-pro", false, &names));
+        assert!(!p.allows("u60-pro", Via::Local, &names));
         assert_eq!(calls.get(), 0);
-        assert!(p.allows("u60-pro", true, &names));
-        assert!(!p.allows("evil.com", true, &names));
+        assert!(p.allows("u60-pro", Via::Tailnet, &names));
+        assert!(!p.allows("evil.com", Via::Loopback, &names));
         assert_eq!(calls.get(), 2);
     }
 
@@ -322,14 +341,14 @@ mod tests {
     fn the_local_name_is_allowed_over_https_only() {
         let p = HostPolicy::from_env_with("u60.home.arpa");
         for host in ["u60.home.arpa", "U60.HOME.ARPA:9443", "u60.home.arpa.:9090"] {
-            assert!(p.allows_via(host, false, true, &Vec::new), "{host}");
-            assert!(!p.allows_via(host, false, false, &Vec::new) && !p.allows_via(host, true, false, &Vec::new), "{host} over http");
-            assert!(!p.allows(host, false, &Vec::new), "{host}");
+            assert!(p.allows_via(host, Via::Local, true, &Vec::new), "{host}");
+            assert!(!p.allows_via(host, Via::Local, false, &Vec::new) && !p.allows_via(host, Via::Loopback, false, &Vec::new), "{host} over http");
+            assert!(!p.allows(host, Via::Local, &Vec::new), "{host}");
         }
         for host in ["home.arpa", "x.u60.home.arpa", "u60.home.arpa.evil.example", "evil.example"] {
-            assert!(!p.allows_via(host, false, true, &Vec::new), "{host}");
+            assert!(!p.allows_via(host, Via::Local, true, &Vec::new), "{host}");
         }
-        assert!(p.allows_via("192.168.0.1:9443", false, true, &Vec::new));
+        assert!(p.allows_via("192.168.0.1:9443", Via::Local, true, &Vec::new));
     }
 
     #[test]
@@ -340,8 +359,8 @@ mod tests {
                 .to_vec(),
         );
         assert_eq!(p.extra, ["router.lan", "nas.lan"]);
-        assert!(p.allows("router.lan", false, &Vec::new));
-        assert!(p.allows("NAS.lan:9090", false, &Vec::new));
+        assert!(p.allows("router.lan", Via::Local, &Vec::new));
+        assert!(p.allows("NAS.lan:9090", Via::Local, &Vec::new));
     }
 
     fn h<'a>(host: &'a str, origin: Option<&'a str>, referer: Option<&'a str>, site: Option<&'a str>) -> ReqHeaders<'a> {

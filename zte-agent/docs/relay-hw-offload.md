@@ -119,7 +119,7 @@ ip -4 route add unreachable 224.0.0.0/4    metric 60631 table main
 ip -4 route add default via <网关> dev ath20 metric 60631 table main
 ```
 
-- **中继优先、蜂窝备用**：所有流量都先查 pref 18640 → 60631 表（中继），这一点不变。
+- **中继优先、蜂窝备用**：除更高优先级的 Mihomo TPROXY 本地交付（`pref 5100 → 60625`）与已验证 Tailnet 目的（`pref 5110 → 52`）外，其余流量优先查 `pref 5120 → 60631` 表（中继，同开机接管时退役旧 `18640`）。
   main 表里这条路由只用来让 IPACM 看到 WAN。蜂窝默认路由由 netifd 以 metric 0 添加
   （`zte_wan` 没有配置 metric），并且使用 NLM_F_REPLACE。如果我们也用 metric 0，
   两条路由会互相替换；所以用 metric 60631，两条可以共存，谁也不会删掉谁。
@@ -364,12 +364,9 @@ IPv6 的 `U60_R6_NAT`/`U60_R6_FWD` 跳转后 4 秒补回（当时的版本；v5 
 排在后面时用一个 restore 事务删掉再插到第一条，期间不会缺失。
 （2026-11-12 注：这里的“中继连上之后”就是上面 IPv6 `set_data` 引起的那次 fw3 重载。）
 
-### 6. RPS 和 backlog（辅助）
+### 6. RPS、backlog 与 TCP pacing（全局性能协调器）
 
-中继连接时，`ath20` 和 `wlan2` 所有接收队列的 `rps_cpus` 设为"没有处理过 Wi-Fi
-中断的 CPU"（从 `/proc/interrupts` 计算，B31 上是 `c`）；`netdev_max_backlog`
-不到 5000 的提到 5000。断开时恢复。这只影响仍然走 CPU 的流量：Mihomo 代理的连接、
-IPv6/NAT66、每条连接的头几个包，以及设备本机的流量。
+共享协调器 `netfx::perf`（带 owner 锁与开机日志，跨中继、Mihomo 与已成功激活的 Tailscale 内核 TUN 引用计数，不再按单功能独立写 sysctl）在任一受管扩展活跃时维护：`wlan0` 与 `wlan2` 所有接收队列（以及仅在中继活跃时包含的 `ath20`）的 `rps_cpus` 设为未处理 Wi-Fi 中断的 CPU（从 `/proc/interrupts` 动态计算，B31 上为 `c`；**不修改 `ecm0`，原样保留其既有掩码，出厂默认为 `0`**）；`netdev_max_backlog` 低于 5000 时提至 5000；`tcp_pacing_ss_ratio`/`tcp_pacing_ca_ratio` 设为 1000。所有扩展退出后按日志恢复原值。这只影响仍走 CPU 的流量：Mihomo 代理连接、IPv6/NAT66、Tailscale TUN、每条连接的头几个包及设备本机流量。
 
 之前单独开 RPS 的效果：单连接 141.7 → 196.8 Mbit/s，4 连接 184 → 238.5；在 backlog
 为 1000 时看到过 softnet 丢包。车主 B31 压测以 `ath20=c`、`ecm0=0`、backlog 5000 最好。给 `ecm0` 开 RPS 后 IPA 降至 188.9 Mbit/s。`ss-aes -P4` 对照在 backlog 1000 时丢 3908，5000 时消除。省电开关在本地吞吐和延迟对照中几乎无差异。

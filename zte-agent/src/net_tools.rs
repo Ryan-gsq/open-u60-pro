@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -87,12 +88,31 @@ impl Cmd {
     }
 
     pub(crate) fn undo(&self) -> Result<(), String> {
+        if self.program == "@u60-sysctl" {
+            if let Some(iface) = self.args.first().and_then(|key| crate::netfx::effect::shared::sysctl_interface(key)) {
+                if !Path::new(&format!("/sys/class/net/{iface}")).try_exists().map_err(|e| e.to_string())? {
+                    return Ok(());
+                }
+            }
+        }
         if self.program == "ip" && self.args == ["link", "del", "dev", "wg-u60"] && !Path::new("/sys/class/net/wg-u60").try_exists().map_err(|e| e.to_string())? { return Ok(()); }
         if self.program == "ip" && self.args.len() == 7 && self.args[1..4] == ["rule", "del", "pref"] && self.args[5] == "lookup" {
             match plain_policy_rule(&self.args[0], &self.args[4], &self.args[6])? {
                 PolicyRule::Owned => {}
                 PolicyRule::Missing | PolicyRule::Foreign => return Ok(()),
                 PolicyRule::Shared => return Err("Policy priority is shared; cleanup paused".into()),
+            }
+        } else if self.program == "ip"
+            && self.args.get(1).map(String::as_str) == Some("rule")
+            && self.args.get(2).map(String::as_str) == Some("del")
+        {
+            let rules = Cmd::new("ip", &[&self.args[0], "rule", "show"]).run()?;
+            match crate::netfx::effect::shared::rule_del_check(&rules, &self.args) {
+                crate::netfx::effect::shared::RuleDelCheck::SafeSingleMatch => {}
+                crate::netfx::effect::shared::RuleDelCheck::Missing => return Ok(()),
+                crate::netfx::effect::shared::RuleDelCheck::Ambiguous => {
+                    return Err("Policy priority is shared or ambiguous; cleanup paused".into());
+                }
             }
         }
         // Firmware can turn off the hotspot during an undo. Check again on
@@ -118,7 +138,7 @@ impl Cmd {
             match self.args[1].as_str() {
                 "rule" => {
                     let rules = Cmd::new("ip", &[family, "rule", "show"]).run()?;
-                    if value("pref").is_some_and(|priority| !rules.lines().any(|line| line.trim_start().starts_with(&format!("{priority}:")))) { return Ok(()); }
+                    if !crate::netfx::effect::shared::rule_del_listed(&rules, &self.args) { return Ok(()); }
                 }
                 "route" => {
                     if let Some(table) = value("table") {
@@ -189,7 +209,42 @@ impl Reconciled {
     pub fn extend(&mut self, other: Reconciled) { self.restored.extend(other.restored); self.failed.extend(other.failed); }
 }
 
-pub(crate) fn boot_id() -> String { fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().to_owned() }
+pub(crate) fn boot_id_from_raw(raw: &[u8]) -> String {
+    valid_boot_token(raw).unwrap_or_default().to_owned()
+}
+
+pub(crate) fn boot_id() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read("/proc/sys/kernel/random/boot_id")
+            .map(|raw| boot_id_from_raw(&raw))
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "host-boot".to_owned()
+    }
+}
+
+/// Strict single-token check for a boot ID string value (e.g. a JSON `"boot"`
+/// field): non-empty and consisting solely of printable non-space ASCII
+/// (`0x21..=0x7E`, matching `zte-agent-supervisor.sh`'s `[^!-~]` check).
+pub(crate) fn is_valid_boot_token_str(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| (b'!'..=b'~').contains(&b))
+}
+
+/// Parse a strict boot-ID token from raw file bytes (e.g. `boot_id` or a
+/// marker file), matching `read_valid_boot_token` in `zte-agent-supervisor.sh`:
+/// NUL-free valid UTF-8, trimmed only of leading/trailing `[ \t\r\n]`,
+/// non-empty, and printable non-space ASCII (`0x21..=0x7E`).
+pub(crate) fn valid_boot_token(raw: &[u8]) -> Option<&str> {
+    if raw.contains(&0) {
+        return None;
+    }
+    let text = std::str::from_utf8(raw).ok()?;
+    let trimmed = text.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
+    is_valid_boot_token_str(trimmed).then_some(trimmed)
+}
 
 #[cfg(test)]
 mod tests {
@@ -236,5 +291,32 @@ mod tests {
         let listed = "table ip u60_t {\n chain pre {\n type filter hook prerouting priority filter; policy accept;\n accept\n return\n }\n}\n";
         assert_eq!(nft_chain_rules(&written), nft_chain_rules(listed));
         assert_eq!(nft_chain_rules(&listed.replace(" accept\n", ""))["pre"], 1);
+    }
+
+    #[test]
+    fn boot_id_from_raw_rejects_malformed_bytes_before_normalization() {
+        assert_eq!(
+            boot_id_from_raw(b"550e8400-e29b-41d4-a716-446655440000\n"),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(boot_id_from_raw(b" \tboot-1\r\n"), "boot-1");
+        for malformed in [
+            b"".as_slice(),
+            b"   \n".as_slice(),
+            b"\x0cboot-1\n".as_slice(),
+            b"\x0bboot-1\n".as_slice(),
+            b"boot-1\x0c\n".as_slice(),
+            b"\xc2\xa0boot-1\n".as_slice(),
+            b"boot\0id\n".as_slice(),
+            b"boot id\n".as_slice(),
+            b"boot\nid\n".as_slice(),
+            b"boot\xff\n".as_slice(),
+        ] {
+            assert_eq!(
+                boot_id_from_raw(malformed),
+                "",
+                "malformed raw boot_id {malformed:?} must fail closed to empty"
+            );
+        }
     }
 }

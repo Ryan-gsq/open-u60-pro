@@ -13,6 +13,7 @@ pub(super) struct Facts {
     pub groups: Vec<(String, bool)>,
     pub providers: Vec<String>,
     pub assets: Vec<super::geodata::Asset>,
+    pub sniffing: bool,
 }
 
 impl Facts {
@@ -34,7 +35,8 @@ impl Facts {
         for key in ["interface-name", "mode", "log-level", "geodata-mode"] { if let Some(v) = config.get(key) { runtime.insert(key.into(), v.clone()); } }
         let groups = config["proxy-groups"].as_sequence().into_iter().flatten().map(|g| (g["name"].as_str().unwrap_or_default().into(), g["type"].as_str() == Some("select"))).collect();
         let providers = config["rule-providers"].as_mapping().into_iter().flat_map(|m| m.keys()).filter_map(|k| k.as_str().map(str::to_owned)).collect();
-        Self { startup: Value::Mapping(startup), runtime: Value::Mapping(runtime), groups, providers, assets: super::geodata::required(config) }
+        let sniffing = config["sniffer"]["enable"].as_bool().unwrap_or(false);
+        Self { startup: Value::Mapping(startup), runtime: Value::Mapping(runtime), groups, providers, assets: super::geodata::required(config), sniffing }
     }
 
     pub fn needs_restart(&self, next: &Self) -> bool {

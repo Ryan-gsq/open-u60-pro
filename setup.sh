@@ -492,9 +492,10 @@ else
     case "$FORWARD_PORT" in ''|*[!0-9]*) fail "Cannot allocate verification port." ;; esac
     VERIFY_URL="http://127.0.0.1:$FORWARD_PORT"
 fi
+VERIFY_HOST="$GATEWAY:$AGENT_PORT"
 READY=false
 for attempt in $(seq 1 30); do
-    if curl --noproxy '*' -fsSL --max-time 2 "$VERIFY_URL/console/" >"$WORKDIR/console.html" 2>/dev/null \
+    if curl --noproxy '*' -fsSL --max-time 2 -H "Host: $VERIFY_HOST" "$VERIFY_URL/console/" >"$WORKDIR/console.html" 2>/dev/null \
         && grep -q 'OpenU60' "$WORKDIR/console.html"; then
         READY=true
         break
@@ -502,7 +503,7 @@ for attempt in $(seq 1 30); do
     sleep 1
 done
 [ "$READY" = true ] || fail "Console not ready; boot hook is unchanged."
-[ "$(curl --noproxy '*' -sS --max-time 5 -o /dev/null -w '%{http_code}' "$VERIFY_URL/api/device")" = 401 ] \
+[ "$(curl --noproxy '*' -sS --max-time 5 -o /dev/null -w '%{http_code}' -H "Host: $VERIFY_HOST" "$VERIFY_URL/api/device")" = 401 ] \
     || fail "Unauthenticated API was not rejected; boot hook is unchanged."
 rcmd "p=\$(cat /tmp/zte-agent-run/pid); [ \"\$(readlink /proc/\$p/exe)\" = '$REMOTE_SLOT' ]" \
     || fail "The responding agent is not the process the supervisor started from OTA slot A."
@@ -513,7 +514,7 @@ if [ "$FACTORY_PASSWORD" = true ]; then
 else
     printf '%s' "$AGENT_PASSWORD" | python3 -c 'import json,sys; json.dump({"password":sys.stdin.read()},sys.stdout)' >"$WORKDIR/login.json"
     chmod 600 "$WORKDIR/login.json"
-    curl --noproxy '*' -fsS --max-time 10 "$VERIFY_URL/api/auth/login" -H 'Content-Type: application/json' \
+    curl --noproxy '*' -fsS --max-time 10 -H "Host: $VERIFY_HOST" "$VERIFY_URL/api/auth/login" -H 'Content-Type: application/json' \
         --data-binary "@$WORKDIR/login.json" >"$WORKDIR/login-response.json"
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("ok") and d.get("data",{}).get("token")' "$WORKDIR/login-response.json"
     ok "Agent authenticated with the explicit password."

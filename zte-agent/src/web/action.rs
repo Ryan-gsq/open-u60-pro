@@ -38,7 +38,7 @@ use super::{job, CspNonce};
 use crate::httpd::gate::Lane;
 use crate::auth::{Principal, SessionId};
 use crate::handlers::AppState;
-use crate::httpd::{Ctx, Peer};
+use crate::httpd::{Ctx, Via};
 use crate::server::{self, Method};
 
 pub enum Kind {
@@ -489,7 +489,7 @@ pub fn confirm_page(ctx: &Ctx, p: &Principal, req: &Request, a: &'static Action)
     let Some(c) = a.confirm.iter().find(|c| query_param(query, c.when.0).as_deref() == Some(c.when.1)) else {
         return render::bad_request(&nonce);
     };
-    let lines = c.remote.filter(|_| session::is_remote(req.extensions().get::<Peer>())).unwrap_or(c.lines);
+    let lines = c.remote.filter(|_| session::is_remote(Via::of(req.extensions()))).unwrap_or(c.lines);
     // An action with `once`: a fresh single-use token for this question.
     let token = if a.once { ctx.once.fresh(&ctx.app.auth, p.id) } else { String::new() };
     let with_token = [(c.when.0, c.when.1), ("once", token.as_str())];

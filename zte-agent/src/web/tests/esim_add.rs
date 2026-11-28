@@ -44,7 +44,7 @@ fn multipart(parts: &[Part]) -> Vec<u8> {
     out
 }
 
-fn upload_req(peer: Peer, cookie: &str, body: Vec<u8>) -> axum::http::request::Builder {
+fn upload_req(peer: FixturePeer, cookie: &str, body: Vec<u8>) -> axum::http::request::Builder {
     let b = req("POST", ADD, peer)
         .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"))
         .header("content-length", body.len());
@@ -55,7 +55,7 @@ fn upload_req(peer: Peer, cookie: &str, body: Vec<u8>) -> axum::http::request::B
     }
 }
 
-async fn upload(c: &Ctx, peer: Peer, cookie: &str, parts: &[Part<'_>]) -> Reply {
+async fn upload(c: &Ctx, peer: FixturePeer, cookie: &str, parts: &[Part<'_>]) -> Reply {
     let body = multipart(parts);
     let r = upload_req(peer, cookie, body.clone()).header("origin", ORIGIN).body(Body::from(body)).unwrap();
     let reply = send(c, r).await;
@@ -93,7 +93,7 @@ fn calls(c: &Ctx) -> Vec<(String, Value)> {
 }
 
 /// The entry page's tokens: (csrf, once).
-async fn entry(c: &Ctx, peer: Peer, cookie: &str) -> (String, String) {
+async fn entry(c: &Ctx, peer: FixturePeer, cookie: &str) -> (String, String) {
     let r = get_with(c, ADD, peer, cookie).await;
     r.assert_secure_html(200);
     (r.input("csrf"), r.input("once"))

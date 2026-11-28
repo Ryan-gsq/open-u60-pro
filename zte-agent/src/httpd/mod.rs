@@ -11,7 +11,7 @@ pub mod mobile;
 pub mod tls;
 
 use std::io::ErrorKind;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -33,12 +33,9 @@ pub(crate) fn none_match(headers: &axum::http::HeaderMap, etag: &str) -> bool {
 
 /// Open connections; one more is accepted and closed at once, without a reply.
 pub const MAX_CONNS: usize = 64;
-/// Open connections from one LAN address, so one host (a leaky client, a
-/// browser preconnecting) cannot take every slot. Loopback has no such cap:
-/// every Tailscale client arrives as 127.0.0.1 (userspace networking).
+/// Open connections from one LAN or Tailnet address. Loopback is exempt.
 pub const MAX_CONNS_PER_PEER: usize = 16;
-/// The last slots of `MAX_CONNS` only loopback (Tailscale) peers may use, so
-/// LAN hosts holding connections cannot lock out remote users.
+/// The last slots of `MAX_CONNS` only Loopback and Tailnet peers may use.
 pub const LOOPBACK_RESERVED: usize = 8;
 /// hyper's header-read timeout: the first request's headers and every idle
 /// keep-alive wait. Long enough that an app's next poll reuses the connection.
@@ -72,11 +69,52 @@ const MAX_BUF: usize = 64 * 1024;
 #[derive(Copy, Clone, Debug)]
 pub struct Peer(pub std::net::SocketAddr);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    Loopback,
+    Tailnet,
+    Local,
+}
+
+impl Via {
+    pub fn of(ext: &axum::http::Extensions) -> Self {
+        ext.get::<Self>().copied().unwrap_or(Self::Local)
+    }
+
+    fn allows_tailnet(self) -> bool {
+        matches!(self, Self::Loopback | Self::Tailnet)
+    }
+}
+
+fn tailnet_ip(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(addr) => {
+            let [first, second, ..] = addr.octets();
+            first == 100 && (64..128).contains(&second)
+        }
+        IpAddr::V6(addr) => addr.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+pub(crate) fn is_canonical_loopback(ip: IpAddr) -> bool {
+    matches!(ip.to_canonical(), IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST))
+}
+
+pub(crate) fn classify_via(peer: IpAddr, iface: Option<&str>, userspace_loopback: bool) -> Via {
+    match iface {
+        Some("lo") if is_canonical_loopback(peer) => {
+            if userspace_loopback { Via::Tailnet } else { Via::Loopback }
+        }
+        Some("tailscale0") if tailnet_ip(peer) => Via::Tailnet,
+        _ => Via::Local,
+    }
+}
+
 /// An upgraded socket outlives Hyper's HTTP connection future. Its owner must
 /// retain these listener slots and observe the HTTPS listener's Reset signal.
 #[derive(Clone)]
 pub(crate) struct ConnectionLifetime {
-    held: Arc<(OwnedSemaphorePermit, PeerSlot)>,
+    held: Arc<(OwnedSemaphorePermit, Option<PeerSlot>)>,
     stop: Option<watch::Receiver<()>>,
 }
 
@@ -200,10 +238,11 @@ pub fn serve(bind: &str, threads: usize, state: Arc<AppState>) {
         }
     };
     let caps = Caps::new(Limits::of(MAX_CONNS));
+    crate::ota::confirm_boot_ready();
     rt.block_on(async move {
         let twin = side.twin();
         tokio::spawn(tls::supervise(Arc::clone(&ctx.app.tls), ctx.clone(), caps.clone(), move || twin.twin()));
-        accept_loop_with(listener, ctx, caps, side, Wire::Plain).await
+        accept_loop(listener, ctx, caps, side, Wire::Plain).await
     });
     std::process::exit(1);
 }
@@ -221,8 +260,83 @@ pub fn http_port() -> u16 {
 pub fn listen(bind: &str) -> std::io::Result<std::net::TcpListener> {
     let listener = std::net::TcpListener::bind(bind)?;
     set_tcp_keepalive(&listener);
+    #[cfg(target_os = "linux")]
+    ingress::enable(&listener)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+#[cfg(target_os = "linux")]
+mod ingress {
+    use std::ffi::CStr;
+    use std::mem::{size_of, MaybeUninit};
+    use std::net::{IpAddr, TcpListener};
+    use std::os::fd::{AsRawFd, RawFd};
+
+    pub fn enable(listener: &TcpListener) -> std::io::Result<()> {
+        let fd = listener.as_raw_fd();
+        if listener.local_addr()?.is_ipv6() {
+            super::set_opt(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1)?;
+        }
+        super::set_opt(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, 1)
+    }
+
+    pub fn interface(tcp: &tokio::net::TcpStream, peer: IpAddr) -> Option<String> {
+        let fd = tcp.as_raw_fd();
+        let index = match peer.to_canonical() {
+            IpAddr::V4(_) => {
+                let info = unsafe { packet_info::<libc::in_pktinfo>(fd, libc::IPPROTO_IP, libc::IP_PKTOPTIONS, libc::IP_PKTINFO) }?;
+                u32::try_from(info.ipi_ifindex).ok()?
+            }
+            IpAddr::V6(_) => {
+                let info = unsafe { packet_info::<libc::in6_pktinfo>(fd, libc::IPPROTO_IPV6, libc::IPV6_2292PKTOPTIONS, libc::IPV6_PKTINFO) }?;
+                info.ipi6_ifindex
+            }
+        };
+        if index == 0 {
+            return None;
+        }
+        let mut name = [0; libc::IF_NAMESIZE];
+        let result = unsafe { libc::if_indextoname(index, name.as_mut_ptr().cast()) };
+        if result.is_null() {
+            return None;
+        }
+        CStr::from_bytes_until_nul(&name).ok()?.to_str().ok().map(str::to_owned)
+    }
+
+    #[repr(C)]
+    struct PacketInfo<T> {
+        header: libc::cmsghdr,
+        info: T,
+    }
+
+    /// `T` must match the option's control payload and permit every bit pattern.
+    unsafe fn packet_info<T: Copy>(fd: RawFd, level: libc::c_int, option: libc::c_int, kind: libc::c_int) -> Option<T> {
+        let mut data = MaybeUninit::<PacketInfo<T>>::zeroed();
+        let mut len = size_of::<PacketInfo<T>>() as libc::socklen_t;
+        let rc = unsafe { libc::getsockopt(fd, level, option, data.as_mut_ptr().cast(), &mut len) };
+        let expected = unsafe { libc::CMSG_LEN(size_of::<T>() as libc::c_uint) } as usize;
+        if rc != 0 || (len as usize) < expected {
+            return None;
+        }
+        let data = unsafe { data.assume_init() };
+        (data.header.cmsg_level == level && data.header.cmsg_type == kind && data.header.cmsg_len as usize == expected)
+            .then_some(data.info)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod ingress {
+    use std::net::IpAddr;
+
+    pub fn interface(tcp: &tokio::net::TcpStream, peer: IpAddr) -> Option<String> {
+        #[cfg(test)]
+        if super::is_canonical_loopback(peer) && tcp.local_addr().is_ok_and(|addr| super::is_canonical_loopback(addr.ip())) {
+            return Some("lo".to_owned());
+        }
+        let _ = (tcp, peer);
+        None
+    }
 }
 
 /// Current-thread runtime; its blocking pool has room for every gate permit
@@ -245,19 +359,19 @@ fn runtime(threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
 /// thread (it must not block; `mobile::Guard` reads its table on the
 /// blocking pool, and only new connections wait for it).
 trait Admit {
-    async fn admit(&mut self, peer: std::net::SocketAddr, tcp: &tokio::net::TcpStream) -> bool;
+    async fn admit_via(&mut self, peer: std::net::SocketAddr, tcp: &tokio::net::TcpStream, via: Via, iface: Option<&str>) -> bool;
 }
 
 impl Admit for mobile::Guard {
-    async fn admit(&mut self, peer: std::net::SocketAddr, tcp: &tokio::net::TcpStream) -> bool {
-        mobile::Guard::admit(self, peer, || tcp.local_addr().ok()).await
+    async fn admit_via(&mut self, peer: std::net::SocketAddr, tcp: &tokio::net::TcpStream, via: Via, iface: Option<&str>) -> bool {
+        mobile::Guard::admit_via(self, peer, via, iface, || tcp.local_addr().ok()).await
     }
 }
 
 /// A test's classifier.
 #[cfg(test)]
 impl<F: FnMut(std::net::SocketAddr, &tokio::net::TcpStream) -> bool> Admit for F {
-    async fn admit(&mut self, peer: std::net::SocketAddr, tcp: &tokio::net::TcpStream) -> bool {
+    async fn admit_via(&mut self, peer: std::net::SocketAddr, tcp: &tokio::net::TcpStream, _: Via, _: Option<&str>) -> bool {
         self(peer, tcp)
     }
 }
@@ -266,25 +380,19 @@ impl<F: FnMut(std::net::SocketAddr, &tokio::net::TcpStream) -> bool> Admit for F
 #[derive(Copy, Clone)]
 pub struct Limits {
     conns: usize,
-    /// Per address, except `shared` ones.
     per_peer: usize,
     idle: Duration,
-    /// Slots only `shared` addresses may take.
     reserved: usize,
-    /// Addresses many clients arrive from (loopback: Tailscale).
-    shared: fn(&IpAddr) -> bool,
 }
 
 impl Limits {
-    /// The router's: `conns` in all, `MAX_CONNS_PER_PEER` per LAN address,
-    /// the last `LOOPBACK_RESERVED` for loopback (Tailscale).
+    /// The router's limits across its listeners.
     fn of(conns: usize) -> Limits {
         Limits {
             conns,
             per_peer: MAX_CONNS_PER_PEER.min(conns),
             idle: IDLE_TIMEOUT,
             reserved: LOOPBACK_RESERVED.min(conns),
-            shared: IpAddr::is_loopback,
         }
     }
 }
@@ -301,6 +409,17 @@ pub struct Caps {
 impl Caps {
     fn new(limits: Limits) -> Caps {
         Caps { conns: Arc::new(Semaphore::new(limits.conns)), peers: Arc::default(), limits }
+    }
+
+    fn take(&self, ip: IpAddr, via: Via) -> Option<(OwnedSemaphorePermit, Option<PeerSlot>)> {
+        let ip = ip.to_canonical();
+        let limits = self.limits;
+        let permit = Arc::clone(&self.conns).try_acquire_owned().ok()?;
+        if !via.allows_tailnet() && self.conns.available_permits() < limits.reserved {
+            return None;
+        }
+        let slot = if via == Via::Loopback { None } else { Some(self.peers.take(ip, limits.per_peer)?) };
+        Some((permit, slot))
     }
 }
 
@@ -339,8 +458,20 @@ where
 /// How long a connection whose listener stopped may finish its request.
 const STOP_WAIT: Duration = Duration::from_secs(2);
 
-/// `admit`: whether to serve a connection from this peer (see `Admit`).
-async fn accept_loop_with(listener: std::net::TcpListener, ctx: Ctx, caps: Caps, mut admit: impl Admit, wire: Wire) {
+async fn accept_loop(listener: std::net::TcpListener, ctx: Ctx, caps: Caps, admit: impl Admit, wire: Wire) {
+    let tailscale = Arc::clone(&ctx.app.tailscale);
+    accept_loop_with(listener, ctx, caps, admit, wire, ingress::interface, move || tailscale.userspace_loopback_active()).await
+}
+
+async fn accept_loop_with(
+    listener: std::net::TcpListener,
+    ctx: Ctx,
+    caps: Caps,
+    mut admit: impl Admit,
+    wire: Wire,
+    interface: impl Fn(&tokio::net::TcpStream, IpAddr) -> Option<String>,
+    userspace_loopback_active: impl Fn() -> bool,
+) {
     let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(l) => l,
         Err(e) => {
@@ -348,7 +479,7 @@ async fn accept_loop_with(listener: std::net::TcpListener, ctx: Ctx, caps: Caps,
             return;
         }
     };
-    let Caps { conns, peers, limits } = caps;
+    let idle = caps.limits.idle;
     let router = app(ctx);
     let mut failing = false;
     loop {
@@ -370,48 +501,36 @@ async fn accept_loop_with(listener: std::net::TcpListener, ctx: Ctx, caps: Caps,
                 continue;
             }
         };
-        // From the mobile-data side: closed without a reply, before any cap.
-        if !admit.admit(addr, &tcp).await {
-            drop(tcp);
+        let iface = interface(&tcp, addr.ip());
+        let via = classify_via(addr.ip(), iface.as_deref(), userspace_loopback_active());
+        if !admit.admit_via(addr, &tcp, via, iface.as_deref()).await {
             continue;
         }
-        // Over a cap: close without a reply.
-        let Ok(permit) = Arc::clone(&conns).try_acquire_owned() else {
-            drop(tcp);
-            continue;
-        };
-        let ip = addr.ip().to_canonical();
-        let shared = (limits.shared)(&ip);
-        if !shared && conns.available_permits() < limits.reserved {
-            drop(tcp);
-            continue;
-        }
-        let cap = if shared { limits.conns } else { limits.per_peer };
-        let Some(slot) = peers.take(ip, cap) else {
-            drop(tcp);
+        let Some(held) = caps.take(addr.ip(), via) else {
             continue;
         };
         let _ = tcp.set_nodelay(true);
         set_tcp_user_timeout(&tcp);
         let router = router.clone();
-        let connection = ConnectionLifetime { held: Arc::new((permit, slot)), stop: None };
+        let connection = ConnectionLifetime { held: Arc::new(held), stop: None };
         match &wire {
             Wire::Plain => {
                 let svc = hyper::service::service_fn(
                     move |mut req: axum::http::Request<hyper::body::Incoming>| {
                         req.extensions_mut().insert(Peer(addr));
+                        req.extensions_mut().insert(via);
                         req.extensions_mut().insert(connection.clone());
                         tower::ServiceExt::oneshot(router.clone(), req.map(Body::new))
                     },
                 );
                 tokio::spawn(async move {
-                    serve_http1(hyper_util::rt::TokioIo::new(tcp), svc, limits.idle, std::future::pending()).await;
+                    serve_http1(hyper_util::rt::TokioIo::new(tcp), svc, idle, std::future::pending()).await;
                 });
             }
             Wire::Tls(w) => {
                 let w = Arc::clone(w);
                 tokio::spawn(async move {
-                    w.serve(tcp, addr, router, limits.idle, connection).await;
+                    w.serve(tcp, addr, via, router, idle, connection).await;
                 });
             }
         }
@@ -527,20 +646,28 @@ fn set_tcp_user_timeout(tcp: &tokio::net::TcpStream) {
 #[cfg(target_os = "linux")]
 fn set_opts(fd: std::os::unix::io::RawFd, opts: &[(libc::c_int, libc::c_int, libc::c_int)]) {
     for &(level, name, value) in opts {
-        // SAFETY: fd is a valid open socket owned by the caller; `value` outlives the call.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                &value as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            eprintln!("[http] setsockopt({level},{name}) failed: {}", std::io::Error::last_os_error());
+        if let Err(error) = set_opt(fd, level, name, value) {
+            eprintln!("[http] {error}");
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn set_opt(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> std::io::Result<()> {
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    Err(std::io::Error::new(error.kind(), format!("setsockopt({level},{name}) failed: {error}")))
 }
 
 /// Tailscale names for the Host allowlist without ever waiting on the
@@ -576,6 +703,84 @@ mod tests {
     use super::*;
     use crate::tailscale::TsConfig;
     use serde_json::json;
+
+    #[test]
+    fn ingress_identity_requires_the_expected_interface_and_peer() {
+        for (userspace, loopback) in [(false, Via::Loopback), (true, Via::Tailnet)] {
+            for peer in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+                let ip = peer.parse().unwrap();
+                assert_eq!(classify_via(ip, Some("lo"), userspace), loopback, "{peer}");
+                for iface in [None, Some("br-lan"), Some("rmnet_data0"), Some("tailscale0")] {
+                    assert_eq!(classify_via(ip, iface, userspace), Via::Local, "{peer} on {iface:?}");
+                }
+            }
+            for peer in ["100.64.0.0", "100.127.255.255", "::ffff:100.64.0.1", "fd7a:115c:a1e0::1"] {
+                let ip = peer.parse().unwrap();
+                assert_eq!(classify_via(ip, Some("tailscale0"), userspace), Via::Tailnet, "{peer}");
+                for iface in [None, Some("lo"), Some("br-lan"), Some("rmnet_data0")] {
+                    assert_eq!(classify_via(ip, iface, userspace), Via::Local, "{peer} on {iface:?}");
+                }
+            }
+            for peer in ["127.0.0.2", "::ffff:127.0.0.2", "100.63.255.255", "100.128.0.0", "fd7a:115c:a1e1::1", "192.168.0.20"] {
+                let ip = peer.parse().unwrap();
+                assert_eq!(classify_via(ip, Some("tailscale0"), userspace), Via::Local, "{peer}");
+                assert_eq!(classify_via(ip, Some("lo"), userspace), Via::Local, "{peer}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn packet_options_confirm_loopback_on_ipv4_and_ipv6() {
+        for (bind, ip) in [("127.0.0.1:0", "127.0.0.1"), ("[::1]:0", "::1"), ("[::]:0", "::ffff:127.0.0.1")] {
+            let listener = tokio::net::TcpListener::from_std(listen(bind).unwrap()).unwrap();
+            let dest = std::net::SocketAddr::new(ip.parse().unwrap(), listener.local_addr().unwrap().port());
+            let _client = tokio::net::TcpStream::connect(dest).await.unwrap();
+            let (tcp, peer) = listener.accept().await.unwrap();
+            assert_eq!(ingress::interface(&tcp, peer.ip()).as_deref(), Some("lo"), "{peer}");
+        }
+    }
+
+    #[test]
+    fn tailnet_can_use_reserves_with_a_per_peer_limit() {
+        let caps = Caps::new(Limits { conns: 6, per_peer: 2, reserved: 2, ..Limits::of(6) });
+        let lan = IpAddr::from([192, 168, 0, 2]);
+        let another_lan = IpAddr::from([192, 168, 0, 3]);
+        let tailnet = IpAddr::from([100, 64, 0, 2]);
+        let another_tailnet = IpAddr::from([100, 64, 0, 3]);
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        let mut held = Vec::new();
+        for peer in [lan, lan, another_lan, another_lan] {
+            held.push(caps.take(peer, Via::Local).unwrap());
+        }
+        assert!(caps.take(IpAddr::from([192, 168, 0, 4]), Via::Local).is_none());
+        held.push(caps.take(tailnet, Via::Tailnet).unwrap());
+        held.push(caps.take(another_tailnet, Via::Tailnet).unwrap());
+        assert!(caps.take(loopback, Via::Loopback).is_none());
+        held.clear();
+        held.push(caps.take(tailnet, Via::Tailnet).unwrap());
+        held.push(caps.take(tailnet, Via::Tailnet).unwrap());
+        assert!(caps.take("::ffff:100.64.0.2".parse().unwrap(), Via::Tailnet).is_none());
+        for _ in 0..4 {
+            held.push(caps.take(loopback, Via::Loopback).unwrap());
+        }
+    }
+
+    #[test]
+    fn noncanonical_loopback_has_ordinary_caps() {
+        for peer in ["127.0.0.2", "::ffff:127.0.0.2"] {
+            let caps = Caps::new(Limits { conns: 3, per_peer: 1, reserved: 1, ..Limits::of(3) });
+            let ip = peer.parse().unwrap();
+            let via = classify_via(ip, Some("lo"), false);
+            let held = caps.take(ip, via).unwrap();
+            assert!(held.1.is_some(), "{peer}");
+            assert!(caps.take(ip, via).is_none(), "{peer}");
+            drop(held);
+            let _lan = caps.take("192.168.0.2".parse().unwrap(), Via::Local).unwrap();
+            let _other_lan = caps.take("192.168.0.3".parse().unwrap(), Via::Local).unwrap();
+            assert!(caps.take(ip, via).is_none(), "{peer}");
+        }
+    }
 
     fn enabled() -> TsConfig {
         TsConfig {
@@ -652,12 +857,11 @@ mod wire_tests {
     /// (so its own limiter), left running for the test process. Every test
     /// client is 127.0.0.1 (loopback: no per-peer cap, no reserved slots).
     fn start(ctx: Ctx, max_conns: usize, idle: Duration) -> SocketAddr {
-        start_with(ctx, Limits { conns: max_conns, per_peer: max_conns, idle, reserved: 0, shared: IpAddr::is_loopback })
+        start_with(ctx, Limits { conns: max_conns, per_peer: max_conns, idle, reserved: 0 }, "lo", || false)
     }
 
-    /// Caps as for LAN peers: the test clients (127.0.0.1) are not shared.
     fn lan_limits(conns: usize, per_peer: usize, reserved: usize) -> Limits {
-        Limits { conns, per_peer, idle: IDLE_TIMEOUT, reserved, shared: |_| false }
+        Limits { conns, per_peer, idle: IDLE_TIMEOUT, reserved }
     }
 
     /// `n` connections that each got an answer.
@@ -677,16 +881,31 @@ mod wire_tests {
         c.closed()
     }
 
-    fn start_with(ctx: Ctx, limits: Limits) -> SocketAddr {
-        start_admitting(ctx, limits, |_: SocketAddr, _: &tokio::net::TcpStream| true)
+    fn start_with(ctx: Ctx, limits: Limits, iface: &'static str, userspace_loopback_active: impl Fn() -> bool + Send + 'static) -> SocketAddr {
+        start_admitting(ctx, limits, iface, userspace_loopback_active, |_: SocketAddr, _: &tokio::net::TcpStream| true)
     }
 
     /// As `start_with`, with `admit` deciding which peers are served.
-    fn start_admitting(ctx: Ctx, limits: Limits, admit: impl Admit + Send + 'static) -> SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
+    fn start_admitting(
+        ctx: Ctx,
+        limits: Limits,
+        iface: &'static str,
+        userspace_loopback_active: impl Fn() -> bool + Send + 'static,
+        admit: impl Admit + Send + 'static,
+    ) -> SocketAddr {
+        let listener = listen("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || runtime(2).unwrap().block_on(accept_loop_with(listener, ctx, Caps::new(limits), admit, Wire::Plain)));
+        std::thread::spawn(move || {
+            runtime(2).unwrap().block_on(accept_loop_with(
+                listener,
+                ctx,
+                Caps::new(limits),
+                admit,
+                Wire::Plain,
+                move |_, _| Some(iface.to_owned()),
+                userspace_loopback_active,
+            ))
+        });
         addr
     }
 
@@ -812,7 +1031,7 @@ mod wire_tests {
 
         fn ping(&mut self, token: Option<&str>) -> Reply {
             let auth = token.map(|t| format!("\r\nAuthorization: Bearer {t}")).unwrap_or_default();
-            self.request(&format!("GET /api/lan/ping HTTP/1.1\r\nHost: 127.0.0.1{auth}"), b"")
+            self.request(&format!("GET /api/lan/ping HTTP/1.1\r\nHost: 192.168.0.1{auth}"), b"")
         }
 
         fn login(&mut self, body: &[u8]) -> Reply {
@@ -955,21 +1174,54 @@ mod wire_tests {
     }
 
     #[test]
+    fn userspace_tailnet_loopback_has_tailnet_hosts_and_quotas() {
+        let mut state = state(Some(PW));
+        let tailscale = Arc::new(TailscaleManager::for_test(
+            crate::tailscale::TsConfig { enabled: true, hostname: "u60-pro".into(), ..Default::default() },
+            json!({"dns_name": "u60-pro.tailnet.ts.net."}),
+        ));
+        state.tailscale = Arc::clone(&tailscale);
+        let local = state.auth.issue_local().unwrap();
+        let ctx = Ctx::new(Arc::new(state), 2);
+        let bearer = token(&ctx);
+        let manager = Arc::clone(&tailscale);
+        let addr = start_with(ctx, lan_limits(3, 1, 2), "lo", move || manager.userspace_loopback_active());
+        let ping = |conn: &mut Conn, host: &str, token: &str| {
+            conn.request(&format!("GET /api/lan/ping HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nAuthorization: Bearer {token}"), b"").status
+        };
+
+        let mut forwarded = Conn::open(addr);
+        assert_eq!(ping(&mut forwarded, "u60-pro.tailnet.ts.net", &bearer), 200);
+        assert_eq!(ping(&mut forwarded, "100.64.1.1", &bearer), 200);
+        assert_eq!(ping(&mut forwarded, "u60-pro.tailnet.ts.net", local.expose()), 401);
+        assert_eq!(ping(&mut forwarded, "localhost", &bearer), 403);
+        assert_eq!(ping(&mut forwarded, "127.0.0.1", &bearer), 403);
+        assert!(refused(addr), "the forwarded connection counts toward the per-peer limit");
+
+        tailscale.set_kernel_tun_for_test(true);
+        let mut local_conns = [Conn::open(addr), Conn::open(addr)];
+        for local_conn in &mut local_conns {
+            assert_eq!(ping(local_conn, "localhost", local.expose()), 200);
+            assert_eq!(ping(local_conn, "127.0.0.1", local.expose()), 200);
+        }
+        assert_eq!(ping(&mut forwarded, "u60-pro.tailnet.ts.net", local.expose()), 401);
+    }
+
+    #[test]
     fn loopback_has_no_per_peer_cap_but_lan_keeps_off_the_reserved_slots() {
-        // Tailscale clients (loopback): past the per-peer cap, into the reserve.
         let ctx = Ctx::new(Arc::new(state(None)), 2);
-        let addr = start_with(ctx, Limits { shared: IpAddr::is_loopback, ..lan_limits(6, 2, 2) });
+        let addr = start_with(ctx, lan_limits(6, 2, 2), "lo", || false);
         let _held = hold(addr, 6);
         assert!(refused(addr));
         // LAN peers: the last two slots stay free.
         let ctx = Ctx::new(Arc::new(state(None)), 2);
-        let addr = start_with(ctx, lan_limits(6, 6, 2));
+        let addr = start_with(ctx, lan_limits(6, 6, 2), "br-lan", || false);
         let mut held = hold(addr, 4);
         assert!(refused(addr));
         drop(held.pop());
         eventually("no slot after a connection closed", || {
             let mut c = Conn::open(addr);
-            c.raw("GET /api/lan/ping HTTP/1.1\r\nHost: 127.0.0.1", b"").is_ok_and(|r| r.status == 200)
+            c.raw("GET /api/lan/ping HTTP/1.1\r\nHost: 192.168.0.1", b"").is_ok_and(|r| r.status == 200)
         });
     }
 
@@ -983,7 +1235,7 @@ mod wire_tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (r, s) = (Arc::clone(&refuse), Arc::clone(&seen));
         let ctx = Ctx::new(Arc::new(state(None)), 2);
-        let addr = start_admitting(ctx, lan_limits(1, 1, 0), move |peer: SocketAddr, tcp: &tokio::net::TcpStream| {
+        let addr = start_admitting(ctx, lan_limits(1, 1, 0), "br-lan", || false, move |peer: SocketAddr, tcp: &tokio::net::TcpStream| {
             s.lock().unwrap().push((peer.ip(), tcp.local_addr().ok()));
             !r.load(SeqCst)
         });
@@ -999,21 +1251,20 @@ mod wire_tests {
         assert!(seen.iter().all(|(ip, local)| *ip == IpAddr::from([127, 0, 0, 1]) && *local == Some(addr)), "{seen:?}");
     }
 
-    /// The router's guard on the loop: loopback (Tailscale) is always
-    /// served, whatever the table (here: no LAN at all).
+    /// The router's guard serves verified loopback regardless of the table.
     #[test]
     fn the_mobile_guard_serves_loopback() {
         let lookup: mobile::Lookup = Arc::new(|| Ok(Vec::new()));
         let side = mobile::Guard::new(false, lookup, Arc::new(crate::boottime::BootClock));
         let ctx = Ctx::new(Arc::new(state(None)), 2);
-        let addr = start_admitting(ctx, lan_limits(4, 4, 0), side);
+        let addr = start_admitting(ctx, lan_limits(4, 4, 0), "lo", || false, side);
         assert_alive(addr, None);
     }
 
     #[test]
     fn connection_over_the_per_peer_cap_is_closed_without_reply() {
         let ctx = Ctx::new(Arc::new(state(None)), 2);
-        let addr = start_with(ctx, lan_limits(8, 2, 0));
+        let addr = start_with(ctx, lan_limits(8, 2, 0), "br-lan", || false);
         let mut held: Vec<Conn> = (0..2)
             .map(|_| {
                 let mut c = Conn::open(addr);
@@ -1028,14 +1279,14 @@ mod wire_tests {
         drop(held.pop());
         eventually("no per-peer slot after a connection closed", || {
             let mut c = Conn::open(addr);
-            c.raw("GET /api/lan/ping HTTP/1.1\r\nHost: 127.0.0.1", b"").is_ok_and(|r| r.status == 200)
+            c.raw("GET /api/lan/ping HTTP/1.1\r\nHost: 192.168.0.1", b"").is_ok_and(|r| r.status == 200)
         });
     }
 
     #[test]
     fn upgraded_sockets_keep_total_and_per_peer_slots_until_closed() {
         for (conns, per_peer) in [(1, 8), (8, 1)] {
-            let addr = start_with(Ctx::new(Arc::new(state(None)), 2), lan_limits(conns, per_peer, 0));
+            let addr = start_with(Ctx::new(Arc::new(state(None)), 2), lan_limits(conns, per_peer, 0), "br-lan", || false);
             let mut upgraded = Conn::open(addr);
             upgraded.stream.write_all(b"GET /test-upgrade HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: u60-test\r\n\r\n").unwrap();
             assert_eq!(upgraded.reply(true).unwrap().status, 101);
@@ -1045,7 +1296,7 @@ mod wire_tests {
             assert!(refused(addr));
             drop(upgraded);
             eventually("upgrade did not release its listener slots", || {
-                Conn::open(addr).raw("GET /api/lan/ping HTTP/1.1\r\nHost: 127.0.0.1", b"").is_ok_and(|r| r.status == 200)
+                Conn::open(addr).raw("GET /api/lan/ping HTTP/1.1\r\nHost: 192.168.0.1", b"").is_ok_and(|r| r.status == 200)
             });
         }
     }

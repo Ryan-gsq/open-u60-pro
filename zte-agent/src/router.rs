@@ -450,7 +450,7 @@ pub fn router_qos_set(_state: &AppState, body: &[u8]) -> (u16, Value) {
     })
 }
 
-fn read_smart_qos_mode() -> Option<String> {
+pub(crate) fn read_smart_qos_mode() -> Option<String> {
     read_smart_qos_mode_with(ubus::committed_option, ubus::uci_get)
 }
 

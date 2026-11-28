@@ -224,7 +224,7 @@ fn characterize_update(scenario: Scenario, expected: Result<(), &str>, finish: &
             trace.borrow_mut().push("resume");
             let expected_live = match (scenario, quiesces.get()) {
                 (Scenario::QuiesceFailure | Scenario::SecondRenameFailure, _)
-                | (Scenario::HealthFailure, 2) => &old,
+                | (Scenario::HealthFailure | Scenario::PersistFailure, 2) => &old,
                 _ => &new,
             };
             assert_eq!(&live(), expected_live);
@@ -361,7 +361,7 @@ fn update_polls_120_times_and_rolls_back_only_after_second_quiesce() {
 }
 
 #[test]
-fn update_skips_health_wait_when_unenrolled_and_ignores_persist_failure() {
+fn update_skips_health_wait_when_unenrolled_and_rolls_back_on_persist_failure() {
     characterize_update(
         Scenario::Unenrolled,
         Ok(()),
@@ -369,9 +369,10 @@ fn update_skips_health_wait_when_unenrolled_and_ignores_persist_failure() {
     );
     characterize_update(
         Scenario::PersistFailure,
-        Ok(()),
+        Err("save failed"),
         &[
-            "quiesce", "resume", "wait", "status", "wait", "status", "persist",
+            "quiesce", "resume", "wait", "status", "wait", "status", "persist", "quiesce",
+            "resume",
         ],
     );
 }

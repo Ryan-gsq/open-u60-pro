@@ -700,6 +700,10 @@ impl Upstream {
         self.session = Some(session.to_owned());
         declare(&mut self.setup, setup_plan())?;
         declare(&mut self.network, network_plan(&dns_lease, &ula, &sources))?;
+        self.network.retire_legacy_commands(|undo| {
+            undo.program == "ip"
+                && undo.args.windows(2).any(|w| w == ["pref", crate::netfx::ids::LEGACY_RELAY_PREF])
+        })?;
         declare(&mut self.network, vec![ra_step(&ula, linklocal, mtu)])?;
         self.requested = true;
         self.installed = Some(lease);
@@ -1174,7 +1178,7 @@ fn address_step(ip: Ipv6Addr, prefix: u8, iface: &str, valid: u32, preferred: u3
 }
 
 fn policy_rule() -> Resource {
-    Resource::Rule(Rule { family: Family::V6, priority: PREF.parse().unwrap(), table: TABLE.into(), mark: None })
+    Resource::Rule(Rule::lookup(Family::V6, PREF.parse().unwrap(), TABLE))
 }
 
 fn network_plan(l: &Lease, ula: &str, sources: &[String]) -> Vec<Resource> {
@@ -1964,12 +1968,13 @@ mod tests {
             ("network", super::super::relay_plan(&v4, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap()), vec![
                 "ip -4 addr del 10.20.0.7/24 dev ath20", "ip -4 route del 10.20.0.0/24 dev ath20 scope link src 10.20.0.7 table 60631",
                 "ip -4 route del throw 100.64.0.0/10 table 60631", "ip -4 route del throw 169.254.0.0/16 table 60631", "ip -4 route del throw 224.0.0.0/4 table 60631", "ip -4 route del throw 192.168.0.0/24 table 60631",
-                "ip -4 route del default via 10.20.0.1 dev ath20 table 60631", "iptables -w 2 -t filter -X U60_RELAY_FWD", "iptables -w 2 -t filter -D FORWARD -j U60_RELAY_FWD", "ip -4 rule del pref 18640 lookup 60631"]),
+                "ip -4 route del unreachable 100.64.0.0/10 metric 60631 table main", "ip -4 route del unreachable 169.254.0.0/16 metric 60631 table main", "ip -4 route del unreachable 224.0.0.0/4 metric 60631 table main",
+                "ip -4 route del default via 10.20.0.1 dev ath20 table 60631", "iptables -w 2 -t filter -X U60_RELAY_FWD", "iptables -w 2 -t filter -D FORWARD -j U60_RELAY_FWD", "ip -4 rule del pref 5120 lookup 60631"]),
             ("ipv6-setup", super::setup_plan(), vec!["ip6tables -w 2 -t filter -X U60_R6_IN", "ip6tables -w 2 -t filter -D INPUT -i ath20 -j U60_R6_IN"]),
             ("ipv6-network", super::network_plan(&lease(), ula, &[ula.into()]), vec![
-                "ip -6 addr del 2001:db8:1::2/128 dev ath20", "true", "ip -6 addr del fd12:3456:789a::1/64 dev br-lan", "ip -6 route del fe80::/64 dev ath20 table 60631", "ip -6 route del fd12:3456:789a::/64 dev br-lan table 60631", "ip -6 route del throw fd7a:115c:a1e0::/48 table 60631", "ip -6 route del throw ff00::/8 table 60631", "ip -6 route del 2001:db8:1::/64 dev ath20 table 60631", "ip -6 route del default via fe80::1 dev ath20 metric 1024 table 60631", "ip6tables -w 2 -t filter -X U60_R6_FWD", "ip6tables -w 2 -t filter -D FORWARD -j U60_R6_FWD", "ip -6 rule del pref 18640 lookup 60631"]),
+                "ip -6 addr del 2001:db8:1::2/128 dev ath20", "true", "ip -6 addr del fd12:3456:789a::1/64 dev br-lan", "ip -6 route del fe80::/64 dev ath20 table 60631", "ip -6 route del fd12:3456:789a::/64 dev br-lan table 60631", "ip -6 route del throw fd7a:115c:a1e0::/48 table 60631", "ip -6 route del throw ff00::/8 table 60631", "ip -6 route del 2001:db8:1::/64 dev ath20 table 60631", "ip -6 route del default via fe80::1 dev ath20 metric 1024 table 60631", "ip6tables -w 2 -t filter -X U60_R6_FWD", "ip6tables -w 2 -t filter -D FORWARD -j U60_R6_FWD", "ip -6 rule del pref 5120 lookup 60631"]),
             ("portal", super::super::portal::web_bypasses(), vec!["iptables -w 2 -t nat -D redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN", "ip6tables -w 2 -t nat -D redirect_chain -i br-lan -m comment --comment zte-agent-wifi-relay -j RETURN"]),
-            ("offload", super::super::offload::route_plan("10.20.0.1", "10.20.0.0/24"), vec!["ip -4 route del unreachable 100.64.0.0/10 metric 60631 table main", "ip -4 route del unreachable 169.254.0.0/16 metric 60631 table main", "ip -4 route del unreachable 224.0.0.0/4 metric 60631 table main", "ip -4 route del default via 10.20.0.1 dev ath20 metric 60631 table main"]),
+            ("offload", vec![super::super::offload::route("10.20.0.1".parse().unwrap())], vec!["ip -4 route del default via 10.20.0.1 dev ath20 metric 60631 table main"]),
         ];
         let expected_restores = [
             "*filter\n-N U60_RELAY_IN\n-A U60_RELAY_IN -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n-A U60_RELAY_IN -p udp -m udp --sport 67 --dport 68 -j ACCEPT\n-I INPUT 1 -i ath20 -j U60_RELAY_IN\nCOMMIT\n",
@@ -2007,8 +2012,8 @@ mod tests {
             ("guard", Layout::default()),
             ("discovery", Layout { discovery: true, ..Layout::default() }),
             ("relay", Layout { relay: Some(relay.clone()), ..Layout::default() }),
-            ("full", Layout { relay: Some(relay.clone()), discovery: true, nat66: Some(nat66(Some("2001:db8:20::1"))) }),
-            ("full-nodns", Layout { relay: Some(relay.clone()), discovery: true, nat66: Some(nat66(None)) }),
+            ("full", Layout { relay: Some(relay.clone()), discovery: true, nat66: Some(nat66(Some("2001:db8:20::1"))), ..Layout::default() }),
+            ("full-nodns", Layout { relay: Some(relay.clone()), discovery: true, nat66: Some(nat66(None)), ..Layout::default() }),
         ];
         for (generation, (name, layout)) in layouts.iter().enumerate() {
             let (marker, text) = crate::netfx::effect::batch("relay", uplink::TABLE, generation as u64 + 1, uplink::tables(layout, crate::netfx::ids::CORE_OUT_MARK).unwrap()).unwrap();

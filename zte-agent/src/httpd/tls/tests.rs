@@ -3,7 +3,7 @@
 //! reset and the shared caps.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -50,13 +50,13 @@ fn start_with_state<A: Admit + 'static>(world: World, conns: usize, side: impl F
     configure(&mut state);
     let app = Arc::new(state);
     let ctx = Ctx::new(Arc::clone(&app), 2);
-    let caps = Caps::new(Limits { conns, per_peer: conns, idle: IDLE_TIMEOUT, reserved: 0, shared: IpAddr::is_loopback });
+    let caps = Caps::new(Limits { conns, per_peer: conns, idle: IDLE_TIMEOUT, reserved: 0 });
     let listener = listen("127.0.0.1:0").unwrap();
     let plain = listener.local_addr().unwrap();
     let t = Arc::clone(&tls);
     std::thread::spawn(move || {
         runtime(2).unwrap().block_on(async move {
-            let plain = accept_loop_with(listener, ctx.clone(), caps.clone(), |_: SocketAddr, _: &tokio::net::TcpStream| true, super::super::Wire::Plain);
+            let plain = accept_loop(listener, ctx.clone(), caps.clone(), |_: SocketAddr, _: &tokio::net::TcpStream| true, super::super::Wire::Plain);
             futures_util::future::join(supervise(t, ctx, caps, side), plain).await
         })
     });
@@ -303,6 +303,35 @@ fn cookies_do_not_authenticate_the_console_api() {
         assert_eq!(request(&mut c,&format!("POST /api/https/reset HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json"),"{\"confirm\":true}").status,403);
         assert!(s.tls.is_on());
     }
+}
+
+#[test]
+fn userspace_tailscale_cannot_use_loopback_privileges_over_https() {
+    use crate::tailscale::{TailscaleManager, TsConfig};
+
+    let s = start_with_state(
+        World::new("https-userspace-loopback"),
+        8,
+        || |_: SocketAddr, _: &tokio::net::TcpStream| true,
+        |app| {
+            app.tailscale = Arc::new(TailscaleManager::for_test(
+                TsConfig { enabled: true, hostname: "u60-pro".into(), ..TsConfig::default() },
+                serde_json::json!({"dns_name": "u60-pro.tailnet.ts.net."}),
+            ));
+        },
+    );
+    let addr = on(&s);
+    let cfg = client(&s.tls.ca_der().unwrap(), &[&rustls::version::TLS13]);
+    let local = s.app.auth.issue_local().unwrap();
+    let mut forwarded = connect(addr, Arc::clone(&cfg), "u60.home.arpa").unwrap();
+    assert_eq!(request(&mut forwarded, "GET /console/ HTTP/1.1\r\nHost: u60-pro.tailnet.ts.net", "").status, 200);
+    assert_eq!(request(&mut forwarded, "GET /console/ HTTP/1.1\r\nHost: localhost", "").status, 403);
+    let ping = format!("GET /api/lan/ping HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}", local.expose());
+    assert_eq!(request(&mut forwarded, &ping, "").status, 401);
+    s.app.tailscale.set_kernel_tun_for_test(true);
+    let mut loopback = connect(addr, cfg, "u60.home.arpa").unwrap();
+    assert_eq!(request(&mut loopback, "GET /console/ HTTP/1.1\r\nHost: localhost", "").status, 200);
+    assert_eq!(request(&mut loopback, &ping, "").status, 200);
 }
 
 trait ReadWrite: Read + Write {}
@@ -721,9 +750,9 @@ fn the_mobile_side_is_refused_before_the_handshake() {
     }
 
     impl Admit for LogicalPeer {
-        async fn admit(&mut self, _: SocketAddr, tcp: &tokio::net::TcpStream) -> bool {
+        async fn admit_via(&mut self, _: SocketAddr, tcp: &tokio::net::TcpStream, _: Via, _: Option<&str>) -> bool {
             let peer = *self.peer.lock().unwrap();
-            self.guard.admit(peer, || tcp.local_addr().ok()).await
+            self.guard.admit_via(peer, Via::Local, None, || tcp.local_addr().ok()).await
         }
     }
 

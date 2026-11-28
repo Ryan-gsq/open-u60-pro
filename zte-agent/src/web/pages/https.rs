@@ -34,7 +34,7 @@ use maud::{html, Markup};
 use crate::handlers::AppState;
 use crate::httpd::gate::Lane;
 use crate::httpd::tls::Secure;
-use crate::httpd::{Ctx, Peer};
+use crate::httpd::{Ctx, Via};
 use crate::tls::{Status, Utc, DOWNLOAD_CRT, DOWNLOAD_PROFILE};
 use crate::web::action::{self, Ask};
 use crate::web::job::{self, OnceJob, Sent};
@@ -445,5 +445,5 @@ pub fn download(ctx: &Ctx, method: &HttpMethod, path: &str) -> Option<Response> 
 /// The login page's line over plain http while HTTPS is on.
 pub fn login_hint(ctx: &Ctx, parts: &axum::http::request::Parts) -> Option<String> {
     let ext = &parts.extensions;
-    hint(&ctx.app.tls.status(), ext.get::<Secure>().is_some(), session::is_remote(ext.get::<Peer>()))
+    hint(&ctx.app.tls.status(), ext.get::<Secure>().is_some(), session::is_remote(Via::of(ext)))
 }

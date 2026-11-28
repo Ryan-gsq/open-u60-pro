@@ -10,8 +10,9 @@
 //!   is gone: the upstream INPUT guard and a drop of all forwarding through
 //!   the upstream;
 //! - `relay` (routes installed): the forwarding returns, the relay DNS, and
-//!   the IPv6 baseline (cellular rejected first, LAN-local exceptions, the
-//!   one OUTPUT reject to `rmnet*`). Routes are released after shrinking back;
+//!   cellular rejects for forwarding and for IPv6 and marked IPv4 output.
+//!   Strict zero-cellular blocks cellular forwarding and output in both families
+//!   and keeps those blocks through station handover;
 //! - `discovery` (IPv6 requested and started): RA, NS/NA, ICMPv6 errors and
 //!   DHCPv6 replies on the upstream; closed otherwise;
 //! - `nat66` (a valid IPv6 lease, from `ipv6`): its forwarding returns, the
@@ -48,6 +49,7 @@ const SRCNAT: &str = "srcnat - 1";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
     pub relay: Option<Relay>,
+    pub strict_zero_cellular: bool,
     pub discovery: bool,
     pub nat66: Option<Nat66>,
 }
@@ -98,6 +100,19 @@ fn dns_output(mark: Option<u32>) -> Vec<String> {
 }
 
 const LOCAL: &str = "fib daddr type local return";
+const REJECT_CELLULAR: &str = "oifname \"rmnet*\" reject";
+
+fn marked_cellular_rejects(core: Option<u32>) -> Vec<String> {
+    let (tproxy, mask) = ids::TPROXY_MARK.split_once('/').expect("TPROXY mark and mask");
+    let mut rules = vec![
+        format!("meta mark & {mask} == {tproxy} {REJECT_CELLULAR}"),
+        format!("meta mark & 0xff0000 == 0x80000 {REJECT_CELLULAR}"),
+    ];
+    if let Some(mark) = core {
+        rules.insert(0, format!("meta mark & 0x{mark:08x} == 0x{mark:08x} {REJECT_CELLULAR}"));
+    }
+    rules
+}
 
 fn v4(layout: &Layout, mark: Option<u32>) -> Result<String, String> {
     let mine = format!("iifname \"{IFACE}\"");
@@ -107,13 +122,24 @@ fn v4(layout: &Layout, mark: Option<u32>) -> Result<String, String> {
         format!("{mine} drop"),
     ];
     let mut forward = Vec::new();
+    if layout.relay.is_some() || layout.strict_zero_cellular {
+        forward.push(REJECT_CELLULAR.into());
+    }
     if layout.relay.is_some() {
         forward.push(format!("iifname \"br-lan\" oifname \"{IFACE}\" return"));
+        forward.push(format!("iifname \"{}\" oifname \"{IFACE}\" return", ids::TAILSCALE_IFACE));
         forward.push(format!("{mine} oifname \"br-lan\" ct state established,related return"));
+        forward.push(format!("{mine} oifname \"{}\" ct state established,related return", ids::TAILSCALE_IFACE));
     }
     forward.extend([format!("{mine} drop"), format!("oifname \"{IFACE}\" drop")]);
     let (filter_in, filter_fwd) = (hook("filter", "input", FILTER), hook("filter", "forward", FILTER));
     let mut chains = vec![("input", filter_in.as_str(), input), ("forward", filter_fwd.as_str(), forward)];
+    let filter_out = hook("filter", "output", FILTER);
+    if layout.strict_zero_cellular {
+        chains.push(("output", filter_out.as_str(), vec![REJECT_CELLULAR.into()]));
+    } else if layout.relay.is_some() {
+        chains.push(("output", filter_out.as_str(), marked_cellular_rejects(mark)));
+    }
     let nat = hook("nat", "postrouting", SRCNAT);
     let (pre, out) = (hook("nat", "prerouting", DNS_PRIORITY), hook("nat", "output", DNS_OUTPUT_PRIORITY));
     if let Some(relay) = &layout.relay {
@@ -144,17 +170,22 @@ fn v6(layout: &Layout, mark: Option<u32>) -> Result<String, String> {
     }
     input.push(format!("{mine} drop"));
     let mut forward = Vec::new();
-    if layout.relay.is_some() {
-        // First: no local or multicast exception below may let LAN traffic
-        // out through cellular.
-        forward.push("iifname \"br-lan\" oifname \"rmnet*\" reject".to_owned());
+    if layout.strict_zero_cellular {
+        forward.push(REJECT_CELLULAR.into());
+    } else if layout.relay.is_some() {
+        forward.push(format!(
+            "iifname {{ \"br-lan\", \"{}\" }} {REJECT_CELLULAR}",
+            ids::TAILSCALE_IFACE
+        ));
     }
     if let Some(nat) = &layout.nat66 {
         let sources = nat.sources.iter().map(|s| network(s, true)).collect::<Result<Vec<_>, _>>()?;
         if !sources.is_empty() {
             forward.push(format!("iifname \"br-lan\" oifname \"{IFACE}\" ip6 saddr {{ {} }} return", sources.join(", ")));
         }
+        forward.push(format!("iifname \"{}\" oifname \"{IFACE}\" ip6 saddr {} return", ids::TAILSCALE_IFACE, ids::TAILNET_V6));
         forward.push(format!("{mine} oifname \"br-lan\" ct state established,related return"));
+        forward.push(format!("{mine} oifname \"{}\" ct state established,related return", ids::TAILSCALE_IFACE));
     }
     forward.extend([format!("{mine} drop"), format!("oifname \"{IFACE}\" drop")]);
     if layout.relay.is_some() {
@@ -163,10 +194,10 @@ fn v6(layout: &Layout, mark: Option<u32>) -> Result<String, String> {
     }
     let (filter_in, filter_fwd, filter_out) = (hook("filter", "input", FILTER), hook("filter", "forward", FILTER), hook("filter", "output", FILTER));
     let mut chains = vec![("input", filter_in.as_str(), input), ("forward", filter_fwd.as_str(), forward)];
-    if layout.relay.is_some() {
+    if layout.relay.is_some() || layout.strict_zero_cellular {
         // The one cellular OUTPUT reject, owned by the relay baseline: it
         // covers IPv6 off, a lost lease and a withdrawn NAT66 alike.
-        chains.push(("output", filter_out.as_str(), vec!["oifname \"rmnet*\" reject".to_owned()]));
+        chains.push(("output", filter_out.as_str(), vec![REJECT_CELLULAR.into()]));
     }
     let nat = hook("nat", "postrouting", SRCNAT);
     let pre = hook("nat", "prerouting", DNS_PRIORITY);
@@ -265,13 +296,13 @@ impl Shared {
     /// Verify the previous agent's ownership marker and stage the IPv4 layout.
     /// IPv6 takeover can confirm the combined layout through `update` before
     /// the caller invokes `finish_adopt`.
-    pub fn adopt(&self, relay: Relay) -> Result<(), String> {
+    pub fn adopt(&self, relay: Relay, strict_zero_cellular: bool) -> Result<(), String> {
         let mut s = self.state();
         let tables = NftTables::new("relay", TABLE, s.file.clone());
         if tables.presence(&mut *s.nft)? != Presence::Ours {
             return Err("The relay's nftables tables are not the previous agent's".into());
         }
-        s.layout = Some(Layout { relay: Some(relay), ..Layout::default() });
+        s.layout = Some(Layout { relay: Some(relay), strict_zero_cellular, ..Layout::default() });
         Ok(())
     }
 
@@ -421,31 +452,66 @@ pub mod tests {
     fn forwarding_returns_come_before_the_relays_drops() {
         let [ip, _] = tables(&Layout { relay: Some(relay()), ..Layout::default() }, None).unwrap();
         let forward = chain(&ip, "forward");
-        assert_eq!(forward[0], "iifname \"br-lan\" oifname \"ath20\" return");
-        assert_eq!(forward[1], "iifname \"ath20\" oifname \"br-lan\" ct state established,related return");
-        assert!(at(&forward, "iifname \"ath20\" drop") > 1 && at(&forward, "oifname \"ath20\" drop") > 1);
+        assert_eq!(forward[0], REJECT_CELLULAR);
+        assert_eq!(forward[1], "iifname \"br-lan\" oifname \"ath20\" return");
+        assert_eq!(forward[2], "iifname \"tailscale0\" oifname \"ath20\" return");
+        assert_eq!(forward[3], "iifname \"ath20\" oifname \"br-lan\" ct state established,related return");
+        assert_eq!(forward[4], "iifname \"ath20\" oifname \"tailscale0\" ct state established,related return");
+        assert!(at(&forward, "iifname \"ath20\" drop") > 4 && at(&forward, "oifname \"ath20\" drop") > 4);
         assert_eq!(chain(&ip, "input").len(), 3, "routes add nothing to the upstream INPUT guard");
     }
 
     #[test]
+    fn normal_ipv4_output_rejects_only_proxy_and_tailscale_bypass_marks_on_cellular() {
+        let layout = Layout { relay: Some(relay()), ..Layout::default() };
+        let [ip, _] = tables(&layout, ids::CORE_OUT_MARK).unwrap();
+        assert_eq!(chain(&ip, "output"), [
+            "meta mark & 0x01000000 == 0x01000000 oifname \"rmnet*\" reject",
+            "meta mark & 0xff00 == 0x700 oifname \"rmnet*\" reject",
+            "meta mark & 0xff0000 == 0x80000 oifname \"rmnet*\" reject",
+        ]);
+    }
+
+    #[test]
+    fn strict_mode_blocks_all_cellular_egress_in_both_families() {
+        for relay in [Some(relay()), None] {
+            let layout = Layout { relay, strict_zero_cellular: true, ..Layout::default() };
+            for text in tables(&layout, ids::CORE_OUT_MARK).unwrap() {
+                assert_eq!(chain(&text, "forward")[0], REJECT_CELLULAR);
+                assert_eq!(chain(&text, "output"), [REJECT_CELLULAR]);
+            }
+        }
+    }
+
+    #[test]
     fn ipv6_rejects_cellular_before_any_exception_and_once_on_output() {
-        let [_, ip6] = tables(&Layout { relay: Some(relay()), discovery: true, nat66: Some(nat66(None)) }, None).unwrap();
+        let [_, ip6] = tables(&Layout { relay: Some(relay()), discovery: true, nat66: Some(nat66(None)), ..Layout::default() }, None).unwrap();
         let forward = chain(&ip6, "forward");
-        assert_eq!(forward[0], "iifname \"br-lan\" oifname \"rmnet*\" reject", "before the NAT66 and the local exceptions");
+        assert_eq!(
+            forward[0],
+            "iifname { \"br-lan\", \"tailscale0\" } oifname \"rmnet*\" reject",
+            "before the NAT66 and the local exceptions"
+        );
         let out = at(&forward, "ip6 saddr { fd12:3456:789a::/64, 2001:db8:5::/64 } return");
+        let ts_out = at(&forward, "iifname \"tailscale0\" oifname \"ath20\" ip6 saddr fd7a:115c:a1e0::/48 return");
         let back = at(&forward, "oifname \"br-lan\" ct state established,related return");
+        let ts_back = at(&forward, "oifname \"tailscale0\" ct state established,related return");
         let drop = at(&forward, "iifname \"ath20\" drop");
         let local = at(&forward, "ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } return");
-        assert!(0 < out && out < back && back < drop && drop < local && local < forward.len() - 1);
+        assert!(0 < out && out < ts_out && ts_out < back && back < ts_back && ts_back < drop && drop < local && local < forward.len() - 1);
         assert_eq!(forward.last().unwrap(), "iifname \"br-lan\" reject");
         assert_eq!(ip6.matches("oifname \"rmnet*\" reject").count(), 2, "one forward, one output reject");
         assert_eq!(chain(&ip6, "output"), ["oifname \"rmnet*\" reject"]);
         assert_eq!(chain(&ip6, "nat66"), ["oifname \"ath20\" masquerade"]);
         assert!(ip6.contains("type nat hook postrouting priority srcnat - 1; policy accept;"));
-        // Without NAT66 the baseline still rejects cellular and keeps the
-        // upstream closed.
+        // Without NAT66 the baseline still rejects cellular (for both LAN and tailscale0)
+        // and keeps the upstream closed.
         let [_, baseline] = tables(&Layout { relay: Some(relay()), ..Layout::default() }, None).unwrap();
         assert!(!baseline.contains("masquerade") && !baseline.contains("ip6 saddr"));
+        assert_eq!(
+            chain(&baseline, "forward")[0],
+            "iifname { \"br-lan\", \"tailscale0\" } oifname \"rmnet*\" reject"
+        );
         assert_eq!(chain(&baseline, "output"), ["oifname \"rmnet*\" reject"]);
     }
 
@@ -466,7 +532,7 @@ pub mod tests {
 
     #[test]
     fn ipv6_dns_redirects_lan_dns_locally_and_rejects_router_dns_without_a_resolver() {
-        let layout = |dns| Layout { relay: Some(relay()), discovery: true, nat66: Some(nat66(dns)) };
+        let layout = |dns| Layout { relay: Some(relay()), discovery: true, nat66: Some(nat66(dns)), ..Layout::default() };
         let [_, with] = tables(&layout(Some("2001:db8:1::53")), None).unwrap();
         assert!(with.contains("ip6 daddr { ::1/128, fd7a:115c:a1e0::/48, fe80::/10, fd12:3456:789a::/64, 2001:db8:5::/64 } return"));
         assert!(with.contains("redirect to :53") && with.contains("dnat to [2001:db8:1::53]:53"));
@@ -480,12 +546,12 @@ pub mod tests {
     #[test]
     fn the_cores_marked_dns_keeps_its_destination_only_with_a_verified_mark() {
         assert_eq!(ids::CORE_OUT_MARK, Some(0x0100_0000));
-        let layout = Layout { relay: Some(relay()), discovery: true, nat66: Some(nat66(Some("2001:db8:1::53"))) };
+        let layout = Layout { relay: Some(relay()), discovery: true, nat66: Some(nat66(Some("2001:db8:1::53"))), ..Layout::default() };
         for text in tables(&layout, ids::CORE_OUT_MARK).unwrap() {
             assert_eq!(chain(&text, "dns_out")[0], "meta mark & 0x01000000 == 0x01000000 return");
         }
         for text in tables(&layout, None).unwrap() {
-            assert!(!text.contains("meta mark"));
+            assert!(!chain(&text, "dns_out")[0].contains("meta mark"));
         }
     }
 
@@ -565,7 +631,7 @@ pub mod tests {
         let next = Shared::with(file.clone(), effects.clone(), Box::new(kernel.clone()));
         effects.lock().unwrap().declare_with(vec![next.resource(None)], &mut net::Device, &mut kernel.clone()).unwrap();
         let before = kernel.0.lock().unwrap().loads;
-        next.adopt(relay()).unwrap();
+        next.adopt(relay(), false).unwrap();
         next.update(|layout| {
             layout.discovery = true;
             layout.nat66 = Some(nat66(None));

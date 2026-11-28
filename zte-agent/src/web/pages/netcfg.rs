@@ -54,7 +54,7 @@ use super::{apn, dns, firewall, lan, telemetry, vpnqos, wlan};
 use crate::auth::{Principal, SessionId};
 use crate::handlers::AppState;
 use crate::httpd::gate::{self, Lane};
-use crate::httpd::{api, Ctx, Peer};
+use crate::httpd::{api, Ctx, Via};
 use crate::web::action::{self, Ask};
 use crate::web::job::{self, OnceJob, Sent};
 use crate::web::kit;
@@ -593,7 +593,7 @@ fn ask_page(app: &AppState, p: &Principal, nonce: &str, kind: Kind, q: &Question
 /// back to the form); asked by link: the fields of the query string.
 pub async fn get(ctx: &Ctx, p: Principal, req: Request, kind: Kind) -> Response {
     let nonce = CspNonce::of(&req);
-    let remote = session::is_remote(req.extensions().get::<Peer>());
+    let remote = session::is_remote(Via::of(req.extensions()));
     let query = req.uri().query().map(str::to_owned);
     let port = port_of(api::header(req.headers(), "host"));
     drop(req);
@@ -842,7 +842,7 @@ pub fn result(ctx: &Ctx, p: &Principal, req: &Request, kind: Kind) -> Response {
     let t = query_param(req.uri().query(), "t").unwrap_or_default();
     let sent = matches!(ctx.once.get(&t, p.id, now), Some(Token::Sent(_)));
     let vals = draft_of(&ctx.drafts, &t, p.id, now, kind).filter(|d| sent && d.ready).map(|d| d.vals).unwrap_or_default();
-    let remote = session::is_remote(req.extensions().get::<Peer>());
+    let remote = session::is_remote(Via::of(req.extensions()));
     let (title, body): (String, Markup) = match kind {
         Kind::Lan => lan::applied(&vals, &port_of(api::header(req.headers(), "host")), remote),
         Kind::Guest => wlan::guest_applied(&vals),

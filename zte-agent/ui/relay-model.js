@@ -9,6 +9,17 @@
   };
   const ipv6Label = state => ipv6Labels[state] || 'Off';
 
+  function cellular(status) {
+    const enabled = status?.strict_zero_cellular === true;
+    const pause = status?.cellular_pause;
+    const error = typeof pause?.error === 'string' ? pause.error : '';
+    const label = error ? 'Change failed' : ({
+      paused: 'Cellular data paused',
+      already_off: 'Cellular data was already off'
+    })[pause?.state] || (enabled ? 'Waiting to pause cellular data' : 'Strict mode off');
+    return {enabled, label, error};
+  }
+
   // One place decides what the page calls the relay, so the hero, the actions
   // and the tests cannot disagree.
   function view(status) {
@@ -38,6 +49,7 @@
     rows.push(['Upstream link', Number.isFinite(frequency) && frequency > 0 ? `${band(frequency)} · negotiated bandwidth` : '—', false]);
     rows.push(['Upstream IPv6 / NAT66', ipv6Label(ipv6.state), false]);
     if (ipv6.upstream === true) rows.push(['Upstream IPv6', ipv6.address || '—', true], ['LAN IPv6 prefix', ipv6.lan_prefix || '—', true]);
+    if (typeof data.strict_zero_cellular === 'boolean') rows.push(['Cellular data', cellular(data).label, false]);
     rows.push(['After a restart', data.autostart === true ? 'Automatic reconnect enabled' : data.autostart === false ? 'Stays off; no restart choice saved' : 'Unknown', false]);
     return rows;
   }
@@ -72,6 +84,6 @@
   const usable = networks => (Array.isArray(networks) ? networks : []).filter(network => network && typeof network.id === 'string').map((network, index) => ({network, index}))
     .sort((a, b) => (b.network.supported === true) - (a.network.supported === true) || a.index - b.index).map(item => item.network);
 
-  const api = {band, securityLabel, level, ipv6Label, view, facts, passwordProblem, connectRequest, scope, savedNote, consent, usable};
+  const api = {band, securityLabel, level, ipv6Label, cellular, view, facts, passwordProblem, connectRequest, scope, savedNote, consent, usable};
   if (typeof module === 'object' && module.exports) module.exports = api; else globalThis.OpenU60Relay = api;
 })(globalThis);

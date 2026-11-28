@@ -16,9 +16,13 @@ impl CoreHandle for FakeCore {
         self.generation
     }
     fn stop(&self) -> bool {
-        self.alive.store(false, Ordering::SeqCst);
-        self.world.lock().unwrap().events.push(format!("stop {}", self.generation));
-        true
+        let mut w = self.world.lock().unwrap();
+        w.events.push(format!("stop {}", self.generation));
+        let confirmed = w.stop_confirmed.pop_front().unwrap_or(true);
+        if confirmed {
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        confirmed
     }
 }
 
@@ -36,13 +40,24 @@ struct World {
     tables: Option<String>,
     /// What `NftTables` would load on a reconcile (the last declared).
     target: Option<String>,
+    /// Generation counters mirroring `NftTables`.
+    table_gen: u64,
+    table_target_gen: Option<u64>,
+    table_confirmed_gen: Option<u64>,
     /// A previous agent's journal and tables are still in the kernel.
     leftover: bool,
     spawned: Vec<u64>,
+    spawned_bindings: Vec<Binding>,
     /// Errors for the next `prepare` calls (`None`: succeed).
     prepare: VecDeque<Option<String>>,
-    /// Errors for the next table loads, whatever their shape.
-    tables_fail: VecDeque<String>,
+    /// Results for the next table loads, whatever their shape.
+    tables_fail: VecDeque<Option<String>>,
+    /// Like `tables_fail`, but commits live kernel tables BEFORE returning `Err`
+    /// (simulating a kernel commit whose readback timed out).
+    tables_commit_then_fail: VecDeque<Option<String>>,
+    /// Failures injected BEFORE updating `target`/`ts_target_*` (simulating a
+    /// journal `write_ahead` failure inside `EffectSet::declare_with`).
+    tables_reject_before_target: VecDeque<Option<String>>,
     /// Errors for the next loads of shapes starting with this name.
     shape_fail: Vec<(String, String)>,
     /// Errors for the next D3 withdrawals and rollbacks.
@@ -55,10 +70,15 @@ struct World {
     unready_now: bool,
     resets: Vec<Scope>,
     selected_direct: bool,
+    port_direct: bool,
     writes: Vec<String>,
     write_results: VecDeque<Answered>,
     read_results: VecDeque<Option<bool>>,
     uplink: Uplink,
+    egress_generation: u64,
+    egress_on_full: Option<Uplink>,
+    ts_exit_on_full: Option<TailscaleExitConfig>,
+    uplink_sampled: Option<mpsc::SyncSender<Instant>>,
     busy: Option<String>,
     guard_due: bool,
     /// Panic in the next `engage` (a defect on the controller's thread).
@@ -75,6 +95,21 @@ struct World {
     runtime: Option<Value>,
     /// The mode and log level each `prepare` of the selected profile was given.
     given: Vec<Option<Value>>,
+    /// Tailscale Strategy B Exit Node state for controller linkage tests.
+    tailscale_exit: TailscaleExitConfig,
+    ts_tables_active: bool,
+    ts_tables_v4: bool,
+    ts_tables_v6: bool,
+    ts_target_v4: bool,
+    ts_target_v6: bool,
+    ts_resets: Vec<(bool, bool)>,
+    ts_pending_reset: (bool, bool),
+    ts_v4_reset_started: Option<Instant>,
+    ts_reset_fail_v4: VecDeque<Option<String>>,
+    ts_reset_fail_v6: VecDeque<Option<String>>,
+    /// Per-call return values for `FakeCore::stop()` (`true` by default).
+    stop_confirmed: VecDeque<bool>,
+    state_notifications: usize,
 }
 
 #[derive(Clone)]
@@ -91,9 +126,18 @@ impl FakePort {
 
 fn chain(direct: bool) -> Chain {
     if direct {
-        Chain { rules: vec!["ip daddr @ip_0 return".into()], sets: vec![("ip_0".into(), vec!["1.2.3.0/24".into()])], returns: 1, cut: None, plain: vec![Some((true, vec!["1.2.3.0/24".into()]))] }
+        Chain { rules: vec!["ip daddr @ip_0 return".into()], sets: vec![("ip_0".into(), vec!["1.2.3.0/24".into()])], returns: 1, plain: vec![Some((true, vec!["1.2.3.0/24".into()]))], ..Chain::default() }
     } else {
         Chain::default()
+    }
+}
+
+fn port_direct_chain() -> Chain {
+    Chain {
+        rules: vec!["th dport { 443 } return".into()],
+        returns: 1,
+        plain: vec![None],
+        ..Chain::default()
     }
 }
 
@@ -114,8 +158,7 @@ impl Port for FakePort {
     fn busy(&mut self) -> Option<String> {
         self.world().busy.clone()
     }
-    fn prepare(&mut self, source: &Source, serving: bool) -> Result<Prepared, String> {
-        let previous = matches!(source, Source::Previous(_));
+    fn prepare(&mut self, source: &Source, serving: bool, egress: Binding) -> Result<Prepared, String> {
         self.log(match (source, serving) {
             (Source::Previous(_), _) => "prepare previous",
             (Source::Reload(_), _) => "prepare reload",
@@ -129,16 +172,21 @@ impl Port for FakePort {
         if let Source::Selected { runtime, .. } = source {
             self.world().given.push(runtime.clone());
         }
-        let dns = vec![format!("filter {}", self.world().dns)];
+        let dns = routing::DnsFilter { rules: vec![format!("filter {}", self.world().dns)], ..Default::default() };
         let routes = self.world().config.map_or_else(routing::Routes::default, |yaml| routing::Routes::from(&serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml).unwrap()));
         if let Source::Previous(previous) = source {
-            return Ok((**previous).clone());
+            return Ok(Prepared { egress, ..(**previous).clone() });
         }
         let config = self.world().config.unwrap_or("profile: selected");
         let bypass = !self.world().bypass_off;
+        let tailscale_sniffer = self.world().tailscale_exit.sniffer;
         let notice = super::super::geodata::bypass_notice(config, bypass);
-        let text = if previous { "profile: previous".into() } else { format!("{config}\nfilter: {}", self.world().dns) };
-        Ok(Prepared { facts: super::super::reload::Facts::from(&serde_yaml_ng::from_str(&text).unwrap()), secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode": "rule"}), routes, dns, bypass, notice, source: config.into(), config: text })
+        let text = if tailscale_sniffer {
+            format!("{config}\nfilter: {}\nsniffer: {{enable: true}}\n", self.world().dns)
+        } else {
+            format!("{config}\nfilter: {}", self.world().dns)
+        };
+        Ok(Prepared { facts: super::super::reload::Facts::from(&serde_yaml_ng::from_str(&text).unwrap()), secret: "s".into(), local: "u60.home.arpa".into(), runtime: json!({"mode": "rule"}), routes, dns, bypass, tailscale_sniffer, notice, source: config.into(), config: text, egress })
     }
     fn validator(&self, _: &Prepared, _: bool) -> Option<Validation> { self.world().validation.take() }
     fn ports_free(&mut self) -> Result<(), String> {
@@ -182,31 +230,117 @@ impl Port for FakePort {
         };
         self.log(format!("tables {name}"));
         let mut w = self.world();
+        w.table_gen += 1;
+        w.table_target_gen = Some(w.table_gen);
         w.target = Some(name.clone());
-        if let Some(error) = w.tables_fail.pop_front() {
+        if let Some(Some(error)) = w.tables_fail.pop_front() {
             return Err(error);
         }
         if let Some(at) = w.shape_fail.iter().position(|(prefix, _)| name.starts_with(prefix.as_str())) {
             return Err(w.shape_fail.remove(at).1);
         }
         w.tables = Some(name);
+        w.table_confirmed_gen = w.table_target_gen;
+        if matches!(shape, Shape::Full(_)) {
+            if let Some(uplink) = w.egress_on_full.take() {
+                w.uplink = uplink;
+            }
+            if let Some(ts_exit) = w.ts_exit_on_full.take() {
+                w.tailscale_exit = ts_exit;
+            }
+        }
         Ok(())
+    }
+    fn tables_with_tailscale(&mut self, shape: Shape, ts: TailscaleExit) -> Result<(), String> {
+        {
+            let mut w = self.world();
+            if let Some(Some(error)) = w.tables_reject_before_target.pop_front() {
+                return Err(error);
+            }
+            let active = matches!(shape, Shape::Hold | Shape::Full(_));
+            w.ts_target_v4 = active && ts.v4;
+            w.ts_target_v6 = active && ts.v6;
+        }
+        let commit_fail = self.world().tables_commit_then_fail.pop_front().flatten();
+        let res = self.tables(shape);
+        if res.is_ok() || commit_fail.is_some() {
+            let mut w = self.world();
+            w.ts_tables_v4 = w.ts_target_v4;
+            w.ts_tables_v6 = w.ts_target_v6;
+            w.ts_tables_active = w.ts_tables_v4 || w.ts_tables_v6;
+        }
+        if let Some(err) = commit_fail {
+            return Err(err);
+        }
+        res
+    }
+    fn tailscale_exit(&mut self) -> TailscaleExitConfig {
+        self.world().tailscale_exit.clone()
+    }
+    fn plan_tailscale(&mut self, _: &routing::Routes, _: Mode, selected: &Selected, unsettled: &[String]) -> Chain {
+        let direct = selected.get("G").is_some_and(|g| g == "DIRECT") && unsettled.is_empty();
+        if direct && self.world().port_direct {
+            port_direct_chain()
+        } else {
+            chain(direct)
+        }
+    }
+    fn reset_tailscale(&mut self, _reason: &'static str, v4: bool, v6: bool) -> Result<(), String> {
+        let mut w = self.world();
+        let want_v4 = v4 || w.ts_pending_reset.0;
+        let want_v6 = v6 || w.ts_pending_reset.1;
+        if !want_v4 && !want_v6 {
+            return Ok(());
+        }
+        w.ts_resets.push((want_v4, want_v6));
+        let started = Instant::now();
+        let fail_v4 = want_v4 && w.ts_reset_fail_v4.pop_front().flatten().is_some();
+        let fail_v6 = want_v6 && w.ts_reset_fail_v6.pop_front().flatten().is_some();
+        if want_v4 && !fail_v4 {
+            w.ts_v4_reset_started = Some(started);
+        }
+        w.ts_pending_reset = (fail_v4, fail_v6);
+        if fail_v4 || fail_v6 {
+            Err("simulated marked conntrack failure".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn tailscale_reset_pending(&mut self) -> (bool, bool) {
+        self.world().ts_pending_reset
+    }
+    fn tailscale_v4_reset_started(&mut self) -> Option<Instant> {
+        self.world().ts_v4_reset_started
+    }
+    fn on_state_change(&mut self) {
+        self.world().state_notifications += 1;
     }
     fn tables_status(&mut self) -> Value {
         json!(self.world().tables)
+    }
+    fn tables_target_generation(&mut self) -> Option<u64> {
+        self.world().table_target_gen
     }
     fn direct(&mut self) -> Result<(), String> {
         self.log("direct");
         let mut w = self.world();
         if let Some(error) = w.direct_fail.pop_front() {
             if w.owned {
+                w.table_gen += 1;
+                w.table_target_gen = Some(w.table_gen);
                 w.target = Some("reject".into());
             }
             return Err(error);
         }
         if w.owned {
+            w.table_gen += 1;
+            w.table_target_gen = Some(w.table_gen);
+            w.table_confirmed_gen = w.table_target_gen;
             w.tables = Some("reject".into());
             w.target = w.tables.clone();
+            w.ts_tables_active = false;
+            w.ts_tables_v4 = false;
+            w.ts_tables_v6 = false;
             w.steps = false;
         }
         Ok(())
@@ -221,6 +355,8 @@ impl Port for FakePort {
         w.steps = false;
         w.tables = None;
         w.target = None;
+        w.table_target_gen = None;
+        w.table_confirmed_gen = None;
         w.leftover = false;
         Ok(())
     }
@@ -228,6 +364,7 @@ impl Port for FakePort {
         self.log(format!("spawn {generation}"));
         let mut w = self.world();
         w.spawned.push(generation);
+        w.spawned_bindings.push(prepared.egress.clone());
         w.running_configs.push(prepared.config.clone());
         w.unready_now = w.unready_spawns.pop_front().unwrap_or(false);
         Ok(Box::new(FakeCore { generation, alive: Arc::new(AtomicBool::new(true)), world: Arc::clone(&self.0) }))
@@ -247,7 +384,11 @@ impl Port for FakePort {
     }
     fn plan(&mut self, _: &routing::Routes, bypass: bool, _: Mode, selected: &Selected, unsettled: &[String]) -> (Bypass, Chain) {
         let direct = bypass && selected.get("G").is_some_and(|g| g == "DIRECT") && unsettled.is_empty();
-        let chain = chain(direct);
+        let chain = if direct && self.world().port_direct {
+            port_direct_chain()
+        } else {
+            chain(direct)
+        };
         (if direct { Bypass::Rules { returns: 1, cut: None } } else { Bypass::None("none".into()) }, chain)
     }
     fn reset(&mut self, _: &'static str, scope: Scope, _: Instant) -> Result<Report, String> {
@@ -275,17 +416,33 @@ impl Port for FakePort {
     fn verify_reload(&mut self, _: &Prepared, _: Option<&(String, bool)>, _: &Selected) -> Result<(), String> {
         self.world().verify.clone().map_or(Ok(()), Err)
     }
-    fn uplink(&mut self, _: bool) -> Uplink {
-        self.world().uplink.clone()
+    fn uplink(&mut self, upstream: bool) -> Uplink {
+        let world = self.world();
+        if let Some(sampled) = &world.uplink_sampled {
+            let _ = sampled.try_send(Instant::now());
+        }
+        let observed = world.uplink.clone();
+        if upstream { observed } else { observed.with_upstream(None) }
+    }
+    fn egress_generation(&self) -> u64 {
+        self.world().egress_generation
     }
     /// As `NftTables::reconcile`: the target is loaded.
     fn reconcile(&mut self) -> Guarded {
         self.log("reconcile");
         let mut w = self.world();
-        if w.owned && w.target != w.tables {
+        if w.owned && (w.target != w.tables || w.ts_target_v4 != w.ts_tables_v4 || w.ts_target_v6 != w.ts_tables_v6) {
             w.tables = w.target.clone();
+            w.ts_tables_v4 = w.ts_target_v4;
+            w.ts_tables_v6 = w.ts_target_v6;
+            w.ts_tables_active = w.ts_tables_v4 || w.ts_tables_v6;
+            w.table_confirmed_gen = w.table_target_gen;
         }
-        Guarded { result: Ok(()), confirmed: w.owned && w.target == w.tables }
+        Guarded {
+            result: Ok(()),
+            confirmed: w.owned && w.target == w.tables,
+            confirmed_generation: w.table_confirmed_gen,
+        }
     }
     fn wanted(&mut self) -> bool {
         let world = self.world();
@@ -305,7 +462,12 @@ impl Port for FakePort {
     fn guard_due(&mut self) -> bool {
         self.world().guard_due
     }
-    fn retry_reset(&mut self) {}
+    fn retry_reset(&mut self) {
+        let pending = self.world().ts_pending_reset;
+        if pending.0 || pending.1 {
+            let _ = self.reset_tailscale("retry", false, false);
+        }
+    }
 }
 
 fn timings() -> Timings {
@@ -425,6 +587,212 @@ fn a_start_guards_before_the_core_and_loads_the_plan_the_ready_core_reports() {
     assert_eq!(events, ["engage Fresh", "tables guard", "prepare", "spawn 1", "tables hold", "tables full/1"]);
     assert!(h.port.world().wanted);
     assert_eq!(h.port.world().resets, [Scope::Lan { v4: true, v6: false }], "the old direct path is reset once");
+}
+
+#[test]
+fn an_egress_switch_during_validation_rebinds_before_spawn() {
+    let relay = Uplink::sample("ath20", 9, "192.0.2.2", None);
+    let cellular = Uplink::sample("rmnet_data0", 3, "10.1.0.2", None);
+    for (next, rejected) in [(cellular.clone(), false), (relay.clone(), false), (cellular, true)] {
+        let port = FakePort(Arc::new(Mutex::new(World { uplink: relay.clone(), ..World::default() })));
+        let changing = port.clone();
+        let entered = next.clone();
+        port.world().validation = Some(Box::new(move || {
+            let mut world = changing.world();
+            world.uplink = entered;
+            world.egress_generation += 1;
+            if rejected { Err("the old egress failed validation".into()) } else { Ok(()) }
+        }));
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(Mutex::new(Snapshot::default()));
+        let mut controller = Controller::new(port.clone(), rx, tx, Arc::clone(&shared), timings());
+
+        controller.enable(String::new(), true).unwrap();
+
+        let binding = Binding { uplink: next.clone(), generation: 1 };
+        assert_eq!(port.world().spawned_bindings, [binding.clone()]);
+        let run = controller.run.as_ref().unwrap();
+        assert_eq!(run.prepared.egress, binding);
+        assert_eq!(run.uplink, next);
+        assert_eq!(shared.lock().unwrap().phase, Phase::Running);
+    }
+}
+
+#[test]
+fn an_unannounced_egress_switch_before_publication_discards_the_candidate() {
+    let relay = Uplink::sample("ath20", 9, "192.0.2.2", None);
+    let cellular = Uplink::sample("rmnet_data0", 3, "10.1.0.2", None);
+    let port = FakePort(Arc::new(Mutex::new(World {
+        uplink: relay.clone(),
+        egress_on_full: Some(cellular.clone()),
+        ..World::default()
+    })));
+    let (tx, rx) = mpsc::channel();
+    let shared = Arc::new(Mutex::new(Snapshot::default()));
+    let mut controller = Controller::new(port.clone(), rx, tx, Arc::clone(&shared), timings());
+
+    controller.enable(String::new(), true).unwrap();
+
+    let world = port.world();
+    assert_eq!(world.spawned_bindings, [
+        Binding { uplink: relay, generation: 0 },
+        Binding { uplink: cellular.clone(), generation: 0 },
+    ]);
+    assert_eq!(world.events, [
+        "engage Fresh", "tables guard", "prepare", "spawn 1", "tables hold", "tables full/0",
+        "tables hold", "stop 1", "prepare previous", "spawn 2", "tables full/0",
+    ]);
+    let run = controller.run.as_ref().unwrap();
+    assert_eq!(run.uplink, cellular);
+    let snapshot = shared.lock().unwrap();
+    assert_eq!((snapshot.phase, snapshot.generation), (Phase::Running, 2));
+}
+
+#[test]
+fn a_restart_resets_lost_direct_from_stale_candidates_with_or_without_profile_fallback() {
+    let relay = Uplink::sample("ath20", 9, "192.0.2.2", None);
+    let cellular = Uplink::sample("rmnet_data0", 3, "10.1.0.2", None);
+    for fallback in [false, true] {
+        let h = Harness::new(World { uplink: relay.clone(), ..World::default() });
+        h.enable(true).unwrap();
+        {
+            let mut world = h.port.world();
+            world.config = Some("profile: replacement");
+            world.egress_on_full = Some(cellular.clone());
+            world.read_results = [Some(true), (!fallback).then_some(false), Some(false)].into();
+        }
+        let result = h.call(|reply| Message::Config { refresh: false, reply });
+        if fallback {
+            assert!(result.unwrap_err().contains("previous profile was started again"));
+        } else {
+            result.unwrap();
+        }
+        let snapshot = h.snapshot();
+        assert_eq!(snapshot.phase, Phase::Running);
+        assert_eq!(snapshot.generation, if fallback { 4 } else { 3 });
+        let world = h.port.world();
+        assert!(after(&world.events, "tables full/1", "stop 2"));
+        assert!(world.running_configs.last().unwrap().starts_with(if fallback { "profile: selected" } else { "profile: replacement" }));
+        assert_eq!(world.resets.last(), Some(&Scope::Destinations(vec!["1.2.3.0/24".parse().unwrap()])));
+    }
+}
+
+#[test]
+fn a_stale_candidate_keeps_serving_when_hold_cannot_be_confirmed() {
+    let h = Harness::new(World { uplink: Uplink::sample("ath20", 9, "192.0.2.2", None), ..World::default() });
+    h.enable(true).unwrap();
+    {
+        let mut world = h.port.world();
+        world.egress_on_full = Some(Uplink::sample("rmnet_data0", 3, "10.1.0.2", None));
+        world.read_results.push_back(Some(true));
+        world.tables_fail = [None, None, Some("Hold did not read back".into())].into();
+    }
+    let error = h.call(|reply| Message::Config { refresh: false, reply }).unwrap_err();
+
+    assert!(error.contains("Hold did not read back"));
+    let snapshot = h.snapshot();
+    assert_eq!((snapshot.phase, snapshot.generation), (Phase::Running, 2));
+    assert_eq!(snapshot.error.as_deref(), Some(error.as_str()));
+    assert_eq!(snapshot.bypass, Some(Bypass::Rules { returns: 1, cut: None }));
+    let world = h.port.world();
+    assert_eq!(world.tables.as_deref(), Some("full/1"));
+    assert_eq!(world.target.as_deref(), Some("hold"));
+    assert_eq!(world.spawned, [1, 2]);
+    assert!(!world.events.iter().any(|e| matches!(e.as_str(), "stop 2" | "prepare previous" | "direct")));
+}
+
+#[test]
+fn a_retained_core_still_resets_prestart_connections_on_fresh_start_and_d3_retry() {
+    // Fresh start: Full installs, egress changes, Hold cannot be confirmed -> core stays running,
+    // Hold error is preserved, and pre-start LAN IPv4 connections are still reset.
+    let fresh = Harness::new(World {
+        uplink: Uplink::sample("ath20", 9, "192.0.2.2", None),
+        egress_on_full: Some(Uplink::sample("rmnet_data0", 3, "10.1.0.2", None)),
+        tables_fail: [None, None, None, Some("Hold did not read back".into())].into(),
+        ..World::default()
+    });
+    let error = fresh.enable(true).unwrap_err();
+    assert!(error.contains("Hold did not read back"));
+    let snapshot = fresh.snapshot();
+    assert_eq!((snapshot.phase, snapshot.generation), (Phase::Running, 1));
+    assert_eq!(snapshot.error.as_deref(), Some(error.as_str()));
+    assert_eq!(fresh.port.world().resets, [Scope::Lan { v4: true, v6: false }]);
+
+    // D3 backoff retry: same Hold rollback failure keeps the core, preserves the Hold error,
+    // and resets both IPv4 and IPv6 LAN connections from the fail-open period.
+    let retry = Harness::new(World { uplink: Uplink::sample("ath20", 9, "192.0.2.2", None), ..World::default() });
+    retry.enable(true).unwrap();
+    retry.tx.send(Message::Exited { generation: 1, how: "signal 9".into() }).unwrap();
+    retry.until("backoff", |s| s.phase == Phase::Backoff);
+    {
+        let mut world = retry.port.world();
+        world.resets.clear();
+        world.egress_on_full = Some(Uplink::sample("rmnet_data0", 3, "10.1.0.2", None));
+        world.tables_fail = [None, None, Some("Hold did not read back".into())].into();
+    }
+    let error = retry.call(|reply| Message::Config { refresh: false, reply }).unwrap_err();
+    assert!(error.contains("Hold did not read back"));
+    let snapshot = retry.snapshot();
+    assert_eq!((snapshot.phase, snapshot.generation), (Phase::Running, 2));
+    assert_eq!(snapshot.error.as_deref(), Some(error.as_str()));
+    assert_eq!(retry.port.world().resets, [Scope::Lan { v4: true, v6: true }]);
+}
+
+#[test]
+fn a_periodic_route_audit_follows_relay_changes_without_notifications() {
+    let relay = |index, gateway| Uplink::sample_with_gateway("ath20", index, "192.0.2.2", None, Some(gateway));
+    let initial = relay(9, "192.0.2.1").with_upstream(Some("c0:a4:76:b1:f0:e4"));
+    let cellular = Uplink::sample("rmnet_data0", 3, "10.1.0.2", None);
+    for (next, expected_generation) in [
+        (initial.clone(), 1),
+        (relay(9, "192.0.2.254"), 2),
+        (relay(10, "192.0.2.1"), 2),
+        (initial.clone().with_upstream(Some("c0:a4:76:b1:f0:e5")), 2),
+        (cellular, 2),
+    ] {
+        let port = FakePort(Arc::new(Mutex::new(World { uplink: initial.clone(), ..World::default() })));
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(Mutex::new(Snapshot::default()));
+        let mut controller = Controller::new(port.clone(), rx, tx, Arc::clone(&shared), timings());
+        controller.enable(String::new(), true).unwrap();
+        port.world().uplink = next.clone();
+        controller.timings.audit = Duration::ZERO;
+
+        controller.tick();
+        let run = controller.run.as_mut().unwrap();
+        assert_eq!(run.core.generation(), 1);
+        assert_eq!(run.stranding.is_some(), expected_generation == 2);
+        if let Some((_, since)) = &mut run.stranding {
+            *since -= egress::EGRESS_SETTLE;
+        }
+        controller.tick();
+
+        let snapshot = shared.lock().unwrap();
+        assert_eq!((snapshot.phase, snapshot.generation), (Phase::Running, expected_generation));
+        assert_eq!(controller.run.as_ref().unwrap().prepared.egress.uplink, next);
+    }
+}
+
+#[test]
+fn frequent_mailbox_messages_do_not_postpone_the_route_audit() {
+    let timings = Timings { tick: Duration::from_millis(120), audit: Duration::from_millis(180), ..timings() };
+    let h = Harness::with(World::default(), timings);
+    h.enable(true).unwrap();
+    let started = Instant::now();
+    let (sampled, observation) = mpsc::sync_channel(1);
+    h.port.world().uplink_sampled = Some(sampled);
+    let (finish, finished) = mpsc::channel();
+    let tx = h.tx.clone();
+    let traffic = std::thread::spawn(move || {
+        while let Err(RecvTimeoutError::Timeout) = finished.recv_timeout(Duration::from_millis(5)) {
+            tx.send(Message::Guard).unwrap();
+        }
+    });
+
+    let audited = observation.recv_timeout(Duration::from_millis(600));
+    finish.send(()).unwrap();
+    traffic.join().unwrap();
+    assert!(audited.expect("audit during continuous mailbox activity").duration_since(started) < Duration::from_millis(600));
 }
 
 /// Release blocker 3: an old generation's exit, arriving after the new core
@@ -577,7 +945,7 @@ fn a_group_switch_tightens_first_and_resets_what_lost_direct() {
     h.write("G", "DIRECT").unwrap();
     assert!(matches!(h.port.world().resets.as_slice(), [Scope::Destinations(d)] if d.is_empty()));
     // A tightening that cannot be confirmed changes nothing in the core.
-    h.port.world().tables_fail.push_back("generation 9 is not confirmed".into());
+    h.port.world().tables_fail.push_back(Some("generation 9 is not confirmed".into()));
     let before = h.port.world().writes.len();
     assert!(h.write("G", "P").unwrap_err().contains("narrowed"));
     assert_eq!(h.port.world().writes.len(), before);
@@ -890,7 +1258,7 @@ fn a_plan_a_reconcile_loads_later_is_shown_and_tightened_before_the_next_switch(
 fn a_narrowing_a_reconcile_loads_later_is_shown_and_widened_again() {
     let h = Harness::new(World { selected_direct: true, ..World::default() });
     h.enable(true).unwrap();
-    h.port.world().tables_fail.push_back("generation 3 is not confirmed".into());
+    h.port.world().tables_fail.push_back(Some("generation 3 is not confirmed".into()));
     assert!(h.write("G", "P").unwrap_err().contains("narrowed"));
     assert_eq!(h.snapshot().bypass.unwrap().label(), "rules", "the kernel still holds the plan");
     let writes = h.port.world().writes.len();
@@ -1076,4 +1444,1200 @@ fn direct_controller(port: &FakePort) -> Controller<FakePort> {
 
 fn select_proxy() -> Write {
     Write { method: "PUT", segments: vec!["proxies".into(), "G".into()], body: json!({"name": "P"}) }
+}
+
+fn select_direct() -> Write {
+    Write { method: "PUT", segments: vec!["proxies".into(), "G".into()], body: json!({"name": "DIRECT"}) }
+}
+
+#[test]
+fn tailscale_exit_d3_backoff_withdraws_tproxy_and_recovery_reengages_with_notifications() {
+    let port = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        ..World::default()
+    })));
+    let mut controller = direct_controller(&port);
+    assert!(!port.world().ts_tables_active);
+    let initial_notes = port.world().state_notifications;
+
+    // 1. Enabling `exit_via_mihomo` (`sniffer` + `tproxy_v4`) hot-reloads Mihomo,
+    //    engages `tailscale0` TPROXY, resets stale direct tailscale conntrack flows,
+    //    and notifies observers.
+    port.world().tailscale_exit = TailscaleExitConfig {
+        sniffer: true,
+        tproxy_v4: true,
+        tproxy_v6: false,
+        skip_v4: vec!["192.168.0.0/24".into()],
+        skip_v6: Vec::new(),
+    };
+    controller.handle(Message::TailscaleExit);
+    {
+        let w = port.world();
+        assert!(w.ts_tables_active, "tailscale0 TPROXY must engage when exit_via_mihomo is active");
+        assert_eq!(w.ts_resets, vec![(true, false)]);
+        assert!(w.state_notifications > initial_notes);
+    }
+
+    // 2. Core exit triggers D3 backoff (`Shape::FakeReject`): `tailscale0` TPROXY
+    //    is withdrawn so Exit traffic falls back to kernel FORWARD + direct DoH.
+    let before_fail_notes = port.world().state_notifications;
+    let gen = controller.generation;
+    controller.handle(Message::Exited { generation: gen, how: "crashed".into() });
+    assert_eq!(controller.phase, Phase::Backoff);
+    {
+        let w = port.world();
+        assert!(!w.ts_tables_active, "D3 backoff must withdraw tailscale0 TPROXY");
+        assert!(w.state_notifications > before_fail_notes, "D3 transition must notify Clean DNS");
+    }
+
+    // 3. Recovery retry brings Mihomo back to `Running`: `tailscale0` TPROXY
+    //    automatically re-engages and evicts fallback direct flows.
+    let before_recover_notes = port.world().state_notifications;
+    controller.retry(Some("test recovery")).unwrap();
+    assert_eq!(controller.phase, Phase::Running);
+    {
+        let w = port.world();
+        assert!(w.ts_tables_active, "recovery from D3 must automatically re-engage tailscale0 TPROXY");
+        assert_eq!(w.ts_resets, vec![(true, false), (true, false)]);
+        assert!(w.state_notifications > before_recover_notes, "recovery must notify Clean DNS");
+    }
+}
+
+#[test]
+fn revoked_tailscale_exit_family_withdraws_without_core_readback_and_retries_table_error() {
+    let port = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: true,
+            skip_v4: vec!["192.168.0.0/24".into()],
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut controller = direct_controller(&port);
+    assert!(port.world().ts_tables_v4);
+    assert!(port.world().ts_tables_v6);
+
+    // Revoke IPv4 exit while keeping sniffer=true and IPv6 exit active, AND
+    // simulate BOTH a transient core read_back outage and a transient nftables error.
+    {
+        let mut w = port.world();
+        w.tailscale_exit.tproxy_v4 = false;
+        w.read_results.extend([None, None, None]);
+        w.tables_fail.push_back(Some("transient nft busy".into()));
+    }
+    controller.handle(Message::TailscaleExit);
+    assert!(port.world().ts_tables_v4, "first attempt failed nftables; must stay dirty");
+
+    // Next tick retries kernel withdrawal WITHOUT needing core read_back!
+    controller.tick();
+    {
+        let w = port.world();
+        assert!(!w.ts_tables_v4, "revoked IPv4 family must be withdrawn even while read_back fails");
+        assert!(w.ts_tables_v6, "still-approved IPv6 family remains active");
+    }
+
+    // Now revoke IPv6 too while read_back is still failing -> immediate withdrawal.
+    {
+        let mut w = port.world();
+        w.tailscale_exit.tproxy_v6 = false;
+        w.read_results.push_back(None);
+    }
+    controller.handle(Message::TailscaleExit);
+    assert!(!port.world().ts_tables_active);
+}
+
+#[test]
+fn d3_retains_stopping_core_and_interception_until_exit_is_confirmed() {
+    let port = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut controller = direct_controller(&port);
+    let gen = controller.generation;
+    assert!(port.world().ts_tables_active);
+
+    // Trigger an egress restart whose prepare() fails while the old core's stop()
+    // returns false (exit not confirmed yet).
+    {
+        let mut w = port.world();
+        w.uplink = Uplink::sample("ath20", 9, "192.0.2.2", None);
+        w.prepare.push_back(Some("prepare failed during egress switch".into()));
+        w.stop_confirmed.push_back(false);
+        w.stop_confirmed.push_back(false);
+    }
+    controller.handle(Message::Egress);
+    assert_eq!(controller.phase, Phase::CleanupPending);
+    assert!(controller.stopping_core.is_some(), "unconfirmed core handle must be retained");
+    assert!(port.world().ts_tables_active, "interception must stay in place until exit is confirmed");
+    assert_ne!(port.world().tables.as_deref(), Some("reject"));
+
+    // A D2 retry while stop() still returns false keeps CleanupPending and does not withdraw.
+    assert!(controller.retry(Some("retry while still alive")).is_err());
+    assert_eq!(controller.phase, Phase::CleanupPending);
+    assert!(port.world().ts_tables_active);
+    assert_eq!(port.world().spawned, vec![gen]);
+
+    // Once the reaper reports Exited for that generation, D3 withdraws interception cleanly.
+    controller.handle(Message::Exited { generation: gen, how: "signal 9".into() });
+    assert_eq!(controller.phase, Phase::Backoff);
+    assert!(controller.stopping_core.is_none());
+    assert!(!port.world().ts_tables_active);
+    assert_eq!(port.world().tables.as_deref(), Some("reject"));
+}
+
+#[test]
+fn timed_out_sniffer_reload_restarts_core_and_failed_ts_reset_retries_on_tick() {
+    let port = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        ..World::default()
+    })));
+    let mut controller = direct_controller(&port);
+    let gen1 = controller.generation;
+
+    // Enabling tailscale sniffer with a timed-out reload PUT must NOT trust
+    // old core state; it must restart into a fresh core generation.
+    {
+        let mut w = port.world();
+        w.tailscale_exit = TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        };
+        w.reload = Some(Err("Mihomo did not answer the reload".into()));
+    }
+    controller.handle(Message::TailscaleExit);
+    assert_eq!(controller.phase, Phase::Running);
+    assert!(controller.generation > gen1, "timed-out sniffer-only reload must restart core");
+    assert!(port.world().ts_tables_active);
+
+    // Losing a Tailscale DIRECT route when reset_tailscale fails must keep the
+    // reset pending in the single netfx owner and retry ONLY the failed family.
+    {
+        let mut w = port.world();
+        w.ts_resets.clear();
+        w.ts_reset_fail_v4.push_back(Some("conntrack busy".into()));
+    }
+    controller.write(&select_proxy()).unwrap();
+    assert_eq!(port.world().ts_resets, vec![(true, false)]);
+    assert_eq!(port.world().ts_pending_reset, (true, false));
+
+    controller.tick();
+    assert_eq!(port.world().ts_pending_reset, (false, false));
+    assert_eq!(port.world().ts_resets, vec![(true, false), (true, false)]);
+
+    // Partial dual-family failure (IPv4 succeeds, IPv6 fails): subsequent ticks
+    // MUST retry ONLY IPv6 and NEVER repeatedly reset healthy IPv4 flows.
+    {
+        let mut w = port.world();
+        w.ts_resets.clear();
+        w.ts_reset_fail_v4.push_back(None);
+        w.ts_reset_fail_v6.push_back(Some("v6 busy".into()));
+        w.ts_reset_fail_v6.push_back(Some("v6 still busy".into()));
+        w.ts_reset_fail_v6.push_back(None);
+        w.tailscale_exit.tproxy_v6 = true;
+    }
+    controller.reset_tailscale_flows("dual test", true, true, false);
+    assert_eq!(port.world().ts_pending_reset, (false, true));
+    controller.tick();
+    controller.tick();
+    assert_eq!(port.world().ts_pending_reset, (false, false));
+    assert_eq!(
+        port.world().ts_resets,
+        vec![(true, true), (false, true), (false, true)],
+        "healthy IPv4 must never be reset again during IPv6 retry"
+    );
+}
+
+#[test]
+fn revocation_supersedes_unconfirmed_enable_and_handles_cleanup_pending_and_late_guard_reset() {
+    let port = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: false,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut controller = direct_controller(&port);
+    assert!(!port.world().ts_tables_active);
+
+    // 1. Enable IPv4 exit, but table read-back fails (unconfirmed enable left in
+    //    `run.pending` and `ts_target_v4 == true`).
+    {
+        let mut w = port.world();
+        w.tailscale_exit.tproxy_v4 = true;
+        w.tables_fail.push_back(Some("readback timed out".into()));
+    }
+    controller.handle(Message::TailscaleExit);
+    assert!(!port.world().ts_tables_v4);
+    assert!(port.world().ts_target_v4);
+
+    // 2a. Revoke IPv4 BEFORE confirmation, inject journal-write failures
+    //     BEFORE `EffectSet` updates its target (`tables_reject_before_target`),
+    //     and run `tick()` with `guard_due = true` -> guard MUST skip
+    //     `reconcile()` rather than replay the old enable target!
+    {
+        let mut w = port.world();
+        w.ts_resets.clear();
+        w.events.clear();
+        w.tailscale_exit.tproxy_v4 = false;
+        w.guard_due = true;
+        // One failure for `guard()`'s pre-reconcile supersede, one for `tick()`'s
+        // subsequent `sync_tailscale_exit()` retry.
+        w.tables_reject_before_target
+            .push_back(Some("journal write failed before nft target update".into()));
+        w.tables_reject_before_target
+            .push_back(Some("journal write still failing".into()));
+    }
+    controller.tick();
+    assert!(
+        !port.world().events.iter().any(|e| e == "reconcile"),
+        "guard must skip reconcile() when withdrawal failed before EffectSet updated target: {:?}",
+        port.world().events
+    );
+    assert!(
+        !port.world().ts_tables_v4,
+        "guard must never replay old enable target when withdrawal failed before EffectSet updated target"
+    );
+    assert!(port.world().ts_target_v4, "old target stayed unaccepted in EffectSet");
+    assert!(port.world().ts_resets.is_empty());
+
+    // 2b. Once journal write recovers, the next `tick()` supersedes and confirms
+    //     the withdrawal without ever replaying the revoked enable.
+    controller.tick();
+    assert!(!port.world().ts_target_v4, "guard must supersede revoked pending enable");
+    assert!(!port.world().ts_tables_v4, "guard must never replay revoked enable");
+    assert!(port.world().ts_resets.is_empty(), "guard must not reset flows for revoked enable");
+
+    // 3. Re-enable IPv4 with initial table confirmation failing, then guard
+    //    reconciles late -> late confirmation MUST trigger conntrack reset!
+    {
+        let mut w = port.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.tproxy_v4 = true;
+        w.tables_fail.push_back(Some("transient nft".into()));
+        w.guard_due = true;
+    }
+    controller.handle(Message::TailscaleExit);
+    assert!(port.world().ts_resets.is_empty());
+    controller.guard();
+    assert!(port.world().ts_tables_v4);
+    assert_eq!(port.world().ts_resets, vec![(true, false)], "late guard confirmation must reset direct flows");
+
+    // 4. Ordinary `widen()` (routing update) running while IPv6 enable was
+    //    published concurrently (before `Message::TailscaleExit` runs) MUST
+    //    reset IPv6 flows at the common `load()` confirmation point AND MUST
+    //    NOT wipe IPv4 bypass history!
+    {
+        let mut w = port.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.tproxy_v6 = true;
+        w.guard_due = false;
+    }
+    controller.widen("concurrent routing update");
+    assert!(port.world().ts_tables_v6);
+    assert_eq!(
+        port.world().ts_resets,
+        vec![(false, true)],
+        "ordinary load() confirming a new family must reset flows"
+    );
+
+    // 5a. External IPv4 retry that completed BEFORE `Hold` removed the old
+    //     DIRECT chain MUST NOT clear IPv4 bypass history: flows created while
+    //     the old DIRECT chain was still live must still be reset when the
+    //     route moves to PROXY!
+    {
+        let mut w = port.world();
+        w.ts_resets.clear();
+        w.ts_pending_reset = (false, false);
+        w.ts_v4_reset_started = Some(Instant::now() - Duration::from_secs(1));
+    }
+    controller.write(&select_proxy()).unwrap();
+    assert_eq!(
+        port.world().ts_resets,
+        vec![(true, false)],
+        "an earlier external IPv4 reset before Hold retired the DIRECT chain must not skip the post-Hold reset"
+    );
+
+    // 5b. External retry (e.g. Wi-Fi relay maintenance) completing a pending
+    //     marked IPv4 reset AFTER `Hold` retired the old DIRECT chain MUST
+    //     retire the bypass history so a later update does NOT reset healthy IPv4 flows!
+    controller.write(&select_direct()).unwrap();
+    {
+        let mut w = port.world();
+        w.ts_resets.clear();
+        w.ts_reset_fail_v4.push_back(Some("conntrack busy".into()));
+    }
+    controller.write(&select_proxy()).unwrap();
+    assert_eq!(port.world().ts_pending_reset, (true, false));
+    assert_eq!(port.world().ts_resets, vec![(true, false)]);
+    // Simulate Wi-Fi relay completing the pending marked IPv4 reset AFTER Hold retired DIRECT.
+    {
+        let mut w = port.world();
+        w.ts_pending_reset = (false, false);
+        w.ts_v4_reset_started = Some(Instant::now());
+        w.ts_resets.clear();
+        w.tailscale_exit.tproxy_v6 = false;
+    }
+    controller.widen("post-external-retry update");
+    assert!(
+        port.world().ts_resets.is_empty(),
+        "ordered completion after retirement must prevent duplicate IPv4 reset: {:?}",
+        port.world().ts_resets
+    );
+
+    // 6. Enter CleanupPending with IPv4 confirmed AND a failed unconfirmed IPv6
+    //    enable still pending in `run.pending`; revoking IPv4 while IPv6 stays
+    //    desired MUST withdraw IPv4 and MUST NOT newly enable IPv6 on the stopping core!
+    {
+        let mut w = port.world();
+        w.tailscale_exit.tproxy_v6 = true;
+        w.tables_fail.push_back(Some("ipv6 enable never reached kernel".into()));
+    }
+    controller.handle(Message::TailscaleExit);
+    assert!(port.world().ts_tables_v4);
+    assert!(!port.world().ts_tables_v6);
+
+    let gen = controller.generation;
+    {
+        let mut w = port.world();
+        w.uplink = Uplink::sample("ath20", 9, "192.0.2.2", None);
+        w.prepare.push_back(Some("prepare failed".into()));
+        w.stop_confirmed.push_back(false);
+    }
+    controller.handle(Message::Egress);
+    assert_eq!(controller.phase, Phase::CleanupPending);
+    assert!(port.world().ts_tables_v4);
+    assert!(!port.world().ts_tables_v6);
+
+    {
+        let mut w = port.world();
+        w.tailscale_exit.tproxy_v4 = false;
+        w.tailscale_exit.tproxy_v6 = true;
+    }
+    controller.handle(Message::TailscaleExit);
+    assert_eq!(controller.phase, Phase::CleanupPending);
+    assert!(!port.world().ts_tables_v4, "revocation during CleanupPending must withdraw IPv4 ts_pre immediately");
+    assert!(
+        !port.world().ts_tables_v6,
+        "CleanupPending must never newly enable an unconfirmed pending IPv6 family on a stopping core"
+    );
+    controller.handle(Message::Exited { generation: gen, how: "signal 9".into() });
+    assert_eq!(controller.phase, Phase::Backoff);
+
+    // 7. First confirmed Hold table enabling IPv4 interception when the
+    //    subsequent Full table fails MUST reset IPv4 flows immediately at Hold
+    //    confirmation and carry `ts_exit.tproxy_v4 == true` into `Run`!
+    let port2 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        shape_fail: vec![("full/".into(), "full table readback failed".into())],
+        ..World::default()
+    })));
+    let (_tx, rx) = mpsc::channel();
+    let shared = Arc::new(Mutex::new(Snapshot::default()));
+    let mut ctrl2 = Controller::new(port2.clone(), rx, _tx, shared, timings());
+    ctrl2.handle(Message::Enable { local: "192.168.0.1".into(), owner: true, reply: None });
+    assert_eq!(ctrl2.phase, Phase::Running);
+    assert_eq!(
+        port2.world().ts_resets,
+        vec![(true, false)],
+        "Hold confirmation enabling IPv4 must reset direct flows even when subsequent Full fails"
+    );
+    assert!(
+        ctrl2.run.as_ref().is_some_and(|r| r.ts_exit.tproxy_v4),
+        "Hold-confirmed family must be carried into Run.ts_exit when Full fails"
+    );
+
+    // 8. Pre-target journal-write failure during IPv6 ENABLE followed by guard
+    //    and CleanupPending: guard confirming the old IPv4-only generation MUST
+    //    NOT promote the rejected IPv6 enable into `Run.ts_exit` or allow
+    //    CleanupPending to newly enable IPv6 on a stopping core!
+    let port3 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl3 = direct_controller(&port3);
+    {
+        let mut w = port3.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.tproxy_v6 = true;
+        w.tables_reject_before_target
+            .push_back(Some("journal write failed before EffectSet accepted v6 enable".into()));
+        w.guard_due = true;
+    }
+    ctrl3.widen("v6 enable hits pre-target journal error");
+    assert!(!port3.world().ts_tables_v6);
+    assert!(!port3.world().ts_target_v6);
+    ctrl3.guard();
+    assert!(
+        !ctrl3.run.as_ref().unwrap().ts_exit.tproxy_v6,
+        "guard confirming older IPv4-only generation must NEVER promote rejected IPv6 enable"
+    );
+    assert!(port3.world().ts_resets.is_empty());
+    let gen3 = ctrl3.generation;
+    {
+        let mut w = port3.world();
+        w.uplink = Uplink::sample("ath20", 9, "192.0.2.2", None);
+        w.prepare.push_back(Some("prepare failed".into()));
+        w.stop_confirmed.push_back(false);
+    }
+    ctrl3.handle(Message::Egress);
+    assert_eq!(ctrl3.phase, Phase::CleanupPending);
+    port3.world().tailscale_exit.tproxy_v4 = false;
+    ctrl3.handle(Message::TailscaleExit);
+    assert!(!port3.world().ts_tables_v4);
+    assert!(
+        !port3.world().ts_tables_v6,
+        "CleanupPending must NOT enable IPv6 after pre-target journal failure + guard"
+    );
+    ctrl3.handle(Message::Exited { generation: gen3, how: "signal 9".into() });
+
+    // 9. Profile restart changing Tailscale DIRECT -> PROXY while IPv4
+    //    interception stays enabled (zero family-enable delta!) MUST carry
+    //    `ts_bypassed` through restart and reset marked IPv4 flows!
+    let port4 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl4 = direct_controller(&port4);
+    {
+        let mut w = port4.world();
+        w.ts_resets.clear();
+        w.selected_direct = false;
+    }
+    ctrl4.restart("profile switched DIRECT to PROXY", Restart::Profile).unwrap();
+    assert_eq!(
+        port4.world().ts_resets,
+        vec![(true, false)],
+        "profile restart dropping a Tailscale DIRECT chain must reset marked IPv4 flows"
+    );
+
+    // 10. Egress rollback after a family first becomes active in `Full`:
+    //     `Full` confirms `tproxy_v4 = true`, then egress moves before
+    //     publication -> the first-interception reset MUST run BEFORE rollback
+    //     copies `tproxy_v4 = true` into `holding_ts` and retries launch!
+    let port5 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: false,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        egress_on_full: Some(Uplink::sample("ath20", 9, "192.0.2.9", None)),
+        ..World::default()
+    })));
+    // Wait until after Hold confirms, then flip tproxy_v4 = true before Full via
+    // a custom launch sequence: start with Hold confirmed (v4=false), enable v4,
+    // and run `launch_prepared` with `egress_on_full` triggering rollback.
+    let mut ctrl5 = direct_controller(&port5);
+    assert!(!port5.world().ts_tables_v4);
+    {
+        let mut w = port5.world();
+        w.ts_resets.clear();
+        w.egress_on_full = Some(Uplink::sample("ath20", 9, "192.0.2.10", None));
+        // Restart holds with v4=false; enable v4 right after Hold so Full is the
+        // FIRST table to confirm v4=true right before egress changes!
+        w.tailscale_exit.tproxy_v4 = false;
+    }
+    // Prepare a restart behind Hold (v4=false), flip v4=true before `launch_prepared`.
+    let prepared5 = ctrl5
+        .prepare(&Source::Selected { local: "u60.home.arpa".into(), runtime: None }, false)
+        .unwrap();
+    let old5 = ctrl5.run.take().unwrap();
+    let mut holding_ts5 = old5.ts_exit.clone();
+    let mut bypassed5 = old5.bypassed;
+    let mut ts_bypassed5 = old5.ts_bypassed;
+    let _ = old5.core.stop();
+    port5.world().tailscale_exit.tproxy_v4 = true;
+    ctrl5
+        .launch_prepared(prepared5, true, &mut holding_ts5, &mut bypassed5, &mut ts_bypassed5)
+        .unwrap();
+    assert!(port5.world().ts_tables_v4);
+    assert_eq!(
+        port5.world().ts_resets,
+        vec![(true, false)],
+        "egress rollback after Full first enabled IPv4 must still run the marked IPv4 reset"
+    );
+
+    // 11. `apply_tailscale_kernel_only()` advancing nft target to IPv6 where
+    //     IPv4 withdrawal ACTUALLY COMMITTED in the kernel before readback
+    //     failed, followed by desired flipping back to IPv4 while core HTTP
+    //     readback is unavailable -> `guard()` MUST supersede the obsolete
+    //     IPv6 target AND reset IPv4 marked flows (reversing an unconfirmed
+    //     withdrawal that may have let direct flows start)!
+    let port6 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl6 = direct_controller(&port6);
+    {
+        let mut w = port6.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.tproxy_v4 = false;
+        w.tailscale_exit.tproxy_v6 = true;
+        w.tables_commit_then_fail
+            .push_back(Some("nft committed v4 withdrawal + v6 enable then readback timed out".into()));
+    }
+    assert!(!ctrl6.apply_tailscale_kernel_only("v4 -> v6 committed then readback failed"));
+    assert!(port6.world().ts_target_v6, "EffectSet accepted the v6 target");
+    assert!(!port6.world().ts_tables_v4, "v4 withdrawal committed in kernel");
+    assert!(port6.world().ts_tables_v6);
+    // Repeated readback failures MUST keep `run.pending` bounded (1 slot, not unbounded Vec).
+    {
+        let mut w = port6.world();
+        w.tables_fail.push_back(Some("repeat fail 1".into()));
+        w.tables_fail.push_back(Some("repeat fail 2".into()));
+    }
+    assert!(!ctrl6.apply_tailscale_kernel_only("retry 1"));
+    assert!(!ctrl6.apply_tailscale_kernel_only("retry 2"));
+    assert!(ctrl6.run.as_ref().unwrap().pending.is_some());
+    // Desired returns to IPv4-only while core HTTP read_back is unavailable.
+    {
+        let mut w = port6.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.tproxy_v4 = true;
+        w.tailscale_exit.tproxy_v6 = false;
+        w.read_results.push_back(None);
+        w.guard_due = true;
+    }
+    ctrl6.guard();
+    assert!(!port6.world().ts_target_v6, "guard must supersede accepted obsolete IPv6 target");
+    assert!(!port6.world().ts_tables_v6, "guard must NEVER reconcile obsolete IPv6 target");
+    assert!(port6.world().ts_tables_v4);
+    assert_eq!(
+        port6.world().ts_resets,
+        vec![(true, false)],
+        "reversing an unconfirmed IPv4 withdrawal must still reset marked IPv4 flows"
+    );
+
+    // 12. Accepted rollback `Hold` whose readback fails must retain the exact
+    //     submitted `TailscaleExitConfig` (not `default()`), so late guard
+    //     confirmation records the enabled family and runs the marked reset!
+    let port7 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: false,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl7 = direct_controller(&port7);
+    let prepared7 = ctrl7
+        .prepare(&Source::Selected { local: "u60.home.arpa".into(), runtime: None }, false)
+        .unwrap();
+    let old7 = ctrl7.run.take().unwrap();
+    let mut holding_ts7 = old7.ts_exit.clone();
+    let mut bypassed7 = old7.bypassed;
+    let mut ts_bypassed7 = old7.ts_bypassed;
+    let _ = old7.core.stop();
+    {
+        let mut w = port7.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.tproxy_v4 = true;
+        w.egress_on_full = Some(Uplink::sample("ath20", 9, "192.0.2.11", None));
+        w.shape_fail.push(("hold".into(), "rollback Hold readback failed".into()));
+    }
+    assert!(ctrl7
+        .launch_prepared(prepared7, true, &mut holding_ts7, &mut bypassed7, &mut ts_bypassed7)
+        .is_err());
+    assert!(ctrl7.run.is_some());
+    assert!(
+        ctrl7.run.as_ref().unwrap().ts_target().tproxy_v4,
+        "accepted rollback Hold pending entry must retain submitted tproxy_v4=true, not default false"
+    );
+    port7.world().guard_due = true;
+    ctrl7.guard();
+    assert!(
+        ctrl7.run.as_ref().unwrap().ts_exit.tproxy_v4,
+        "late guard confirming rollback Hold must keep ts_exit.tproxy_v4=true"
+    );
+
+    // 13. Profile restart publishing confirmed PROXY replacement when rollback
+    //     Hold fails (`launch_prepared` returns `Err` with `self.run.is_some()`)
+    //     MUST still run `reset_restart_bypass` and reset marked IPv4 flows!
+    let port8 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl8 = direct_controller(&port8);
+    {
+        let mut w = port8.world();
+        w.resets.clear();
+        w.ts_resets.clear();
+        w.selected_direct = false;
+        w.egress_on_full = Some(Uplink::sample("ath20", 9, "192.0.2.12", None));
+        // Restart's initial Hold succeeds; Full confirms PROXY (and moves egress);
+        // rollback Hold fails readback -> launch_current publishes Run and returns Err!
+        w.tables_fail.push_back(None); // initial restart Hold succeeds
+        w.tables_fail.push_back(None); // replacement Full succeeds
+        w.tables_fail.push_back(Some("rollback Hold readback failed".into()));
+    }
+    assert!(ctrl8.restart("profile switched DIRECT->PROXY with failed rollback Hold", Restart::Profile).is_err());
+    assert!(ctrl8.run.is_some(), "replacement Run stayed published");
+    assert_eq!(
+        port8.world().resets,
+        vec![Scope::Destinations(vec!["1.2.3.0/24".parse().unwrap()])],
+        "failed rollback Hold must preserve LAN bypassed history and reset lost LAN destinations"
+    );
+    assert_eq!(
+        port8.world().ts_resets,
+        vec![(true, false)],
+        "published replacement Run after failed rollback Hold must still reset lost Tailscale DIRECT flows"
+    );
+
+    // 14. Fresh start where Candidate 1 confirms DIRECT `Full`, loses egress
+    //     and rolls back to `Hold`, and Candidate 2 confirms PROXY `Full` with
+    //     IPv4 interception still enabled -> `start()` MUST reset the stale
+    //     candidate's lost Tailscale DIRECT flows in addition to LAN!
+    let port9 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        read_results: VecDeque::from([Some(true), Some(false)]),
+        egress_on_full: Some(Uplink::sample("ath20", 9, "192.0.2.13", None)),
+        ..World::default()
+    })));
+    let (tx9, rx9) = mpsc::channel();
+    let mut ctrl9 = Controller::new(port9.clone(), rx9, tx9, Arc::new(Mutex::new(Snapshot::default())), timings());
+    ctrl9.handle(Message::Enable { local: "u60.home.arpa".into(), owner: true, reply: None });
+    assert_eq!(ctrl9.phase, Phase::Running);
+    assert_eq!(
+        port9.world().ts_resets,
+        vec![(true, false), (true, false)],
+        "fresh start must reset both initial Hold enable and Candidate 1's lost Tailscale DIRECT flows after rollback"
+    );
+
+    // 15. With LAN bypass OFF and Tailscale DIRECT active, a kernel-only
+    //     update MUST submit `Shape::Full` (not `Shape::Hold`) so the rendered
+    //     Tailscale DIRECT chain matches the submitted table!
+    let port10 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        bypass_off: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl10 = direct_controller(&port10);
+    assert_eq!(ctrl10.run.as_ref().unwrap().ts_chain.returns, 1);
+    assert_eq!(port10.world().tables.as_deref(), Some("full/0"));
+    port10.world().tailscale_exit.skip_v4.push("10.0.0.0/8".into());
+    assert!(ctrl10.apply_tailscale_kernel_only("skip_v4 update with LAN bypass off"));
+    assert_eq!(
+        port10.world().tables.as_deref(),
+        Some("full/0"),
+        "kernel-only update with LAN bypass off and Tailscale DIRECT active must submit Shape::Full, not Hold"
+    );
+    assert_eq!(ctrl10.run.as_ref().unwrap().ts_chain.returns, 1);
+
+    // 16. Rollback Hold confirming IPv4 enabled after an unconfirmed `Full`
+    //     IPv4 withdrawal MUST reset marked IPv4 flows (via
+    //     `run.needs_enable_reset()`) even when both candidates are PROXY.
+    let port11 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: false,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl11 = direct_controller(&port11);
+    let mut prepared11 = ctrl11
+        .prepare(&Source::Selected { local: "u60.home.arpa".into(), runtime: None }, false)
+        .unwrap();
+    let old11 = ctrl11.run.take().unwrap();
+    let mut holding_ts11 = old11.ts_exit.clone();
+    assert!(holding_ts11.tproxy_v4);
+    let mut bypassed11 = old11.bypassed;
+    let mut ts_bypassed11 = old11.ts_bypassed;
+    let _ = old11.core.stop();
+    {
+        let mut w = port11.world();
+        w.ts_resets.clear();
+        // `Full` withdraws IPv4 (committed to kernel, readback fails), egress
+        // moves, and IPv4 approval returns before rollback `Hold` confirms!
+        w.tailscale_exit.tproxy_v4 = false;
+        w.tables_commit_then_fail
+            .push_back(Some("Full IPv4 withdrawal readback failed".into()));
+        w.egress_on_full = Some(Uplink::sample("ath20", 9, "192.0.2.16", None));
+        w.ts_exit_on_full = Some(TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        });
+    }
+    let rolled = ctrl11
+        .launch_current(&mut prepared11, &mut true, &mut holding_ts11, &mut bypassed11, &mut ts_bypassed11)
+        .expect("rollback Hold should succeed");
+    assert!(!rolled, "egress moved -> rollback returns Ok(false)");
+    assert!(holding_ts11.tproxy_v4);
+    assert_eq!(
+        port11.world().ts_resets,
+        vec![(true, false)],
+        "rollback Hold re-enabling IPv4 after unconfirmed Full withdrawal must reset marked IPv4 flows"
+    );
+
+    // 17. CleanupPending MUST never re-enable a family on a stopping core once
+    //     withdrawal was attempted — even if the first withdrawal failed
+    //     readback (or failed pre-target) and approval returned before retry!
+    let port12 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: false,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl12 = direct_controller(&port12);
+    port12.world().stop_confirmed.push_back(false);
+    assert!(ctrl12.stop_all().is_err());
+    assert_eq!(ctrl12.phase, Phase::CleanupPending);
+    assert_eq!(ctrl12.stopping_ts.allow, (true, false));
+    {
+        let mut w = port12.world();
+        w.tailscale_exit.tproxy_v4 = false;
+        w.tables_commit_then_fail
+            .push_back(Some("cleanup withdrawal readback failed".into()));
+    }
+    ctrl12.handle(Message::TailscaleExit);
+    assert!(ctrl12.cleanup_ts_dirty);
+    assert_eq!(ctrl12.stopping_ts.allow, (false, false), "attempted withdrawal removes v4 from re-enable set");
+    assert_eq!(ctrl12.stopping_ts.may, (true, false), "unconfirmed withdrawal remains eligible for retries");
+    // Approval returns BEFORE the cleanup retry!
+    port12.world().tailscale_exit.tproxy_v4 = true;
+    ctrl12.tick();
+    assert!(!ctrl12.cleanup_ts_dirty);
+    assert_eq!(ctrl12.stopping_ts.allow, (false, false));
+    assert_eq!(ctrl12.stopping_ts.may, (false, false));
+    assert!(
+        !port12.world().ts_target_v4 && !port12.world().ts_tables_v4,
+        "CleanupPending retry must keep IPv4 withdrawn, never re-enabling on stopping core"
+    );
+    // Also verify pre-target journal failure + returning approval + guard supersede:
+    ctrl12.stopping_ts.allow = (true, false);
+    ctrl12.stopping_ts.may = (true, false);
+    {
+        let mut w = port12.world();
+        w.ts_target_v4 = true;
+        w.tailscale_exit.tproxy_v4 = false;
+        w.tables_reject_before_target
+            .push_back(Some("journal write failed before cleanup withdrawal".into()));
+    }
+    ctrl12.handle(Message::TailscaleExit);
+    assert!(port12.world().ts_target_v4, "pre-target failure left old v4 target");
+    assert_eq!(ctrl12.stopping_ts.allow, (false, false));
+    assert_eq!(ctrl12.stopping_ts.may, (true, false));
+    port12.world().tailscale_exit.tproxy_v4 = true;
+    assert_eq!(ctrl12.supersede_revoked_tailscale_before_guard(), Ok(true));
+    assert!(
+        !port12.world().ts_target_v4 && !port12.world().ts_tables_v4,
+        "supersede before guard must still withdraw even when approval returned after pre-target failure"
+    );
+
+    // 18. Removing an approved public subnet from `skip_v4` / `skip_v6` while
+    //     the exit family stays enabled on an unchanged PROXY profile MUST
+    //     reset existing marked flows for that family (both confirmed and
+    //     unconfirmed skip additions).
+    let port13 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: false,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: true,
+            skip_v4: vec!["198.51.100.0/24".into()],
+            skip_v6: vec!["2001:db8::/32".into()],
+        },
+        ..World::default()
+    })));
+    let mut ctrl13 = direct_controller(&port13);
+    port13.world().ts_resets.clear();
+    port13.world().tailscale_exit.skip_v4.clear();
+    ctrl13.sync_tailscale_exit();
+    assert_eq!(
+        port13.world().ts_resets,
+        vec![(true, false)],
+        "removing skip_v4 on unchanged PROXY profile must reset marked IPv4 flows"
+    );
+    port13.world().ts_resets.clear();
+    port13.world().tailscale_exit.skip_v6.clear();
+    ctrl13.sync_tailscale_exit();
+    assert_eq!(
+        port13.world().ts_resets,
+        vec![(false, true)],
+        "removing skip_v6 on unchanged PROXY profile must reset marked IPv6 flows"
+    );
+    // Unconfirmed skip_v4 addition followed by removal in `widen()` must also reset!
+    {
+        let mut w = port13.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.skip_v4 = vec!["198.51.100.0/24".into()];
+        w.tables_commit_then_fail
+            .push_back(Some("unconfirmed skip_v4 addition".into()));
+    }
+    assert!(!ctrl13.apply_tailscale_kernel_only("unconfirmed skip_v4 add"));
+    port13.world().tailscale_exit.skip_v4.clear();
+    ctrl13.widen("removed unconfirmed skip_v4");
+    assert_eq!(
+        port13.world().ts_resets,
+        vec![(true, false)],
+        "removing an unconfirmed skip_v4 prefix via widen() must reset marked IPv4 flows"
+    );
+
+    // 19. Late guard confirmation MUST preserve accumulated `pending_narrowing`
+    //     when a failed `Hold` (`narrowing == true`) is followed by a failed
+    //     kernel-only update (`narrowing == false`) with both exit families off.
+    let port14 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: false,
+            tproxy_v4: false,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl14 = direct_controller(&port14);
+    assert_eq!(ctrl14.run.as_ref().unwrap().kernel.1.returns, 1);
+    port14.world().tables_fail.push_back(Some("Hold readback failed".into()));
+    assert!(ctrl14.load(Shape::Hold, Bypass::None("narrowing".into()), Chain::default(), true).is_err());
+    port14.world().tailscale_exit.skip_v4.push("10.0.0.0/8".into());
+    port14.world().tables_fail.push_back(Some("kernel-only readback failed".into()));
+    assert!(!ctrl14.apply_tailscale_kernel_only("copied Hold with narrowing=false"));
+    assert!(ctrl14.run.as_ref().unwrap().pending_narrowing);
+    assert!(!ctrl14.run.as_ref().unwrap().pending.as_ref().unwrap().narrowing);
+    port14.world().guard_due = true;
+    ctrl14.guard();
+    assert_eq!(
+        ctrl14.run.as_ref().unwrap().kernel.1.returns,
+        1,
+        "late guard confirmation must preserve pending_narrowing and widen LAN DIRECT back"
+    );
+
+    // 20. Restarting from all-PROXY into a profile with a port-based DIRECT
+    //     rule MUST NOT trigger a whole-LAN reset, and fresh start into a
+    //     port-based DIRECT profile MUST NOT trigger an extra self-comparison
+    //     Tailscale reset!
+    let port15 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: false,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: false,
+            tproxy_v4: false,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl15 = direct_controller(&port15);
+    {
+        let mut w = port15.world();
+        w.resets.clear();
+        w.selected_direct = true;
+        w.port_direct = true;
+    }
+    ctrl15.restart("switch PROXY -> port-DIRECT", Restart::Profile).unwrap();
+    assert_eq!(
+        port15.world().resets,
+        vec![Scope::Destinations(Vec::new())],
+        "replacement's own port-based DIRECT chain must not trigger a whole-LAN reset"
+    );
+
+    let port16 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: true,
+        port_direct: true,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let (tx16, rx16) = mpsc::channel();
+    let mut ctrl16 = Controller::new(port16.clone(), rx16, tx16, Arc::new(Mutex::new(Snapshot::default())), timings());
+    ctrl16.handle(Message::Enable { local: "u60.home.arpa".into(), owner: true, reply: None });
+    assert_eq!(ctrl16.phase, Phase::Running);
+    assert_eq!(
+        port16.world().ts_resets,
+        vec![(true, false)],
+        "fresh start into a port-based DIRECT profile must only run the initial enable reset, not a self-comparison reset"
+    );
+
+    // 21. An unconfirmed IPv4 withdrawal attempted while `Running` (readback
+    //     failed) MUST be carried across `stop_all()` into `CleanupPending` so
+    //     returning approval cannot re-enable IPv4 on the stopping core!
+    let port17 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: false,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: false,
+            skip_v4: Vec::new(),
+            skip_v6: Vec::new(),
+        },
+        ..World::default()
+    })));
+    let mut ctrl17 = direct_controller(&port17);
+    {
+        let mut w = port17.world();
+        w.tailscale_exit.tproxy_v4 = false;
+        w.tables_commit_then_fail
+            .push_back(Some("Running IPv4 withdrawal readback failed".into()));
+    }
+    assert!(!ctrl17.apply_tailscale_kernel_only("Running withdrawal"));
+    assert!(ctrl17.run.as_ref().unwrap().ts_unconfirmed_disabled.0);
+    // Stop fails while withdrawal is still unconfirmed -> enters CleanupPending!
+    port17.world().stop_confirmed.push_back(false);
+    assert!(ctrl17.stop_all().is_err());
+    assert_eq!(ctrl17.phase, Phase::CleanupPending);
+    assert_eq!(
+        ctrl17.stopping_ts.allow,
+        (false, false),
+        "stop handoff must carry unconfirmed withdrawal and disallow re-enabling IPv4"
+    );
+    assert_eq!(
+        ctrl17.stopping_ts.may,
+        (true, false),
+        "stop handoff must keep IPv4 eligible for withdrawal retries"
+    );
+    assert!(ctrl17.cleanup_ts_dirty);
+    // Approval returns while stopping -> CleanupPending tick MUST keep IPv4 withdrawn!
+    port17.world().tailscale_exit.tproxy_v4 = true;
+    ctrl17.tick();
+    assert!(!ctrl17.cleanup_ts_dirty);
+    assert_eq!(ctrl17.stopping_ts.allow, (false, false));
+    assert_eq!(ctrl17.stopping_ts.may, (false, false));
+    assert!(
+        !port17.world().ts_target_v4 && !port17.world().ts_tables_v4,
+        "CleanupPending must not re-enable IPv4 after a Running withdrawal failed readback"
+    );
+
+    // 22. Removing an approved public subnet from `skip_v4`/`skip_v6` during
+    //     `CleanupPending` while that exit family stays intercepted MUST reset
+    //     existing marked flows for that family (including unconfirmed additions).
+    let port18 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: false,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: true,
+            skip_v4: vec!["198.51.100.0/24".into()],
+            skip_v6: vec!["2001:db8::/32".into()],
+        },
+        ..World::default()
+    })));
+    let mut ctrl18 = direct_controller(&port18);
+    port18.world().stop_confirmed.push_back(false);
+    assert!(ctrl18.stop_all().is_err());
+    assert_eq!(ctrl18.phase, Phase::CleanupPending);
+    port18.world().ts_resets.clear();
+    port18.world().tailscale_exit.skip_v4.clear();
+    ctrl18.handle(Message::TailscaleExit);
+    assert_eq!(
+        port18.world().ts_resets,
+        vec![(true, false)],
+        "removing skip_v4 during CleanupPending must reset marked IPv4 flows"
+    );
+    port18.world().ts_resets.clear();
+    port18.world().tailscale_exit.skip_v6.clear();
+    ctrl18.handle(Message::TailscaleExit);
+    assert_eq!(
+        port18.world().ts_resets,
+        vec![(false, true)],
+        "removing skip_v6 during CleanupPending must reset marked IPv6 flows"
+    );
+    // Unconfirmed skip_v4 addition during CleanupPending followed by removal must also reset!
+    {
+        let mut w = port18.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.skip_v4 = vec!["203.0.113.0/24".into()];
+        w.tables_commit_then_fail
+            .push_back(Some("unconfirmed cleanup skip_v4 add".into()));
+    }
+    ctrl18.handle(Message::TailscaleExit);
+    assert!(ctrl18.cleanup_ts_dirty);
+    port18.world().tailscale_exit.skip_v4.clear();
+    ctrl18.tick();
+    assert_eq!(
+        port18.world().ts_resets,
+        vec![(true, false)],
+        "removing an unconfirmed cleanup skip_v4 prefix must reset marked IPv4 flows"
+    );
+
+    // 22b. Skip-prefix removal that committed while `Running` and failed
+    //      readback BEFORE `stop_all()` MUST keep `cleanup_ts_dirty = true` so
+    //      the very next `tick()` — with desired config unchanged and NO second
+    //      Tailscale notification — confirms the removal and resets ONLY the
+    //      affected family (verified for both IPv4 and IPv6)!
+    let port19 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: false,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: true,
+            skip_v4: vec!["198.51.100.0/24".into()],
+            skip_v6: vec!["2001:db8::/32".into()],
+        },
+        ..World::default()
+    })));
+    let mut ctrl19 = direct_controller(&port19);
+    {
+        let mut w = port19.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.skip_v4.clear();
+        w.tables_commit_then_fail
+            .push_back(Some("Running skip_v4 removal readback failed".into()));
+    }
+    assert!(!ctrl19.apply_tailscale_kernel_only("Running skip_v4 removal"));
+    assert!(port19.world().ts_resets.is_empty(), "unconfirmed removal did not reset yet");
+    port19.world().stop_confirmed.push_back(false);
+    assert!(ctrl19.stop_all().is_err());
+    assert_eq!(ctrl19.phase, Phase::CleanupPending);
+    assert!(
+        ctrl19.cleanup_ts_dirty,
+        "stop handoff must carry pending Running skip_v4 removal into cleanup_ts_dirty"
+    );
+    // Desired config is unchanged and no TailscaleExit notification arrives:
+    // the next `tick()` MUST confirm the removal and reset ONLY IPv4!
+    ctrl19.tick();
+    assert!(!ctrl19.cleanup_ts_dirty);
+    assert_eq!(
+        port19.world().ts_resets,
+        vec![(true, false)],
+        "CleanupPending tick must confirm Running skip_v4 removal and reset only IPv4"
+    );
+
+    let port20 = FakePort(Arc::new(Mutex::new(World {
+        selected_direct: false,
+        wanted: true,
+        tailscale_exit: TailscaleExitConfig {
+            sniffer: true,
+            tproxy_v4: true,
+            tproxy_v6: true,
+            skip_v4: vec!["198.51.100.0/24".into()],
+            skip_v6: vec!["2001:db8::/32".into()],
+        },
+        ..World::default()
+    })));
+    let mut ctrl20 = direct_controller(&port20);
+    {
+        let mut w = port20.world();
+        w.ts_resets.clear();
+        w.tailscale_exit.skip_v6.clear();
+        w.tables_commit_then_fail
+            .push_back(Some("Running skip_v6 removal readback failed".into()));
+    }
+    assert!(!ctrl20.apply_tailscale_kernel_only("Running skip_v6 removal"));
+    assert!(port20.world().ts_resets.is_empty());
+    port20.world().stop_confirmed.push_back(false);
+    assert!(ctrl20.stop_all().is_err());
+    assert_eq!(ctrl20.phase, Phase::CleanupPending);
+    assert!(
+        ctrl20.cleanup_ts_dirty,
+        "stop handoff must carry pending Running skip_v6 removal into cleanup_ts_dirty"
+    );
+    ctrl20.tick();
+    assert!(!ctrl20.cleanup_ts_dirty);
+    assert_eq!(
+        port20.world().ts_resets,
+        vec![(false, true)],
+        "CleanupPending tick must confirm Running skip_v6 removal and reset only IPv6"
+    );
 }

@@ -177,7 +177,7 @@ mod tests {
         wireless.assume(super::super::input_guards());
         let mut network = EffectSet::new("relay", path("network.json"));
         network.assume(super::super::relay_plan(&lease, 24, "192.168.0.1".parse().unwrap(), "255.255.255.0".parse().unwrap()));
-        network.assume(super::super::offload::route_plan("192.168.2.1", "192.168.2.0/24"));
+        network.assume(vec![super::super::offload::route(lease.gateway)]);
         let mut dns = EffectSet::new("relay", path("dns.json"));
         dns.assume(web_bypasses());
         let mut device = Kernel::empty_router();

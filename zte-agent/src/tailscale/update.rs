@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::{
-    config, daemon_status, run_with_timeout, unix_now, AppState, TailscaleManager, TsConfig,
+    daemon_status, handler_error, run_with_timeout, unix_now, AppState, TailscaleManager, TsConfig,
     BIN_DIR,
 };
 
@@ -430,21 +430,34 @@ fn fetch_official_sha256_at(url: &str) -> Result<String, String> {
 /// background (multi-minute download on cellular) — poll /status for
 /// "updating" and "last_update".
 pub fn update(state: &AppState, body: &[u8]) -> (u16, Value) {
+    update_with_runner(state, body, run_update)
+}
+
+pub(super) fn update_with_runner(
+    state: &AppState,
+    body: &[u8],
+    run: impl FnOnce(&Arc<TailscaleManager>, &str, Option<&str>) -> Result<(), String> + Send + 'static,
+) -> (u16, Value) {
     let mgr = &state.tailscale;
     let (version, sha256) = match parse_update_request(body) {
         Ok(req) => req,
         Err(err) => return (400, json!({"ok": false, "error": err})),
     };
 
-    if mgr
-        .updating
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
     {
-        return (
-            409,
-            json!({"ok": false, "error": "update already in progress"}),
-        );
+        let Ok(_prefs) = mgr.prefs_lock.try_lock() else {
+            return handler_error((409, "tailscale preferences are being changed".into()));
+        };
+        if mgr.updating.load(Ordering::Acquire) {
+            return handler_error((409, "update already in progress".into()));
+        }
+        if mgr.slot_change_blocked() {
+            return handler_error((409, "OTA slot change or health trial in progress".into()));
+        }
+        if mgr.enrollment_active() {
+            return handler_error((409, "enrollment in progress".into()));
+        }
+        mgr.updating.store(true, Ordering::Release);
     }
     // Refresh so clients polling /status see "updating" immediately (the
     // cache is otherwise served for up to 10s)
@@ -452,7 +465,7 @@ pub fn update(state: &AppState, body: &[u8]) -> (u16, Value) {
 
     let mgr2 = Arc::clone(&state.tailscale);
     thread::spawn(move || {
-        let result = run_update(&mgr2, &version, sha256.as_deref());
+        let result = run(&mgr2, &version, sha256.as_deref());
         if let Err(ref e) = result {
             eprintln!("[tailscale] update to {version} failed: {e}");
         }
@@ -462,7 +475,10 @@ pub fn update(state: &AppState, body: &[u8]) -> (u16, Value) {
             "error": result.err(),
             "finished_at": unix_now(),
         }));
-        mgr2.updating.store(false, Ordering::SeqCst);
+        {
+            let _prefs = mgr2.prefs_lock.lock().unwrap();
+            mgr2.updating.store(false, Ordering::Release);
+        }
         mgr2.refresh_status();
     });
     (202, json!({"ok": true, "data": {"status": "updating"}}))
@@ -487,7 +503,7 @@ fn run_update(
             resume: &|| mgr.resume_supervisor(),
             wait: &thread::sleep,
             status: &daemon_status,
-            persist: &config::save,
+            persist: &|cfg| mgr.save_config(cfg),
         },
     )
 }
@@ -628,32 +644,45 @@ fn switch_daemon(
         return Err("supervisor did not quiesce — update aborted".into());
     }
 
-    let swap = || -> Result<(), String> {
+    let mut switched = Vec::new();
+    let swapped = (|| -> Result<(), String> {
         for name in BINARIES {
             let current = binary_path(bin_dir, name, "");
             let prev = binary_path(bin_dir, name, ".prev");
             let staged = binary_path(bin_dir, name, ".new");
-            if current.exists() {
+            let had_current = current.exists();
+            if had_current {
                 std::fs::rename(&current, &prev).map_err(|e| format!("backup {name}: {e}"))?;
             }
-            std::fs::rename(&staged, &current).map_err(|e| format!("install {name}: {e}"))?;
+            switched.push((name, current.clone(), prev, had_current));
+            std::fs::rename(staged, current).map_err(|e| format!("install {name}: {e}"))?;
         }
         Ok(())
-    };
-    let rollback = || {
-        for name in BINARIES {
-            let current = binary_path(bin_dir, name, "");
-            let prev = binary_path(bin_dir, name, ".prev");
-            if prev.exists() {
-                let _ = std::fs::rename(&prev, &current);
+    })();
+    let rollback = |failure: String| {
+        let mut errors = Vec::new();
+        for (name, current, prev, had_current) in switched.iter().rev() {
+            let result = if *had_current {
+                std::fs::rename(prev, current)
+            } else if current.exists() {
+                std::fs::remove_file(current)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = result {
+                errors.push(format!("restore {name}: {error}"));
             }
+        }
+        (ops.resume)();
+        if errors.is_empty() {
+            failure
+        } else {
+            format!("{failure}. Rollback failed ({})", errors.join(", "))
         }
     };
 
-    if let Err(e) = swap() {
-        rollback();
-        (ops.resume)();
-        return Err(e);
+    if let Err(error) = swapped {
+        return Err(rollback(error));
     }
 
     // 6. Resume; if it was enrolled+enabled, require Running within 120s or
@@ -681,15 +710,31 @@ fn switch_daemon(
                         .into(),
                 );
             }
-            rollback();
-            (ops.resume)();
-            return Err("updated tailscaled did not reach Running in 120s — rolled back".into());
+            return Err(rollback(
+                "updated tailscaled did not reach Running in 120s — rolled back".into(),
+            ));
         }
     }
 
-    let mut cfg = mgr.config.lock().unwrap();
-    cfg.pinned_version = version.to_string();
-    let _ = (ops.persist)(&cfg);
+    let persisted = {
+        let _prefs = mgr.prefs_lock.lock().unwrap();
+        let mut current = mgr.config.lock().unwrap();
+        let mut candidate = current.clone();
+        candidate.pinned_version = version.to_string();
+        (ops.persist)(&candidate).map(|()| {
+            *current = candidate;
+            mgr.prefs_gen.fetch_add(1, Ordering::Relaxed);
+        })
+    };
+    if let Err(error) = persisted {
+        if !(ops.quiesce)() {
+            (ops.resume)();
+            return Err(format!(
+                "{error}. Supervisor did not quiesce for rollback — manual intervention needed"
+            ));
+        }
+        return Err(rollback(error));
+    }
     Ok(())
 }
 

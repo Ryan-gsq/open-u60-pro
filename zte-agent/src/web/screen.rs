@@ -20,7 +20,7 @@ use crate::auth::Principal;
 use crate::events::Topic;
 use crate::handlers::AppState;
 use crate::httpd::gate::{self, Lane};
-use crate::httpd::{Ctx, Peer};
+use crate::httpd::{Ctx, Via};
 use crate::server::{self, Method};
 
 /// The nav bar of a screen (iOS: tab root, push, sheet).
@@ -321,7 +321,7 @@ impl Req {
         Req {
             nonce: CspNonce::of(req),
             query: req.uri().query().map(str::to_owned),
-            remote: session::is_remote(req.extensions().get::<Peer>()),
+            remote: session::is_remote(Via::of(req.extensions())),
             dismissed: Arc::clone(&ctx.dismissed),
             once: Arc::clone(&ctx.once),
             at: Arc::clone(&ctx.at),

@@ -1,7 +1,7 @@
-mod cache;
+pub(crate) mod cache;
 pub mod config;
 pub(crate) mod dns_packet;
-mod upstream;
+pub(crate) mod upstream;
 
 pub use config::{DohConfig, EncryptedTransport};
 

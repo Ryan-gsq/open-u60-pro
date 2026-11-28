@@ -12,7 +12,7 @@ use super::pages::{at, automations, confirm, devctl, esim, esim_add, forward as 
 use super::screen::{self, Screen, Search};
 use super::tabs::{dashboard, router, settings, sms, tools};
 use super::{live, prefs, render, session, CspNonce};
-use crate::httpd::{Ctx, Peer};
+use crate::httpd::{Ctx, Via};
 
 pub static SCREENS: [&Screen; 75] = [
     &dashboard::DASHBOARD,
@@ -314,7 +314,7 @@ pub async fn dispatch(State(ctx): State<Ctx>, req: Request) -> Response {
         }
         Get::Rule(page) => forward_page::get(&ctx, p, CspNonce::of(&req), page).await,
         Get::Job(page) => {
-            let remote = session::is_remote(req.extensions().get::<Peer>());
+            let remote = session::is_remote(Via::of(req.extensions()));
             automations::get(&ctx, p, CspNonce::of(&req), remote, page).await
         }
         Get::Ask(kind) => confirm::get(&ctx, p, req, kind).await,

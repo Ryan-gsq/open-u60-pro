@@ -24,10 +24,6 @@ fn calls(c: &Ctx) -> Vec<(String, Value)> {
     device::calls(&c.app)
 }
 
-fn tailnet(port: u16) -> Peer {
-    Peer(SocketAddr::from(([127, 0, 0, 1], port)))
-}
-
 /// `location` of a 303.
 fn to(r: &Reply) -> String {
     assert_eq!(r.status, 303, "{}", r.text());

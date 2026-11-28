@@ -41,7 +41,7 @@ use serde_json::{json, Value};
 use crate::auth::Principal;
 use crate::handlers::AppState;
 use crate::httpd::gate::{self, Lane};
-use crate::httpd::{Ctx, Peer};
+use crate::httpd::{Ctx, Via};
 use crate::server::{self, Method};
 use crate::web::action::Ask;
 use crate::web::kit::{self, Icon, Tab};
@@ -826,7 +826,7 @@ async fn show(r: Req, note: Note, status: u16) -> Response {
 /// the call, given back if nothing is sent.
 pub async fn post(ctx: Ctx, req: Request) -> Response {
     let nonce = CspNonce::of(&req);
-    let remote = session::is_remote(req.extensions().get::<Peer>());
+    let remote = session::is_remote(Via::of(req.extensions()));
     let (parts, body) = req.into_parts();
     let Some(p) = session::find_session(&ctx.app.auth, &parts.headers) else {
         let to_login = session::login_redirect(&HttpMethod::POST, LIST, None);
