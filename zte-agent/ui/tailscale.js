@@ -1345,6 +1345,11 @@
           advBtn.disabled = inactive;
           actions.append(advBtn);
         } else {
+          if (meta.state === 'pending') {
+            const readvBtn = button('Re-advertise', () => toggleServiceDrain(svc, false, {readvertise: true}), 'primary');
+            readvBtn.disabled = inactive;
+            actions.append(readvBtn);
+          }
           const drainBtn = button('Drain', () => toggleServiceDrain(svc, true));
           drainBtn.disabled = inactive;
           actions.append(drainBtn);
@@ -1529,17 +1534,24 @@
     }
   }
 
-  async function toggleServiceDrain(svc, drain) {
+  async function toggleServiceDrain(svc, drain, {readvertise = false} = {}) {
     if (!svc || busy) return;
-    const titleText = drain ? `Drain ${svc.service}?` : `Advertise ${svc.service}?`;
+    const titleText = drain
+      ? `Drain ${svc.service}?`
+      : readvertise
+        ? `Re-advertise ${svc.service}?`
+        : `Advertise ${svc.service}?`;
     const bodyText = drain
       ? `Stop accepting new connections for ${svc.service} on this router. Existing connections stay open and rules remain saved so you can re-advertise later.`
-      : `Resume advertising ${svc.service} from this router to your tailnet.`;
-    if (!await confirm(titleText, bodyText, {label: drain ? 'Drain service' : 'Advertise service'})) return;
+      : readvertise
+        ? `Drain and re-advertise ${svc.service} so the Tailscale control plane registers this router as a host (useful if you defined the service in Tailscale Admin after configuring it here).`
+        : `Resume advertising ${svc.service} from this router to your tailnet.`;
+    const confirmLabel = drain ? 'Drain service' : readvertise ? 'Re-advertise service' : 'Advertise service';
+    if (!await confirm(titleText, bodyText, {label: confirmLabel})) return;
     await mutate(servicesText, async live => {
       busy = true;
       draw();
-      say(servicesText, drain ? `Draining ${svc.service}…` : `Advertising ${svc.service}…`);
+      say(servicesText, drain ? `Draining ${svc.service}…` : readvertise ? `Re-advertising ${svc.service}…` : `Advertising ${svc.service}…`);
       try {
         const action = drain ? 'drain' : 'advertise';
         const data = await request(
@@ -1548,7 +1560,7 @@
         );
         if (!live()) return;
         servicesData = data;
-        say(servicesText, drain ? `${svc.service} drained.` : `${svc.service} advertised.`);
+        say(servicesText, drain ? `${svc.service} drained.` : readvertise ? `${svc.service} re-advertised.` : `${svc.service} advertised.`);
       } catch (error) {
         if (live()) say(servicesText, error.message, true);
       } finally {

@@ -566,12 +566,12 @@
   function servicePendingNotice(svc) {
     const defined = svc?.defined_in_tailnet === true || (Array.isArray(svc?.vips) && svc.vips.length > 0);
     if (defined) {
-      return `Defined in Tailscale Admin, waiting for host approval (open ${svc.service || 'this service'} in Tailscale Admin and approve this router).`;
+      return `Defined in Tailscale Admin, waiting for host approval. Approve this router under ${svc.service || 'this service'}, or click Re-advertise if Tailscale Admin still shows no hosts.`;
     }
     const ports = Array.isArray(svc?.configured_ports) && svc.configured_ports.length
       ? `, ports: ${svc.configured_ports.map(p => `tcp:${p}`).join(', ')}`
       : '';
-    return `Not defined in Tailscale Admin yet. Click “Define Service” in Tailscale Admin (name: ${svc?.name || ''}${ports}), then approve this router as a host.`;
+    return `Not defined in Tailscale Admin yet. Click “Define Service” in Tailscale Admin (name: ${svc?.name || ''}${ports}), then click Re-advertise if Tailscale Admin does not list this router.`;
   }
 
   function isValidHostName(host) {

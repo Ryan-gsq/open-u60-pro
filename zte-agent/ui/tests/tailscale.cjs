@@ -946,8 +946,11 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     const lastSvcPut = fixture.requests.filter(r => r.method === 'PUT' && r.url === '/api/tailscale/services/my-web').at(-1);
     assert.equal(lastSvcPut.body.rules.length, 3);
 
-    // Drain, Advertise, and Clear with confirmation dialog.
+    // Re-advertise on pending service, then Drain, Advertise, and Clear with confirmation dialog.
     const myWebCard = services.locator('[data-service="svc:my-web"]');
+    await myWebCard.getByRole('button', {name: 'Re-advertise', exact: true}).click();
+    await confirm('Re-advertise service');
+    await said('#tailscale-services .action-status', 'svc:my-web re-advertised.');
     await myWebCard.getByRole('button', {name: 'Drain', exact: true}).click();
     await confirm('Drain service');
     await said('#tailscale-services .action-status', 'svc:my-web drained.');

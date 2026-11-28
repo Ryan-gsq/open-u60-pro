@@ -1572,7 +1572,7 @@ fn service_cli_action(
     if let Some(resp) = require_password(state) {
         return resp;
     }
-    let (_, svc_key) = match parse_service_name(raw_name) {
+    let (short_name, svc_key) = match parse_service_name(raw_name) {
         Ok(pair) => pair,
         Err(e) => return (400, json!({"ok": false, "error": e})),
     };
@@ -1591,8 +1591,8 @@ fn service_cli_action(
         return resp;
     }
 
+    let sock = mgr.device_path(SOCK);
     if require_configured {
-        let sock = mgr.device_path(SOCK);
         let deadline = Instant::now() + Duration::from_secs(STATUS_CLI_TIMEOUT_SECS);
         let current = match daemon_serve_config_at_until(&sock, deadline) {
             Ok(c) => c,
@@ -1614,6 +1614,28 @@ fn service_cli_action(
                 404,
                 json!({"ok": false, "error": format!("{svc_key} is not configured on this router")}),
             );
+        }
+    }
+
+    // Re-advertising an already-advertised service (e.g. after defining it in
+    // Tailscale Admin) requires a drain->advertise transition so tailscaled
+    // emits a fresh AdvertiseServices preference update to the control plane.
+    if subcmd == "advertise" {
+        let deadline = Instant::now() + Duration::from_secs(STATUS_CLI_TIMEOUT_SECS);
+        let already_advertised = daemon_prefs_at_until(&sock, deadline).is_some_and(|p| {
+            p.advertise_services
+                .iter()
+                .any(|s| parse_service_name(s).ok().is_some_and(|(n, _)| n == short_name))
+        });
+        if already_advertised {
+            if let Err(e) = mgr.run_cli(&["serve", "drain", &svc_key], CLI_TIMEOUT_SECS) {
+                return (
+                    502,
+                    json!({"ok": false, "error": format!("tailscale serve drain {svc_key}: {e}")}),
+                );
+            }
+            #[cfg(not(test))]
+            std::thread::sleep(Duration::from_millis(300));
         }
     }
 
@@ -2251,7 +2273,8 @@ mod tests {
             .unwrap();
         assert_eq!(newapp["state"], "drained");
 
-        // Advertise restores it.
+        // Advertise restores it (drained -> advertise only).
+        cli_log.lock().unwrap().clear();
         let (code, body) = service_advertise(&state, "newapp");
         assert_eq!(code, 200);
         let newapp = body["data"]["services"]
@@ -2261,6 +2284,29 @@ mod tests {
             .find(|s| s["name"] == "newapp")
             .unwrap();
         assert_eq!(newapp["drained"], false);
+        assert_eq!(
+            *cli_log.lock().unwrap(),
+            vec![vec!["serve", "advertise", "svc:newapp"]]
+        );
+
+        // Re-advertising an already-advertised service triggers drain then advertise.
+        cli_log.lock().unwrap().clear();
+        let (code, body) = service_advertise(&state, "newapp");
+        assert_eq!(code, 200);
+        let newapp = body["data"]["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "newapp")
+            .unwrap();
+        assert_eq!(newapp["drained"], false);
+        assert_eq!(
+            *cli_log.lock().unwrap(),
+            vec![
+                vec!["serve", "drain", "svc:newapp"],
+                vec!["serve", "advertise", "svc:newapp"],
+            ]
+        );
 
         // ETag 412 surfaces as 409 Conflict.
         *mock.force_412.lock().unwrap() = true;
