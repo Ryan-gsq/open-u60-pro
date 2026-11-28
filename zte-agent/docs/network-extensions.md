@@ -1214,7 +1214,7 @@ boot restoration.
 | GET | `/api/tailscale/services` | Aggregate `ServeConfig`, `Prefs.AdvertiseServices`, `Self.CapMap`, and `Self.PrimaryRoutes` for `svc:*` services |
 | PUT | `/api/tailscale/services/:name` | Atomically create or update one `svc:<name>` service via `If-Match`-guarded `POST /localapi/v0/serve-config` |
 | POST | `/api/tailscale/services/:name/drain` | Stop accepting new connections for `svc:<name>` while retaining saved handlers |
-| POST | `/api/tailscale/services/:name/advertise` | Resume advertising `svc:<name>` to the tailnet |
+| POST | `/api/tailscale/services/:name/advertise` | Resume advertising `svc:<name>` to the tailnet, or re-advertise (`drain` then `advertise`) if already advertised |
 | DELETE | `/api/tailscale/services/:name` | Clear all handlers and advertisement for `svc:<name>` |
 
 Send the managed fields you want to change with `PUT /api/tailscale/config`.
@@ -1242,8 +1242,7 @@ conflicts, and HTTPS path uniqueness, preserve all other services and node-level
 Serve entries verbatim, pass the `ETag` via `If-Match` (returning HTTP 409 on
 concurrent edits), refuse to silently overwrite CLI-only advanced handlers
 (`Text`, plaintext `HTTP`, `TerminateTLS`, `ProxyProtocol`, `AcceptAppCaps`,
-`--tun`), and automatically advertise newly created services while preserving
-an existing service's drained state on edit. All Tailscale Services endpoints
+`--tun`), distinguish undefined services (`defined_in_tailnet: false`) from defined-but-unapproved services, and automatically advertise newly created services while preserving an existing service's drained state on edit. Calling `POST /api/tailscale/services/:name/advertise` on an already-advertised service cycles `drain` then `advertise` so a service defined in Tailscale Admin after initial configuration registers immediately. All Tailscale Services endpoints
 run on the Slow lane and require authentication, CSRF/Origin checks, and
 serialization through `prefs_lock`.
 
