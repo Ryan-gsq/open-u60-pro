@@ -359,15 +359,19 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
         target_kind: 'lan_private',
         subnet_route_state: 'not_advertised'
       }));
+      const definedInTailnet = !!(existing?.defined_in_tailnet || existing?.vips?.length);
       const next = {
         name,
         service: `svc:${name}`,
         fqdn: `${name}.tail1234.ts.net`,
-        admin_url: `https://console.tailscale.com/admin/services/svc:${name}`,
+        admin_url: definedInTailnet
+          ? `https://console.tailscale.com/admin/services/svc:${name}`
+          : 'https://console.tailscale.com/admin/services',
         state: existing?.approved ? 'active' : 'pending',
         configured: true,
         advertised: existing ? existing.advertised || !existing.configured : true,
         drained: existing?.drained === true,
+        defined_in_tailnet: definedInTailnet,
         approved: existing?.approved === true,
         editable: true,
         unsupported_reasons: [],
@@ -936,6 +940,9 @@ const {start, envelope, watchApiResponses, releaseResponse, refreshOn} = require
     await button('Save service').click();
     await said('#tailscale-services .action-status', 'svc:my-web saved.');
     await services.locator('[data-service="svc:my-web"]').waitFor({state: 'visible'});
+    const myWebAdmin = services.locator('[data-service="svc:my-web"] a', {hasText: 'Define in Tailscale admin'});
+    assert.equal(await myWebAdmin.getAttribute('href'), 'https://console.tailscale.com/admin/services');
+    assert.match(await services.locator('[data-service="svc:my-web"]').textContent(), /Define Service.*name: my-web, ports: tcp:443, tcp:9001/);
     const lastSvcPut = fixture.requests.filter(r => r.method === 'PUT' && r.url === '/api/tailscale/services/my-web').at(-1);
     assert.equal(lastSvcPut.body.rules.length, 3);
 

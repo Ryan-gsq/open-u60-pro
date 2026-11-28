@@ -313,7 +313,10 @@ assert.deepEqual(M.lastUpdateSummary({version: '1.86.2', ok: false, error: 'sha2
 assert.deepEqual(M.normalizeServiceName('t3code'), {name: 't3code', service: 'svc:t3code'});
 assert.deepEqual(M.normalizeServiceName('svc:my-app-1'), {name: 'my-app-1', service: 'svc:my-app-1'});
 assert.equal(M.serviceAdminUrl('t3code'), 'https://console.tailscale.com/admin/services/svc:t3code');
+assert.equal(M.serviceAdminUrl('t3code', false), 'https://console.tailscale.com/admin/services');
 assert.equal(M.serviceAdminUrl('Bad_Name'), '');
+assert.match(M.servicePendingNotice({name: 't3code', service: 'svc:t3code', defined_in_tailnet: false, vips: [], configured_ports: [443, 3773]}), /Define Service.*name: t3code, ports: tcp:443, tcp:3773/);
+assert.match(M.servicePendingNotice({name: 't3code', service: 'svc:t3code', defined_in_tailnet: true, vips: ['100.75.1.1']}), /Defined in Tailscale Admin, waiting for host approval/);
 for (const bad of ['', 'svc:', 'Upper', '-lead', 'trail-', 'a.b', 'a/b', 'a'.repeat(64)]) {
   assert.ok(M.serviceNameProblem(bad), `expected error for ${bad}`);
 }

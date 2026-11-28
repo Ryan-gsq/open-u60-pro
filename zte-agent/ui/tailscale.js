@@ -1267,7 +1267,7 @@
         warn.append(el('p', '', mismatchMsg));
         card.append(warn);
       } else if (meta.state === 'pending') {
-        card.append(el('p', 'field-help', 'Waiting for Tailscale admin approval (VIP not yet active in PrimaryRoutes).'));
+        card.append(el('p', 'field-help', M.servicePendingNotice(svc)));
       } else if (meta.state === 'unconfigured') {
         card.append(el('p', 'field-help', 'Assigned to this router in Tailscale admin, but no local backend rules are configured yet.'));
       }
@@ -1321,9 +1321,10 @@
         const copyPrimary = button('Copy address', () => copyText(primaryUrl, servicesText, primaryUrl));
         actions.append(copyPrimary);
       }
-      const adminHref = svc.admin_url || M.serviceAdminUrl(svc.name);
+      const isDefined = svc.defined_in_tailnet === true || (Array.isArray(svc.vips) && svc.vips.length > 0);
+      const adminHref = svc.admin_url || M.serviceAdminUrl(svc.name, isDefined);
       if (adminHref) {
-        const link = el('a', 'button', 'Tailscale admin ↗');
+        const link = el('a', 'button', isDefined ? 'Tailscale admin ↗' : 'Define in Tailscale admin ↗');
         link.href = adminHref;
         link.target = '_blank';
         link.rel = 'noopener noreferrer';

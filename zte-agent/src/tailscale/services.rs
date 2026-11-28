@@ -28,6 +28,7 @@ use super::{
 
 pub(crate) const MAX_RULES_PER_SERVICE: usize = 32;
 const MAX_PATH_LEN: usize = 256;
+const ADMIN_SERVICES_URL: &str = "https://console.tailscale.com/admin/services";
 const ADMIN_SERVICE_BASE_URL: &str = "https://console.tailscale.com/admin/services/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1158,11 +1159,16 @@ pub(crate) fn aggregate_services(
     for short in all_names {
         let svc_key = format!("svc:{short}");
         let fqdn = suffix.as_ref().map(|s| format!("{short}.{s}"));
-        let admin_url = format!("{ADMIN_SERVICE_BASE_URL}{svc_key}");
         let cap = cap_services.get(&short);
         let vips = cap.map(|c| c.vips.clone()).unwrap_or_default();
         let tailnet_ports = cap.map(|c| c.ports.clone()).unwrap_or_default();
         let has_service_def = cap.is_some_and(|c| c.has_service_def);
+        let defined_in_tailnet = has_service_def || !vips.is_empty();
+        let admin_url = if defined_in_tailnet {
+            format!("{ADMIN_SERVICE_BASE_URL}{svc_key}")
+        } else {
+            ADMIN_SERVICES_URL.to_string()
+        };
 
         let primary_vips: Vec<String> = vips
             .iter()
@@ -1270,6 +1276,7 @@ pub(crate) fn aggregate_services(
             "configured": configured,
             "advertised": advertised,
             "drained": drained,
+            "defined_in_tailnet": defined_in_tailnet,
             "approved": approved,
             "editable": editable,
             "unsupported_reasons": unsupported_reasons,
@@ -1908,6 +1915,8 @@ mod tests {
             .map(|s| (s["name"].as_str().unwrap().to_string(), s))
             .collect();
         assert_eq!(by_name["active-app"]["state"], "active");
+        assert_eq!(by_name["active-app"]["defined_in_tailnet"], true);
+        assert_eq!(by_name["active-app"]["admin_url"], "https://console.tailscale.com/admin/services/svc:active-app");
         assert_eq!(by_name["active-app"]["unallowed_ports"], json!([]));
         assert_eq!(by_name["active-app"]["rules"][0]["subnet_route_state"], "approved");
 
@@ -1918,6 +1927,8 @@ mod tests {
         assert_eq!(by_name["drained-app"]["drained"], true);
 
         assert_eq!(by_name["pending-app"]["state"], "pending");
+        assert_eq!(by_name["pending-app"]["defined_in_tailnet"], false);
+        assert_eq!(by_name["pending-app"]["admin_url"], "https://console.tailscale.com/admin/services");
         assert_eq!(by_name["pending-app"]["rules"][0]["subnet_route_state"], "not_advertised");
 
         assert_eq!(by_name["unconf-app"]["state"], "unconfigured");

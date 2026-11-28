@@ -1,6 +1,7 @@
 'use strict';
 ((globalThis) => {
   const ADMIN_CONSOLE_URL = 'https://login.tailscale.com/admin/machines';
+  const ADMIN_SERVICES_URL = 'https://console.tailscale.com/admin/services';
   const ADMIN_SERVICES_BASE_URL = 'https://console.tailscale.com/admin/services/';
   const PACKAGES_URL = 'https://pkgs.tailscale.com/stable/#static';
   const HOSTNAME_RE = /^[A-Za-z0-9-]+$/;
@@ -556,9 +557,21 @@
     return normalizeServiceName(raw).error || '';
   }
 
-  function serviceAdminUrl(raw) {
+  function serviceAdminUrl(raw, defined = true) {
+    if (!defined) return ADMIN_SERVICES_URL;
     const parsed = normalizeServiceName(raw);
     return parsed.service ? `${ADMIN_SERVICES_BASE_URL}${parsed.service}` : '';
+  }
+
+  function servicePendingNotice(svc) {
+    const defined = svc?.defined_in_tailnet === true || (Array.isArray(svc?.vips) && svc.vips.length > 0);
+    if (defined) {
+      return `Defined in Tailscale Admin, waiting for host approval (open ${svc.service || 'this service'} in Tailscale Admin and approve this router).`;
+    }
+    const ports = Array.isArray(svc?.configured_ports) && svc.configured_ports.length
+      ? `, ports: ${svc.configured_ports.map(p => `tcp:${p}`).join(', ')}`
+      : '';
+    return `Not defined in Tailscale Admin yet. Click “Define Service” in Tailscale Admin (name: ${svc?.name || ''}${ports}), then approve this router as a host.`;
   }
 
   function isValidHostName(host) {
@@ -916,6 +929,7 @@
 
   const api = {
     ADMIN_CONSOLE_URL,
+    ADMIN_SERVICES_URL,
     ADMIN_SERVICES_BASE_URL,
     PACKAGES_URL,
     MAX_ADVERTISE_ROUTES,
@@ -963,6 +977,7 @@
     normalizeServiceName,
     serviceNameProblem,
     serviceAdminUrl,
+    servicePendingNotice,
     normalizeServicePath,
     validateServiceRules,
     extractTargetIp,
